@@ -28,7 +28,7 @@ README.md
 
 ## Run tests
 ```
-python -m unittest discover -s tests -v
+python tests/test_phase_a_contracts.py
 ```
 
 ## Not included

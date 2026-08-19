@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import sys
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import quant
 from quant.models import (
     HORIZONS,
     ExactSixBundle,
     HorizonForecast,
     SetupState,
 )
-from quant.snapshot import missing_example
+from quant.snapshot import from_price, missing_example, stale_example
 
 
 def forecast(horizon: str) -> HorizonForecast:
@@ -29,6 +34,18 @@ def bundle(rows: list[HorizonForecast]) -> ExactSixBundle:
 
 
 class PhaseAContractTests(unittest.TestCase):
+    def test_quant_exports_only_thin_contracts(self) -> None:
+        self.assertEqual(
+            quant.__all__,
+            [
+                "HORIZONS",
+                "ExactSixBundle",
+                "HorizonForecast",
+                "SetupState",
+                "Snapshot",
+            ],
+        )
+
     def test_horizons_are_exact_and_ordered(self) -> None:
         self.assertEqual(HORIZONS, ("30S", "1M", "5M", "15M", "30M", "1H"))
 
@@ -60,6 +77,12 @@ class PhaseAContractTests(unittest.TestCase):
         self.assertIsNone(snapshot.bar_close)
         self.assertFalse(snapshot.is_usable())
         self.assertEqual(snapshot.reason_codes, ["MISSING_LAST"])
+
+    def test_stale_snapshot_is_unusable(self) -> None:
+        self.assertFalse(stale_example().is_usable())
+
+    def test_fresh_snapshot_with_a_positive_price_is_usable(self) -> None:
+        self.assertTrue(from_price("COIN", 150.0, fresh=True).is_usable())
 
     def test_non_trade_forecast_does_not_invent_a_probability(self) -> None:
         row = forecast("30S").to_dict()
