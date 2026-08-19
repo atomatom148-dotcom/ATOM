@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-from .ledger import LedgerRecord
+from .ledger import LedgerRecord, validate_bundle_integrity
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,9 @@ def resolve_due(
 
     if not math.isfinite(outcome_price) or outcome_price <= 0:
         raise ValueError("outcome_price must be positive and finite")
+    if not math.isfinite(now_epoch):
+        raise ValueError("now_epoch must be finite")
+    validate_bundle_integrity(record.bundle)
 
     return [
         ResolvedOutcome(

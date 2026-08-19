@@ -92,6 +92,18 @@ class PhaseB3ResolverTests(unittest.TestCase):
                         outcome_price=invalid,
                     )
 
+    def test_invalid_resolution_times_are_rejected(self) -> None:
+        for invalid in (math.nan, math.inf, -math.inf):
+            with self.subTest(now_epoch=invalid):
+                with self.assertRaisesRegex(ValueError, "now_epoch must be finite"):
+                    self.resolve(invalid)
+
+    def test_mutated_commit_evidence_is_rejected_before_resolving(self) -> None:
+        self.record.bundle.rows[0].maturity_epoch = CUTOFF
+
+        with self.assertRaisesRegex(ValueError, "mature after"):
+            self.resolve(CUTOFF + 30)
+
     def test_forbidden_surfaces_are_absent(self) -> None:
         for name in (
             "direction",

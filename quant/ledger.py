@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import math
 
 from .models import ExactSixBundle, HORIZONS
 
@@ -27,9 +28,7 @@ class Ledger:
         if bundle.cycle_id in self._records:
             raise ValueError(f"cycle already committed: {bundle.cycle_id}")
 
-        horizons = tuple(row.horizon for row in bundle.rows)
-        if len(bundle.rows) != len(HORIZONS) or horizons != HORIZONS:
-            raise ValueError("commit requires exactly six horizons in exact order")
+        validate_bundle_integrity(bundle)
 
         record = LedgerRecord(bundle=deepcopy(bundle))
         self._records[bundle.cycle_id] = record
@@ -52,6 +51,24 @@ class Ledger:
         """Return the number of committed records."""
 
         return len(self._records)
+
+
+def validate_bundle_integrity(bundle: ExactSixBundle) -> None:
+    """Reject rows that cannot truthfully belong to the claimed commit."""
+
+    horizons = tuple(row.horizon for row in bundle.rows)
+    if len(bundle.rows) != len(HORIZONS) or horizons != HORIZONS:
+        raise ValueError("commit requires exactly six horizons in exact order")
+    if not math.isfinite(bundle.cutoff_epoch):
+        raise ValueError("commit cutoff must be finite")
+    if any(row.cutoff_epoch != bundle.cutoff_epoch for row in bundle.rows):
+        raise ValueError("every row cutoff must match the bundle cutoff")
+    if any(
+        not math.isfinite(row.maturity_epoch)
+        or row.maturity_epoch <= bundle.cutoff_epoch
+        for row in bundle.rows
+    ):
+        raise ValueError("every horizon must mature after the commit cutoff")
 
 
 __all__ = ["Ledger", "LedgerRecord"]

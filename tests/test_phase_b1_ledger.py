@@ -20,8 +20,13 @@ def bundle(cycle_id: str = "cycle-1") -> ExactSixBundle:
         snapshot_hash=f"snapshot-{cycle_id}",
         policy_version="phase-b1",
         rows=[
-            HorizonForecast(horizon=horizon, setup_state=SetupState.NO_SETUP)
-            for horizon in HORIZONS
+            HorizonForecast(
+                horizon=horizon,
+                setup_state=SetupState.NO_SETUP,
+                cutoff_epoch=1_700_000_000.0,
+                maturity_epoch=1_700_000_030.0 + index,
+            )
+            for index, horizon in enumerate(HORIZONS)
         ],
     )
 
@@ -74,6 +79,26 @@ class PhaseB1LedgerTests(unittest.TestCase):
         candidate.rows[0], candidate.rows[1] = candidate.rows[1], candidate.rows[0]
 
         with self.assertRaisesRegex(ValueError, "exact order"):
+            ledger.commit(candidate)
+
+        self.assertEqual(ledger.count(), 0)
+
+    def test_row_cutoff_must_match_committed_bundle(self) -> None:
+        ledger = Ledger()
+        candidate = bundle()
+        candidate.rows[0].cutoff_epoch += 1
+
+        with self.assertRaisesRegex(ValueError, "row cutoff"):
+            ledger.commit(candidate)
+
+        self.assertEqual(ledger.count(), 0)
+
+    def test_every_horizon_must_mature_after_cutoff(self) -> None:
+        ledger = Ledger()
+        candidate = bundle()
+        candidate.rows[0].maturity_epoch = candidate.cutoff_epoch
+
+        with self.assertRaisesRegex(ValueError, "mature after"):
             ledger.commit(candidate)
 
         self.assertEqual(ledger.count(), 0)
