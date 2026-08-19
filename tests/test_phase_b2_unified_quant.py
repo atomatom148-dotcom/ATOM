@@ -8,18 +8,31 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from quant.ledger import Ledger, LedgerRecord
 from quant.models import HORIZONS, SetupState
 from quant.snapshot import from_price, missing_example, stale_example
-from quant.unified_quant import UnifiedQuant
+import quant.unified_quant as unified_quant
+from quant.unified_quant import write_cycle
+
+
+CUTOFF = 1_700_000_100.0
 
 
 class PhaseB2UnifiedQuantTests(unittest.TestCase):
     def test_usable_snapshot_writes_exact_six_honest_non_trades(self) -> None:
         snapshot = from_price("COIN", 150.0, asof_epoch=1_700_000_000.0)
-        bundle = UnifiedQuant().write(snapshot, cycle_id="cycle-1")
+        ledger = Ledger()
+        record = write_cycle(
+            snapshot, ledger, cycle_id="cycle-1", cutoff_epoch=CUTOFF
+        )
+        bundle = record.bundle
 
+        self.assertIsInstance(record, LedgerRecord)
+        self.assertEqual(ledger.count(), 1)
+        self.assertEqual(record, ledger.get("cycle-1"))
         self.assertEqual(tuple(row.horizon for row in bundle.rows), HORIZONS)
-        self.assertEqual(bundle.cutoff_epoch, snapshot.asof_epoch)
+        self.assertEqual(bundle.cutoff_epoch, CUTOFF)
+        self.assertEqual([row.cutoff_epoch for row in bundle.rows], [CUTOFF] * 6)
         self.assertEqual(
             [row.maturity_epoch - row.cutoff_epoch for row in bundle.rows],
             [30, 60, 300, 900, 1800, 3600],
@@ -36,7 +49,13 @@ class PhaseB2UnifiedQuantTests(unittest.TestCase):
             (stale_example(), "STALE_CORE"),
         ):
             with self.subTest(reason=expected_reason):
-                bundle = UnifiedQuant().write(snapshot, cycle_id=expected_reason)
+                record = write_cycle(
+                    snapshot,
+                    Ledger(),
+                    cycle_id=expected_reason,
+                    cutoff_epoch=CUTOFF,
+                )
+                bundle = record.bundle
                 for row in bundle.rows:
                     self.assertEqual(row.setup_state, SetupState.UNAVAILABLE)
                     self.assertEqual(row.reason_codes, [expected_reason])
@@ -46,7 +65,9 @@ class PhaseB2UnifiedQuantTests(unittest.TestCase):
     def test_unusable_snapshot_without_a_reason_gets_an_honest_reason(self) -> None:
         snapshot = from_price("COIN", None, asof_epoch=1_700_000_000.0)
 
-        bundle = UnifiedQuant().write(snapshot, cycle_id="cycle-1")
+        bundle = write_cycle(
+            snapshot, Ledger(), cycle_id="cycle-1", cutoff_epoch=CUTOFF
+        ).bundle
 
         self.assertEqual(
             [row.reason_codes for row in bundle.rows],
@@ -54,24 +75,39 @@ class PhaseB2UnifiedQuantTests(unittest.TestCase):
         )
 
     def test_hash_is_stable_and_changes_with_snapshot_evidence(self) -> None:
-        writer = UnifiedQuant()
         first = from_price("COIN", 150.0, asof_epoch=1_700_000_000.0)
         same = from_price("COIN", 150.0, asof_epoch=1_700_000_000.0)
         changed = from_price("COIN", 151.0, asof_epoch=1_700_000_000.0)
 
-        first_hash = writer.write(first, cycle_id="first").snapshot_hash
+        first_hash = write_cycle(
+            first, Ledger(), cycle_id="first", cutoff_epoch=CUTOFF
+        ).bundle.snapshot_hash
         self.assertEqual(
-            first_hash, writer.write(same, cycle_id="same").snapshot_hash
+            first_hash,
+            write_cycle(
+                same, Ledger(), cycle_id="same", cutoff_epoch=CUTOFF
+            ).bundle.snapshot_hash,
         )
         self.assertNotEqual(
-            first_hash, writer.write(changed, cycle_id="changed").snapshot_hash
+            first_hash,
+            write_cycle(
+                changed, Ledger(), cycle_id="changed", cutoff_epoch=CUTOFF
+            ).bundle.snapshot_hash,
         )
 
-    def test_forbidden_forecast_and_execution_surfaces_are_absent(self) -> None:
-        writer = UnifiedQuant()
+    def test_duplicate_cycle_is_rejected_without_changing_ledger(self) -> None:
+        ledger = Ledger()
+        snapshot = from_price("COIN", 150.0)
+        write_cycle(snapshot, ledger, cycle_id="cycle-1", cutoff_epoch=CUTOFF)
 
+        with self.assertRaisesRegex(ValueError, "already committed"):
+            write_cycle(snapshot, ledger, cycle_id="cycle-1", cutoff_epoch=CUTOFF)
+
+        self.assertEqual(ledger.count(), 1)
+
+    def test_forbidden_forecast_and_execution_surfaces_are_absent(self) -> None:
         for name in ("direction_brain", "broker", "order", "execute", "resolve"):
-            self.assertFalse(hasattr(writer, name), name)
+            self.assertFalse(hasattr(unified_quant, name), name)
 
 
 if __name__ == "__main__":
