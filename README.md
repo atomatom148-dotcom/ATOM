@@ -28,7 +28,7 @@ README.md
 
 ## Run tests
 ```
-python tests/test_thin_spine.py
+python -m unittest discover -s tests -v
 ```
 
 ## Not included
