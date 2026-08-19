@@ -1,4 +1,4 @@
-"""Phase B1 proofs for the process-local exact-six ledger."""
+"""Phase B1 proofs for the exact-six ledger."""
 
 from __future__ import annotations
 
@@ -8,80 +8,109 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from quant.ledger import ExactSixLedger, LedgerCommitError
+from quant.ledger import Ledger
 from quant.models import HORIZONS, ExactSixBundle, HorizonForecast, SetupState
 
 
-CUTOFF = 1_700_000_000.0
-
-
 def bundle(cycle_id: str = "cycle-1") -> ExactSixBundle:
-    rows = [
-        HorizonForecast(
-            horizon=horizon,
-            setup_state=SetupState.NO_SETUP,
-            cutoff_epoch=CUTOFF,
-            maturity_epoch=CUTOFF + offset,
-        )
-        for horizon, offset in zip(HORIZONS, (30, 60, 300, 900, 1800, 3600))
-    ]
     return ExactSixBundle(
         cycle_id=cycle_id,
         symbol="COIN",
-        cutoff_epoch=CUTOFF,
-        snapshot_hash="snapshot-proof",
+        cutoff_epoch=1_700_000_000.0,
+        snapshot_hash=f"snapshot-{cycle_id}",
         policy_version="phase-b1",
-        rows=rows,
+        rows=[
+            HorizonForecast(horizon=horizon, setup_state=SetupState.NO_SETUP)
+            for horizon in HORIZONS
+        ],
     )
 
 
 class PhaseB1LedgerTests(unittest.TestCase):
-    def test_commits_one_exact_six_bundle_atomically(self) -> None:
-        ledger = ExactSixLedger()
-        receipt = ledger.commit(bundle(), committed_at_epoch=CUTOFF + 1)
+    def test_empty_ledger(self) -> None:
+        ledger = Ledger()
 
-        self.assertEqual(len(ledger), 1)
-        self.assertEqual(receipt.cycle_id, "cycle-1")
-        self.assertEqual(tuple(row.horizon for row in receipt.bundle.rows), HORIZONS)
+        self.assertEqual(ledger.count(), 0)
+        self.assertIsNone(ledger.latest())
 
-    def test_rejects_a_commit_at_or_after_maturity_without_partial_write(self) -> None:
-        ledger = ExactSixLedger()
+    def test_get_by_cycle_id_and_missing_get(self) -> None:
+        ledger = Ledger()
+        expected = ledger.commit(bundle())
 
-        with self.assertRaisesRegex(LedgerCommitError, "before horizon maturity"):
-            ledger.commit(bundle(), committed_at_epoch=CUTOFF + 30)
+        self.assertEqual(ledger.get("cycle-1"), expected)
+        self.assertIsNone(ledger.get("missing"))
 
-        self.assertEqual(len(ledger), 0)
+    def test_two_commits_preserve_order_and_latest(self) -> None:
+        ledger = Ledger()
+        first = ledger.commit(bundle("cycle-1"))
+        second = ledger.commit(bundle("cycle-2"))
 
-    def test_committed_cycle_cannot_be_overwritten(self) -> None:
-        ledger = ExactSixLedger()
-        ledger.commit(bundle(), committed_at_epoch=CUTOFF + 1)
+        self.assertEqual(ledger.count(), 2)
+        self.assertEqual(ledger.get("cycle-1"), first)
+        self.assertEqual(ledger.latest(), second)
 
-        with self.assertRaisesRegex(LedgerCommitError, "already committed"):
-            ledger.commit(bundle(), committed_at_epoch=CUTOFF + 2)
+    def test_duplicate_cycle_leaves_count_unchanged(self) -> None:
+        ledger = Ledger()
+        ledger.commit(bundle())
 
-        self.assertEqual(len(ledger), 1)
+        with self.assertRaisesRegex(ValueError, "already committed"):
+            ledger.commit(bundle())
 
-    def test_committed_history_is_isolated_from_caller_mutation(self) -> None:
-        ledger = ExactSixLedger()
-        source = bundle()
-        ledger.commit(source, committed_at_epoch=CUTOFF + 1)
-        source.rows[0].reason_codes.append("REWRITTEN")
+        self.assertEqual(ledger.count(), 1)
 
-        read = ledger.get(source.cycle_id)
-        self.assertEqual(read.bundle.rows[0].reason_codes, [])
-
-        read.bundle.rows[0].reason_codes.append("ALSO_REWRITTEN")
-        self.assertEqual(ledger.get(source.cycle_id).bundle.rows[0].reason_codes, [])
-
-    def test_all_row_cutoffs_must_match_cycle_cutoff(self) -> None:
-        ledger = ExactSixLedger()
+    def test_mutated_wrong_row_count_is_rejected(self) -> None:
+        ledger = Ledger()
         candidate = bundle()
-        candidate.rows[-1].cutoff_epoch += 1
+        candidate.rows.pop()
 
-        with self.assertRaisesRegex(LedgerCommitError, "cutoff"):
-            ledger.commit(candidate, committed_at_epoch=CUTOFF + 1)
+        with self.assertRaisesRegex(ValueError, "exactly six"):
+            ledger.commit(candidate)
 
-        self.assertEqual(len(ledger), 0)
+        self.assertEqual(ledger.count(), 0)
+
+    def test_mutated_wrong_horizon_order_is_rejected(self) -> None:
+        ledger = Ledger()
+        candidate = bundle()
+        candidate.rows[0], candidate.rows[1] = candidate.rows[1], candidate.rows[0]
+
+        with self.assertRaisesRegex(ValueError, "exact order"):
+            ledger.commit(candidate)
+
+        self.assertEqual(ledger.count(), 0)
+
+    def test_original_bundle_mutation_cannot_alter_stored_evidence(self) -> None:
+        ledger = Ledger()
+        original = bundle()
+        ledger.commit(original)
+        original.rows[0].reason_codes.append("MUTATED")
+
+        self.assertEqual(ledger.get("cycle-1").bundle.rows[0].reason_codes, [])
+
+    def test_returned_records_cannot_alter_stored_evidence(self) -> None:
+        ledger = Ledger()
+        committed = ledger.commit(bundle())
+        committed.bundle.rows[0].reason_codes.append("COMMIT_MUTATION")
+        fetched = ledger.get("cycle-1")
+        fetched.bundle.rows[0].reason_codes.append("GET_MUTATION")
+        latest = ledger.latest()
+        latest.bundle.rows[0].reason_codes.append("LATEST_MUTATION")
+
+        self.assertEqual(ledger.get("cycle-1").bundle.rows[0].reason_codes, [])
+
+    def test_forbidden_public_methods_are_absent(self) -> None:
+        ledger = Ledger()
+
+        for name in (
+            "update",
+            "delete",
+            "resolve",
+            "broker",
+            "order",
+            "account",
+            "execute",
+            "execution",
+        ):
+            self.assertFalse(hasattr(ledger, name), name)
 
 
 if __name__ == "__main__":

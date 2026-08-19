@@ -1,8 +1,4 @@
-"""Atomic, process-local storage for exact-six forecast bundles.
-
-Phase B1 deliberately defines only the ledger boundary.  Persistence and
-forecast resolution belong to later phases.
-"""
+"""In-memory exact-six bundle ledger for Phase B1."""
 
 from __future__ import annotations
 
@@ -12,80 +8,50 @@ from dataclasses import dataclass
 from .models import ExactSixBundle, HORIZONS
 
 
-class LedgerCommitError(ValueError):
-    """Raised when a bundle cannot be committed without breaking ledger law."""
+@dataclass
+class LedgerRecord:
+    """One committed exact-six bundle."""
+
+    bundle: ExactSixBundle
 
 
-@dataclass(frozen=True)
-class LedgerCommit:
-    """An immutable receipt plus a private snapshot of the committed bundle."""
-
-    cycle_id: str
-    committed_at_epoch: float
-    _bundle: ExactSixBundle
-
-    @property
-    def bundle(self) -> ExactSixBundle:
-        """Return a copy so callers cannot rewrite committed history."""
-
-        return deepcopy(self._bundle)
-
-
-class ExactSixLedger:
-    """Minimal in-memory, append-only exact-six ledger."""
+class Ledger:
+    """An insertion-ordered, append-only ledger of exact-six bundles."""
 
     def __init__(self) -> None:
-        self._commits: dict[str, LedgerCommit] = {}
+        self._records: dict[str, LedgerRecord] = {}
 
-    def commit(
-        self, bundle: ExactSixBundle, *, committed_at_epoch: float
-    ) -> LedgerCommit:
-        """Atomically commit one bundle before any of its rows mature.
+    def commit(self, bundle: ExactSixBundle) -> LedgerRecord:
+        """Commit a defensive copy of a valid, previously unseen bundle."""
 
-        Validation happens before the ledger is modified.  A cycle identifier
-        is idempotency ownership, not an update key: committed cycles cannot be
-        overwritten, even with an otherwise identical bundle.
-        """
+        if bundle.cycle_id in self._records:
+            raise ValueError(f"cycle already committed: {bundle.cycle_id}")
 
-        if bundle.cycle_id in self._commits:
-            raise LedgerCommitError(f"cycle already committed: {bundle.cycle_id}")
+        horizons = tuple(row.horizon for row in bundle.rows)
+        if len(bundle.rows) != len(HORIZONS) or horizons != HORIZONS:
+            raise ValueError("commit requires exactly six horizons in exact order")
 
-        got = tuple(row.horizon for row in bundle.rows)
-        if len(bundle.rows) != len(HORIZONS) or got != HORIZONS:
-            raise LedgerCommitError("commit requires exactly six ordered horizons")
+        record = LedgerRecord(bundle=deepcopy(bundle))
+        self._records[bundle.cycle_id] = record
+        return deepcopy(record)
 
-        if any(row.cutoff_epoch != bundle.cutoff_epoch for row in bundle.rows):
-            raise LedgerCommitError("row cutoff must match bundle cutoff")
+    def latest(self) -> LedgerRecord | None:
+        """Return a copy of the most recently committed record, if one exists."""
 
-        if any(row.maturity_epoch <= committed_at_epoch for row in bundle.rows):
-            raise LedgerCommitError("bundle must be committed before horizon maturity")
+        if not self._records:
+            return None
+        return deepcopy(next(reversed(self._records.values())))
 
-        stored = deepcopy(bundle)
-        receipt = LedgerCommit(
-            cycle_id=bundle.cycle_id,
-            committed_at_epoch=committed_at_epoch,
-            _bundle=stored,
-        )
-        self._commits[bundle.cycle_id] = receipt
-        return self.get(bundle.cycle_id)
+    def get(self, cycle_id: str) -> LedgerRecord | None:
+        """Return a copy of a record by cycle ID, or ``None`` when missing."""
 
-    def get(self, cycle_id: str) -> LedgerCommit:
-        """Return a defensive copy of a cycle's commit receipt."""
+        record = self._records.get(cycle_id)
+        return deepcopy(record) if record is not None else None
 
-        receipt = self._commits[cycle_id]
-        return LedgerCommit(
-            cycle_id=receipt.cycle_id,
-            committed_at_epoch=receipt.committed_at_epoch,
-            _bundle=deepcopy(receipt._bundle),
-        )
+    def count(self) -> int:
+        """Return the number of committed records."""
 
-    def __len__(self) -> int:
-        return len(self._commits)
+        return len(self._records)
 
 
-# The shorter name keeps the phase boundary pleasant to consume while the
-# descriptive name documents its exact-six invariant.
-Ledger = ExactSixLedger
-
-
-__all__ = ["ExactSixLedger", "Ledger", "LedgerCommit", "LedgerCommitError"]
+__all__ = ["Ledger", "LedgerRecord"]
