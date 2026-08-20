@@ -18,28 +18,31 @@ from .evidence import EvidenceStore, records_for_results
 from .q1_momentum import MomentumResult, calculate_momentum
 from .q2_mean_reversion import MeanReversionResult, calculate_mean_reversion
 from .q3_volatility import VolatilityResult, calculate_volatility
+from .q4_stat_arb import StatArbResult, calculate_stat_arb
 from .q5_microstructure import MicrostructureResult, calculate_microstructure
 from .q6_volume_liquidity import VolumeLiquidityResult, calculate_volume_liquidity
 
 
-ALPACA_LATEST_QUOTE_URL = "https://data.alpaca.markets/v2/stocks/COIN/quotes/latest"
+ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
 HISTORY_SECONDS = 3600.0
 
 
 @dataclass(frozen=True, slots=True)
 class LiveSnapshot:
     history: MidpointHistory
+    qqq_history: MidpointHistory
     quote_history: QuoteHistory
     last_cycle: float | None
     momentum: MomentumResult | None
     mean_reversion: MeanReversionResult | None
     volatility: VolatilityResult | None
+    stat_arb: StatArbResult | None
     microstructure: MicrostructureResult | None
     volume_liquidity: VolumeLiquidityResult | None
 
 
 class LiveMarketState:
-    """Thread-safe, causal live state holding only Q1-Q3 midpoint history."""
+    """Thread-safe causal live state with separate COIN and QQQ histories."""
 
     def __init__(self, *, clock: Callable[[], float] = time.time,
                  evidence_store: EvidenceStore | None = None) -> None:
@@ -47,8 +50,38 @@ class LiveMarketState:
         self._evidence_store = evidence_store
         self._lock = threading.Lock()
         self._snapshot = LiveSnapshot(
-            MidpointHistory(), QuoteHistory(), None, None, None, None, None, None
+            MidpointHistory(), MidpointHistory(), QuoteHistory(), None,
+            None, None, None, None, None, None,
         )
+
+    def accept_qqq_quote(self, *, bid: float, ask: float, event_epoch: float) -> bool:
+        """Store one validated QQQ midpoint without inventing or resampling data."""
+
+        values = (bid, ask, event_epoch)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+            return False
+        bid, ask, event_epoch = map(float, values)
+        if not all(map(math.isfinite, (bid, ask, event_epoch))):
+            return False
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return False
+
+        observation = MidpointObservation(event_epoch, (bid + ask) / 2.0)
+        with self._lock:
+            old = self._snapshot.qqq_history.observations
+            if old and event_epoch <= old[-1].event_epoch:
+                return False
+            observations = old + (observation,)
+            boundary = event_epoch - HISTORY_SECONDS
+            observations = tuple(item for item in observations if item.event_epoch >= boundary)
+            self._snapshot = LiveSnapshot(
+                self._snapshot.history, MidpointHistory(observations),
+                self._snapshot.quote_history, self._snapshot.last_cycle,
+                self._snapshot.momentum, self._snapshot.mean_reversion,
+                self._snapshot.volatility, self._snapshot.stat_arb,
+                self._snapshot.microstructure, self._snapshot.volume_liquidity,
+            )
+        return True
 
     def accept_quote(
         self, *, bid: float, ask: float, event_epoch: float,
@@ -94,11 +127,13 @@ class LiveMarketState:
             cycle = self._clock()
             next_snapshot = LiveSnapshot(
                 history,
+                self._snapshot.qqq_history,
                 quote_history,
                 cycle,
                 calculate_momentum(history, cutoff_epoch=event_epoch),
                 calculate_mean_reversion(history, cutoff_epoch=event_epoch),
                 calculate_volatility(history, cutoff_epoch=event_epoch),
+                calculate_stat_arb(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
                 calculate_microstructure(quote_history, cutoff_epoch=event_epoch),
                 calculate_volume_liquidity(quote_history, cutoff_epoch=event_epoch),
             )
@@ -128,7 +163,7 @@ def parse_alpaca_timestamp(value: str) -> float:
 
 
 def poll_alpaca(state: LiveMarketState, *, interval: float = 1.0) -> None:
-    """Continuously fetch Alpaca's latest COIN quote using standard-library HTTPS."""
+    """Continuously fetch latest COIN and QQQ quotes in one Alpaca request."""
 
     api_key = os.environ["ALPACA_API_KEY"]
     secret_key = os.environ["ALPACA_SECRET_KEY"]
@@ -138,9 +173,19 @@ def poll_alpaca(state: LiveMarketState, *, interval: float = 1.0) -> None:
     }
     while True:
         try:
-            request = Request(ALPACA_LATEST_QUOTE_URL, headers=headers)
+            request = Request(ALPACA_LATEST_QUOTES_URL, headers=headers)
             with urlopen(request, timeout=10) as response:
-                quote = json.load(response)["quote"]
+                quotes = json.load(response)["quotes"]
+            qqq = quotes.get("QQQ")
+            if qqq is not None:
+                try:
+                    state.accept_qqq_quote(
+                        bid=qqq["bp"], ask=qqq["ap"],
+                        event_epoch=parse_alpaca_timestamp(qqq["t"]),
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    print(f"Alpaca QQQ quote rejected: {error}", flush=True)
+            quote = quotes["COIN"]
             state.accept_quote(
                 bid=quote["bp"],
                 ask=quote["ap"],

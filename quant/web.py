@@ -59,11 +59,12 @@ def dashboard_data(
     q1 = snapshot.momentum if snapshot and snapshot.momentum else calculate_momentum(history, cutoff_epoch=cutoff_epoch)
     q2 = snapshot.mean_reversion if snapshot and snapshot.mean_reversion else calculate_mean_reversion(history, cutoff_epoch=cutoff_epoch)
     q3 = snapshot.volatility if snapshot and snapshot.volatility else calculate_volatility(history, cutoff_epoch=cutoff_epoch)
+    q4 = snapshot.stat_arb if snapshot else None
     q5 = snapshot.microstructure if snapshot else None
     q6 = snapshot.volume_liquidity if snapshot else None
     populated = (
         q1.forecast_bps, q2.forecast_bps, q3.volatility_bps,
-        (None,) * 6,
+        q4.forecast_bps if q4 else (None,) * 6,
         q5.forecast_bps if q5 else (None,) * 6,
         q6.forecast_bps if q6 else (None,) * 6,
     )
@@ -79,6 +80,7 @@ def dashboard_data(
         "market": {
             "symbol": history.latest.midpoint if history.latest else None,
             "benchmarks": ["BTC", "QQQ", "NDX"],
+            "qqq": snapshot.qqq_history.latest.midpoint if snapshot and snapshot.qqq_history.latest else None,
             "data_age": max(0.0, (time.time() if now_epoch is None else now_epoch) - history.latest.event_epoch) if history.latest else None,
             "last_cycle": snapshot.last_cycle if snapshot else (cutoff_epoch if supplied else None),
         },
@@ -144,7 +146,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
 </style></head><body><main><h1>ATOM QUANT</h1>
 <h2>MARKET</h2><div class=market>
 <div><div class=label>COIN</div><div class=value>{_decimal_cell(market['symbol'])}</div></div>
-<div><div class=label>BTC</div><div class=value></div></div><div><div class=label>QQQ</div><div class=value></div></div><div><div class=label>NDX</div><div class=value></div></div>
+<div><div class=label>BTC</div><div class=value></div></div><div><div class=label>QQQ</div><div class=value>{_decimal_cell(market['qqq'])}</div></div><div><div class=label>NDX</div><div class=value></div></div>
 <div><div class=label>DATA AGE</div><div class=value>{_decimal_cell(market['data_age'], 's')}</div></div><div><div class=label>LAST CYCLE</div><div class=value>{_cycle_cell(market['last_cycle'])}</div></div></div>
 <h2>FINAL NUMBERS</h2>{_table(horizons, final_numbers.items())}
 <h2>12 QUANT FAMILIES</h2>{_table(horizons, display_families)}
