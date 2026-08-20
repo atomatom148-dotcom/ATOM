@@ -64,6 +64,7 @@ class PostgresEvidenceStore:
                     FROM forecasts AS f
                     LEFT JOIN forecast_outcomes AS o USING (forecast_id)
                     WHERE o.forecast_id IS NULL AND f.maturity_epoch <= %s
+                    ON CONFLICT (forecast_id) DO NOTHING
                     """,
                     (observation_midpoint, observation_midpoint,
                      observation_epoch, observation_epoch),
