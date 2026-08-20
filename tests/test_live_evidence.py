@@ -1,7 +1,12 @@
 import math
 import unittest
 
-from quant.evidence import EvidenceStore, ForecastRecord, records_for_results
+from quant.evidence import (
+    EvidenceStore,
+    ForecastRecord,
+    PostgresEvidenceStore,
+    records_for_results,
+)
 from quant.live_market import LiveMarketState
 from quant.web import dashboard_data
 
@@ -97,6 +102,71 @@ class LiveEvidenceTests(unittest.TestCase):
                                        observation_midpoint=120)
         self.assertEqual(store.outcomes[0], outcome)
         self.assertEqual(store.forecasts[0], original)
+
+    def test_postgres_outcome_resolution_is_idempotent(self):
+        class Cursor:
+            def __init__(self):
+                self.outcomes = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def execute(self, statement, parameters):
+                self.assert_conflict_safe(statement)
+                midpoint, _, resolved_epoch, _ = parameters
+                if 1 not in self.outcomes:
+                    self.outcomes[1] = (
+                        midpoint,
+                        10_000 * math.log(midpoint / 100),
+                        resolved_epoch,
+                    )
+
+            def executemany(self, statement, parameters):
+                self.assertEqual(parameters, [])
+
+            def assert_conflict_safe(self, statement):
+                normalized = " ".join(statement.split())
+                if "ON CONFLICT (forecast_id) DO NOTHING" not in normalized:
+                    raise RuntimeError("duplicate forecast outcome")
+
+            def assertEqual(self, first, second):
+                if first != second:
+                    raise AssertionError(f"{first!r} != {second!r}")
+
+        class Connection:
+            def __init__(self, cursor):
+                self._cursor = cursor
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def cursor(self):
+                return self._cursor
+
+        cursor = Cursor()
+        store = object.__new__(PostgresEvidenceStore)
+        store._database_url = "postgresql://test"
+        store._connect = lambda _: Connection(cursor)
+
+        store.record_cycle_and_resolve(
+            (), observation_epoch=131, observation_midpoint=110
+        )
+        first = cursor.outcomes[1]
+        store.record_cycle_and_resolve(
+            (), observation_epoch=140, observation_midpoint=120
+        )
+
+        self.assertEqual(len(cursor.outcomes), 1)
+        self.assertEqual(cursor.outcomes[1], first)
+        self.assertEqual(first[0], 110)
+        self.assertAlmostEqual(first[1], 10_000 * math.log(1.1))
+        self.assertEqual(first[2], 131)
 
     def test_store_contract_has_no_update_or_delete_api(self):
         self.assertFalse(hasattr(EvidenceStore, "update"))
