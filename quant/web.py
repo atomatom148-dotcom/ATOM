@@ -59,11 +59,18 @@ def dashboard_data(
     q1 = snapshot.momentum if snapshot and snapshot.momentum else calculate_momentum(history, cutoff_epoch=cutoff_epoch)
     q2 = snapshot.mean_reversion if snapshot and snapshot.mean_reversion else calculate_mean_reversion(history, cutoff_epoch=cutoff_epoch)
     q3 = snapshot.volatility if snapshot and snapshot.volatility else calculate_volatility(history, cutoff_epoch=cutoff_epoch)
-    populated = (q1.forecast_bps, q2.forecast_bps, q3.volatility_bps)
+    q5 = snapshot.microstructure if snapshot else None
+    q6 = snapshot.volume_liquidity if snapshot else None
+    populated = (
+        q1.forecast_bps, q2.forecast_bps, q3.volatility_bps,
+        (None,) * 6,
+        q5.forecast_bps if q5 else (None,) * 6,
+        q6.forecast_bps if q6 else (None,) * 6,
+    )
     families = [
         {
             "name": name,
-            "values": list(populated[index]) if index < 3 else [None] * 6,
+            "values": list(populated[index]) if index < 6 else [None] * 6,
         }
         for index, name in enumerate(FAMILY_NAMES)
     ]
@@ -127,7 +134,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     evidence = data["evidence"]
     display_families = (
         (item["name"], (_decimal_cell(value) for value in item["values"]))
-        if index < 3 else (item["name"], item["values"])
+        if index < 6 else (item["name"], item["values"])
         for index, item in enumerate(families)
     )
     document = f"""<!doctype html>
