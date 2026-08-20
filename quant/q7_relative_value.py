@@ -9,7 +9,7 @@ from .history import MidpointHistory, MidpointObservation
 
 
 QUANT_ID = "q7_relative_value"
-FORMULA_VERSION = "coin-qqq-relative-return-v1"
+FORMULA_VERSION = "coin-qqq-relative-return-v2"
 HORIZON_SECONDS = (30, 60, 300, 900, 1800, 3600)
 LOOKBACK_SECONDS = 900
 MAX_QQQ_AGE_SECONDS = 5
@@ -23,7 +23,8 @@ class RelativeValueResult:
     formula_version: str
     cutoff_epoch: float
     forecast_bps: tuple[float, ...]
-    relative_mean: float
+    historical_relative_mean: float
+    current_relative_return: float
     relative_displacement: float
 
 
@@ -59,17 +60,23 @@ def calculate_relative_value(
     )
     if not relative_returns or not all(math.isfinite(value) for value in relative_returns):
         return None
-    relative_mean = sum(relative_returns) / len(relative_returns)
-    displacement = sum(value - relative_mean for value in relative_returns)
+    baseline_returns = relative_returns[:-1]
+    if not baseline_returns:
+        return None
+    current_relative_return = relative_returns[-1]
+    historical_relative_mean = sum(baseline_returns) / len(baseline_returns)
+    displacement = current_relative_return - historical_relative_mean
     forecasts = tuple(
         10_000.0 * -(1.0 - math.exp(-seconds / TAU_SECONDS)) * displacement
         for seconds in HORIZON_SECONDS
     )
-    if not all(math.isfinite(value) for value in (relative_mean, displacement, *forecasts)):
+    if not all(math.isfinite(value) for value in (
+        historical_relative_mean, current_relative_return, displacement, *forecasts
+    )):
         return None
     return RelativeValueResult(
         QUANT_ID, FORMULA_VERSION, cutoff_epoch, forecasts,
-        relative_mean, displacement,
+        historical_relative_mean, current_relative_return, displacement,
     )
 
 
