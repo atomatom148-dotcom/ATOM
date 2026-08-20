@@ -1,4 +1,4 @@
-"""Phase D5 certification of deterministic D1-D4 evidence operations."""
+"""Phase D5 proofs for deterministic operational consistency certification."""
 
 from __future__ import annotations
 
@@ -9,181 +9,237 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from quant.blocking import assess_blocking
-from quant.hydration import hydrate_exact_six
-from quant.ledger import Ledger, LedgerRecord
-from quant.models import (
-    ExactSixBundle,
-    HORIZONS,
-    HorizonForecast,
-    SetupState,
-    Snapshot,
-)
-from quant.recovery import assess_recovery
-from quant.resolver import ResolvedOutcome, Resolver
-from quant.staleness import assess_staleness
-from quant.structure import evaluate_structure
-from quant.vol_friction import evaluate_vol_friction
+import quant.certification as certification
+from quant.blocking import BlockingEvidence
+from quant.certification import OperationalCertification, certify_operations
+from quant.hydration import HydratedState
+from quant.ledger import Ledger
+from quant.recovery import RecoveryStatus
+from quant.resolver import Resolver
+from quant.staleness import StalenessEvidence
 
 
-CUTOFF = 1_700_000_100.25
-SECONDS = (30, 60, 300, 900, 1800, 3600)
-
-
-def stored_record() -> LedgerRecord:
-    return LedgerRecord(
-        bundle=ExactSixBundle(
-            cycle_id="cycle-certified",
-            symbol="COIN",
-            cutoff_epoch=CUTOFF,
-            snapshot_hash="snapshot-certified",
-            policy_version="stored-policy",
-            rows=[
-                HorizonForecast(
-                    horizon=horizon,
-                    setup_state=SetupState.NO_SETUP,
-                    reason_codes=["STORED"],
-                    cutoff_epoch=CUTOFF,
-                    maturity_epoch=CUTOFF + seconds,
-                )
-                for horizon, seconds in zip(HORIZONS, SECONDS)
-            ],
-        ),
-        committed_at_epoch=CUTOFF + 0.125,
+def recovery(
+    ledger_records: int = 0,
+    resolved_outcomes: int = 0,
+    *,
+    recoverable: bool = True,
+) -> RecoveryStatus:
+    return RecoveryStatus(
+        ledger_records,
+        resolved_outcomes,
+        recoverable,
+        (),
     )
 
 
-def stored_outcomes(record: LedgerRecord) -> tuple[ResolvedOutcome, ...]:
-    return (
-        ResolvedOutcome(
-            record.bundle.cycle_id,
-            "30S",
-            CUTOFF + 30,
-            CUTOFF + 30.5,
-            150.875,
-        ),
-        ResolvedOutcome(
-            record.bundle.cycle_id,
-            "1M",
-            CUTOFF + 60,
-            CUTOFF + 60.75,
-            151.25,
-        ),
+def hydrated(
+    ledger_records: int = 0,
+    resolved_outcomes: int = 0,
+    *,
+    ledger: Ledger | None = None,
+    resolver: Resolver | None = None,
+) -> HydratedState:
+    return HydratedState(
+        ledger or Ledger(),
+        resolver or Resolver(),
+        ledger_records,
+        resolved_outcomes,
     )
 
 
-def numerical_evidence() -> tuple[float | int | None, ...]:
-    """Run D1-D4 and expose only their existing numerical evidence."""
-
-    record = stored_record()
-    outcomes = stored_outcomes(record)
-    hydrated = hydrate_exact_six(records=(record,), outcomes=outcomes)
-    recovery = assess_recovery(hydrated.ledger, hydrated.resolver)
-
-    snapshot = Snapshot(
-        symbol="COIN",
-        asof_epoch=CUTOFF - 12.5,
-        last=150.5,
-        bid=150.25,
-        ask=150.75,
-        bar_close=149.75,
-        fresh=True,
-    )
-    staleness = assess_staleness(
-        snapshot,
-        now_epoch=CUTOFF,
-        max_age_seconds=30.0,
-    )
-    vol_friction = evaluate_vol_friction(snapshot)
-    structure = evaluate_structure(snapshot)
-    assess_blocking(
-        staleness=staleness,
-        vol_friction=vol_friction,
-        structure=structure,
-    )
-
-    restored = hydrated.ledger.get(record.bundle.cycle_id)
-    restored_outcomes = hydrated.resolver.all()
-    assert restored is not None
-    return (
-        recovery.ledger_records,
-        recovery.resolved_outcomes,
-        staleness.age_seconds,
-        vol_friction.range_pct,
-        vol_friction.spread_pct,
-        vol_friction.net_range_pct,
-        structure.distance_from_close_pct,
-        structure.midpoint,
-        structure.distance_from_mid_pct,
-        structure.location_in_quote,
-        hydrated.ledger_records,
-        hydrated.resolved_outcomes,
-        restored.committed_at_epoch,
-        restored.bundle.cutoff_epoch,
-        *(row.maturity_epoch for row in restored.bundle.rows),
-        *(outcome.outcome_price for outcome in restored_outcomes),
-        *(outcome.resolved_at_epoch for outcome in restored_outcomes),
+def certify(
+    *,
+    recovery_evidence: RecoveryStatus | None = None,
+    staleness: StalenessEvidence | None = None,
+    blocking: BlockingEvidence | None = None,
+    hydration: HydratedState | None = None,
+) -> OperationalCertification:
+    return certify_operations(
+        recovery=recovery_evidence or recovery(),
+        staleness=staleness or StalenessEvidence(True, 0.0, ()),
+        blocking=blocking or BlockingEvidence(False, ()),
+        hydrated=hydration or hydrated(),
     )
 
 
 class PhaseD5CertificationTests(unittest.TestCase):
-    def test_d1_d4_numerical_evidence_is_exact_and_deterministic(self) -> None:
-        expected = (
-            1,
-            2,
-            12.5,
-            0.75 / 150.5,
-            0.5 / 150.5,
-            (0.75 / 150.5) - (0.5 / 150.5),
-            0.75 / 150.5,
-            150.5,
-            0.0,
-            0.5,
-            1,
-            2,
-            CUTOFF + 0.125,
-            CUTOFF,
-            *(CUTOFF + seconds for seconds in SECONDS),
-            150.875,
-            151.25,
-            CUTOFF + 30.5,
-            CUTOFF + 60.75,
+    def test_clean_empty_startup_certifies(self) -> None:
+        self.assertEqual(
+            certify(),
+            OperationalCertification(True, 0, 0, ()),
         )
 
-        first = numerical_evidence()
-        second = numerical_evidence()
-
-        self.assertEqual(first, expected)
-        self.assertEqual(second, expected)
-        self.assertEqual(first, second)
-        self.assertTrue(
-            all(
-                value is None or type(value) in (int, float)
-                for value in first
-            )
+    def test_hydrated_evidence_matching_recovery_counts_certifies(self) -> None:
+        ledger = Ledger()
+        resolver = Resolver()
+        state = hydrated(
+            ledger.count(), resolver.count(), ledger=ledger, resolver=resolver
         )
 
-    def test_certification_does_not_mutate_supplied_evidence(self) -> None:
-        record = stored_record()
-        outcomes = stored_outcomes(record)
-        before = deepcopy((record, outcomes))
+        self.assertEqual(
+            certify(
+                recovery_evidence=recovery(0, 0, recoverable=False),
+                hydration=state,
+            ),
+            OperationalCertification(True, 0, 0, ()),
+        )
 
-        first = hydrate_exact_six(records=(record,), outcomes=outcomes)
-        second = hydrate_exact_six(records=(record,), outcomes=outcomes)
+    def test_stale_evidence_fails_with_reasons_or_fallback(self) -> None:
+        cases = (
+            (
+                StalenessEvidence(False, 31.0, ("SNAPSHOT_TOO_OLD",)),
+                ("STALENESS:SNAPSHOT_TOO_OLD",),
+            ),
+            (
+                StalenessEvidence(False, None, ()),
+                ("STALENESS:UNUSABLE_WITHOUT_REASON",),
+            ),
+        )
+        for evidence, reasons in cases:
+            with self.subTest(evidence=evidence):
+                self.assertEqual(
+                    certify(staleness=evidence),
+                    OperationalCertification(False, 0, 0, reasons),
+                )
 
-        self.assertEqual((record, outcomes), before)
-        self.assertEqual(first.ledger.get("cycle-certified"), before[0])
-        self.assertEqual(second.ledger.get("cycle-certified"), before[0])
-        self.assertEqual(first.resolver.all(), second.resolver.all())
+    def test_blocked_evidence_fails_with_reasons_or_fallback(self) -> None:
+        cases = (
+            (
+                BlockingEvidence(True, ("STRUCTURE:MISSING_BID",)),
+                ("BLOCKING:STRUCTURE:MISSING_BID",),
+            ),
+            (
+                BlockingEvidence(True, ()),
+                ("BLOCKING:BLOCKED_WITHOUT_REASON",),
+            ),
+        )
+        for evidence, reasons in cases:
+            with self.subTest(evidence=evidence):
+                self.assertEqual(
+                    certify(blocking=evidence),
+                    OperationalCertification(False, 0, 0, reasons),
+                )
 
-    def test_certification_adds_no_runtime_authority(self) -> None:
-        import quant
+    def test_ledger_count_mismatch_fails(self) -> None:
+        self.assertEqual(
+            certify(hydration=hydrated(1, 0)),
+            OperationalCertification(
+                False, 1, 0, ("HYDRATION:LEDGER_COUNT_MISMATCH",)
+            ),
+        )
 
-        self.assertFalse(hasattr(quant, "certification"))
-        self.assertFalse(hasattr(quant, "certify"))
-        self.assertFalse(hasattr(quant, "score"))
-        self.assertFalse(hasattr(quant, "rank"))
-        self.assertFalse(hasattr(quant, "predict"))
+    def test_resolver_count_mismatch_fails(self) -> None:
+        self.assertEqual(
+            certify(hydration=hydrated(0, 1)),
+            OperationalCertification(
+                False, 0, 1, ("HYDRATION:RESOLVER_COUNT_MISMATCH",)
+            ),
+        )
+
+    def test_missing_restored_ledger_evidence_fails(self) -> None:
+        self.assertEqual(
+            certify(
+                recovery_evidence=recovery(1, 0, recoverable=False),
+            ),
+            OperationalCertification(
+                False,
+                0,
+                0,
+                ("RECOVERY:LEDGER_EVIDENCE_NOT_RESTORED",),
+            ),
+        )
+
+    def test_missing_restored_resolver_evidence_fails(self) -> None:
+        self.assertEqual(
+            certify(
+                recovery_evidence=recovery(0, 1, recoverable=False),
+            ),
+            OperationalCertification(
+                False,
+                0,
+                0,
+                ("RECOVERY:RESOLVED_EVIDENCE_NOT_RESTORED",),
+            ),
+        )
+
+    def test_multiple_failures_preserve_exact_required_order(self) -> None:
+        result = certify(
+            recovery_evidence=recovery(3, 4, recoverable=False),
+            staleness=StalenessEvidence(False, 40.0, ("OLD", "LATE")),
+            blocking=BlockingEvidence(True, ("FIRST", "SECOND")),
+            hydration=hydrated(1, 2),
+        )
+
+        self.assertEqual(
+            result,
+            OperationalCertification(
+                False,
+                1,
+                2,
+                (
+                    "STALENESS:OLD",
+                    "STALENESS:LATE",
+                    "BLOCKING:FIRST",
+                    "BLOCKING:SECOND",
+                    "HYDRATION:LEDGER_COUNT_MISMATCH",
+                    "HYDRATION:RESOLVER_COUNT_MISMATCH",
+                    "RECOVERY:LEDGER_EVIDENCE_NOT_RESTORED",
+                    "RECOVERY:RESOLVED_EVIDENCE_NOT_RESTORED",
+                ),
+            ),
+        )
+
+    def test_usable_and_nonblocking_warnings_are_ignored(self) -> None:
+        self.assertEqual(
+            certify(
+                staleness=StalenessEvidence(True, 1.0, ("WARNING",)),
+                blocking=BlockingEvidence(False, ("WARNING",)),
+            ),
+            OperationalCertification(True, 0, 0, ()),
+        )
+
+    def test_result_counts_come_only_from_hydrated_count_fields(self) -> None:
+        result = certify(
+            recovery_evidence=recovery(91, 92, recoverable=True),
+            hydration=hydrated(7, 8),
+        )
+
+        self.assertEqual((result.ledger_records, result.resolved_outcomes), (7, 8))
+
+    def test_inputs_remain_unchanged(self) -> None:
+        supplied = (
+            recovery(2, 3, recoverable=False),
+            StalenessEvidence(False, 5.0, ("STALE",)),
+            BlockingEvidence(True, ("BLOCKED",)),
+            hydrated(1, 1),
+        )
+        before = deepcopy(supplied[:3])
+        ledger = supplied[3].ledger
+        resolver = supplied[3].resolver
+        counts_before = (ledger.count(), resolver.count())
+
+        certify_operations(
+            recovery=supplied[0],
+            staleness=supplied[1],
+            blocking=supplied[2],
+            hydrated=supplied[3],
+        )
+
+        self.assertEqual(supplied[:3], before)
+        self.assertIs(supplied[3].ledger, ledger)
+        self.assertIs(supplied[3].resolver, resolver)
+        self.assertEqual((ledger.count(), resolver.count()), counts_before)
+
+    def test_public_contract_is_exactly_d5(self) -> None:
+        self.assertEqual(
+            tuple(OperationalCertification.__dataclass_fields__),
+            ("certified", "ledger_records", "resolved_outcomes", "reason_codes"),
+        )
+        self.assertEqual(
+            certification.__all__,
+            ["OperationalCertification", "certify_operations"],
+        )
 
 
 if __name__ == "__main__":
