@@ -9,15 +9,21 @@ from tests.test_web import request
 
 
 class Cursor:
-    def __init__(self, rows=()):
-        self.rows = rows
+    def __init__(self, rows=(), effective_rows=()):
+        self.metric_rows = rows
+        self.effective_rows = effective_rows
+        self.rows = ()
         self.statement = None
         self.parameters = None
+        self.executions = []
 
     def __enter__(self): return self
     def __exit__(self, *args): pass
     def execute(self, statement, parameters):
         self.statement, self.parameters = statement, parameters
+        self.executions.append((statement, parameters))
+        self.rows = (self.effective_rows if "f.cutoff_epoch, f.forecast_id" in statement
+                     else self.metric_rows)
     def fetchall(self): return self.rows
 
 
@@ -44,9 +50,9 @@ class PhaseEStoreTests(unittest.TestCase):
         ))
         values = store_with(cursor).phase_e_cohorts(100.0)
         self.assertEqual(values, (
-            PhaseECohortMetrics("q1", "v1", "COIN", "30S", 3, 2, 1, .5, 4.25, 1.0, 4.0, 2.0),
-            PhaseECohortMetrics("q1", "v2", "COIN", "1H", 1, 0, 0, None, None, None, None, None),
-            PhaseECohortMetrics("q2", "v1", "SPY", "1M", 2, 2, 2, 1.0, 0.0, .5, 0.0, 0.0),
+            PhaseECohortMetrics("q1", "v1", "COIN", "30S", 3, 2, 1, .5, 4.25, 1.0, 4.0, 2.0, 0),
+            PhaseECohortMetrics("q1", "v2", "COIN", "1H", 1, 0, 0, None, None, None, None, None, 0),
+            PhaseECohortMetrics("q2", "v1", "SPY", "1M", 2, 2, 2, 1.0, 0.0, .5, 0.0, 0.0, 0),
         ))
         with self.assertRaises((AttributeError, TypeError)):
             values[0].coverage = 1.0
@@ -54,10 +60,10 @@ class PhaseEStoreTests(unittest.TestCase):
     def test_query_has_exact_grouping_left_join_boundary_and_formulas(self):
         cursor = Cursor()
         store_with(cursor).phase_e_cohorts(123.5)
-        sql = " ".join(cursor.statement.split())
+        sql = " ".join(cursor.executions[0][0].split())
         self.assertIn("LEFT JOIN forecast_outcomes AS o USING (forecast_id)", sql)
         self.assertIn("GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon", sql)
-        self.assertEqual(cursor.parameters, (123.5,) * 14)
+        self.assertEqual(cursor.executions[0][1], (123.5,) * 14)
         self.assertEqual(sql.count("f.maturity_epoch <= %s"), 8)
         self.assertEqual(sql.count("o.resolved_epoch <= %s"), 6)
         self.assertIn("NULLIF(count(*) FILTER", sql)
@@ -73,6 +79,9 @@ class PhaseEStoreTests(unittest.TestCase):
 
             def execute(self, statement, parameters):
                 super().execute(statement, parameters)
+                if "f.cutoff_epoch, f.forecast_id" in statement:
+                    self.rows = ()
+                    return
                 as_of = parameters[0]
                 matured = self.maturity_epoch <= as_of
                 outcome_is_visible = matured and self.resolved_epoch <= as_of
@@ -94,7 +103,7 @@ class PhaseEStoreTests(unittest.TestCase):
             before,
             (PhaseECohortMetrics(
                 "q1", "v1", "COIN", "30S", 1, 1, 0, 0.0, None,
-                None, None, None,
+                None, None, None, 0,
             ),),
         )
 
@@ -109,7 +118,7 @@ class PhaseEStoreTests(unittest.TestCase):
     def test_resolution_epoch_bound_applies_to_each_outcome_population(self):
         cursor = Cursor()
         store_with(cursor).phase_e_cohorts(105)
-        sql = " ".join(cursor.statement.split())
+        sql = " ".join(cursor.executions[0][0].split())
         resolved_filter = re.search(
             r"count\(o\.forecast_id\) FILTER \( WHERE f\.maturity_epoch <= %s "
             r"AND o\.resolved_epoch <= %s \) AS resolved_count",
@@ -132,7 +141,7 @@ class PhaseEStoreTests(unittest.TestCase):
     def test_e2_equations_and_causal_population_are_in_grouped_select(self):
         cursor = Cursor()
         store_with(cursor).phase_e_cohorts(50)
-        sql = " ".join(cursor.statement.split())
+        sql = " ".join(cursor.executions[0][0].split())
         self.assertIn("f.forecast_bps <> 0 AND o.outcome_bps <> 0", sql)
         self.assertIn("f.forecast_bps > 0 AND o.outcome_bps > 0", sql)
         self.assertIn("f.forecast_bps < 0 AND o.outcome_bps < 0", sql)
@@ -178,7 +187,7 @@ class PhaseEStoreTests(unittest.TestCase):
     def test_query_is_one_read_only_select_and_orders_exact_cohorts(self):
         cursor = Cursor()
         store_with(cursor).phase_e_cohorts(1.0)
-        sql = re.sub(r"--[^\n]*|/\*.*?\*/", "", cursor.statement,
+        sql = re.sub(r"--[^\n]*|/\*.*?\*/", "", cursor.executions[0][0],
                      flags=re.DOTALL).upper()
         self.assertEqual(len(re.findall(r"\bSELECT\b", sql)), 1)
         for forbidden in ("INSERT", "UPDATE", "DELETE", "ALTER", "DROP", "CREATE", "TRUNCATE"):
@@ -188,6 +197,74 @@ class PhaseEStoreTests(unittest.TestCase):
         positions = [normalized.index(f"WHEN '{horizon}' THEN {index}")
                      for index, horizon in enumerate(("30S", "1M", "5M", "15M", "30M", "1H"), 1)]
         self.assertEqual(positions, sorted(positions))
+
+    def test_effective_n_uses_exact_horizon_spacing_and_greedy_boundaries(self):
+        metric_rows = tuple(
+            ("q1", "v1", "COIN", horizon, 4, 4, 4, 1.0, 0.0, 1.0, 0.0, 0.0)
+            for horizon in ("30S", "1M", "5M", "15M", "30M", "1H")
+        )
+        seconds = {"30S": 30, "1M": 60, "5M": 300,
+                   "15M": 900, "30M": 1800, "1H": 3600}
+        effective_rows = []
+        for horizon, spacing in seconds.items():
+            effective_rows.extend(("q1", "v1", "COIN", horizon, cutoff, forecast_id)
+                                  for forecast_id, cutoff in enumerate(
+                                      (0, spacing - 1, spacing, 2 * spacing), 1))
+        values = store_with(Cursor(metric_rows, effective_rows)).phase_e_cohorts(10_000)
+        self.assertEqual({value.horizon: value.effective_n for value in values},
+                         {horizon: 3 for horizon in seconds})
+        self.assertTrue(all(value.effective_n <= value.resolved_count for value in values))
+
+    def test_effective_n_matches_five_minute_example(self):
+        metrics = (("q1", "v1", "COIN", "5M", 8, 8, 8, 1.0,
+                    0.0, 1.0, 0.0, 0.0),)
+        cutoffs = (0, 30, 60, 299, 300, 301, 599, 600)
+        resolved = tuple(("q1", "v1", "COIN", "5M", cutoff, index)
+                         for index, cutoff in enumerate(cutoffs, 1))
+        value = store_with(Cursor(metrics, resolved)).phase_e_cohorts(1_000)[0]
+        self.assertEqual(value.effective_n, 3)
+
+    def test_effective_n_never_shares_exact_cohort_observations(self):
+        identities = (
+            ("q1", "v1", "COIN", "30S"),
+            ("q2", "v1", "COIN", "30S"),  # quant
+            ("q1", "v2", "COIN", "30S"),  # formula
+            ("q1", "v1", "SPY", "30S"),   # symbol
+            ("q1", "v1", "COIN", "1M"),   # horizon
+        )
+        metrics = tuple(identity + (1, 1, 1, 1.0, 0.0, 1.0, 0.0, 0.0)
+                        for identity in identities)
+        resolved = tuple(identity + (0, index)
+                         for index, identity in enumerate(identities, 1))
+        values = store_with(Cursor(metrics, resolved)).phase_e_cohorts(100)
+        self.assertEqual([value.effective_n for value in values], [1] * 5)
+
+    def test_effective_n_query_is_causal_deterministic_and_read_only(self):
+        cursor = Cursor()
+        values = store_with(cursor).phase_e_cohorts(123.5)
+        self.assertEqual(values, ())
+        self.assertEqual(len(cursor.executions), 2)
+        sql, parameters = cursor.executions[1]
+        normalized = " ".join(sql.split())
+        self.assertEqual(parameters, (123.5, 123.5))
+        self.assertIn("f.maturity_epoch <= %s", normalized)
+        self.assertIn("o.forecast_id IS NOT NULL", normalized)
+        self.assertIn("o.resolved_epoch <= %s", normalized)
+        self.assertIn("f.cutoff_epoch, f.forecast_id", normalized)
+        self.assertRegex(normalized, r"ORDER BY .* f.cutoff_epoch, f.forecast_id")
+        for statement, _ in cursor.executions:
+            command = re.sub(r"--[^\n]*|/\*.*?\*/", "", statement,
+                             flags=re.DOTALL).strip().upper()
+            self.assertTrue(command.startswith("SELECT"))
+            for forbidden in ("INSERT", "UPDATE", "DELETE", "ALTER", "DROP",
+                              "CREATE", "TRUNCATE"):
+                self.assertIsNone(re.search(rf"\b{forbidden}\b", command))
+
+    def test_no_causally_resolved_forecasts_means_zero_effective_n(self):
+        metrics = (("q1", "v1", "COIN", "30S", 3, 2, 0, 0.0,
+                    None, None, None, None),)
+        value = store_with(Cursor(metrics)).phase_e_cohorts(50)[0]
+        self.assertEqual(value.effective_n, 0)
 
     def test_nonfinite_as_of_is_rejected_before_connecting(self):
         store = object.__new__(PostgresEvidenceStore)
@@ -215,7 +292,7 @@ class PhaseEApiTests(unittest.TestCase):
     def test_endpoint_exact_contract_uses_clock_and_only_phase_e_read(self):
         cohort = PhaseECohortMetrics(
             "q7", "v2", "COIN", "30S", 4, 3, 2, 2 / 3, 5.5,
-            0.5, 4.5, -1.25,
+            0.5, 4.5, -1.25, 2,
         )
 
         class Store:
@@ -242,7 +319,7 @@ class PhaseEApiTests(unittest.TestCase):
                 "horizon": "30S", "forecast_count": 4, "matured_count": 3,
                 "resolved_count": 2, "coverage": 2 / 3, "rmse_bps": 5.5,
                 "directional_accuracy": 0.5, "mae_bps": 4.5,
-                "bias_bps": -1.25,
+                "bias_bps": -1.25, "effective_n": 2,
             }],
         })
 

@@ -41,6 +41,7 @@ class PhaseECohortMetrics:
     directional_accuracy: float | None
     mae_bps: float | None
     bias_bps: float | None
+    effective_n: int
 
 
 class EvidenceStore(Protocol):
@@ -184,6 +185,37 @@ class PostgresEvidenceStore:
                     (as_of_epoch,) * 14,
                 )
                 rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT f.quant_id, f.formula_version, f.symbol, f.horizon,
+                           f.cutoff_epoch, f.forecast_id
+                    FROM forecasts AS f
+                    JOIN forecast_outcomes AS o USING (forecast_id)
+                    WHERE f.maturity_epoch <= %s
+                      AND o.forecast_id IS NOT NULL
+                      AND o.resolved_epoch <= %s
+                    ORDER BY f.quant_id, f.formula_version, f.symbol,
+                             CASE f.horizon
+                                 WHEN '30S' THEN 1 WHEN '1M' THEN 2
+                                 WHEN '5M' THEN 3 WHEN '15M' THEN 4
+                                 WHEN '30M' THEN 5 WHEN '1H' THEN 6
+                             END,
+                             f.cutoff_epoch, f.forecast_id
+                    """,
+                    (as_of_epoch, as_of_epoch),
+                )
+                effective_rows = cursor.fetchall()
+
+        horizon_seconds = dict(zip(HORIZONS, HORIZON_SECONDS))
+        effective_counts: dict[tuple[str, str, str, str], int] = {}
+        next_cutoff: dict[tuple[str, str, str, str], float] = {}
+        for quant_id, formula_version, symbol, horizon, cutoff_epoch, _ in effective_rows:
+            cohort = (str(quant_id), str(formula_version), str(symbol), str(horizon))
+            cutoff = float(cutoff_epoch)
+            if cohort not in next_cutoff or cutoff >= next_cutoff[cohort]:
+                effective_counts[cohort] = effective_counts.get(cohort, 0) + 1
+                next_cutoff[cohort] = cutoff + horizon_seconds[cohort[3]]
+
         return tuple(PhaseECohortMetrics(
             quant_id=str(row[0]), formula_version=str(row[1]),
             symbol=str(row[2]), horizon=str(row[3]),
@@ -194,6 +226,9 @@ class PostgresEvidenceStore:
             directional_accuracy=None if row[9] is None else float(row[9]),
             mae_bps=None if row[10] is None else float(row[10]),
             bias_bps=None if row[11] is None else float(row[11]),
+            effective_n=effective_counts.get(
+                (str(row[0]), str(row[1]), str(row[2]), str(row[3])), 0,
+            ),
         ) for row in rows)
 
 
