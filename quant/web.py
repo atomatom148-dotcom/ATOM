@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import os
 from html import escape
@@ -239,6 +240,23 @@ def create_app(
 
     def application(environ: dict[str, object], start_response: Callable) -> list[bytes]:
         path = environ.get("PATH_INFO", "")
+        if path == "/api/phase-e":
+            if evidence_store is None:
+                status, content_type, body = (
+                    "503 Service Unavailable", "application/json",
+                    b'{"error":"evidence store unavailable"}',
+                )
+            else:
+                as_of_epoch = clock()
+                cohorts = evidence_store.phase_e_cohorts(as_of_epoch)
+                body = json.dumps({
+                    "as_of_epoch": as_of_epoch,
+                    "cohorts": [asdict(cohort) for cohort in cohorts],
+                }, separators=(",", ":"), allow_nan=False).encode()
+                status, content_type = "200 OK", "application/json"
+            start_response(status, [("Content-Type", content_type),
+                                    ("Content-Length", str(len(body)))])
+            return [body]
         snapshot = state.snapshot() if state is not None else None
         counts = evidence_store.counts() if evidence_store is not None else None
         data = dashboard_data(
