@@ -12,7 +12,8 @@ from wsgiref.simple_server import make_server
 
 from .history import MidpointHistory
 from .evidence import EvidenceStore, PostgresEvidenceStore
-from .live_market import LiveMarketState, LiveSnapshot, start_alpaca_poller
+from .live_market import (LiveMarketState, LiveSnapshot, start_alpaca_options_poller,
+                          start_alpaca_poller)
 from .q1_momentum import calculate_momentum
 from .q2_mean_reversion import calculate_mean_reversion
 from .q3_volatility import calculate_volatility
@@ -87,6 +88,16 @@ def dashboard_data(
         }
         for index, name in enumerate(FAMILY_NAMES)
     ]
+    option = snapshot.option_observation if snapshot else None
+    options_data = {field: None for field in OPTION_FIELDS}
+    if option is not None:
+        options_data.update({
+            "Strike": option.strike, "Expiration": option.expiration,
+            "Premium": option.premium, "IV": option.implied_volatility,
+            "Delta": option.delta, "Gamma": option.gamma, "Theta": option.theta,
+            "Vega": option.vega, "Bid": option.bid, "Ask": option.ask,
+            "Spread": option.spread,
+        })
     return {
         "title": "ATOM QUANT",
         "market": {
@@ -103,7 +114,7 @@ def dashboard_data(
             metric: [None] * 6 for metric in ("BPS", "MOVE%", "RANGE")
         },
         "quant_families": families,
-        "options_data": {field: None for field in OPTION_FIELDS},
+        "options_data": options_data,
         "evidence": {
             "Forecasts": evidence_counts[0] if evidence_counts else None,
             "Resolved": evidence_counts[1] if evidence_counts else None,
@@ -256,6 +267,7 @@ def main() -> None:
     evidence_store = PostgresEvidenceStore(os.environ["DATABASE_URL"])
     state = LiveMarketState(evidence_store=evidence_store)
     start_alpaca_poller(state)
+    start_alpaca_options_poller(state)
     app = create_app(state=state, evidence_store=evidence_store)
     with make_server(args.host, args.port, app) as server:
         server.serve_forever()
