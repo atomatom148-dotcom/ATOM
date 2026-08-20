@@ -54,12 +54,17 @@ class LiveEvidenceTests(unittest.TestCase):
                                event_epoch=float(second))
         return state, store, now
 
-    def test_live_q1_q2_map_to_records_with_causal_cutoff(self):
+    def test_live_q1_q2_map_once_to_records_with_causal_cutoff(self):
         _, store, _ = self.populated_state()
         latest = [row for row in store.forecasts if row.cutoff_epoch == 3600]
-        self.assertEqual(len(latest), 12)
-        self.assertEqual({row.quant_id for row in latest},
-                         {"q1_momentum", "q2_mean_reversion"})
+        q1_q2 = [row for row in latest if row.quant_id in
+                 {"q1_momentum", "q2_mean_reversion"}]
+        self.assertEqual(len(q1_q2), 12)
+        self.assertEqual(
+            {quant_id: sum(row.quant_id == quant_id for row in q1_q2)
+             for quant_id in ("q1_momentum", "q2_mean_reversion")},
+            {"q1_momentum": 6, "q2_mean_reversion": 6},
+        )
         self.assertEqual({row.cutoff_midpoint for row in latest}, {136.0})
         self.assertTrue(all(row.created_epoch <= row.maturity_epoch for row in latest))
         self.assertNotIn("q3_volatility", {row.quant_id for row in store.forecasts})

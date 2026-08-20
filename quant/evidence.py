@@ -1,4 +1,4 @@
-"""Append-only PostgreSQL evidence for live Q1/Q2 forecasts."""
+"""Append-only PostgreSQL evidence for live directional forecasts."""
 
 from __future__ import annotations
 
@@ -107,6 +107,8 @@ def records_for_results(*, results: Sequence[object], cycle_id: str,
 
     records = []
     for result in results:
+        if result is None:
+            continue
         values = result.forecast_bps
         for horizon, seconds, value in zip(HORIZONS, HORIZON_SECONDS, values):
             if value is None:
