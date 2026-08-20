@@ -21,6 +21,9 @@ from .q3_volatility import VolatilityResult, calculate_volatility
 from .q4_stat_arb import StatArbResult, calculate_stat_arb
 from .q5_microstructure import MicrostructureResult, calculate_microstructure
 from .q6_volume_liquidity import VolumeLiquidityResult, calculate_volume_liquidity
+from .q7_relative_value import RelativeValueResult, calculate_relative_value
+from .q8_cross_asset import CrossAssetResult, calculate_cross_asset
+from .q9_factor import FactorResult, calculate_factor
 
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
@@ -39,6 +42,9 @@ class LiveSnapshot:
     stat_arb: StatArbResult | None
     microstructure: MicrostructureResult | None
     volume_liquidity: VolumeLiquidityResult | None
+    relative_value: RelativeValueResult | None
+    cross_asset: CrossAssetResult | None
+    factor: FactorResult | None
 
 
 class LiveMarketState:
@@ -51,7 +57,7 @@ class LiveMarketState:
         self._lock = threading.Lock()
         self._snapshot = LiveSnapshot(
             MidpointHistory(), MidpointHistory(), QuoteHistory(), None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
         )
 
     def accept_qqq_quote(self, *, bid: float, ask: float, event_epoch: float) -> bool:
@@ -80,6 +86,8 @@ class LiveMarketState:
                 self._snapshot.momentum, self._snapshot.mean_reversion,
                 self._snapshot.volatility, self._snapshot.stat_arb,
                 self._snapshot.microstructure, self._snapshot.volume_liquidity,
+                self._snapshot.relative_value, self._snapshot.cross_asset,
+                self._snapshot.factor,
             )
         return True
 
@@ -136,6 +144,9 @@ class LiveMarketState:
                 calculate_stat_arb(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
                 calculate_microstructure(quote_history, cutoff_epoch=event_epoch),
                 calculate_volume_liquidity(quote_history, cutoff_epoch=event_epoch),
+                calculate_relative_value(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
+                calculate_cross_asset(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
+                calculate_factor(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
             )
             if self._evidence_store is not None:
                 forecasts = records_for_results(
