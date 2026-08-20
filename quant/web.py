@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from html import escape
+import time
 from typing import Callable, Iterable
 from wsgiref.simple_server import make_server
 
 from .history import MidpointHistory
+from .live_market import LiveMarketState, LiveSnapshot, start_alpaca_poller
 from .q1_momentum import calculate_momentum
 from .q2_mean_reversion import calculate_mean_reversion
 from .q3_volatility import calculate_volatility
@@ -39,18 +42,21 @@ EVIDENCE_FIELDS = (
 
 
 def dashboard_data(
-    history: MidpointHistory | None = None, *, cutoff_epoch: float | None = None
+    history: MidpointHistory | None = None, *, cutoff_epoch: float | None = None,
+    snapshot: LiveSnapshot | None = None, now_epoch: float | None = None,
 ) -> dict[str, object]:
     """Build the frozen dashboard structure, optionally calculating Q1-Q3."""
 
-    supplied = history is not None
+    supplied = history is not None or snapshot is not None
+    if snapshot is not None:
+        history = snapshot.history
     history = history if history is not None else MidpointHistory()
     if cutoff_epoch is None:
         cutoff_epoch = history.latest.event_epoch if history.latest else 0.0
 
-    q1 = calculate_momentum(history, cutoff_epoch=cutoff_epoch)
-    q2 = calculate_mean_reversion(history, cutoff_epoch=cutoff_epoch)
-    q3 = calculate_volatility(history, cutoff_epoch=cutoff_epoch)
+    q1 = snapshot.momentum if snapshot and snapshot.momentum else calculate_momentum(history, cutoff_epoch=cutoff_epoch)
+    q2 = snapshot.mean_reversion if snapshot and snapshot.mean_reversion else calculate_mean_reversion(history, cutoff_epoch=cutoff_epoch)
+    q3 = snapshot.volatility if snapshot and snapshot.volatility else calculate_volatility(history, cutoff_epoch=cutoff_epoch)
     populated = (q1.forecast_bps, q2.forecast_bps, q3.volatility_bps)
     families = [
         {
@@ -62,10 +68,10 @@ def dashboard_data(
     return {
         "title": "ATOM QUANT",
         "market": {
-            "symbol": "COIN",
+            "symbol": history.latest.midpoint if history.latest else None,
             "benchmarks": ["BTC", "QQQ", "NDX"],
-            "data_age": None,
-            "last_cycle": cutoff_epoch if supplied else None,
+            "data_age": max(0.0, (time.time() if now_epoch is None else now_epoch) - history.latest.event_epoch) if history.latest else None,
+            "last_cycle": snapshot.last_cycle if snapshot else (cutoff_epoch if supplied else None),
         },
         "horizons": list(HORIZON_LABELS),
         "final_numbers": {
@@ -118,20 +124,19 @@ def dashboard_page(data: dict[str, object]) -> bytes:
 
 
 def create_app(
-    history: MidpointHistory | None = None, *, cutoff_epoch: float | None = None
+    history: MidpointHistory | None = None, *, cutoff_epoch: float | None = None,
+    state: LiveMarketState | None = None, clock: Callable[[], float] = time.time,
 ) -> Callable:
-    """Create the WSGI application with immutable numerical input."""
-
-    data = dashboard_data(history, cutoff_epoch=cutoff_epoch)
-    json_body = json.dumps(data, separators=(",", ":"), allow_nan=False).encode()
-    page_body = dashboard_page(data)
+    """Create the WSGI application, rendering current state on every request."""
 
     def application(environ: dict[str, object], start_response: Callable) -> list[bytes]:
         path = environ.get("PATH_INFO", "")
+        snapshot = state.snapshot() if state is not None else None
+        data = dashboard_data(history, cutoff_epoch=cutoff_epoch, snapshot=snapshot, now_epoch=clock())
         if path == "/":
-            status, content_type, body = "200 OK", "text/html; charset=utf-8", page_body
+            status, content_type, body = "200 OK", "text/html; charset=utf-8", dashboard_page(data)
         elif path == "/api/dashboard":
-            status, content_type, body = "200 OK", "application/json", json_body
+            status, content_type, body = "200 OK", "application/json", json.dumps(data, separators=(",", ":"), allow_nan=False).encode()
         elif path == "/health":
             status, content_type, body = "200 OK", "application/json", b'{"status":"running"}'
         else:
@@ -145,9 +150,11 @@ def create_app(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve the ATOM numerical dashboard")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
     args = parser.parse_args()
-    with make_server(args.host, args.port, create_app()) as server:
+    state = LiveMarketState()
+    start_alpaca_poller(state)
+    with make_server(args.host, args.port, create_app(state=state)) as server:
         server.serve_forever()
 
 
