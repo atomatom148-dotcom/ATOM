@@ -1,147 +1,76 @@
-"""Exact restoration of previously stored exact-six evidence for Phase D4."""
+"""Exact restoration of existing numerical evidence for Phase D4."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from copy import deepcopy
-import math
-from typing import Any
+from dataclasses import dataclass
 
 from .ledger import Ledger, LedgerRecord
-from .models import ExactSixBundle, HorizonForecast, SetupState
+from .resolver import ResolvedOutcome, Resolver
 
 
-_RECORD_KEYS = {"bundle", "committed_at_epoch"}
-_BUNDLE_KEYS = {
-    "cycle_id",
-    "symbol",
-    "cutoff_epoch",
-    "snapshot_hash",
-    "policy_version",
-    "rows",
-}
-_ROW_KEYS = {
-    "horizon",
-    "setup_state",
-    "direction",
-    "probability",
-    "reason_codes",
-    "cutoff_epoch",
-    "maturity_epoch",
-}
-
-
-def store_exact_six(record: LedgerRecord) -> dict[str, Any]:
-    """Return a detached, JSON-compatible representation of stored evidence."""
-
-    bundle = record.bundle
-    return {
-        "bundle": bundle.to_dict(),
-        "committed_at_epoch": record.committed_at_epoch,
-    }
+@dataclass(frozen=True)
+class HydratedState:
+    ledger: Ledger
+    resolver: Resolver
+    ledger_records: int
+    resolved_outcomes: int
 
 
 def hydrate_exact_six(
-    stored_evidence: Mapping[str, object],
-    ledger: Ledger,
-) -> LedgerRecord:
-    """Restore one exact-six record without producing or altering a forecast."""
+    *,
+    records: tuple[LedgerRecord, ...],
+    outcomes: tuple[ResolvedOutcome, ...],
+) -> HydratedState:
+    """Restore supplied records and outcomes through their existing stores."""
 
-    evidence = _mapping_with_exact_keys(
-        stored_evidence, _RECORD_KEYS, "stored evidence"
-    )
-    bundle_values = _mapping_with_exact_keys(
-        evidence["bundle"], _BUNDLE_KEYS, "stored bundle"
-    )
-    rows_value = bundle_values["rows"]
-    if (
-        not isinstance(rows_value, Sequence)
-        or isinstance(rows_value, (str, bytes, bytearray))
-    ):
-        raise ValueError("stored rows must be a sequence")
+    ledger = Ledger()
+    resolver = Resolver()
+    committed: dict[str, LedgerRecord] = {}
 
-    rows: list[HorizonForecast] = []
-    for index, stored_row in enumerate(rows_value):
-        row = _mapping_with_exact_keys(
-            stored_row, _ROW_KEYS, f"stored row {index}"
+    for supplied in records:
+        restored = ledger.commit(
+            deepcopy(supplied.bundle),
+            committed_at_epoch=supplied.committed_at_epoch,
         )
-        reason_codes = row["reason_codes"]
-        if (
-            not isinstance(reason_codes, Sequence)
-            or isinstance(reason_codes, (str, bytes, bytearray))
-            or any(not isinstance(reason, str) for reason in reason_codes)
-        ):
-            raise ValueError("stored reason_codes must be a sequence of strings")
+        committed[restored.bundle.cycle_id] = restored
 
-        try:
-            setup_state = SetupState(
-                _required_string(row["setup_state"], "setup_state")
+    matched: list[tuple[int, ResolvedOutcome, LedgerRecord]] = []
+    for position, outcome in enumerate(outcomes):
+        record = committed.get(outcome.cycle_id)
+        if record is None:
+            raise ValueError(
+                f"outcome references unknown cycle: {outcome.cycle_id}"
             )
-        except ValueError as error:
-            raise ValueError("stored setup_state is invalid") from error
-        direction = row["direction"]
-        if direction is not None and not isinstance(direction, str):
-            raise ValueError("stored direction must be a string or null")
-        probability = row["probability"]
-        if probability is not None:
-            probability = _finite_number(probability, "probability")
+        row = next(
+            (
+                row
+                for row in record.bundle.rows
+                if row.horizon == outcome.horizon
+                and row.maturity_epoch == outcome.maturity_epoch
+            ),
+            None,
+        )
+        if row is None:
+            raise ValueError("outcome horizon and maturity must match a committed row")
+        matched.append((position, outcome, record))
 
-        rows.append(
-            HorizonForecast(
-                horizon=_required_string(row["horizon"], "horizon"),
-                setup_state=setup_state,
-                direction=direction,
-                probability=probability,
-                reason_codes=list(reason_codes),
-                cutoff_epoch=_finite_number(row["cutoff_epoch"], "row cutoff"),
-                maturity_epoch=_finite_number(
-                    row["maturity_epoch"], "row maturity"
-                ),
-            )
+    for _, outcome, record in sorted(
+        matched,
+        key=lambda item: (item[1].resolved_at_epoch, item[0]),
+    ):
+        resolver.resolve_due(
+            record,
+            now_epoch=outcome.resolved_at_epoch,
+            prices_by_horizon={outcome.horizon: outcome.outcome_price},
         )
 
-    bundle = ExactSixBundle(
-        cycle_id=_required_string(bundle_values["cycle_id"], "cycle_id"),
-        symbol=_required_string(bundle_values["symbol"], "symbol"),
-        cutoff_epoch=_finite_number(bundle_values["cutoff_epoch"], "cutoff"),
-        snapshot_hash=_required_string(
-            bundle_values["snapshot_hash"], "snapshot_hash"
-        ),
-        policy_version=_required_string(
-            bundle_values["policy_version"], "policy_version"
-        ),
-        rows=rows,
-    )
-    return ledger.commit(
-        bundle,
-        committed_at_epoch=_finite_number(
-            evidence["committed_at_epoch"], "commit timestamp"
-        ),
+    return HydratedState(
+        ledger=ledger,
+        resolver=resolver,
+        ledger_records=ledger.count(),
+        resolved_outcomes=resolver.count(),
     )
 
 
-def _mapping_with_exact_keys(
-    value: object, keys: set[str], label: str
-) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or set(value) != keys:
-        raise ValueError(f"{label} must contain its exact stored fields")
-    return value
-
-
-def _required_string(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"stored {label} must be a non-empty string")
-    return value
-
-
-def _finite_number(value: object, label: str) -> float:
-    if (
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-    ):
-        raise ValueError(f"stored {label} must be finite")
-    return deepcopy(value)
-
-
-__all__ = ["hydrate_exact_six", "store_exact_six"]
+__all__ = ["HydratedState", "hydrate_exact_six"]
