@@ -3,7 +3,7 @@ import math
 import re
 import unittest
 
-from quant.evidence import PhaseECohortMetrics, PostgresEvidenceStore
+from quant.evidence import MIN_EFFECTIVE_N, PhaseECohortMetrics, PostgresEvidenceStore
 from quant.web import create_app, dashboard_data
 from tests.test_web import request
 
@@ -50,9 +50,9 @@ class PhaseEStoreTests(unittest.TestCase):
         ))
         values = store_with(cursor).phase_e_cohorts(100.0)
         self.assertEqual(values, (
-            PhaseECohortMetrics("q1", "v1", "COIN", "30S", 3, 2, 1, .5, 4.25, 1.0, 4.0, 2.0, 0),
-            PhaseECohortMetrics("q1", "v2", "COIN", "1H", 1, 0, 0, None, None, None, None, None, 0),
-            PhaseECohortMetrics("q2", "v1", "SPY", "1M", 2, 2, 2, 1.0, 0.0, .5, 0.0, 0.0, 0),
+            PhaseECohortMetrics("q1", "v1", "COIN", "30S", 3, 2, 1, .5, 4.25, 1.0, 4.0, 2.0, 0, False),
+            PhaseECohortMetrics("q1", "v2", "COIN", "1H", 1, 0, 0, None, None, None, None, None, 0, False),
+            PhaseECohortMetrics("q2", "v1", "SPY", "1M", 2, 2, 2, 1.0, 0.0, .5, 0.0, 0.0, 0, False),
         ))
         with self.assertRaises((AttributeError, TypeError)):
             values[0].coverage = 1.0
@@ -103,7 +103,7 @@ class PhaseEStoreTests(unittest.TestCase):
             before,
             (PhaseECohortMetrics(
                 "q1", "v1", "COIN", "30S", 1, 1, 0, 0.0, None,
-                None, None, None, 0,
+                None, None, None, 0, False,
             ),),
         )
 
@@ -266,6 +266,45 @@ class PhaseEStoreTests(unittest.TestCase):
         value = store_with(Cursor(metrics)).phase_e_cohorts(50)[0]
         self.assertEqual(value.effective_n, 0)
 
+    def test_eligibility_threshold_boundaries(self):
+        self.assertEqual(MIN_EFFECTIVE_N, 20)
+        for effective_n, expected in ((0, False), (1, False), (19, False),
+                                      (20, True), (21, True)):
+            with self.subTest(effective_n=effective_n):
+                metrics = (("q1", "v1", "COIN", "30S", effective_n,
+                            effective_n, effective_n, 1.0, 0.0, 1.0,
+                            0.0, 0.0),)
+                resolved = tuple(
+                    ("q1", "v1", "COIN", "30S", index * 30, index)
+                    for index in range(effective_n)
+                )
+                value = store_with(Cursor(metrics, resolved)).phase_e_cohorts(10_000)[0]
+                self.assertEqual(value.effective_n, effective_n)
+                self.assertIs(value.eligible, expected)
+
+    def test_eligibility_uses_only_effective_n(self):
+        identities = (
+            ("excellent", "v1", "COIN", "30S", 19, .01, 1.0, .01, 0.0),
+            ("terrible", "v2", "SPY", "1H", 20, 9999.0, 0.0, 9999.0, -9999.0),
+        )
+        metrics = tuple(
+            (quant_id, version, symbol, horizon, effective_n, effective_n,
+             effective_n, .001 if quant_id == "excellent" else 1.0,
+             rmse, direction, mae, bias)
+            for (quant_id, version, symbol, horizon, effective_n, rmse,
+                 direction, mae, bias) in identities
+        )
+        spacing = {"30S": 30, "1H": 3600}
+        resolved = tuple(
+            (quant_id, version, symbol, horizon, index * spacing[horizon],
+             f"{quant_id}-{index}")
+            for (quant_id, version, symbol, horizon, effective_n, *_rest) in identities
+            for index in range(effective_n)
+        )
+        values = store_with(Cursor(metrics, resolved)).phase_e_cohorts(100_000)
+        self.assertEqual([(value.effective_n, value.eligible) for value in values],
+                         [(19, False), (20, True)])
+
     def test_nonfinite_as_of_is_rejected_before_connecting(self):
         store = object.__new__(PostgresEvidenceStore)
         store._database_url = "test"
@@ -292,7 +331,7 @@ class PhaseEApiTests(unittest.TestCase):
     def test_endpoint_exact_contract_uses_clock_and_only_phase_e_read(self):
         cohort = PhaseECohortMetrics(
             "q7", "v2", "COIN", "30S", 4, 3, 2, 2 / 3, 5.5,
-            0.5, 4.5, -1.25, 2,
+            0.5, 4.5, -1.25, 2, False,
         )
 
         class Store:
@@ -319,7 +358,7 @@ class PhaseEApiTests(unittest.TestCase):
                 "horizon": "30S", "forecast_count": 4, "matured_count": 3,
                 "resolved_count": 2, "coverage": 2 / 3, "rmse_bps": 5.5,
                 "directional_accuracy": 0.5, "mae_bps": 4.5,
-                "bias_bps": -1.25, "effective_n": 2,
+                "bias_bps": -1.25, "effective_n": 2, "eligible": False,
             }],
         })
 
