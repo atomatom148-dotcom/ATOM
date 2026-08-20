@@ -1,4 +1,4 @@
-"""Phase D1 proofs for restart recovery from existing evidence."""
+"""Phase D1 proofs for honest restart-loss assessment."""
 
 from __future__ import annotations
 
@@ -9,104 +9,117 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import quant.recovery as recovery
 from quant.ledger import Ledger
-from quant.recovery import recover_state
-from quant.resolver import ResolvedOutcome, Resolver
+import quant.recovery as recovery
+from quant.recovery import RecoveryStatus, assess_recovery
+from quant.resolver import Resolver
 from quant.snapshot import from_price
-from quant.status import QuantStatus, build_status
 from quant.unified_quant import write_cycle
 
 
 CUTOFF = 1_700_000_100.0
 
 
-def evidence():
-    ledger = Ledger()
-    resolver = Resolver()
-    first = write_cycle(
-        from_price("COIN", 150.0), ledger, cycle_id="cycle-1",
-        cutoff_epoch=CUTOFF, committed_at_epoch=CUTOFF,
+def commit(ledger: Ledger, cycle_id: str = "cycle-1"):
+    return write_cycle(
+        from_price("COIN", 150.0),
+        ledger,
+        cycle_id=cycle_id,
+        cutoff_epoch=CUTOFF,
+        committed_at_epoch=CUTOFF,
     )
-    write_cycle(
-        from_price("COIN", 151.0), ledger, cycle_id="cycle-2",
-        cutoff_epoch=CUTOFF + 1, committed_at_epoch=CUTOFF + 1,
-    )
-    resolver.resolve_due(
-        first, now_epoch=CUTOFF + 60,
-        prices_by_horizon={"30S": 152.0, "1M": 153.0},
-    )
-    return [ledger.get("cycle-1"), ledger.get("cycle-2")], resolver.all()
 
 
 class PhaseD1RecoveryTests(unittest.TestCase):
-    def test_restart_recovers_truthful_phase_b_state(self) -> None:
-        records, outcomes = evidence()
-
-        state = recover_state(records, outcomes)
-
-        self.assertEqual(state.ledger.count(), 2)
-        self.assertEqual(state.ledger.latest(), records[1])
-        self.assertEqual(state.resolver.all(), outcomes)
+    def test_empty_ledger_and_resolver_are_recoverable(self) -> None:
         self.assertEqual(
-            build_status(state.ledger, state.resolver),
-            QuantStatus(True, 2, "cycle-2", 2, True),
+            assess_recovery(Ledger(), Resolver()),
+            RecoveryStatus(
+                ledger_records=0,
+                resolved_outcomes=0,
+                recoverable=True,
+                reason_codes=(),
+            ),
         )
 
-    def test_empty_restart_stays_truthfully_empty(self) -> None:
-        state = recover_state([], [])
+    def test_committed_ledger_reports_exact_count_and_loss_reason(self) -> None:
+        ledger = Ledger()
+        commit(ledger, "cycle-1")
+        commit(ledger, "cycle-2")
 
         self.assertEqual(
-            build_status(state.ledger, state.resolver),
-            QuantStatus(False, 0, None, 0, False),
+            assess_recovery(ledger, Resolver()),
+            RecoveryStatus(
+                ledger_records=2,
+                resolved_outcomes=0,
+                recoverable=False,
+                reason_codes=("VOLATILE_LEDGER_NOT_DURABLE",),
+            ),
         )
 
-    def test_recovery_does_not_mutate_or_alias_evidence(self) -> None:
-        records, outcomes = evidence()
-        before = deepcopy((records, outcomes))
-
-        state = recover_state(records, outcomes)
-        self.assertEqual((records, outcomes), before)
-        records[0].bundle.rows[0].reason_codes.append("MUTATED")
-        outcomes.clear()
-
-        self.assertEqual(state.ledger.count(), 2)
-        self.assertEqual(state.resolver.count(), 2)
-        self.assertNotIn(
-            "MUTATED",
-            state.ledger.get("cycle-1").bundle.rows[0].reason_codes,
+    def test_actual_resolve_reports_exact_counts_and_ordered_reasons(self) -> None:
+        ledger = Ledger()
+        record = commit(ledger)
+        resolver = Resolver()
+        resolver.resolve_due(
+            record,
+            now_epoch=CUTOFF + 30,
+            prices_by_horizon={"30S": 151.0},
         )
 
-    def test_invalid_evidence_returns_no_partial_state(self) -> None:
-        records, outcomes = evidence()
-        invalid = outcomes + [
-            ResolvedOutcome(
-                cycle_id="missing", horizon="30S",
-                maturity_epoch=CUTOFF + 30,
-                resolved_at_epoch=CUTOFF + 60, outcome_price=154.0,
-            )
-        ]
-
-        with self.assertRaisesRegex(ValueError, "unknown cycle"):
-            recover_state(records, invalid)
-
-    def test_maturity_identity_must_match_committed_row(self) -> None:
-        records, outcomes = evidence()
-        outcome = outcomes[0]
-        outcomes[0] = ResolvedOutcome(
-            outcome.cycle_id, outcome.horizon, outcome.maturity_epoch + 1,
-            outcome.resolved_at_epoch, outcome.outcome_price,
+        self.assertEqual(
+            assess_recovery(ledger, resolver),
+            RecoveryStatus(
+                ledger_records=1,
+                resolved_outcomes=1,
+                recoverable=False,
+                reason_codes=(
+                    "VOLATILE_LEDGER_NOT_DURABLE",
+                    "VOLATILE_RESOLVER_NOT_DURABLE",
+                ),
+            ),
         )
 
-        with self.assertRaisesRegex(ValueError, "committed horizon"):
-            recover_state(records, outcomes)
+    def test_assessment_does_not_mutate_ledger_or_resolver(self) -> None:
+        ledger = Ledger()
+        record = commit(ledger)
+        resolver = Resolver()
+        resolver.resolve_due(
+            record,
+            now_epoch=CUTOFF + 30,
+            prices_by_horizon={"30S": 151.0},
+        )
+        ledger_before = deepcopy(ledger.get("cycle-1"))
+        outcomes_before = resolver.all()
 
-    def test_d1_has_no_persistence_or_later_phase_surface(self) -> None:
-        for name in (
-            "save", "load", "serialize", "deserialize", "database", "file",
-            "stale", "blocked_model", "hydrate", "broker", "execute",
-        ):
+        assess_recovery(ledger, resolver)
+
+        self.assertEqual(ledger.count(), 1)
+        self.assertEqual(ledger.get("cycle-1"), ledger_before)
+        self.assertEqual(resolver.count(), 1)
+        self.assertEqual(resolver.all(), outcomes_before)
+
+    def test_forbidden_surfaces_are_absent(self) -> None:
+        forbidden = (
+            "RecoveredState", "recover_state", "reconstruct", "replay",
+            "hydrate", "durability", "persistence", "file", "database",
+            "supabase", "render", "worker", "ready", "predictive_ready",
+            "certified", "http", "api", "ui", "broker", "execution",
+            "stale", "blocked_model",
+        )
+        for name in forbidden:
             self.assertFalse(hasattr(recovery, name), name)
+            self.assertFalse(hasattr(RecoveryStatus, name), name)
+
+        self.assertEqual(
+            tuple(RecoveryStatus.__dataclass_fields__),
+            (
+                "ledger_records",
+                "resolved_outcomes",
+                "recoverable",
+                "reason_codes",
+            ),
+        )
 
 
 if __name__ == "__main__":
