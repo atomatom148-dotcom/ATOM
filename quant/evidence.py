@@ -135,16 +135,19 @@ class PostgresEvidenceStore:
                            ) AS matured_count,
                            count(o.forecast_id) FILTER (
                                WHERE f.maturity_epoch <= %s
+                                 AND o.resolved_epoch <= %s
                            ) AS resolved_count,
                            count(o.forecast_id) FILTER (
                                WHERE f.maturity_epoch <= %s
+                                 AND o.resolved_epoch <= %s
                            )::double precision /
                                NULLIF(count(*) FILTER (
                                    WHERE f.maturity_epoch <= %s
                                ), 0) AS coverage,
                            sqrt(avg(power(f.forecast_bps - o.outcome_bps, 2))
                                FILTER (WHERE f.maturity_epoch <= %s
-                                      AND o.forecast_id IS NOT NULL)) AS rmse_bps
+                                      AND o.forecast_id IS NOT NULL
+                                      AND o.resolved_epoch <= %s)) AS rmse_bps
                     FROM forecasts AS f
                     LEFT JOIN forecast_outcomes AS o USING (forecast_id)
                     GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon
@@ -155,7 +158,7 @@ class PostgresEvidenceStore:
                                  WHEN '30M' THEN 5 WHEN '1H' THEN 6
                              END
                     """,
-                    (as_of_epoch,) * 5,
+                    (as_of_epoch,) * 8,
                 )
                 rows = cursor.fetchall()
         return tuple(PhaseECohortMetrics(

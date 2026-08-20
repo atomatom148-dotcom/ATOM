@@ -57,11 +57,68 @@ class PhaseEStoreTests(unittest.TestCase):
         sql = " ".join(cursor.statement.split())
         self.assertIn("LEFT JOIN forecast_outcomes AS o USING (forecast_id)", sql)
         self.assertIn("GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon", sql)
-        self.assertEqual(cursor.parameters, (123.5,) * 5)
+        self.assertEqual(cursor.parameters, (123.5,) * 8)
         self.assertGreaterEqual(sql.count("f.maturity_epoch <= %s"), 5)
+        self.assertEqual(sql.count("o.resolved_epoch <= %s"), 3)
         self.assertIn("NULLIF(count(*) FILTER", sql)
         self.assertIn("sqrt(avg(power(f.forecast_bps - o.outcome_bps, 2))", sql)
         self.assertIn("AND o.forecast_id IS NOT NULL", sql)
+
+    def test_outcome_is_invisible_until_its_resolution_epoch(self):
+        class PointInTimeCursor(Cursor):
+            maturity_epoch = 100
+            resolved_epoch = 110
+            forecast_bps = 5.0
+            outcome_bps = 2.0
+
+            def execute(self, statement, parameters):
+                super().execute(statement, parameters)
+                as_of = parameters[0]
+                matured = self.maturity_epoch <= as_of
+                outcome_is_visible = matured and self.resolved_epoch <= as_of
+                self.rows = ((
+                    "q1", "v1", "COIN", "30S", 1, int(matured),
+                    int(outcome_is_visible),
+                    int(outcome_is_visible) / int(matured) if matured else None,
+                    abs(self.forecast_bps - self.outcome_bps)
+                    if outcome_is_visible else None,
+                ),)
+
+        before = store_with(PointInTimeCursor()).phase_e_cohorts(105)
+        self.assertEqual(
+            before,
+            (PhaseECohortMetrics(
+                "q1", "v1", "COIN", "30S", 1, 1, 0, 0.0, None,
+            ),),
+        )
+
+        at_resolution = store_with(PointInTimeCursor()).phase_e_cohorts(110)
+        self.assertEqual(at_resolution[0].resolved_count, 1)
+        self.assertEqual(at_resolution[0].coverage, 1.0)
+        self.assertEqual(at_resolution[0].rmse_bps, 3.0)
+
+    def test_resolution_epoch_bound_applies_to_each_outcome_population(self):
+        cursor = Cursor()
+        store_with(cursor).phase_e_cohorts(105)
+        sql = " ".join(cursor.statement.split())
+        resolved_filter = re.search(
+            r"count\(o\.forecast_id\) FILTER \( WHERE f\.maturity_epoch <= %s "
+            r"AND o\.resolved_epoch <= %s \) AS resolved_count",
+            sql,
+        )
+        coverage_filter = re.search(
+            r"count\(o\.forecast_id\) FILTER \( WHERE f\.maturity_epoch <= %s "
+            r"AND o\.resolved_epoch <= %s \)::double precision",
+            sql,
+        )
+        rmse_filter = re.search(
+            r"FILTER \(WHERE f\.maturity_epoch <= %s "
+            r"AND o\.forecast_id IS NOT NULL AND o\.resolved_epoch <= %s\)",
+            sql,
+        )
+        self.assertIsNotNone(resolved_filter)
+        self.assertIsNotNone(coverage_filter)
+        self.assertIsNotNone(rmse_filter)
 
     def test_query_is_one_read_only_select_and_orders_exact_cohorts(self):
         cursor = Cursor()
