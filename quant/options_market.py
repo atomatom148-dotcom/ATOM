@@ -9,6 +9,7 @@ import os
 import time
 from typing import Callable, Iterable
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .q10_options_vol import OptionObservation, OptionSurface
@@ -205,12 +206,22 @@ def fetch_coin_option_surface(*, midpoint: float, cutoff_epoch: float) -> Option
     selected = calls + puts
     if expiration is None or not selected:
         return None
-    symbols = [str(item["symbol"]) for item in selected]
-    snapshot_query = {"symbols": ",".join(symbols), "limit": len(symbols)}
-    with urlopen(Request(
-        f"{ALPACA_COIN_OPTION_SNAPSHOTS_URL}?{urlencode(snapshot_query)}", headers=headers,
-    ), timeout=10) as response:
-        snapshots = json.load(response).get("snapshots", {})
+    symbols = {str(item["symbol"]) for item in selected}
+    snapshots: dict[str, object] = {}
+    snapshot_query: dict[str, object] = {"limit": 1000}
+    while symbols - snapshots.keys():
+        with urlopen(Request(
+            f"{ALPACA_COIN_OPTION_SNAPSHOTS_URL}?{urlencode(snapshot_query)}", headers=headers,
+        ), timeout=10) as response:
+            page = json.load(response)
+        page_snapshots = page.get("snapshots", {})
+        if isinstance(page_snapshots, dict):
+            snapshots.update((symbol, value) for symbol, value in page_snapshots.items()
+                             if symbol in symbols)
+        token = page.get("next_page_token")
+        if not token:
+            break
+        snapshot_query["page_token"] = token
 
     def observations(items: tuple[dict[str, object], ...]) -> tuple[OptionObservation, ...]:
         return tuple(parse_alpaca_option_snapshot(item, snapshots[item["symbol"]], cutoff_epoch=cutoff_epoch)
@@ -235,6 +246,13 @@ def poll_alpaca_options(state: object, *, interval: float = OPTIONS_POLL_INTERVA
                 )
                 if surface is not None:
                     state.accept_option_surface(surface, midpoint=snapshot.history.latest.midpoint)
+        except HTTPError as error:
+            body = error.read(2048).decode("utf-8", errors="replace")
+            for credential_name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
+                credential = os.environ.get(credential_name)
+                if credential:
+                    body = body.replace(credential, "[REDACTED]")
+            print(f"Alpaca options poll failed: HTTP {error.code}: {body}", flush=True)
         except Exception as error:
             print(f"Alpaca options poll failed: {error}", flush=True)
         time.sleep(interval)
