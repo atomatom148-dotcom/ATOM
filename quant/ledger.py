@@ -14,6 +14,7 @@ class LedgerRecord:
     """One committed exact-six bundle."""
 
     bundle: ExactSixBundle
+    committed_at_epoch: float
 
 
 class Ledger:
@@ -22,15 +23,25 @@ class Ledger:
     def __init__(self) -> None:
         self._records: dict[str, LedgerRecord] = {}
 
-    def commit(self, bundle: ExactSixBundle) -> LedgerRecord:
+    def commit(
+        self, bundle: ExactSixBundle, *, committed_at_epoch: float
+    ) -> LedgerRecord:
         """Commit a defensive copy of a valid, previously unseen bundle."""
 
         if bundle.cycle_id in self._records:
             raise ValueError(f"cycle already committed: {bundle.cycle_id}")
 
         validate_bundle_integrity(bundle)
+        if not math.isfinite(committed_at_epoch):
+            raise ValueError("commit timestamp must be finite")
+        if any(
+            committed_at_epoch >= row.maturity_epoch for row in bundle.rows
+        ):
+            raise ValueError("commit must occur before every horizon maturity")
 
-        record = LedgerRecord(bundle=deepcopy(bundle))
+        record = LedgerRecord(
+            bundle=deepcopy(bundle), committed_at_epoch=committed_at_epoch
+        )
         self._records[bundle.cycle_id] = record
         return deepcopy(record)
 

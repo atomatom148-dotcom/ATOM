@@ -40,15 +40,15 @@ class PhaseB1LedgerTests(unittest.TestCase):
 
     def test_get_by_cycle_id_and_missing_get(self) -> None:
         ledger = Ledger()
-        expected = ledger.commit(bundle())
+        expected = ledger.commit(bundle(), committed_at_epoch=1_700_000_001.0)
 
         self.assertEqual(ledger.get("cycle-1"), expected)
         self.assertIsNone(ledger.get("missing"))
 
     def test_two_commits_preserve_order_and_latest(self) -> None:
         ledger = Ledger()
-        first = ledger.commit(bundle("cycle-1"))
-        second = ledger.commit(bundle("cycle-2"))
+        first = ledger.commit(bundle("cycle-1"), committed_at_epoch=1_700_000_001.0)
+        second = ledger.commit(bundle("cycle-2"), committed_at_epoch=1_700_000_001.0)
 
         self.assertEqual(ledger.count(), 2)
         self.assertEqual(ledger.get("cycle-1"), first)
@@ -56,10 +56,10 @@ class PhaseB1LedgerTests(unittest.TestCase):
 
     def test_duplicate_cycle_leaves_count_unchanged(self) -> None:
         ledger = Ledger()
-        ledger.commit(bundle())
+        ledger.commit(bundle(), committed_at_epoch=1_700_000_001.0)
 
         with self.assertRaisesRegex(ValueError, "already committed"):
-            ledger.commit(bundle())
+            ledger.commit(bundle(), committed_at_epoch=1_700_000_001.0)
 
         self.assertEqual(ledger.count(), 1)
 
@@ -69,7 +69,7 @@ class PhaseB1LedgerTests(unittest.TestCase):
         candidate.rows.pop()
 
         with self.assertRaisesRegex(ValueError, "exactly six"):
-            ledger.commit(candidate)
+            ledger.commit(candidate, committed_at_epoch=1_700_000_001.0)
 
         self.assertEqual(ledger.count(), 0)
 
@@ -79,7 +79,7 @@ class PhaseB1LedgerTests(unittest.TestCase):
         candidate.rows[0], candidate.rows[1] = candidate.rows[1], candidate.rows[0]
 
         with self.assertRaisesRegex(ValueError, "exact order"):
-            ledger.commit(candidate)
+            ledger.commit(candidate, committed_at_epoch=1_700_000_001.0)
 
         self.assertEqual(ledger.count(), 0)
 
@@ -89,7 +89,7 @@ class PhaseB1LedgerTests(unittest.TestCase):
         candidate.rows[0].cutoff_epoch += 1
 
         with self.assertRaisesRegex(ValueError, "row cutoff"):
-            ledger.commit(candidate)
+            ledger.commit(candidate, committed_at_epoch=1_700_000_001.0)
 
         self.assertEqual(ledger.count(), 0)
 
@@ -99,21 +99,33 @@ class PhaseB1LedgerTests(unittest.TestCase):
         candidate.rows[0].maturity_epoch = candidate.cutoff_epoch
 
         with self.assertRaisesRegex(ValueError, "mature after"):
-            ledger.commit(candidate)
+            ledger.commit(candidate, committed_at_epoch=1_700_000_001.0)
 
         self.assertEqual(ledger.count(), 0)
+
+    def test_commit_timestamp_is_stored_and_must_precede_maturity(self) -> None:
+        ledger = Ledger()
+        committed = ledger.commit(
+            bundle(), committed_at_epoch=1_700_000_029.0
+        )
+
+        self.assertEqual(committed.committed_at_epoch, 1_700_000_029.0)
+        with self.assertRaisesRegex(ValueError, "before every horizon"):
+            Ledger().commit(
+                bundle(), committed_at_epoch=1_700_000_030.0
+            )
 
     def test_original_bundle_mutation_cannot_alter_stored_evidence(self) -> None:
         ledger = Ledger()
         original = bundle()
-        ledger.commit(original)
+        ledger.commit(original, committed_at_epoch=1_700_000_001.0)
         original.rows[0].reason_codes.append("MUTATED")
 
         self.assertEqual(ledger.get("cycle-1").bundle.rows[0].reason_codes, [])
 
     def test_returned_records_cannot_alter_stored_evidence(self) -> None:
         ledger = Ledger()
-        committed = ledger.commit(bundle())
+        committed = ledger.commit(bundle(), committed_at_epoch=1_700_000_001.0)
         committed.bundle.rows[0].reason_codes.append("COMMIT_MUTATION")
         fetched = ledger.get("cycle-1")
         fetched.bundle.rows[0].reason_codes.append("GET_MUTATION")

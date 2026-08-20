@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from quant.ledger import Ledger
 import quant.resolver as resolver
-from quant.resolver import ResolvedOutcome, resolve_due
+from quant.resolver import ResolvedOutcome, Resolver, resolve_due
 from quant.snapshot import from_price
 from quant.unified_quant import write_cycle
 
@@ -29,6 +29,7 @@ class PhaseB3ResolverTests(unittest.TestCase):
             self.ledger,
             cycle_id="cycle-1",
             cutoff_epoch=CUTOFF,
+            committed_at_epoch=CUTOFF,
         )
 
     def resolve(self, now_epoch: float) -> list[ResolvedOutcome]:
@@ -103,6 +104,39 @@ class PhaseB3ResolverTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "mature after"):
             self.resolve(CUTOFF + 30)
+
+    def test_resolver_appends_each_horizon_only_once(self) -> None:
+        resolver_store = Resolver()
+
+        self.assertEqual(
+            [item.horizon for item in resolver_store.resolve_due(
+                self.record,
+                now_epoch=CUTOFF + 30,
+                outcome_price=OUTCOME_PRICE,
+            )],
+            ["30S"],
+        )
+        self.assertEqual(
+            resolver_store.resolve_due(
+                self.record,
+                now_epoch=CUTOFF + 30,
+                outcome_price=OUTCOME_PRICE,
+            ),
+            [],
+        )
+        self.assertEqual(
+            [item.horizon for item in resolver_store.resolve_due(
+                self.record,
+                now_epoch=CUTOFF + 60,
+                outcome_price=OUTCOME_PRICE,
+            )],
+            ["1M"],
+        )
+        self.assertEqual(resolver_store.count(), 2)
+
+        returned = resolver_store.outcomes()
+        returned.clear()
+        self.assertEqual(resolver_store.count(), 2)
 
     def test_forbidden_surfaces_are_absent(self) -> None:
         for name in (

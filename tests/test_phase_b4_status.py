@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from pathlib import Path
 import sys
 import unittest
@@ -10,7 +9,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from quant.ledger import Ledger
-from quant.resolver import resolve_due
+from quant.resolver import Resolver
 from quant.snapshot import from_price
 import quant.status as status
 from quant.status import QuantStatus, build_status
@@ -26,80 +25,86 @@ def commit(ledger: Ledger, cycle_id: str, cutoff_epoch: float = CUTOFF):
         ledger,
         cycle_id=cycle_id,
         cutoff_epoch=cutoff_epoch,
+        committed_at_epoch=cutoff_epoch,
     )
 
 
 class PhaseB4StatusTests(unittest.TestCase):
     def test_empty_ledger_and_no_outcomes(self) -> None:
         self.assertEqual(
-            build_status(Ledger(), []),
+            build_status(Ledger(), Resolver()),
             QuantStatus(False, 0, None, 0, False),
         )
 
     def test_one_committed_cycle_and_no_outcomes(self) -> None:
         ledger = Ledger()
+        resolver = Resolver()
         commit(ledger, "cycle-1")
 
         self.assertEqual(
-            build_status(ledger, []),
+            build_status(ledger, resolver),
             QuantStatus(True, 1, "cycle-1", 0, False),
         )
 
     def test_one_actual_resolved_outcome(self) -> None:
         ledger = Ledger()
+        resolver = Resolver()
         record = commit(ledger, "cycle-1")
-        outcomes = resolve_due(
+        resolver.resolve_due(
             record,
             now_epoch=CUTOFF + 30,
             outcome_price=151.25,
         )
 
         self.assertEqual(
-            build_status(ledger, outcomes),
+            build_status(ledger, resolver),
             QuantStatus(True, 1, "cycle-1", 1, True),
         )
 
     def test_six_actual_resolved_outcomes(self) -> None:
         ledger = Ledger()
+        resolver = Resolver()
         record = commit(ledger, "cycle-1")
-        outcomes = resolve_due(
+        resolver.resolve_due(
             record,
             now_epoch=CUTOFF + 3600,
             outcome_price=151.25,
         )
 
         self.assertEqual(
-            build_status(ledger, outcomes),
+            build_status(ledger, resolver),
             QuantStatus(True, 1, "cycle-1", 6, True),
         )
 
     def test_multiple_cycles_report_exact_count_and_latest_cycle_id(self) -> None:
         ledger = Ledger()
+        resolver = Resolver()
         commit(ledger, "cycle-1")
         commit(ledger, "cycle-2", CUTOFF + 1)
         commit(ledger, "cycle-3", CUTOFF + 2)
 
-        result = build_status(ledger, [])
+        result = build_status(ledger, resolver)
 
         self.assertEqual(result.ledger_count, 3)
         self.assertEqual(result.latest_cycle_id, "cycle-3")
 
     def test_build_status_does_not_mutate_ledger_or_outcomes(self) -> None:
         ledger = Ledger()
+        resolver = Resolver()
         record = commit(ledger, "cycle-1")
-        outcomes = resolve_due(
+        resolver.resolve_due(
             record,
             now_epoch=CUTOFF + 60,
             outcome_price=151.25,
         )
         ledger_before = ledger.get("cycle-1")
-        outcomes_before = deepcopy(outcomes)
+        outcomes_before = resolver.outcomes()
 
-        build_status(ledger, outcomes)
+        build_status(ledger, resolver)
 
         self.assertEqual(ledger.count(), 1)
         self.assertEqual(ledger.get("cycle-1"), ledger_before)
-        self.assertEqual(outcomes, outcomes_before)
+        self.assertEqual(resolver.outcomes(), outcomes_before)
 
     def test_forbidden_surfaces_are_absent(self) -> None:
         for name in (
