@@ -20,9 +20,9 @@ def snapshot(**overrides: object) -> Snapshot:
         "symbol": "COIN",
         "asof_epoch": 1_700_000_000.0,
         "last": 102.0,
-        "bid": 101.0,
-        "ask": 103.0,
-        "bar_close": 100.0,
+        "bid": 100.0,
+        "ask": 104.0,
+        "bar_close": 96.0,
         "source": "test",
         "fresh": True,
         "reason_codes": ["SOURCE_EVIDENCE"],
@@ -32,87 +32,109 @@ def snapshot(**overrides: object) -> Snapshot:
 
 
 class PhaseC2StructureTests(unittest.TestCase):
-    def test_describes_above_below_and_at_bar_close(self) -> None:
-        above = evaluate_structure(snapshot())
-        below = evaluate_structure(snapshot(last=98.0))
-        at_close = evaluate_structure(snapshot(last=100.0))
+    def test_exact_valid_calculations(self) -> None:
+        evidence = evaluate_structure(snapshot(last=102.0, bid=100.0, ask=106.0))
 
-        self.assertEqual(
-            above,
-            StructureEvidence(True, 0.02, "ABOVE_BAR_CLOSE", ()),
-        )
-        self.assertEqual(below.displacement_pct, -0.02)
-        self.assertEqual(below.relation, "BELOW_BAR_CLOSE")
-        self.assertEqual(at_close.displacement_pct, 0.0)
-        self.assertEqual(at_close.relation, "AT_BAR_CLOSE")
+        self.assertEqual(evidence.midpoint, 103.0)
+        self.assertEqual(evidence.distance_from_close_pct, 6.0 / 102.0)
+        self.assertEqual(evidence.distance_from_mid_pct, -1.0 / 102.0)
+        self.assertEqual(evidence.location_in_quote, 2.0 / 6.0)
+        self.assertEqual(evidence.reason_codes, ())
+        self.assertTrue(evidence.usable)
 
-    def test_missing_and_invalid_evidence_remains_unavailable(self) -> None:
-        for field in ("last", "bar_close"):
+    def test_location_outside_quote_is_not_clamped(self) -> None:
+        above = evaluate_structure(snapshot(last=106.0, bid=100.0, ask=104.0))
+        below = evaluate_structure(snapshot(last=98.0, bid=100.0, ask=104.0))
+
+        self.assertEqual(above.location_in_quote, 1.5)
+        self.assertEqual(below.location_in_quote, -0.5)
+
+    def test_zero_width_quote_remains_usable(self) -> None:
+        evidence = evaluate_structure(snapshot(last=102.0, bid=101.0, ask=101.0))
+
+        self.assertTrue(evidence.usable)
+        self.assertEqual(evidence.midpoint, 101.0)
+        self.assertEqual(evidence.distance_from_mid_pct, 1.0 / 102.0)
+        self.assertIsNone(evidence.location_in_quote)
+        self.assertEqual(evidence.reason_codes, ("ZERO_QUOTE_WIDTH",))
+
+    def test_missing_or_invalid_close_is_optional(self) -> None:
+        for value in (None, 0.0, -1.0, math.nan, math.inf, -math.inf, True):
+            with self.subTest(value=value):
+                evidence = evaluate_structure(snapshot(bar_close=value))
+                self.assertTrue(evidence.usable)
+                self.assertIsNone(evidence.distance_from_close_pct)
+                self.assertEqual(evidence.midpoint, 102.0)
+                self.assertEqual(evidence.distance_from_mid_pct, 0.0)
+                self.assertEqual(evidence.location_in_quote, 0.5)
+                self.assertEqual(evidence.reason_codes, ("CLOSE_UNAVAILABLE",))
+
+    def test_required_quote_validation(self) -> None:
+        for field in ("last", "bid", "ask"):
             with self.subTest(field=field, kind="missing"):
                 evidence = evaluate_structure(snapshot(**{field: None}))
-                self.assertEqual(
-                    evidence.reason_codes, (f"MISSING_{field.upper()}",)
-                )
-                self.assertFalse(evidence.usable)
-                self.assertIsNone(evidence.displacement_pct)
-                self.assertIsNone(evidence.relation)
+                self._assert_unusable(evidence, (f"MISSING_{field.upper()}",))
 
             for value in (0.0, -1.0, math.nan, math.inf, -math.inf, True):
                 with self.subTest(field=field, value=value):
                     evidence = evaluate_structure(snapshot(**{field: value}))
-                    self.assertEqual(
-                        evidence.reason_codes, (f"INVALID_{field.upper()}",)
+                    self._assert_unusable(
+                        evidence, (f"INVALID_{field.upper()}",)
                     )
-                    self.assertFalse(evidence.usable)
 
-    def test_reasons_have_deterministic_order(self) -> None:
+    def test_stale_and_reversed_quotes_are_unusable(self) -> None:
+        self._assert_unusable(
+            evaluate_structure(snapshot(fresh=False)), ("STALE_SNAPSHOT",)
+        )
+        self._assert_unusable(
+            evaluate_structure(snapshot(bid=105.0, ask=104.0)),
+            ("ASK_BELOW_BID",),
+        )
+
+    def test_required_reasons_have_deterministic_order(self) -> None:
         evidence = evaluate_structure(
-            snapshot(fresh=False, last=None, bar_close=math.nan)
+            snapshot(fresh=False, last=None, bid=math.nan, ask=-1.0)
         )
 
-        self.assertEqual(
-            evidence.reason_codes,
-            ("STALE_SNAPSHOT", "MISSING_LAST", "INVALID_BAR_CLOSE"),
-        )
-
-    def test_unrelated_quote_fields_do_not_change_structure(self) -> None:
-        expected = evaluate_structure(snapshot())
-
-        self.assertEqual(
-            evaluate_structure(snapshot(bid=None, ask=None)), expected
+        self._assert_unusable(
+            evidence,
+            ("STALE_SNAPSHOT", "MISSING_LAST", "INVALID_BID", "INVALID_ASK"),
         )
 
     def test_snapshot_is_not_mutated(self) -> None:
         original = snapshot()
         before = deepcopy(original)
-
         evaluate_structure(original)
-
         self.assertEqual(original, before)
 
-    def test_surface_is_descriptive_only(self) -> None:
+    def test_forbidden_surfaces_and_categories_are_absent(self) -> None:
         forbidden = (
-            "SetupState",
-            "direction",
-            "probability",
-            "score",
-            "target",
-            "stop",
-            "pnl",
-            "write_cycle",
-            "ledger",
-            "resolver",
-            "status",
-            "broker",
-            "execute",
+            "SetupState", "direction", "probability", "score", "support",
+            "resistance", "breakout", "target", "stop", "pnl", "write_cycle",
+            "ledger", "resolver", "status", "broker", "execute", "relation",
+            "displacement_pct", "ABOVE_BAR_CLOSE", "BELOW_BAR_CLOSE",
+            "AT_BAR_CLOSE",
         )
         for name in forbidden:
             self.assertFalse(hasattr(structure, name), name)
 
         self.assertEqual(
             tuple(StructureEvidence.__dataclass_fields__),
-            ("usable", "displacement_pct", "relation", "reason_codes"),
+            (
+                "usable", "distance_from_close_pct", "midpoint",
+                "distance_from_mid_pct", "location_in_quote", "reason_codes",
+            ),
         )
+
+    def _assert_unusable(
+        self, evidence: StructureEvidence, reasons: tuple[str, ...]
+    ) -> None:
+        self.assertFalse(evidence.usable)
+        self.assertIsNone(evidence.distance_from_close_pct)
+        self.assertIsNone(evidence.midpoint)
+        self.assertIsNone(evidence.distance_from_mid_pct)
+        self.assertIsNone(evidence.location_in_quote)
+        self.assertEqual(evidence.reason_codes, reasons)
 
 
 if __name__ == "__main__":
