@@ -77,9 +77,12 @@ class WebSurfaceTests(unittest.TestCase):
             for value in family["values"]:
                 self.assertIn(f">{value:.2f}</td>", page)
 
-    def test_mobile_market_grid_uses_two_non_overlapping_columns(self):
+    def test_mobile_market_grid_uses_readable_responsive_columns(self):
         page = request(create_app(), "/")["body"].decode()
-        self.assertIn(".market{grid-template-columns:repeat(2,minmax(0,1fr))}", page)
+        self.assertIn(
+            ".market{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}",
+            page,
+        )
 
     def test_health_only_reports_process_running(self):
         response = request(create_app(), "/health")
