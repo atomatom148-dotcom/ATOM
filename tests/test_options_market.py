@@ -1,8 +1,12 @@
 import json
+import io
 import threading
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlparse
 
 from quant.live_market import LiveMarketState
 from quant.options_market import (OPTIONS_POLL_INTERVAL, fetch_coin_option_surface,
@@ -108,6 +112,10 @@ class ParsingAndSelectionTests(unittest.TestCase):
             with patch("quant.options_market.json.load", side_effect=lambda response: response.value):
                 surface = fetch_coin_option_surface(midpoint=200, cutoff_epoch=CUTOFF)
         self.assertEqual(get.call_count, 2)  # one discovery page plus one bulk snapshot request
+        snapshot_url = get.call_args_list[1].args[0].full_url
+        self.assertEqual(urlparse(snapshot_url).path, "/v1beta1/options/snapshots/COIN")
+        self.assertEqual(parse_qs(urlparse(snapshot_url).query), {"limit": ["1000"]})
+        self.assertNotIn("symbols", snapshot_url)
         self.assertEqual(len(surface.calls), 4)
         self.assertEqual(len(surface.puts), 5)
         self.assertNotIn("C200", [item.contract_symbol for item in surface.calls])
@@ -150,6 +158,30 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(state.accept_qqq_quote(bid=400, ask=402, event_epoch=CUTOFF))
         self.assertTrue(state.accept_quote(bid=200, ask=202, event_epoch=CUTOFF))
         self.assertIsNotNone(state.snapshot().momentum)
+        self.assertIs(state.snapshot().option_observation, original)
+        self.assertIs(state.snapshot().option_surface, original_surface)
+
+    @patch.dict("os.environ", {"ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret"})
+    def test_http_error_diagnostic_has_status_and_body_but_no_credentials(self):
+        state = LiveMarketState(clock=lambda: CUTOFF)
+        state.accept_quote(bid=199, ask=201, event_epoch=CUTOFF - 1)
+        original = parse_alpaca_option_snapshot(contract("KEEP"), snapshot(), cutoff_epoch=CUTOFF)
+        original_surface = OptionSurface(CUTOFF, "2026-09-19", (original,), ())
+        state.accept_option_surface(original_surface, midpoint=200)
+        error = HTTPError("https://key:secret@example.test", 400, "Bad Request",
+                          {"Authorization": "key secret"},
+                          io.BytesIO(b'{"message":"unsupported symbols; key secret"}'))
+        output = io.StringIO()
+        with patch("quant.options_market.fetch_coin_option_surface", side_effect=error), \
+             patch("quant.options_market.time.sleep", side_effect=RuntimeError("stop")), \
+             redirect_stdout(output):
+            with self.assertRaises(RuntimeError):
+                poll_alpaca_options(state)
+        diagnostic = output.getvalue()
+        self.assertIn('HTTP 400: {"message":"unsupported symbols; [REDACTED] [REDACTED]"}', diagnostic)
+        self.assertNotIn("key", diagnostic)
+        self.assertNotIn("secret", diagnostic)
+        self.assertNotIn("Authorization", diagnostic)
         self.assertIs(state.snapshot().option_observation, original)
         self.assertIs(state.snapshot().option_surface, original_surface)
 
