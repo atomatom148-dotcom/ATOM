@@ -28,10 +28,55 @@ from .q10_options_vol import (OptionObservation, OptionSurface, OptionsVolResult
                               calculate_options_vol)
 from .q11_regime import RegimeResult, calculate_regime
 from .q12_event_session import EventSessionResult, calculate_event_session
+from .v9_math_core import V9MathCore, V9MathInput, V9QuantFamily
 
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
 HISTORY_SECONDS = 3600.0
+
+
+def v9_math_core_enabled() -> bool:
+    """Return whether the opt-in observer is enabled for this cycle."""
+
+    return os.environ.get("V9_MATH_CORE_ENABLED", "false").lower() == "true"
+
+
+def build_v9_quant_snapshot(snapshot: "LiveSnapshot", *, symbol: str,
+                            as_of_epoch: float) -> V9MathInput:
+    """Copy already-computed family outputs into V9's immutable contract."""
+
+    results = (
+        snapshot.momentum, snapshot.mean_reversion, snapshot.volatility,
+        snapshot.stat_arb, snapshot.microstructure, snapshot.volume_liquidity,
+        snapshot.relative_value, snapshot.cross_asset, snapshot.factor,
+        snapshot.options_vol, snapshot.regime, snapshot.event_session,
+    )
+    families = tuple(
+        V9QuantFamily(
+            quant_id=result.quant_id,
+            formula_version=result.formula_version,
+            horizon_values=tuple(
+                getattr(result, "volatility_bps", getattr(result, "forecast_bps", ()))
+            ),
+        )
+        for result in results
+        if result is not None
+    )
+    return V9MathInput(symbol=symbol, as_of_epoch=as_of_epoch, families=families)
+
+
+def _observe_v9(snapshot: "LiveSnapshot", *, symbol: str, as_of_epoch: float) -> None:
+    """Run the optional observer fail-open, without affecting ATOM's path."""
+
+    if not v9_math_core_enabled():
+        return
+    try:
+        V9MathCore.evaluate(build_v9_quant_snapshot(
+            snapshot, symbol=symbol, as_of_epoch=as_of_epoch,
+        ))
+    except Exception:
+        # V9 is downstream and observer-only; its failure cannot fail the cycle.
+        return
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +211,7 @@ class LiveMarketState:
                 self._snapshot.option_observation,
                 self._snapshot.option_surface,
             )
+            _observe_v9(next_snapshot, symbol="COIN", as_of_epoch=event_epoch)
             if self._evidence_store is not None:
                 forecasts = records_for_results(
                     results=(
