@@ -38,6 +38,9 @@ class PhaseECohortMetrics:
     resolved_count: int
     coverage: float | None
     rmse_bps: float | None
+    directional_accuracy: float | None
+    mae_bps: float | None
+    bias_bps: float | None
 
 
 class EvidenceStore(Protocol):
@@ -147,7 +150,27 @@ class PostgresEvidenceStore:
                            sqrt(avg(power(f.forecast_bps - o.outcome_bps, 2))
                                FILTER (WHERE f.maturity_epoch <= %s
                                       AND o.forecast_id IS NOT NULL
-                                      AND o.resolved_epoch <= %s)) AS rmse_bps
+                                      AND o.resolved_epoch <= %s)) AS rmse_bps,
+                           avg(CASE
+                                   WHEN f.forecast_bps <> 0
+                                    AND o.outcome_bps <> 0
+                                   THEN CASE
+                                       WHEN (f.forecast_bps > 0 AND o.outcome_bps > 0)
+                                         OR (f.forecast_bps < 0 AND o.outcome_bps < 0)
+                                       THEN 1.0 ELSE 0.0
+                                   END
+                               END) FILTER (WHERE f.maturity_epoch <= %s
+                                           AND o.forecast_id IS NOT NULL
+                                           AND o.resolved_epoch <= %s)
+                               AS directional_accuracy,
+                           avg(abs(f.forecast_bps - o.outcome_bps))
+                               FILTER (WHERE f.maturity_epoch <= %s
+                                      AND o.forecast_id IS NOT NULL
+                                      AND o.resolved_epoch <= %s) AS mae_bps,
+                           avg(f.forecast_bps - o.outcome_bps)
+                               FILTER (WHERE f.maturity_epoch <= %s
+                                      AND o.forecast_id IS NOT NULL
+                                      AND o.resolved_epoch <= %s) AS bias_bps
                     FROM forecasts AS f
                     LEFT JOIN forecast_outcomes AS o USING (forecast_id)
                     GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon
@@ -158,7 +181,7 @@ class PostgresEvidenceStore:
                                  WHEN '30M' THEN 5 WHEN '1H' THEN 6
                              END
                     """,
-                    (as_of_epoch,) * 8,
+                    (as_of_epoch,) * 14,
                 )
                 rows = cursor.fetchall()
         return tuple(PhaseECohortMetrics(
@@ -168,6 +191,9 @@ class PostgresEvidenceStore:
             resolved_count=int(row[6]),
             coverage=None if row[7] is None else float(row[7]),
             rmse_bps=None if row[8] is None else float(row[8]),
+            directional_accuracy=None if row[9] is None else float(row[9]),
+            mae_bps=None if row[10] is None else float(row[10]),
+            bias_bps=None if row[11] is None else float(row[11]),
         ) for row in rows)
 
 
