@@ -177,6 +177,7 @@ class LiveMarketState:
                         next_snapshot.relative_value,
                         next_snapshot.cross_asset,
                         next_snapshot.factor,
+                        next_snapshot.options_vol,
                         next_snapshot.regime,
                         next_snapshot.event_session,
                     ),

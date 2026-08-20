@@ -16,6 +16,7 @@ DIRECTIONAL_QUANTS = (
     "q7_relative_value",
     "q8_cross_asset",
     "q9_factor",
+    "q10_options_vol",
     "q11_regime",
     "q12_event_session",
 )
@@ -44,7 +45,7 @@ def records(results, cycle: int = 1):
 
 
 class DirectionalEvidenceExpansionTests(unittest.TestCase):
-    def test_live_cycle_wires_only_the_ten_directional_families(self):
+    def test_live_cycle_wires_all_eleven_directional_families(self):
         class CapturingStore:
             forecasts = ()
 
@@ -60,6 +61,7 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
                     "calculate_stat_arb", "calculate_microstructure",
                     "calculate_volume_liquidity", "calculate_relative_value",
                     "calculate_cross_asset", "calculate_factor",
+                    "calculate_options_vol",
                     "calculate_regime", "calculate_event_session",
                 ),
                 DIRECTIONAL_QUANTS,
@@ -70,20 +72,18 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
             **{name: Mock(return_value=value)
                for name, value in directional_results.items()},
         ), patch("quant.live_market.calculate_volatility",
-                 return_value=result("q3_volatility")), patch(
-                     "quant.live_market.calculate_options_vol",
-                     return_value=result("q10_options_vol")):
+                 return_value=result("q3_volatility")):
             state = LiveMarketState(clock=lambda: 2.0, evidence_store=store)
             self.assertTrue(state.accept_quote(bid=100, ask=102, event_epoch=1))
 
-        self.assertEqual(len(store.forecasts), 60)
+        self.assertEqual(len(store.forecasts), 66)
         self.assertEqual({row.quant_id for row in store.forecasts},
                          set(DIRECTIONAL_QUANTS))
 
-    def test_all_ten_directional_families_create_sixty_shared_cycle_records(self):
+    def test_all_eleven_directional_families_create_shared_cycle_records(self):
         generated = records(tuple(map(result, DIRECTIONAL_QUANTS)))
 
-        self.assertEqual(len(generated), 60)
+        self.assertEqual(len(generated), 66)
         self.assertEqual({row.quant_id for row in generated}, set(DIRECTIONAL_QUANTS))
         self.assertEqual({row.cycle_id for row in generated}, {"COIN:1.000000000"})
         self.assertEqual({row.cutoff_midpoint for row in generated}, {101.0})
@@ -111,33 +111,91 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
         self.assertEqual({row.quant_id for row in mixed},
                          {"q4_stat_arb", "q5_microstructure"})
 
-    def test_q3_and_unavailable_q10_are_not_directional_records(self):
-        generated = records(tuple(map(result, DIRECTIONAL_QUANTS)) + (None,))
+    def test_q3_and_unavailable_q10_create_no_directional_records(self):
+        generated = records(tuple(
+            result(quant_id) for quant_id in DIRECTIONAL_QUANTS
+            if quant_id != "q10_options_vol"
+        ) + (None,))
         quant_ids = {row.quant_id for row in generated}
         self.assertNotIn("q3_volatility", quant_ids)
         self.assertNotIn("q10_options_vol", quant_ids)
 
-    def test_one_hundred_cycles_have_six_thousand_idempotent_identities(self):
+    def test_live_cycle_writes_zero_q10_records_when_result_is_none(self):
+        class CapturingStore:
+            forecasts = ()
+
+            def record_cycle_and_resolve(self, forecasts, **_observation):
+                self.forecasts = tuple(forecasts)
+
+        store = CapturingStore()
+        directional_results = {
+            function: result(quant_id)
+            for function, quant_id in zip(
+                (
+                    "calculate_momentum", "calculate_mean_reversion",
+                    "calculate_stat_arb", "calculate_microstructure",
+                    "calculate_volume_liquidity", "calculate_relative_value",
+                    "calculate_cross_asset", "calculate_factor",
+                    "calculate_regime", "calculate_event_session",
+                ),
+                (quant_id for quant_id in DIRECTIONAL_QUANTS
+                 if quant_id != "q10_options_vol"),
+            )
+        }
+        with patch.multiple(
+            "quant.live_market",
+            **{name: Mock(return_value=value)
+               for name, value in directional_results.items()},
+        ), patch("quant.live_market.calculate_options_vol", return_value=None):
+            state = LiveMarketState(clock=lambda: 2.0, evidence_store=store)
+            self.assertTrue(state.accept_quote(bid=100, ask=102, event_epoch=1))
+
+        self.assertEqual(len(store.forecasts), 60)
+        self.assertNotIn(
+            "q10_options_vol", {row.quant_id for row in store.forecasts}
+        )
+
+    def test_q10_uses_immutable_identity_and_common_coin_cutoff(self):
+        q10 = DirectionalResult(
+            "q10_options_vol", "coin-options-skew-delta-v1",
+            (1, 2, 3, 4, 5, 6),
+        )
+
+        generated = records((q10,))
+
+        self.assertEqual(len(generated), 6)
+        self.assertEqual({row.quant_id for row in generated}, {"q10_options_vol"})
+        self.assertEqual(
+            {row.formula_version for row in generated},
+            {"coin-options-skew-delta-v1"},
+        )
+        self.assertEqual({row.cycle_id for row in generated}, {"COIN:1.000000000"})
+        self.assertEqual({row.symbol for row in generated}, {"COIN"})
+        self.assertEqual({row.cutoff_epoch for row in generated}, {1.0})
+        self.assertEqual({row.cutoff_midpoint for row in generated}, {101.0})
+        self.assertEqual(tuple(row.horizon for row in generated), HORIZONS)
+
+    def test_one_hundred_cycles_have_6600_idempotent_identities(self):
         durable = {}
         attempts = []
         for cycle in range(100):
             attempts.extend(records(tuple(map(result, DIRECTIONAL_QUANTS)), cycle))
 
-        self.assertEqual(len(attempts), 6_000)
+        self.assertEqual(len(attempts), 6_600)
         for row in attempts:
             identity = (row.quant_id, row.formula_version, row.cycle_id,
                         row.symbol, row.horizon)
             durable.setdefault(identity, row)
-        self.assertEqual(len(durable), 6_000)
+        self.assertEqual(len(durable), 6_600)
 
         for row in attempts:
             identity = (row.quant_id, row.formula_version, row.cycle_id,
                         row.symbol, row.horizon)
             durable.setdefault(identity, row)
-        self.assertEqual(len(durable), 6_000)
+        self.assertEqual(len(durable), 6_600)
         self.assertEqual(
             len({(row.cycle_id, row.quant_id, row.horizon) for row in attempts}),
-            6_000,
+            6_600,
         )
 
     def test_expanded_records_use_the_common_coin_outcome_equation(self):
@@ -149,7 +207,7 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
             )
             for row in generated if row.horizon == "30S"
         }
-        self.assertEqual(len(outcomes), 10)
+        self.assertEqual(len(outcomes), 11)
         self.assertEqual(len(set(outcomes.values())), 1)
 
 
