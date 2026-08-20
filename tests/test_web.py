@@ -2,7 +2,9 @@ import json
 import unittest
 
 from quant.history import MidpointHistory, MidpointObservation
-from quant.web import FAMILY_NAMES, HORIZON_LABELS, create_app, dashboard_data
+from quant.evidence import PhaseECohortMetrics
+from quant.web import (FAMILY_NAMES, HORIZON_LABELS, PHASE_E_FAMILY_NAMES,
+                       create_app, dashboard_data)
 
 
 def request(app, path):
@@ -128,6 +130,62 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertNotIn("render", failure_handler)
         self.assertNotIn("textContent", failure_handler)
         self.assertIn("setInterval(refreshDashboard, 1000)", page)
+
+    def test_phase_e_dashboard_mapping_order_format_and_raw_precision(self):
+        quant_ids = tuple(PHASE_E_FAMILY_NAMES)
+        cohorts = tuple(
+            PhaseECohortMetrics(
+                quant_id, "v1", "COIN", "1H" if index == 0 else "30S",
+                21, 20, 19, 0.999123, 2.3456, 0.514, 1.2345,
+                None if index == 1 else -0.126, 20, index % 2 == 0,
+            )
+            for index, quant_id in enumerate(reversed(quant_ids))
+        )
+
+        class Store:
+            def __init__(self): self.phase_calls = []
+            def counts(self): return (123, 98)
+            def phase_e_cohorts(self, as_of):
+                self.phase_calls.append(as_of)
+                return cohorts + (PhaseECohortMetrics(
+                    "q3_volatility", "v1", "COIN", "30S", 1, 1, 1,
+                    1.0, 0.0, None, None, None, 1, False,
+                ),)
+
+        store = Store()
+        app = create_app(evidence_store=store, clock=lambda: 456.75)
+        payload = json.loads(request(app, "/api/dashboard")["body"])
+        rows = payload["phase_e_cohorts"]
+
+        self.assertEqual(store.phase_calls, [456.75])
+        self.assertEqual(payload["evidence"], {"Forecasts": 123, "Resolved": 98})
+        self.assertEqual([row["family"] for row in rows], list(PHASE_E_FAMILY_NAMES.values()))
+        self.assertNotIn("q3_volatility", [row["quant_id"] for row in rows])
+        self.assertEqual(rows[0]["directional_accuracy"], 0.514)
+        self.assertEqual(rows[0]["coverage"], 0.999123)
+        self.assertEqual(rows[0]["rmse_bps"], 2.3456)
+
+        page = request(create_app(evidence_store=store, clock=lambda: 456.75), "/")["body"].decode()
+        self.assertIn("FAMILY/HORIZON", page)
+        self.assertIn("EFFECTIVE N", page)
+        self.assertIn(">YES<", page)
+        self.assertIn(">NO<", page)
+        self.assertIn(">51.4%<", page)
+        self.assertIn(">99.9%<", page)
+        self.assertIn(">2.35<", page)
+        self.assertIn(">1.23<", page)
+        self.assertIn(">-0.13<", page)
+        self.assertNotIn(">None<", page)
+
+    def test_phase_e_horizons_have_fixed_display_order(self):
+        cohorts = tuple(
+            PhaseECohortMetrics("q1_momentum", "v1", "COIN", horizon,
+                                1, 1, 1, 1.0, 1.0, 1.0, 1.0, 1.0, 1, False)
+            for horizon in reversed(("30S", "1M", "5M", "15M", "30M", "1H"))
+        )
+        rows = dashboard_data(phase_e_cohorts=cohorts)["phase_e_cohorts"]
+        self.assertEqual([row["horizon"] for row in rows],
+                         ["30S", "1M", "5M", "15M", "30M", "1H"])
 
 
 if __name__ == "__main__":

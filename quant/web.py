@@ -39,15 +39,27 @@ OPTION_FIELDS = (
     "Strike", "Expiration", "Premium", "IV", "Delta", "Gamma",
     "Theta", "Vega", "Bid", "Ask", "Spread",
 )
-EVIDENCE_FIELDS = (
-    "Forecasts", "Resolved", "Eligible", "RMSE", "Coverage", "Effective N",
-)
+PHASE_E_FAMILY_NAMES = {
+    "q1_momentum": "Momentum",
+    "q2_mean_reversion": "Mean Reversion",
+    "q4_stat_arb": "Stat Arb",
+    "q5_microstructure": "Microstructure",
+    "q6_volume_liquidity": "Volume/Liquidity",
+    "q7_relative_value": "Relative Value",
+    "q8_cross_asset": "Cross-Asset",
+    "q9_factor": "Factor",
+    "q10_options_vol": "Options/Vol",
+    "q11_regime": "Regime",
+    "q12_event_session": "Event/Session",
+}
+PHASE_E_HORIZONS = ("30S", "1M", "5M", "15M", "30M", "1H")
 
 
 def dashboard_data(
     history: MidpointHistory | None = None, *, cutoff_epoch: float | None = None,
     snapshot: LiveSnapshot | None = None, now_epoch: float | None = None,
     evidence_counts: tuple[int, int] | None = None,
+    phase_e_cohorts: Iterable[object] = (),
 ) -> dict[str, object]:
     """Build the frozen dashboard structure, optionally using live quant results."""
 
@@ -99,6 +111,15 @@ def dashboard_data(
             "Vega": option.vega, "Bid": option.bid, "Ask": option.ask,
             "Spread": option.spread,
         })
+    family_order = {quant_id: index for index, quant_id in enumerate(PHASE_E_FAMILY_NAMES)}
+    horizon_order = {horizon: index for index, horizon in enumerate(PHASE_E_HORIZONS)}
+    visible_cohorts = sorted(
+        (cohort for cohort in phase_e_cohorts if cohort.quant_id in PHASE_E_FAMILY_NAMES),
+        key=lambda cohort: (
+            family_order[cohort.quant_id], cohort.formula_version, cohort.symbol,
+            horizon_order.get(cohort.horizon, len(horizon_order)), cohort.horizon,
+        ),
+    )
     return {
         "title": "ATOM QUANT",
         "market": {
@@ -119,9 +140,9 @@ def dashboard_data(
         "evidence": {
             "Forecasts": evidence_counts[0] if evidence_counts else None,
             "Resolved": evidence_counts[1] if evidence_counts else None,
-            "Eligible": None, "RMSE": None, "Coverage": None,
-            "Effective N": None,
         },
+        "phase_e_cohorts": [dict(asdict(cohort), family=PHASE_E_FAMILY_NAMES[cohort.quant_id])
+                            for cohort in visible_cohorts],
     }
 
 
@@ -170,6 +191,27 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     families = data["quant_families"]
     options = data["options_data"]
     evidence = data["evidence"]
+    phase_e = data["phase_e_cohorts"]
+    phase_e_headers = ("FAMILY/HORIZON", "EFFECTIVE N", "ELIGIBLE", "ACC", "RMSE", "MAE", "BIAS", "COVERAGE")
+    def phase_e_row(cohort: dict[str, object]) -> tuple[object, ...]:
+        return (
+            f"{cohort['family']} / {cohort['horizon']}", cohort["effective_n"],
+            "YES" if cohort["eligible"] else "NO",
+            "" if cohort["directional_accuracy"] is None else f"{cohort['directional_accuracy'] * 100:.1f}%",
+            _decimal_cell(cohort["rmse_bps"]), _decimal_cell(cohort["mae_bps"]),
+            _decimal_cell(cohort["bias_bps"]),
+            "" if cohort["coverage"] is None else f"{cohort['coverage'] * 100:.1f}%",
+        )
+    phase_e_body = "".join(
+        "<tr>" + "".join(
+            f'<td data-dashboard-field="phase_e_cohorts.{row_index}.{column_index}">{_cell(value)}</td>'
+            for column_index, value in enumerate(phase_e_row(cohort))
+        ) + "</tr>"
+        for row_index, cohort in enumerate(phase_e)
+    )
+    phase_e_table = ("<div class=scroll><table><thead><tr>" +
+                     "".join(f"<th>{header}</th>" for header in phase_e_headers) +
+                     f"</tr></thead><tbody id=phase-e-body>{phase_e_body}</tbody></table></div>")
     document = f"""<!doctype html>
 <html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>ATOM QUANT</title><style>
@@ -182,7 +224,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
 <h2>FINAL NUMBERS</h2>{_table(horizons, final_numbers.items(), section='final_numbers', decimal=True)}
 <h2>12 QUANT FAMILIES</h2>{_table(horizons, ((item['name'], item['values']) for item in families), section='quant_families', decimal=True)}
 <h2>OPTIONS DATA</h2>{_table((), ((key, (value,)) for key, value in options.items()), section='options_data')}
-<h2>EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in evidence.items()), section='evidence')}
+<h2>EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in evidence.items()), section='evidence')}{phase_e_table}
 </main><script>
 (() => {{
   const cells = new Map(
@@ -215,6 +257,23 @@ def dashboard_page(data: dict[str, object]) -> bytes:
       set(`options_data.${{name}}.0`, value));
     Object.entries(data.evidence).forEach(([name, value]) =>
       set(`evidence.${{name}}.0`, value));
+    const phaseEBody = document.getElementById("phase-e-body");
+    phaseEBody.replaceChildren(...data.phase_e_cohorts.map(cohort => {{
+      const values = [
+        `${{cohort.family}} / ${{cohort.horizon}}`, String(cohort.effective_n),
+        cohort.eligible ? "YES" : "NO",
+        cohort.directional_accuracy == null ? "" : (cohort.directional_accuracy * 100).toFixed(1) + "%",
+        decimal(cohort.rmse_bps), decimal(cohort.mae_bps), decimal(cohort.bias_bps),
+        cohort.coverage == null ? "" : (cohort.coverage * 100).toFixed(1) + "%"
+      ];
+      const row = document.createElement("tr");
+      row.replaceChildren(...values.map(value => {{
+        const cell = document.createElement("td");
+        cell.textContent = value;
+        return cell;
+      }}));
+      return row;
+    }}));
   }};
   const refreshDashboard = async () => {{
     try {{
@@ -257,11 +316,13 @@ def create_app(
             start_response(status, [("Content-Type", content_type),
                                     ("Content-Length", str(len(body)))])
             return [body]
+        as_of_epoch = clock()
         snapshot = state.snapshot() if state is not None else None
         counts = evidence_store.counts() if evidence_store is not None else None
+        cohorts = evidence_store.phase_e_cohorts(as_of_epoch) if evidence_store is not None else ()
         data = dashboard_data(
             history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
-            now_epoch=clock(), evidence_counts=counts,
+            now_epoch=as_of_epoch, evidence_counts=counts, phase_e_cohorts=cohorts,
         )
         if path == "/":
             status, content_type, body = "200 OK", "text/html; charset=utf-8", dashboard_page(data)
