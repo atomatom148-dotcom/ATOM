@@ -18,6 +18,7 @@ def write_cycle(
     *,
     cycle_id: str,
     cutoff_epoch: float,
+    committed_at_epoch: float,
     policy_version: str = "phase-b2",
 ) -> LedgerRecord:
     """Write and commit all six rows from one point-in-time snapshot.
@@ -51,7 +52,7 @@ def write_cycle(
         policy_version=policy_version,
         rows=rows,
     )
-    return ledger.commit(bundle)
+    return ledger.commit(bundle, committed_at_epoch=committed_at_epoch)
 
 
 def _snapshot_hash(snapshot: Snapshot) -> str:
