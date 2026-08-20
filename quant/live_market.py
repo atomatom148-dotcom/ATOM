@@ -162,7 +162,18 @@ class LiveMarketState:
             )
             if self._evidence_store is not None:
                 forecasts = records_for_results(
-                    results=(next_snapshot.momentum, next_snapshot.mean_reversion),
+                    results=(
+                        next_snapshot.momentum,
+                        next_snapshot.mean_reversion,
+                        next_snapshot.stat_arb,
+                        next_snapshot.microstructure,
+                        next_snapshot.volume_liquidity,
+                        next_snapshot.relative_value,
+                        next_snapshot.cross_asset,
+                        next_snapshot.factor,
+                        next_snapshot.regime,
+                        next_snapshot.event_session,
+                    ),
                     cycle_id=f"COIN:{event_epoch:.9f}", symbol="COIN",
                     cutoff_epoch=event_epoch, cutoff_midpoint=observation.midpoint,
                     created_epoch=cycle,
