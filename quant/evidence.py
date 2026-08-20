@@ -9,6 +9,7 @@ from typing import Protocol, Sequence
 
 HORIZONS = ("30S", "1M", "5M", "15M", "30M", "1H")
 HORIZON_SECONDS = (30, 60, 300, 900, 1800, 3600)
+MIN_EFFECTIVE_N = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +43,7 @@ class PhaseECohortMetrics:
     mae_bps: float | None
     bias_bps: float | None
     effective_n: int
+    eligible: bool
 
 
 class EvidenceStore(Protocol):
@@ -229,6 +231,9 @@ class PostgresEvidenceStore:
             effective_n=effective_counts.get(
                 (str(row[0]), str(row[1]), str(row[2]), str(row[3])), 0,
             ),
+            eligible=effective_counts.get(
+                (str(row[0]), str(row[1]), str(row[2]), str(row[3])), 0,
+            ) >= MIN_EFFECTIVE_N,
         ) for row in rows)
 
 
@@ -260,6 +265,6 @@ def records_for_results(*, results: Sequence[object], cycle_id: str,
 
 
 __all__ = [
-    "EvidenceStore", "ForecastRecord", "PhaseECohortMetrics",
+    "EvidenceStore", "ForecastRecord", "MIN_EFFECTIVE_N", "PhaseECohortMetrics",
     "PostgresEvidenceStore", "records_for_results",
 ]
