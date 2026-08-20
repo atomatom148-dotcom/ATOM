@@ -65,6 +65,9 @@ def dashboard_data(
     q7 = snapshot.relative_value if snapshot else None
     q8 = snapshot.cross_asset if snapshot else None
     q9 = snapshot.factor if snapshot else None
+    q10 = snapshot.options_vol if snapshot else None
+    q11 = snapshot.regime if snapshot else None
+    q12 = snapshot.event_session if snapshot else None
     populated = (
         q1.forecast_bps, q2.forecast_bps, q3.volatility_bps,
         q4.forecast_bps if q4 else (None,) * 6,
@@ -73,11 +76,14 @@ def dashboard_data(
         q7.forecast_bps if q7 else (None,) * 6,
         q8.forecast_bps if q8 else (None,) * 6,
         q9.forecast_bps if q9 else (None,) * 6,
+        q10.forecast_bps if q10 else (None,) * 6,
+        q11.forecast_bps if q11 else (None,) * 6,
+        q12.forecast_bps if q12 else (None,) * 6,
     )
     families = [
         {
             "name": name,
-            "values": list(populated[index]) if index < 9 else [None] * 6,
+            "values": list(populated[index]),
         }
         for index, name in enumerate(FAMILY_NAMES)
     ]
