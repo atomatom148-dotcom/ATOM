@@ -76,6 +76,9 @@ class PostgresEvidenceStore:
                          cutoff_epoch, maturity_epoch, cutoff_midpoint,
                          forecast_bps, created_epoch)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT
+                        (quant_id, formula_version, cycle_id, symbol, horizon)
+                    DO NOTHING
                     """,
                     [(
                         row.quant_id, row.formula_version, row.cycle_id,

@@ -168,6 +168,101 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertAlmostEqual(first[1], 10_000 * math.log(1.1))
         self.assertEqual(first[2], 131)
 
+    def test_postgres_duplicate_forecast_preserves_first_and_resolves(self):
+        class Cursor:
+            def __init__(self):
+                self.forecasts = {}
+                self.outcomes = {}
+                self.next_forecast_id = 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def execute(self, statement, parameters):
+                midpoint, _, resolved_epoch, observation_epoch = parameters
+                for forecast_id, values in self.forecasts.values():
+                    if (forecast_id not in self.outcomes
+                            and values[6] <= observation_epoch):
+                        self.outcomes[forecast_id] = (
+                            midpoint,
+                            10_000 * math.log(midpoint / values[7]),
+                            resolved_epoch,
+                        )
+
+            def executemany(self, statement, parameters):
+                normalized = " ".join(statement.split())
+                conflict_clause = (
+                    "ON CONFLICT (quant_id, formula_version, cycle_id, "
+                    "symbol, horizon) DO NOTHING"
+                )
+                if conflict_clause not in normalized:
+                    raise RuntimeError("duplicate forecast identity")
+                for values in parameters:
+                    identity = values[:5]
+                    if identity not in self.forecasts:
+                        self.forecasts[identity] = (
+                            self.next_forecast_id, values
+                        )
+                        self.next_forecast_id += 1
+
+        class Connection:
+            def __init__(self, cursor):
+                self._cursor = cursor
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def cursor(self):
+                return self._cursor
+
+        cursor = Cursor()
+        store = object.__new__(PostgresEvidenceStore)
+        store._database_url = "postgresql://test"
+        store._connect = lambda _: Connection(cursor)
+        original = ForecastRecord(
+            "q1_momentum", "direct-log-momentum-v1", "COIN:cycle", "COIN",
+            "30S", 100, 130, 100, 5, 101,
+        )
+        conflicting = ForecastRecord(
+            "q1_momentum", "direct-log-momentum-v1", "COIN:cycle", "COIN",
+            "30S", 110, 140, 999, 999, 111,
+        )
+
+        store.record_cycle_and_resolve(
+            (original,), observation_epoch=100, observation_midpoint=100
+        )
+        identity = (
+            original.quant_id, original.formula_version, original.cycle_id,
+            original.symbol, original.horizon,
+        )
+        first_forecast_id, first_values = cursor.forecasts[identity]
+        store.record_cycle_and_resolve(
+            (conflicting,), observation_epoch=131, observation_midpoint=110
+        )
+
+        self.assertEqual(len(cursor.forecasts), 1)
+        authoritative_forecast_id, authoritative_values = cursor.forecasts[identity]
+        self.assertEqual(authoritative_forecast_id, first_forecast_id)
+        self.assertEqual(authoritative_values, first_values)
+        self.assertEqual(authoritative_values[5:], (100, 130, 100, 5, 101))
+        self.assertEqual(len(cursor.outcomes), 1)
+        outcome = cursor.outcomes[first_forecast_id]
+        self.assertEqual(outcome[0], 110)
+        self.assertAlmostEqual(outcome[1], 10_000 * math.log(1.1))
+        self.assertEqual(outcome[2], 131)
+
+        store.record_cycle_and_resolve(
+            (), observation_epoch=140, observation_midpoint=120
+        )
+        self.assertEqual(len(cursor.outcomes), 1)
+        self.assertEqual(cursor.outcomes[first_forecast_id], outcome)
+
     def test_store_contract_has_no_update_or_delete_api(self):
         self.assertFalse(hasattr(EvidenceStore, "update"))
         self.assertFalse(hasattr(EvidenceStore, "delete"))
