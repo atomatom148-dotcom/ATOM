@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .ledger import Ledger
-from .resolver import ResolvedOutcome
+from .resolver import Resolver
 
 
 @dataclass(frozen=True)
@@ -19,13 +19,13 @@ class QuantStatus:
 
 def build_status(
     ledger: Ledger,
-    outcomes: list[ResolvedOutcome],
+    resolver: Resolver,
 ) -> QuantStatus:
     """Build status only from committed and resolved evidence."""
 
     ledger_count = ledger.count()
     latest = ledger.latest()
-    resolved_count = len(outcomes)
+    resolved_count = resolver.count()
     return QuantStatus(
         ledger_active=ledger_count > 0,
         ledger_count=ledger_count,

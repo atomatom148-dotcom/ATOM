@@ -23,7 +23,11 @@ class PhaseB2UnifiedQuantTests(unittest.TestCase):
         snapshot = from_price("COIN", 150.0, asof_epoch=1_700_000_000.0)
         ledger = Ledger()
         record = write_cycle(
-            snapshot, ledger, cycle_id="cycle-1", cutoff_epoch=CUTOFF
+            snapshot,
+            ledger,
+            cycle_id="cycle-1",
+            cutoff_epoch=CUTOFF,
+            committed_at_epoch=CUTOFF,
         )
         bundle = record.bundle
 
@@ -54,6 +58,7 @@ class PhaseB2UnifiedQuantTests(unittest.TestCase):
                     Ledger(),
                     cycle_id=expected_reason,
                     cutoff_epoch=CUTOFF,
+                    committed_at_epoch=CUTOFF,
                 )
                 bundle = record.bundle
                 for row in bundle.rows:
@@ -66,7 +71,11 @@ class PhaseB2UnifiedQuantTests(unittest.TestCase):
         snapshot = from_price("COIN", None, asof_epoch=1_700_000_000.0)
 
         bundle = write_cycle(
-            snapshot, Ledger(), cycle_id="cycle-1", cutoff_epoch=CUTOFF
+            snapshot,
+            Ledger(),
+            cycle_id="cycle-1",
+            cutoff_epoch=CUTOFF,
+            committed_at_epoch=CUTOFF,
         ).bundle
 
         self.assertEqual(
@@ -80,28 +89,40 @@ class PhaseB2UnifiedQuantTests(unittest.TestCase):
         changed = from_price("COIN", 151.0, asof_epoch=1_700_000_000.0)
 
         first_hash = write_cycle(
-            first, Ledger(), cycle_id="first", cutoff_epoch=CUTOFF
+            first,
+            Ledger(),
+            cycle_id="first",
+            cutoff_epoch=CUTOFF,
+            committed_at_epoch=CUTOFF,
         ).bundle.snapshot_hash
         self.assertEqual(
             first_hash,
             write_cycle(
-                same, Ledger(), cycle_id="same", cutoff_epoch=CUTOFF
+                same,
+                Ledger(),
+                cycle_id="same",
+                cutoff_epoch=CUTOFF,
+                committed_at_epoch=CUTOFF,
             ).bundle.snapshot_hash,
         )
         self.assertNotEqual(
             first_hash,
             write_cycle(
-                changed, Ledger(), cycle_id="changed", cutoff_epoch=CUTOFF
+                changed,
+                Ledger(),
+                cycle_id="changed",
+                cutoff_epoch=CUTOFF,
+                committed_at_epoch=CUTOFF,
             ).bundle.snapshot_hash,
         )
 
     def test_duplicate_cycle_is_rejected_without_changing_ledger(self) -> None:
         ledger = Ledger()
         snapshot = from_price("COIN", 150.0)
-        write_cycle(snapshot, ledger, cycle_id="cycle-1", cutoff_epoch=CUTOFF)
+        write_cycle(snapshot, ledger, cycle_id="cycle-1", cutoff_epoch=CUTOFF, committed_at_epoch=CUTOFF)
 
         with self.assertRaisesRegex(ValueError, "already committed"):
-            write_cycle(snapshot, ledger, cycle_id="cycle-1", cutoff_epoch=CUTOFF)
+            write_cycle(snapshot, ledger, cycle_id="cycle-1", cutoff_epoch=CUTOFF, committed_at_epoch=CUTOFF)
 
         self.assertEqual(ledger.count(), 1)
 

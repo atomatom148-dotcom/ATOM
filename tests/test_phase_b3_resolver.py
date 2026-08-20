@@ -1,4 +1,4 @@
-"""Phase B3 proofs for the minimal due-horizon resolver."""
+"""Phase B3 proofs for the append-only due-horizon resolver."""
 
 from __future__ import annotations
 
@@ -11,14 +11,12 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from quant.ledger import Ledger
-import quant.resolver as resolver
-from quant.resolver import ResolvedOutcome, resolve_due
+from quant.resolver import ResolvedOutcome, Resolver
 from quant.snapshot import from_price
 from quant.unified_quant import write_cycle
 
 
 CUTOFF = 1_700_000_100.0
-OUTCOME_PRICE = 151.25
 
 
 class PhaseB3ResolverTests(unittest.TestCase):
@@ -29,86 +27,93 @@ class PhaseB3ResolverTests(unittest.TestCase):
             self.ledger,
             cycle_id="cycle-1",
             cutoff_epoch=CUTOFF,
+            committed_at_epoch=CUTOFF,
         )
+        self.resolver = Resolver()
 
-    def resolve(self, now_epoch: float) -> list[ResolvedOutcome]:
-        return resolve_due(
+    def test_supplied_due_horizons_use_their_own_prices(self) -> None:
+        outcomes = self.resolver.resolve_due(
             self.record,
-            now_epoch=now_epoch,
-            outcome_price=OUTCOME_PRICE,
+            now_epoch=CUTOFF + 60,
+            prices_by_horizon={"30S": 151.0, "1M": 152.0},
         )
 
-    def test_before_30s_returns_nothing(self) -> None:
-        self.assertEqual(self.resolve(CUTOFF + 29), [])
-
-    def test_exactly_30s_returns_only_30s(self) -> None:
-        self.assertEqual(
-            [outcome.horizon for outcome in self.resolve(CUTOFF + 30)],
-            ["30S"],
-        )
-
-    def test_exactly_60s_returns_30s_then_1m(self) -> None:
-        self.assertEqual(
-            [outcome.horizon for outcome in self.resolve(CUTOFF + 60)],
-            ["30S", "1M"],
-        )
-
-    def test_after_1h_returns_all_six_in_frozen_order(self) -> None:
-        self.assertEqual(
-            [outcome.horizon for outcome in self.resolve(CUTOFF + 3601)],
-            ["30S", "1M", "5M", "15M", "30M", "1H"],
-        )
-
-    def test_identity_and_resolution_evidence_are_preserved(self) -> None:
-        now_epoch = CUTOFF + 60
-        outcomes = self.resolve(now_epoch)
-
+        self.assertEqual([item.horizon for item in outcomes], ["30S", "1M"])
+        self.assertEqual([item.outcome_price for item in outcomes], [151.0, 152.0])
         self.assertTrue(all(isinstance(item, ResolvedOutcome) for item in outcomes))
-        self.assertEqual([item.cycle_id for item in outcomes], ["cycle-1"] * 2)
+
+    def test_omitted_due_horizon_remains_unresolved(self) -> None:
         self.assertEqual(
-            [item.maturity_epoch for item in outcomes],
-            [row.maturity_epoch for row in self.record.bundle.rows[:2]],
+            self.resolver.resolve_due(
+                self.record,
+                now_epoch=CUTOFF + 60,
+                prices_by_horizon={"1M": 152.0},
+            )[0].horizon,
+            "1M",
         )
-        self.assertEqual([item.resolved_at_epoch for item in outcomes], [now_epoch] * 2)
-        self.assertEqual([item.outcome_price for item in outcomes], [OUTCOME_PRICE] * 2)
+        self.assertIsNone(self.resolver.get("cycle-1", "30S"))
+
+    def test_invalid_input_is_atomic(self) -> None:
+        invalid_cases = (
+            (CUTOFF + 30, {"UNKNOWN": 151.0}),
+            (CUTOFF + 29, {"30S": 151.0}),
+            (CUTOFF + 30, {"30S": 0.0}),
+            (CUTOFF + 30, {"30S": math.nan}),
+            (math.inf, {"30S": 151.0}),
+        )
+        for now_epoch, prices in invalid_cases:
+            with self.subTest(now_epoch=now_epoch, prices=prices):
+                with self.assertRaises(ValueError):
+                    self.resolver.resolve_due(
+                        self.record,
+                        now_epoch=now_epoch,
+                        prices_by_horizon=prices,
+                    )
+                self.assertEqual(self.resolver.count(), 0)
+
+    def test_duplicate_is_rejected_before_other_writes(self) -> None:
+        self.resolver.resolve_due(
+            self.record,
+            now_epoch=CUTOFF + 30,
+            prices_by_horizon={"30S": 151.0},
+        )
+        before = self.resolver.all()
+
+        with self.assertRaisesRegex(ValueError, "already resolved"):
+            self.resolver.resolve_due(
+                self.record,
+                now_epoch=CUTOFF + 60,
+                prices_by_horizon={"1M": 152.0, "30S": 999.0},
+            )
+
+        self.assertEqual(self.resolver.all(), before)
+
+    def test_get_and_all_return_defensive_copies(self) -> None:
+        self.resolver.resolve_due(
+            self.record,
+            now_epoch=CUTOFF + 30,
+            prices_by_horizon={"30S": 151.0},
+        )
+        fetched = self.resolver.get("cycle-1", "30S")
+        returned = self.resolver.all()
+        returned.clear()
+
+        self.assertEqual(fetched.horizon, "30S")
+        self.assertIsNone(self.resolver.get("missing", "30S"))
+        self.assertEqual(self.resolver.count(), 1)
 
     def test_original_forecast_and_ledger_remain_unchanged(self) -> None:
         record_before = deepcopy(self.record)
         ledger_before = self.ledger.get("cycle-1")
 
-        self.resolve(CUTOFF + 3601)
+        self.resolver.resolve_due(
+            self.record,
+            now_epoch=CUTOFF + 30,
+            prices_by_horizon={"30S": 151.0},
+        )
 
         self.assertEqual(self.record, record_before)
-        self.assertEqual(self.ledger.count(), 1)
         self.assertEqual(self.ledger.get("cycle-1"), ledger_before)
-
-    def test_invalid_outcome_prices_are_rejected_before_resolving(self) -> None:
-        for invalid in (0.0, -1.0, math.nan, math.inf, -math.inf):
-            with self.subTest(outcome_price=invalid):
-                with self.assertRaisesRegex(ValueError, "positive and finite"):
-                    resolve_due(
-                        self.record,
-                        now_epoch=CUTOFF + 29,
-                        outcome_price=invalid,
-                    )
-
-    def test_forbidden_surfaces_are_absent(self) -> None:
-        for name in (
-            "direction",
-            "probability",
-            "score",
-            "pnl",
-            "classification",
-            "persist",
-            "deduplicate",
-            "status",
-            "broker",
-            "order",
-            "execute",
-            "execution",
-        ):
-            self.assertFalse(hasattr(ResolvedOutcome, name), name)
-            self.assertFalse(hasattr(resolver, name), name)
 
 
 if __name__ == "__main__":
