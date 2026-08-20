@@ -362,12 +362,9 @@ class PhaseEApiTests(unittest.TestCase):
             }],
         })
 
-    def test_dashboard_evidence_fields_remain_frozen(self):
+    def test_dashboard_keeps_only_global_evidence_totals(self):
         evidence = dashboard_data(evidence_counts=(10, 8))["evidence"]
-        self.assertEqual(evidence["Forecasts"], 10)
-        self.assertEqual(evidence["Resolved"], 8)
-        for key in ("Eligible", "RMSE", "Coverage", "Effective N"):
-            self.assertIsNone(evidence[key])
+        self.assertEqual(evidence, {"Forecasts": 10, "Resolved": 8})
 
     def test_dashboard_does_not_poll_phase_e(self):
         page = request(create_app(), "/")["body"].decode()

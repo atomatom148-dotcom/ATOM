@@ -274,10 +274,7 @@ class LiveEvidenceTests(unittest.TestCase):
 
     def test_dashboard_only_populates_durable_counts(self):
         evidence = dashboard_data(evidence_counts=(17, 4))["evidence"]
-        self.assertEqual(evidence["Forecasts"], 17)
-        self.assertEqual(evidence["Resolved"], 4)
-        for field in ("Eligible", "RMSE", "Coverage", "Effective N"):
-            self.assertIsNone(evidence[field])
+        self.assertEqual(evidence, {"Forecasts": 17, "Resolved": 4})
 
 
 if __name__ == "__main__":
