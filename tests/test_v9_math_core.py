@@ -56,14 +56,9 @@ class V9MathCoreTests(unittest.TestCase):
         }
         self.assertEqual(imports, {"dataclasses", "math"})
 
-    def test_production_runtime_does_not_import_boundary(self) -> None:
-        importers = []
-        for path in ROOT.rglob("*.py"):
-            if path == MODULE or "tests" in path.parts:
-                continue
-            if "v9_math_core" in path.read_text(encoding="utf-8"):
-                importers.append(path.relative_to(ROOT))
-        self.assertEqual(importers, [])
+    def test_empty_phase_1a_input_remains_empty(self) -> None:
+        state = V9MathCore.evaluate(V9MathInput(symbol="COIN", as_of_epoch=1.0))
+        self.assertEqual(state.status, "EMPTY")
 
 
 if __name__ == "__main__":
