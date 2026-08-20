@@ -13,10 +13,13 @@ from typing import Callable
 from urllib.request import Request, urlopen
 
 from .history import MidpointHistory, MidpointObservation
+from .quote_history import QuoteHistory, QuoteObservation
 from .evidence import EvidenceStore, records_for_results
 from .q1_momentum import MomentumResult, calculate_momentum
 from .q2_mean_reversion import MeanReversionResult, calculate_mean_reversion
 from .q3_volatility import VolatilityResult, calculate_volatility
+from .q5_microstructure import MicrostructureResult, calculate_microstructure
+from .q6_volume_liquidity import VolumeLiquidityResult, calculate_volume_liquidity
 
 
 ALPACA_LATEST_QUOTE_URL = "https://data.alpaca.markets/v2/stocks/COIN/quotes/latest"
@@ -26,10 +29,13 @@ HISTORY_SECONDS = 3600.0
 @dataclass(frozen=True, slots=True)
 class LiveSnapshot:
     history: MidpointHistory
+    quote_history: QuoteHistory
     last_cycle: float | None
     momentum: MomentumResult | None
     mean_reversion: MeanReversionResult | None
     volatility: VolatilityResult | None
+    microstructure: MicrostructureResult | None
+    volume_liquidity: VolumeLiquidityResult | None
 
 
 class LiveMarketState:
@@ -40,9 +46,14 @@ class LiveMarketState:
         self._clock = clock
         self._evidence_store = evidence_store
         self._lock = threading.Lock()
-        self._snapshot = LiveSnapshot(MidpointHistory(), None, None, None, None)
+        self._snapshot = LiveSnapshot(
+            MidpointHistory(), QuoteHistory(), None, None, None, None, None, None
+        )
 
-    def accept_quote(self, *, bid: float, ask: float, event_epoch: float) -> bool:
+    def accept_quote(
+        self, *, bid: float, ask: float, event_epoch: float,
+        bid_size: float | None = None, ask_size: float | None = None,
+    ) -> bool:
         """Validate a quote, preserve its event time, and run Q1-Q3."""
 
         values = (bid, ask, event_epoch)
@@ -68,13 +79,28 @@ class LiveMarketState:
             # Q1 needs the last real observation at or before its 3600s target.
             observations = observations[max(0, first_in_window - 1):]
             history = MidpointHistory(observations)
+            quote_history = self._snapshot.quote_history
+            if bid_size is not None and ask_size is not None:
+                try:
+                    quote = QuoteObservation(event_epoch, bid, ask, bid_size, ask_size)
+                except ValueError:
+                    return False
+                quote_observations = quote_history.observations + (quote,)
+                quote_observations = tuple(
+                    item for item in quote_observations
+                    if item.event_epoch >= event_epoch - 300.0
+                )
+                quote_history = QuoteHistory(quote_observations)
             cycle = self._clock()
             next_snapshot = LiveSnapshot(
                 history,
+                quote_history,
                 cycle,
                 calculate_momentum(history, cutoff_epoch=event_epoch),
                 calculate_mean_reversion(history, cutoff_epoch=event_epoch),
                 calculate_volatility(history, cutoff_epoch=event_epoch),
+                calculate_microstructure(quote_history, cutoff_epoch=event_epoch),
+                calculate_volume_liquidity(quote_history, cutoff_epoch=event_epoch),
             )
             if self._evidence_store is not None:
                 forecasts = records_for_results(
@@ -118,6 +144,8 @@ def poll_alpaca(state: LiveMarketState, *, interval: float = 1.0) -> None:
             state.accept_quote(
                 bid=quote["bp"],
                 ask=quote["ap"],
+                bid_size=quote["bs"],
+                ask_size=quote["as"],
                 event_epoch=parse_alpaca_timestamp(quote["t"]),
             )
         except Exception as error:  # Keep web-process health independent of market data.
