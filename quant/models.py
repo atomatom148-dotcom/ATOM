@@ -37,6 +37,11 @@ class Snapshot:
 
 @dataclass
 class HorizonForecast:
+    """Evidence for one horizon, including its expected midpoint log return.
+
+    ``forecast_bps`` uses ``10^4 * ln(m(t+h) / m(t))`` for this exact horizon.
+    """
+
     horizon: str
     setup_state: SetupState
     direction: Optional[str] = None  # "UP" | "DOWN" | None
@@ -44,6 +49,7 @@ class HorizonForecast:
     reason_codes: list[str] = field(default_factory=list)
     cutoff_epoch: float = 0.0
     maturity_epoch: float = 0.0
+    forecast_bps: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -54,12 +60,13 @@ class HorizonForecast:
             "reason_codes": list(self.reason_codes),
             "cutoff_epoch": self.cutoff_epoch,
             "maturity_epoch": self.maturity_epoch,
+            "forecast_bps": self.forecast_bps,
         }
 
 
 @dataclass
 class ExactSixBundle:
-    """One cycle = exactly six horizon rows. Always length 6."""
+    """One cycle = exactly six horizon rows with explicit quant evidence."""
 
     cycle_id: str
     symbol: str
@@ -67,6 +74,8 @@ class ExactSixBundle:
     snapshot_hash: str
     policy_version: str
     rows: list[HorizonForecast]
+    quant_id: str = "unified-quant"
+    formula_version: str = "legacy"
 
     def __post_init__(self) -> None:
         if len(self.rows) != 6:
@@ -82,5 +91,7 @@ class ExactSixBundle:
             "cutoff_epoch": self.cutoff_epoch,
             "snapshot_hash": self.snapshot_hash,
             "policy_version": self.policy_version,
+            "quant_id": self.quant_id,
+            "formula_version": self.formula_version,
             "rows": [r.to_dict() for r in self.rows],
         }
