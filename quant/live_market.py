@@ -13,6 +13,7 @@ from typing import Callable
 from urllib.request import Request, urlopen
 
 from .history import MidpointHistory, MidpointObservation
+from .evidence import EvidenceStore, records_for_results
 from .q1_momentum import MomentumResult, calculate_momentum
 from .q2_mean_reversion import MeanReversionResult, calculate_mean_reversion
 from .q3_volatility import VolatilityResult, calculate_volatility
@@ -34,8 +35,10 @@ class LiveSnapshot:
 class LiveMarketState:
     """Thread-safe, causal live state holding only Q1-Q3 midpoint history."""
 
-    def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, *, clock: Callable[[], float] = time.time,
+                 evidence_store: EvidenceStore | None = None) -> None:
         self._clock = clock
+        self._evidence_store = evidence_store
         self._lock = threading.Lock()
         self._snapshot = LiveSnapshot(MidpointHistory(), None, None, None, None)
 
@@ -66,13 +69,25 @@ class LiveMarketState:
             observations = observations[max(0, first_in_window - 1):]
             history = MidpointHistory(observations)
             cycle = self._clock()
-            self._snapshot = LiveSnapshot(
+            next_snapshot = LiveSnapshot(
                 history,
                 cycle,
                 calculate_momentum(history, cutoff_epoch=event_epoch),
                 calculate_mean_reversion(history, cutoff_epoch=event_epoch),
                 calculate_volatility(history, cutoff_epoch=event_epoch),
             )
+            if self._evidence_store is not None:
+                forecasts = records_for_results(
+                    results=(next_snapshot.momentum, next_snapshot.mean_reversion),
+                    cycle_id=f"COIN:{event_epoch:.9f}", symbol="COIN",
+                    cutoff_epoch=event_epoch, cutoff_midpoint=observation.midpoint,
+                    created_epoch=cycle,
+                )
+                self._evidence_store.record_cycle_and_resolve(
+                    forecasts, observation_epoch=event_epoch,
+                    observation_midpoint=observation.midpoint,
+                )
+            self._snapshot = next_snapshot
         return True
 
     def snapshot(self) -> LiveSnapshot:

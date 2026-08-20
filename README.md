@@ -33,7 +33,8 @@ python tests/test_phase_a_contracts.py
 
 ## Live Q1-Q3 runtime
 
-Set `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`, then start the single-process
+Install `requirements.txt`, apply `migrations/001_live_q1_q2_evidence.sql`, and
+set `DATABASE_URL`, `ALPACA_API_KEY`, and `ALPACA_SECRET_KEY`. Then start the single-process
 standard-library HTTPS polling runtime (Render supplies `PORT`):
 
 ```
