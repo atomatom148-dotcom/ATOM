@@ -57,9 +57,9 @@ class WebSurfaceTests(unittest.TestCase):
         page = request(app, "/")["body"].decode()
         payload = json.loads(request(app, "/api/dashboard")["body"])
 
-        self.assertIn('<div class=value>123.46</div>', page)
-        self.assertIn('<div class=value>1.23s</div>', page)
-        self.assertIn('<div class=value>22:13:20 UTC</div>', page)
+        self.assertIn('data-dashboard-field="market.symbol">123.46</div>', page)
+        self.assertIn('data-dashboard-field="market.data_age">1.23s</div>', page)
+        self.assertIn('data-dashboard-field="market.last_cycle">22:13:20 UTC</div>', page)
         self.assertEqual(payload["market"]["symbol"], 123.4567)
         self.assertAlmostEqual(payload["market"]["data_age"], 1.234)
         self.assertEqual(payload["market"]["last_cycle"], 1_700_000_000.0)
@@ -85,6 +85,49 @@ class WebSurfaceTests(unittest.TestCase):
         response = request(create_app(), "/health")
         self.assertEqual(response["status"], "200 OK")
         self.assertEqual(json.loads(response["body"]), {"status": "running"})
+
+    def test_page_polls_dashboard_every_second_without_cache_or_reload(self):
+        page = request(create_app(), "/")["body"].decode()
+
+        self.assertIn('fetch("/api/dashboard", {cache: "no-store"})', page)
+        self.assertIn("setInterval(refreshDashboard, 1000)", page)
+        self.assertNotIn("location.reload", page)
+        self.assertNotIn("window.location", page)
+
+    def test_live_renderer_updates_every_market_field(self):
+        page = request(create_app(), "/")["body"].decode()
+
+        for field in ("symbol", "btc", "qqq", "ndx", "data_age", "last_cycle"):
+            self.assertIn(f'data-dashboard-field="market.{field}"', page)
+            self.assertIn(f'set("market.{field}", data.market.{field}', page)
+
+    def test_live_renderer_updates_final_quant_options_and_evidence_cells(self):
+        page = request(create_app(), "/")["body"].decode()
+
+        self.assertIn('data-dashboard-field="final_numbers.BPS.0"', page)
+        self.assertIn('data-dashboard-field="quant_families.Momentum.0"', page)
+        self.assertIn('data-dashboard-field="quant_families.Event/Session.5"', page)
+        self.assertIn('data-dashboard-field="options_data.Strike.0"', page)
+        self.assertIn('data-dashboard-field="evidence.Forecasts.0"', page)
+        self.assertIn("Object.entries(data.final_numbers)", page)
+        self.assertIn("data.quant_families.forEach", page)
+        self.assertIn("Object.entries(data.options_data)", page)
+        self.assertIn("Object.entries(data.evidence)", page)
+
+    def test_live_renderer_blanks_null_values_without_fake_zeroes(self):
+        page = request(create_app(), "/")["body"].decode()
+
+        self.assertIn('value == null ? "" : String(value)', page)
+        self.assertIn('value == null ? "" : Number(value).toFixed(2)', page)
+        self.assertNotIn('value || 0', page)
+
+    def test_poll_failure_keeps_values_and_allows_interval_to_retry(self):
+        page = request(create_app(), "/")["body"].decode()
+
+        failure_handler = page.split("} catch (_) {", 1)[1].split("}", 1)[0]
+        self.assertNotIn("render", failure_handler)
+        self.assertNotIn("textContent", failure_handler)
+        self.assertIn("setInterval(refreshDashboard, 1000)", page)
 
 
 if __name__ == "__main__":
