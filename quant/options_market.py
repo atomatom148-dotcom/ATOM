@@ -11,7 +11,7 @@ from typing import Callable, Iterable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .q10_options_vol import OptionObservation
+from .q10_options_vol import OptionObservation, OptionSurface
 
 
 ALPACA_OPTIONS_CONTRACTS_URL = "https://api.alpaca.markets/v2/options/contracts"
@@ -78,6 +78,36 @@ def select_coin_option_contract(
     chosen_expiration = min({item[1] for item in pool}, key=lambda item: (abs((item - target).days), item))
     pool = [item for item in pool if item[1] == chosen_expiration]
     return min(pool, key=lambda item: (abs(item[2] - midpoint), item[2], item[3]))[0]
+
+
+def select_coin_option_surface_contracts(
+    contracts: Iterable[dict[str, object]], *, midpoint: float, cutoff_epoch: float,
+) -> tuple[date | None, tuple[dict[str, object], ...], tuple[dict[str, object], ...]]:
+    """Select up to five real calls and puts at one deterministic expiration."""
+
+    cutoff = datetime.fromtimestamp(cutoff_epoch, timezone.utc).date()
+    target = cutoff + timedelta(days=30)
+    valid: list[tuple[dict[str, object], date, float, str, str]] = []
+    for contract in contracts:
+        expiration = _contract_date(contract)
+        strike = _strike(contract.get("strike_price"))
+        symbol = contract.get("symbol")
+        kind = contract.get("type")
+        if (contract.get("underlying_symbol") != "COIN" or contract.get("status") != "active" or
+                expiration is None or expiration <= cutoff or strike is None or strike <= 0 or
+                not isinstance(symbol, str) or not symbol or kind not in ("call", "put")):
+            continue
+        valid.append((contract, expiration, strike, symbol, kind))
+    if not valid:
+        return None, (), ()
+    expiration = min({item[1] for item in valid}, key=lambda item: (abs((item - target).days), item))
+
+    def side(kind: str) -> tuple[dict[str, object], ...]:
+        candidates = [item for item in valid if item[1] == expiration and item[4] == kind]
+        nearest = sorted(candidates, key=lambda item: (abs(item[2] - midpoint), item[2], item[3]))[:5]
+        return tuple(item[0] for item in sorted(nearest, key=lambda item: (item[2], item[3])))
+
+    return expiration, side("call"), side("put")
 
 
 def parse_alpaca_option_snapshot(
@@ -151,6 +181,47 @@ def fetch_coin_option_observation(*, midpoint: float, cutoff_epoch: float) -> Op
     return parse_alpaca_option_snapshot(contract, snapshot, cutoff_epoch=cutoff_epoch) if isinstance(snapshot, dict) else None
 
 
+def fetch_coin_option_surface(*, midpoint: float, cutoff_epoch: float) -> OptionSurface | None:
+    """Discover contracts, then map one bulk Alpaca snapshot response."""
+
+    headers = alpaca_headers()
+    query = {
+        "underlying_symbols": "COIN", "status": "active",
+        "expiration_date_gte": datetime.fromtimestamp(cutoff_epoch, timezone.utc).date().isoformat(),
+        "limit": "10000",
+    }
+    contracts: list[dict[str, object]] = []
+    while True:
+        with urlopen(Request(f"{ALPACA_OPTIONS_CONTRACTS_URL}?{urlencode(query)}", headers=headers), timeout=10) as response:
+            page = json.load(response)
+        contracts.extend(page.get("option_contracts", []))
+        token = page.get("next_page_token")
+        if not token:
+            break
+        query["page_token"] = token
+    expiration, calls, puts = select_coin_option_surface_contracts(
+        contracts, midpoint=midpoint, cutoff_epoch=cutoff_epoch,
+    )
+    selected = calls + puts
+    if expiration is None or not selected:
+        return None
+    symbols = [str(item["symbol"]) for item in selected]
+    snapshot_query = {"symbols": ",".join(symbols), "limit": len(symbols)}
+    with urlopen(Request(
+        f"{ALPACA_COIN_OPTION_SNAPSHOTS_URL}?{urlencode(snapshot_query)}", headers=headers,
+    ), timeout=10) as response:
+        snapshots = json.load(response).get("snapshots", {})
+
+    def observations(items: tuple[dict[str, object], ...]) -> tuple[OptionObservation, ...]:
+        return tuple(parse_alpaca_option_snapshot(item, snapshots[item["symbol"]], cutoff_epoch=cutoff_epoch)
+                     for item in items if isinstance(snapshots.get(item["symbol"]), dict))
+
+    call_observations, put_observations = observations(calls), observations(puts)
+    if not call_observations and not put_observations:
+        return None
+    return OptionSurface(cutoff_epoch, expiration.isoformat(), call_observations, put_observations)
+
+
 def poll_alpaca_options(state: object, *, interval: float = OPTIONS_POLL_INTERVAL,
                         clock: Callable[[], float] = time.time) -> None:
     """Poll independently; failures deliberately retain the last valid snapshot."""
@@ -159,16 +230,17 @@ def poll_alpaca_options(state: object, *, interval: float = OPTIONS_POLL_INTERVA
         try:
             snapshot = state.snapshot()
             if snapshot.history.latest is not None:
-                observation = fetch_coin_option_observation(
+                surface = fetch_coin_option_surface(
                     midpoint=snapshot.history.latest.midpoint, cutoff_epoch=clock(),
                 )
-                if observation is not None:
-                    state.accept_option_observation(observation)
+                if surface is not None:
+                    state.accept_option_surface(surface, midpoint=snapshot.history.latest.midpoint)
         except Exception as error:
             print(f"Alpaca options poll failed: {error}", flush=True)
         time.sleep(interval)
 
 
 __all__ = ["ALPACA_COIN_OPTION_SNAPSHOTS_URL", "ALPACA_OPTIONS_CONTRACTS_URL",
-           "OPTIONS_POLL_INTERVAL", "fetch_coin_option_observation", "parse_alpaca_option_snapshot",
-           "poll_alpaca_options", "select_coin_option_contract"]
+           "OPTIONS_POLL_INTERVAL", "fetch_coin_option_observation", "fetch_coin_option_surface",
+           "parse_alpaca_option_snapshot", "poll_alpaca_options", "select_coin_option_contract",
+           "select_coin_option_surface_contracts"]
