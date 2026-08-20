@@ -1,11 +1,14 @@
 import math
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from quant.history import MidpointHistory, MidpointObservation
 from quant.live_market import ALPACA_LATEST_QUOTES_URL, LiveMarketState
-from quant.q10_options_vol import OptionObservation, calculate_options_vol
+from quant.q10_options_vol import (FORMULA_VERSION, HORIZON_SECONDS, MAX_SIGNAL_BPS,
+                                   OptionObservation, OptionSurface,
+                                   calculate_options_vol)
 from quant.q11_regime import HORIZON_SECONDS as Q11_HORIZONS, calculate_regime
 from quant.q12_event_session import EASTERN, HORIZON_SECONDS as Q12_HORIZONS, calculate_event_session
 from quant.web import dashboard_data
@@ -32,6 +35,18 @@ def et_epoch(hour, minute, second=0):
 
 
 class OptionsVolTests(unittest.TestCase):
+    def surface(self, *, call_ivs=(.6, .8), put_ivs=(.4, .6),
+                call_deltas=(.6, -.8), put_deltas=(-.2, .4), event_epoch=100):
+        calls = tuple(option(contract_symbol=f"CALL{i}", strike=200 + i,
+                             event_epoch=event_epoch, expiration_epoch=event_epoch + 100,
+                             implied_volatility=iv, delta=delta)
+                      for i, (iv, delta) in enumerate(zip(call_ivs, call_deltas)))
+        puts = tuple(option(contract_symbol=f"PUT{i}", strike=200 + i,
+                            event_epoch=event_epoch, expiration_epoch=event_epoch + 100,
+                            implied_volatility=iv, delta=delta)
+                     for i, (iv, delta) in enumerate(zip(put_ivs, put_deltas)))
+        return OptionSurface(event_epoch, "1970-01-02", calls, puts)
+
     def test_contract_accepts_valid_numerical_input_and_is_immutable(self):
         observation = option()
         self.assertEqual(observation.strike, 200)
@@ -51,10 +66,97 @@ class OptionsVolTests(unittest.TestCase):
 
     def test_no_dataset_or_stock_substitution_produces_forecast(self):
         self.assertIsNone(calculate_options_vol())
-        self.assertIsNone(calculate_options_vol((option(),)))
         payload = dashboard_data()
         self.assertEqual(payload["quant_families"][9]["values"], [None] * 6)
         self.assertTrue(all(value is None for value in payload["options_data"].values()))
+
+    def test_deterministic_means_asymmetries_and_equal_weighting(self):
+        result = calculate_options_vol(self.surface(), cutoff_epoch=100)
+        call_iv, put_iv = (.6 + .8) / 2, (.4 + .6) / 2
+        call_delta, put_delta = (.6 + .8) / 2, (.2 + .4) / 2
+        iv_asymmetry = (call_iv - put_iv) / (call_iv + put_iv)
+        delta_asymmetry = (call_delta - put_delta) / (call_delta + put_delta)
+        expected_hour = 25 * (.5 * iv_asymmetry + .5 * delta_asymmetry)
+        self.assertEqual(result.formula_version, FORMULA_VERSION)
+        self.assertEqual(FORMULA_VERSION, "coin-options-skew-delta-v1")
+        self.assertAlmostEqual(result.forecast_bps[-1], expected_hour)
+        self.assertGreater(iv_asymmetry, 0)
+        self.assertGreater(delta_asymmetry, 0)
+
+    def test_component_signs_and_zero_signal(self):
+        call_iv_high = calculate_options_vol(
+            self.surface(call_ivs=(.8, .8), put_ivs=(.4, .4),
+                         call_deltas=(.5, .5), put_deltas=(-.5, -.5)), cutoff_epoch=100)
+        put_iv_high = calculate_options_vol(
+            self.surface(call_ivs=(.4, .4), put_ivs=(.8, .8),
+                         call_deltas=(.5, .5), put_deltas=(-.5, -.5)), cutoff_epoch=100)
+        call_delta_high = calculate_options_vol(
+            self.surface(call_ivs=(.5, .5), put_ivs=(.5, .5),
+                         call_deltas=(.8, .8), put_deltas=(-.4, -.4)), cutoff_epoch=100)
+        put_delta_high = calculate_options_vol(
+            self.surface(call_ivs=(.5, .5), put_ivs=(.5, .5),
+                         call_deltas=(.4, .4), put_deltas=(-.8, -.8)), cutoff_epoch=100)
+        equal = calculate_options_vol(
+            self.surface(call_ivs=(.5, .5), put_ivs=(.5, .5),
+                         call_deltas=(.4, -.6), put_deltas=(-.4, .6)), cutoff_epoch=100)
+        self.assertGreater(call_iv_high.forecast_bps[-1], 0)
+        self.assertLess(put_iv_high.forecast_bps[-1], 0)
+        self.assertGreater(call_delta_high.forecast_bps[-1], 0)
+        self.assertLess(put_delta_high.forecast_bps[-1], 0)
+        self.assertEqual(equal.forecast_bps, (0, 0, 0, 0, 0, 0))
+
+    def test_exact_linear_horizons_constant_and_bound(self):
+        result = calculate_options_vol(self.surface(), cutoff_epoch=100)
+        self.assertEqual(HORIZON_SECONDS, (30, 60, 300, 900, 1800, 3600))
+        self.assertEqual(MAX_SIGNAL_BPS, 25.0)
+        self.assertEqual(len(result.forecast_bps), 6)
+        hour = result.forecast_bps[-1]
+        self.assertEqual(result.forecast_bps,
+                         tuple(hour * scale for scale in (1 / 120, 1 / 60, 1 / 12, 1 / 4, 1 / 2, 1)))
+        self.assertLessEqual(abs(hour), 25)
+
+    def test_minimum_observations_missing_and_nonfinite_are_rejected(self):
+        cases = (
+            self.surface(call_ivs=(.5,), call_deltas=(.5,)),
+            self.surface(put_ivs=(.5,), put_deltas=(.5,)),
+            self.surface(call_deltas=(.5,), call_ivs=(.5,)),
+            self.surface(put_deltas=(.5,), put_ivs=(.5,)),
+            self.surface(call_ivs=(None, .5)),
+            self.surface(put_ivs=(None, .5)),
+            self.surface(call_deltas=(None, .5)),
+            self.surface(put_deltas=(None, .5)),
+        )
+        for surface in cases:
+            with self.subTest(surface=surface):
+                self.assertIsNone(calculate_options_vol(surface, cutoff_epoch=100))
+
+    def test_cutoff_freshness_boundaries_and_no_external_dependencies(self):
+        surface = self.surface(event_epoch=100)
+        with patch("urllib.request.urlopen", side_effect=AssertionError("HTTP forbidden")):
+            self.assertIsNotNone(calculate_options_vol(surface, cutoff_epoch=100))
+            self.assertIsNotNone(calculate_options_vol(surface, cutoff_epoch=130))
+            self.assertIsNone(calculate_options_vol(surface, cutoff_epoch=130.000001))
+            self.assertIsNone(calculate_options_vol(surface, cutoff_epoch=99.999999))
+
+    def test_live_cycle_populates_q10_row_from_surface_and_keeps_panel_contract(self):
+        state = LiveMarketState(clock=lambda: 101)
+        surface = self.surface(event_epoch=100)
+        state.accept_option_surface(surface, midpoint=200)
+        self.assertTrue(state.accept_quote(bid=199, ask=201, event_epoch=100))
+        snapshot = state.snapshot()
+        payload = dashboard_data(snapshot=snapshot)
+        self.assertEqual(payload["quant_families"][9]["values"],
+                         list(snapshot.options_vol.forecast_bps))
+        self.assertEqual(payload["options_data"]["Strike"], 200)
+        self.assertEqual(payload["options_data"]["Gamma"], .01)
+
+    def test_live_cycle_leaves_q10_row_blank_for_stale_surface(self):
+        state = LiveMarketState(clock=lambda: 131)
+        state.accept_option_surface(self.surface(event_epoch=100), midpoint=200)
+        self.assertTrue(state.accept_quote(bid=199, ask=201, event_epoch=131))
+        self.assertIsNone(state.snapshot().options_vol)
+        self.assertEqual(dashboard_data(snapshot=state.snapshot())["quant_families"][9]["values"],
+                         [None] * 6)
 
 
 class RegimeTests(unittest.TestCase):

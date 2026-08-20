@@ -24,7 +24,8 @@ from .q6_volume_liquidity import VolumeLiquidityResult, calculate_volume_liquidi
 from .q7_relative_value import RelativeValueResult, calculate_relative_value
 from .q8_cross_asset import CrossAssetResult, calculate_cross_asset
 from .q9_factor import FactorResult, calculate_factor
-from .q10_options_vol import OptionObservation, OptionSurface, calculate_options_vol
+from .q10_options_vol import (OptionObservation, OptionSurface, OptionsVolResult,
+                              calculate_options_vol)
 from .q11_regime import RegimeResult, calculate_regime
 from .q12_event_session import EventSessionResult, calculate_event_session
 
@@ -48,7 +49,7 @@ class LiveSnapshot:
     relative_value: RelativeValueResult | None
     cross_asset: CrossAssetResult | None
     factor: FactorResult | None
-    options_vol: None
+    options_vol: OptionsVolResult | None
     regime: RegimeResult | None
     event_session: EventSessionResult | None
     option_observation: OptionObservation | None
@@ -159,7 +160,7 @@ class LiveMarketState:
                 calculate_relative_value(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
                 calculate_cross_asset(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
                 calculate_factor(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
-                calculate_options_vol(),
+                calculate_options_vol(self._snapshot.option_surface, cutoff_epoch=event_epoch),
                 calculate_regime(history, cutoff_epoch=event_epoch),
                 calculate_event_session(history, cutoff_epoch=event_epoch),
                 self._snapshot.option_observation,
