@@ -47,7 +47,7 @@ def dashboard_data(
     snapshot: LiveSnapshot | None = None, now_epoch: float | None = None,
     evidence_counts: tuple[int, int] | None = None,
 ) -> dict[str, object]:
-    """Build the frozen dashboard structure, optionally calculating Q1-Q3."""
+    """Build the frozen dashboard structure, optionally using live quant results."""
 
     supplied = history is not None or snapshot is not None
     if snapshot is not None:
@@ -62,16 +62,22 @@ def dashboard_data(
     q4 = snapshot.stat_arb if snapshot else None
     q5 = snapshot.microstructure if snapshot else None
     q6 = snapshot.volume_liquidity if snapshot else None
+    q7 = snapshot.relative_value if snapshot else None
+    q8 = snapshot.cross_asset if snapshot else None
+    q9 = snapshot.factor if snapshot else None
     populated = (
         q1.forecast_bps, q2.forecast_bps, q3.volatility_bps,
         q4.forecast_bps if q4 else (None,) * 6,
         q5.forecast_bps if q5 else (None,) * 6,
         q6.forecast_bps if q6 else (None,) * 6,
+        q7.forecast_bps if q7 else (None,) * 6,
+        q8.forecast_bps if q8 else (None,) * 6,
+        q9.forecast_bps if q9 else (None,) * 6,
     )
     families = [
         {
             "name": name,
-            "values": list(populated[index]) if index < 6 else [None] * 6,
+            "values": list(populated[index]) if index < 9 else [None] * 6,
         }
         for index, name in enumerate(FAMILY_NAMES)
     ]
