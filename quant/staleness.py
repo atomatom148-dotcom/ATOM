@@ -1,22 +1,17 @@
-"""Deterministic stale-evidence protection for Phase D2."""
+"""Deterministic stale-evidence assessment for Phase D2."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from .models import Snapshot
 
 
-# D2 deliberately uses one explicit operational limit.  It is not learned,
-# inferred, or adjusted from market activity.
-MAX_SNAPSHOT_AGE_SECONDS = 60.0
-
-
 @dataclass(frozen=True)
-class StalenessStatus:
-    age_seconds: float
-    stale: bool
+class StalenessEvidence:
     usable: bool
+    age_seconds: float | None
     reason_codes: tuple[str, ...]
 
 
@@ -24,35 +19,37 @@ def assess_staleness(
     snapshot: Snapshot,
     *,
     now_epoch: float,
-) -> StalenessStatus:
-    """Assess snapshot age without changing the snapshot or pipeline state.
+    max_age_seconds: float,
+) -> StalenessEvidence:
+    """Return age-based evidence without mutating the snapshot."""
 
-    Existing intake evidence remains authoritative: a snapshot already marked
-    non-fresh stays unusable.  D2 adds the missing wall-clock protection so a
-    previously fresh snapshot cannot be treated as usable forever.
-    """
+    if not _is_finite_number(now_epoch):
+        return StalenessEvidence(False, None, ("INVALID_NOW_EPOCH",))
+    if not _is_finite_number(max_age_seconds) or max_age_seconds < 0:
+        return StalenessEvidence(False, None, ("INVALID_MAX_AGE_SECONDS",))
+    if not _is_finite_number(snapshot.asof_epoch):
+        return StalenessEvidence(False, None, ("INVALID_ASOF_EPOCH",))
 
     age_seconds = now_epoch - snapshot.asof_epoch
-    reasons: list[str] = []
-
-    if age_seconds < 0:
-        reasons.append("SNAPSHOT_FROM_FUTURE")
-    elif age_seconds > MAX_SNAPSHOT_AGE_SECONDS:
-        reasons.append("STALE_SNAPSHOT")
-
     if not snapshot.fresh:
-        reasons.extend(snapshot.reason_codes or ["SNAPSHOT_NOT_FRESH"])
+        return StalenessEvidence(
+            False, age_seconds, ("SNAPSHOT_MARKED_STALE",)
+        )
+    if age_seconds < 0:
+        return StalenessEvidence(
+            False, age_seconds, ("SNAPSHOT_FROM_FUTURE",)
+        )
+    if age_seconds > max_age_seconds:
+        return StalenessEvidence(False, age_seconds, ("SNAPSHOT_TOO_OLD",))
+    return StalenessEvidence(True, age_seconds, ())
 
-    return StalenessStatus(
-        age_seconds=age_seconds,
-        stale="STALE_SNAPSHOT" in reasons,
-        usable=snapshot.is_usable() and not reasons,
-        reason_codes=tuple(reasons),
+
+def _is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
     )
 
 
-__all__ = [
-    "MAX_SNAPSHOT_AGE_SECONDS",
-    "StalenessStatus",
-    "assess_staleness",
-]
+__all__ = ["StalenessEvidence", "assess_staleness"]
