@@ -80,7 +80,9 @@ def dashboard_data(
         "market": {
             "symbol": history.latest.midpoint if history.latest else None,
             "benchmarks": ["BTC", "QQQ", "NDX"],
+            "btc": None,
             "qqq": snapshot.qqq_history.latest.midpoint if snapshot and snapshot.qqq_history.latest else None,
+            "ndx": None,
             "data_age": max(0.0, (time.time() if now_epoch is None else now_epoch) - history.latest.event_epoch) if history.latest else None,
             "last_cycle": snapshot.last_cycle if snapshot else (cutoff_epoch if supplied else None),
         },
@@ -115,11 +117,21 @@ def _cycle_cell(value: object) -> str:
     return "" if value is None else time.strftime("%H:%M:%S UTC", time.gmtime(float(value)))
 
 
-def _table(headers: Iterable[str], rows: Iterable[tuple[str, Iterable[object]]]) -> str:
+def _table(
+    headers: Iterable[str],
+    rows: Iterable[tuple[str, Iterable[object]]],
+    *,
+    section: str,
+    decimal: bool = False,
+) -> str:
     heading = "".join(f"<th>{escape(item)}</th>" for item in headers)
     body = "".join(
         "<tr><th>" + escape(label) + "</th>" +
-        "".join(f"<td>{_cell(value)}</td>" for value in values) + "</tr>"
+        "".join(
+            f'<td data-dashboard-field="{section}.{escape(label)}.{index}">'
+            f'{_decimal_cell(value) if decimal else _cell(value)}</td>'
+            for index, value in enumerate(values)
+        ) + "</tr>"
         for label, values in rows
     )
     return f"<div class=scroll><table><thead><tr><th></th>{heading}</tr></thead><tbody>{body}</tbody></table></div>"
@@ -134,25 +146,64 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     families = data["quant_families"]
     options = data["options_data"]
     evidence = data["evidence"]
-    display_families = (
-        (item["name"], (_decimal_cell(value) for value in item["values"]))
-        if index < 6 else (item["name"], item["values"])
-        for index, item in enumerate(families)
-    )
     document = f"""<!doctype html>
 <html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>ATOM QUANT</title><style>
 :root{{color-scheme:dark}}body{{margin:0;background:#090c0a;color:#c8facc;font:14px ui-monospace,SFMono-Regular,Consolas,monospace}}main{{max-width:1100px;margin:auto;padding:24px}}h1{{font-size:22px}}h2{{font-size:15px;margin-top:30px;border-bottom:1px solid #315636;padding-bottom:7px}}.market{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}}.label{{color:#7bad80;font-size:11px}}.value{{min-height:1.2em;margin-top:4px}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}th,td{{padding:7px 10px;border-bottom:1px solid #203a24;text-align:right}}th:first-child{{text-align:left}}thead th{{color:#7bad80}}.scroll{{overflow-x:auto}}@media(max-width:600px){{main{{padding:14px}}.market{{grid-template-columns:repeat(2,minmax(0,1fr))}}th,td{{padding:6px 8px}}}}
 </style></head><body><main><h1>ATOM QUANT</h1>
 <h2>MARKET</h2><div class=market>
-<div><div class=label>COIN</div><div class=value>{_decimal_cell(market['symbol'])}</div></div>
-<div><div class=label>BTC</div><div class=value></div></div><div><div class=label>QQQ</div><div class=value>{_decimal_cell(market['qqq'])}</div></div><div><div class=label>NDX</div><div class=value></div></div>
-<div><div class=label>DATA AGE</div><div class=value>{_decimal_cell(market['data_age'], 's')}</div></div><div><div class=label>LAST CYCLE</div><div class=value>{_cycle_cell(market['last_cycle'])}</div></div></div>
-<h2>FINAL NUMBERS</h2>{_table(horizons, final_numbers.items())}
-<h2>12 QUANT FAMILIES</h2>{_table(horizons, display_families)}
-<h2>OPTIONS DATA</h2>{_table((), ((key, (value,)) for key, value in options.items()))}
-<h2>EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in evidence.items()))}
-</main></body></html>"""
+<div><div class=label>COIN</div><div class=value data-dashboard-field="market.symbol">{_decimal_cell(market['symbol'])}</div></div>
+<div><div class=label>BTC</div><div class=value data-dashboard-field="market.btc">{_decimal_cell(market['btc'])}</div></div><div><div class=label>QQQ</div><div class=value data-dashboard-field="market.qqq">{_decimal_cell(market['qqq'])}</div></div><div><div class=label>NDX</div><div class=value data-dashboard-field="market.ndx">{_decimal_cell(market['ndx'])}</div></div>
+<div><div class=label>DATA AGE</div><div class=value data-dashboard-field="market.data_age">{_decimal_cell(market['data_age'], 's')}</div></div><div><div class=label>LAST CYCLE</div><div class=value data-dashboard-field="market.last_cycle">{_cycle_cell(market['last_cycle'])}</div></div></div>
+<h2>FINAL NUMBERS</h2>{_table(horizons, final_numbers.items(), section='final_numbers', decimal=True)}
+<h2>12 QUANT FAMILIES</h2>{_table(horizons, ((item['name'], item['values']) for item in families), section='quant_families', decimal=True)}
+<h2>OPTIONS DATA</h2>{_table((), ((key, (value,)) for key, value in options.items()), section='options_data')}
+<h2>EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in evidence.items()), section='evidence')}
+</main><script>
+(() => {{
+  const cells = new Map(
+    Array.from(document.querySelectorAll("[data-dashboard-field]"),
+      cell => [cell.dataset.dashboardField, cell])
+  );
+  const text = value => value == null ? "" : String(value);
+  const decimal = (value, suffix = "") => value == null ? "" : Number(value).toFixed(2) + suffix;
+  const cycle = value => value == null ? "" :
+    new Date(Number(value) * 1000).toLocaleTimeString("en-GB", {{
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hour12: false, timeZone: "UTC"
+    }}) + " UTC";
+  const set = (field, value, format = text) => {{
+    const cell = cells.get(field);
+    if (cell) cell.textContent = format(value);
+  }};
+  const render = data => {{
+    set("market.symbol", data.market.symbol, decimal);
+    set("market.btc", data.market.btc, decimal);
+    set("market.qqq", data.market.qqq, decimal);
+    set("market.ndx", data.market.ndx, decimal);
+    set("market.data_age", data.market.data_age, value => decimal(value, "s"));
+    set("market.last_cycle", data.market.last_cycle, cycle);
+    Object.entries(data.final_numbers).forEach(([name, values]) =>
+      values.forEach((value, index) => set(`final_numbers.${{name}}.${{index}}`, value, decimal)));
+    data.quant_families.forEach(family => family.values.forEach((value, index) =>
+      set(`quant_families.${{family.name}}.${{index}}`, value, decimal)));
+    Object.entries(data.options_data).forEach(([name, value]) =>
+      set(`options_data.${{name}}.0`, value));
+    Object.entries(data.evidence).forEach(([name, value]) =>
+      set(`evidence.${{name}}.0`, value));
+  }};
+  const refreshDashboard = async () => {{
+    try {{
+      const response = await fetch("/api/dashboard", {{cache: "no-store"}});
+      if (!response.ok) throw new Error(`dashboard request failed: ${{response.status}}`);
+      render(await response.json());
+    }} catch (_) {{
+      // Preserve the last successful display; the interval performs the next retry.
+    }}
+  }};
+  setInterval(refreshDashboard, 1000);
+}})();
+</script></body></html>"""
     return document.encode("utf-8")
 
 
