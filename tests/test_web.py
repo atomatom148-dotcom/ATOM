@@ -50,6 +50,37 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertIsNone(payload["market"]["data_age"])
         self.assertIsNone(payload["market"]["last_cycle"])
 
+    def test_page_formats_live_values_without_rounding_api_values(self):
+        history = MidpointHistory((MidpointObservation(1_700_000_000.0, 123.4567),))
+        app = create_app(history, cutoff_epoch=1_700_000_000.0, clock=lambda: 1_700_000_001.234)
+
+        page = request(app, "/")["body"].decode()
+        payload = json.loads(request(app, "/api/dashboard")["body"])
+
+        self.assertIn('<div class=value>123.46</div>', page)
+        self.assertIn('<div class=value>1.23s</div>', page)
+        self.assertIn('<div class=value>22:13:20 UTC</div>', page)
+        self.assertEqual(payload["market"]["symbol"], 123.4567)
+        self.assertAlmostEqual(payload["market"]["data_age"], 1.234)
+        self.assertEqual(payload["market"]["last_cycle"], 1_700_000_000.0)
+
+    def test_page_formats_q1_q3_to_two_decimal_places(self):
+        history = MidpointHistory(
+            MidpointObservation(float(second), 100.0 + second / 100.0)
+            for second in range(0, 3601, 30)
+        )
+        app = create_app(history, cutoff_epoch=3600.0, clock=lambda: 3600.0)
+        payload = json.loads(request(app, "/api/dashboard")["body"])
+        page = request(app, "/")["body"].decode()
+
+        for family in payload["quant_families"][:3]:
+            for value in family["values"]:
+                self.assertIn(f">{value:.2f}</td>", page)
+
+    def test_mobile_market_grid_uses_two_non_overlapping_columns(self):
+        page = request(create_app(), "/")["body"].decode()
+        self.assertIn(".market{grid-template-columns:repeat(2,minmax(0,1fr))}", page)
+
     def test_health_only_reports_process_running(self):
         response = request(create_app(), "/health")
         self.assertEqual(response["status"], "200 OK")
