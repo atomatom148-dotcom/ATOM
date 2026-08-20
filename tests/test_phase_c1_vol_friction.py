@@ -1,7 +1,8 @@
-"""Phase C1 proofs for volatility/friction evidence."""
+"""Phase C1 proofs for descriptive volatility/friction evidence."""
 
 from __future__ import annotations
 
+from copy import deepcopy
 import math
 from pathlib import Path
 import sys
@@ -9,63 +10,144 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from quant.models import SetupState
-from quant.vol_friction import VolFrictionPolicy, evaluate_vol_friction
+from quant.models import Snapshot
+import quant.vol_friction as vol_friction
+from quant.vol_friction import VolFrictionEvidence, evaluate_vol_friction
 
 
-POLICY = VolFrictionPolicy(minimum_volatility=0.01, maximum_friction=0.002)
+def snapshot(**overrides: object) -> Snapshot:
+    values = {
+        "symbol": "COIN",
+        "asof_epoch": 1_700_000_000.0,
+        "last": 100.0,
+        "bid": 99.0,
+        "ask": 101.0,
+        "bar_close": 96.0,
+        "source": "test",
+        "fresh": True,
+        "reason_codes": ["SOURCE_EVIDENCE"],
+    }
+    values.update(overrides)
+    return Snapshot(**values)
 
 
 class PhaseC1VolFrictionTests(unittest.TestCase):
-    def test_evidence_at_thresholds_is_qualified(self) -> None:
-        evidence = evaluate_vol_friction(0.01, 0.002, POLICY)
+    def test_computes_spread_range_and_net_range(self) -> None:
+        evidence = evaluate_vol_friction(snapshot())
 
-        self.assertEqual(evidence.setup_state, SetupState.QUALIFIED)
-        self.assertEqual(evidence.volatility, 0.01)
-        self.assertEqual(evidence.friction, 0.002)
-        self.assertEqual(evidence.reason_codes, ())
-
-    def test_excess_friction_is_blocked_before_volatility(self) -> None:
-        evidence = evaluate_vol_friction(0.0, 0.003, POLICY)
-
-        self.assertEqual(evidence.setup_state, SetupState.BLOCKED)
-        self.assertEqual(evidence.reason_codes, ("FRICTION_TOO_HIGH",))
-
-    def test_low_volatility_is_a_valid_non_setup(self) -> None:
-        evidence = evaluate_vol_friction(0.009, 0.001, POLICY)
-
-        self.assertEqual(evidence.setup_state, SetupState.NO_SETUP)
-        self.assertEqual(evidence.reason_codes, ("VOLATILITY_TOO_LOW",))
-
-    def test_missing_evidence_is_unavailable_not_zero(self) -> None:
-        cases = (
-            (None, 0.001, ("MISSING_VOLATILITY",)),
-            (0.02, None, ("MISSING_FRICTION",)),
-            (None, None, ("MISSING_VOLATILITY", "MISSING_FRICTION")),
+        self.assertEqual(
+            evidence,
+            VolFrictionEvidence(
+                usable=True,
+                range_pct=0.04,
+                spread_pct=0.02,
+                net_range_pct=0.02,
+                reason_codes=(),
+            ),
         )
-        for volatility, friction, reasons in cases:
-            with self.subTest(volatility=volatility, friction=friction):
-                evidence = evaluate_vol_friction(volatility, friction, POLICY)
-                self.assertEqual(evidence.setup_state, SetupState.UNAVAILABLE)
-                self.assertEqual(evidence.reason_codes, reasons)
 
-    def test_invalid_evidence_is_unavailable(self) -> None:
-        for value in (-1.0, math.nan, math.inf, -math.inf, True):
-            with self.subTest(value=value):
-                volatility = evaluate_vol_friction(value, 0.001, POLICY)
-                friction = evaluate_vol_friction(0.02, value, POLICY)
-                self.assertEqual(volatility.setup_state, SetupState.UNAVAILABLE)
-                self.assertEqual(volatility.reason_codes, ("INVALID_VOLATILITY",))
-                self.assertEqual(friction.setup_state, SetupState.UNAVAILABLE)
-                self.assertEqual(friction.reason_codes, ("INVALID_FRICTION",))
+    def test_net_range_has_zero_floor_and_zero_spread_is_valid(self) -> None:
+        below_spread = evaluate_vol_friction(snapshot(bar_close=99.5))
+        zero_spread = evaluate_vol_friction(snapshot(bid=100.0, ask=100.0))
 
-    def test_policy_rejects_invalid_thresholds(self) -> None:
-        for value in (-1.0, math.nan, math.inf, -math.inf, True):
+        self.assertEqual(below_spread.net_range_pct, 0.0)
+        self.assertTrue(zero_spread.usable)
+        self.assertEqual(zero_spread.spread_pct, 0.0)
+        self.assertEqual(zero_spread.net_range_pct, zero_spread.range_pct)
+
+    def test_missing_range_remains_missing_but_spread_is_usable(self) -> None:
+        for value in (None, 0.0, -1.0, math.nan, math.inf, -math.inf, True):
             with self.subTest(value=value):
-                with self.assertRaises(ValueError):
-                    VolFrictionPolicy(value, 0.002)
-                with self.assertRaises(ValueError):
-                    VolFrictionPolicy(0.01, value)
+                evidence = evaluate_vol_friction(snapshot(bar_close=value))
+                self.assertTrue(evidence.usable)
+                self.assertEqual(evidence.spread_pct, 0.02)
+                self.assertIsNone(evidence.range_pct)
+                self.assertIsNone(evidence.net_range_pct)
+                self.assertEqual(evidence.reason_codes, ("RANGE_UNAVAILABLE",))
+
+    def test_all_required_evidence_is_validated_in_deterministic_order(self) -> None:
+        evidence = evaluate_vol_friction(
+            snapshot(fresh=False, last=None, bid=math.nan, ask=-1.0)
+        )
+
+        self.assertEqual(
+            evidence,
+            VolFrictionEvidence(
+                usable=False,
+                range_pct=None,
+                spread_pct=None,
+                net_range_pct=None,
+                reason_codes=(
+                    "STALE_SNAPSHOT",
+                    "MISSING_LAST",
+                    "INVALID_BID",
+                    "INVALID_ASK",
+                ),
+            ),
+        )
+
+    def test_each_missing_or_invalid_required_value_is_unusable(self) -> None:
+        for field, code in (
+            ("last", "MISSING_LAST"),
+            ("bid", "MISSING_BID"),
+            ("ask", "MISSING_ASK"),
+        ):
+            with self.subTest(field=field, kind="missing"):
+                evidence = evaluate_vol_friction(snapshot(**{field: None}))
+                self.assertFalse(evidence.usable)
+                self.assertEqual(evidence.reason_codes, (code,))
+                self.assertIsNone(evidence.spread_pct)
+                self.assertIsNone(evidence.range_pct)
+                self.assertIsNone(evidence.net_range_pct)
+
+            for value in (0.0, -1.0, math.nan, math.inf, -math.inf, True):
+                with self.subTest(field=field, value=value):
+                    evidence = evaluate_vol_friction(snapshot(**{field: value}))
+                    self.assertFalse(evidence.usable)
+                    self.assertEqual(evidence.reason_codes, (f"INVALID_{field.upper()}",))
+
+    def test_stale_and_reversed_quote_are_unusable(self) -> None:
+        stale = evaluate_vol_friction(snapshot(fresh=False))
+        reversed_quote = evaluate_vol_friction(snapshot(bid=101.0, ask=100.0))
+
+        self.assertEqual(stale.reason_codes, ("STALE_SNAPSHOT",))
+        self.assertEqual(reversed_quote.reason_codes, ("ASK_BELOW_BID",))
+        self.assertFalse(stale.usable)
+        self.assertFalse(reversed_quote.usable)
+
+    def test_snapshot_is_not_mutated(self) -> None:
+        original = snapshot()
+        before = deepcopy(original)
+
+        evaluate_vol_friction(original)
+
+        self.assertEqual(original, before)
+
+    def test_forbidden_predictive_and_operational_surfaces_are_absent(self) -> None:
+        forbidden = (
+            "VolFrictionPolicy",
+            "SetupState",
+            "direction",
+            "probability",
+            "score",
+            "target",
+            "stop",
+            "pnl",
+            "write_cycle",
+            "ledger",
+            "resolver",
+            "status",
+            "broker",
+            "execute",
+        )
+        for name in forbidden:
+            self.assertFalse(hasattr(vol_friction, name), name)
+
+        fields = VolFrictionEvidence.__dataclass_fields__
+        self.assertEqual(
+            tuple(fields),
+            ("usable", "range_pct", "spread_pct", "net_range_pct", "reason_codes"),
+        )
 
 
 if __name__ == "__main__":

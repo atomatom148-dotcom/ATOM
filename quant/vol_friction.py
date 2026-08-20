@@ -1,108 +1,89 @@
-"""Phase C1 volatility/friction evidence.
-
-This module classifies only the quality of market evidence.  It does not write
-forecasts, choose a direction, assign a probability, or mutate the Phase B
-pipeline.
-"""
+"""Phase C1 volatility/friction evidence derived from one snapshot."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Optional
 
-from .models import SetupState
-
-
-@dataclass(frozen=True)
-class VolFrictionPolicy:
-    """Explicit thresholds for the small C1 evidence gate."""
-
-    minimum_volatility: float
-    maximum_friction: float
-
-    def __post_init__(self) -> None:
-        for name, value in (
-            ("minimum_volatility", self.minimum_volatility),
-            ("maximum_friction", self.maximum_friction),
-        ):
-            if not _is_non_negative_finite(value):
-                raise ValueError(f"{name} must be finite and non-negative")
+from .models import Snapshot
 
 
 @dataclass(frozen=True)
 class VolFrictionEvidence:
-    """Truthful result of applying the C1 gate to two scalar observations."""
-
-    setup_state: SetupState
-    volatility: Optional[float]
-    friction: Optional[float]
+    usable: bool
+    range_pct: float | None
+    spread_pct: float | None
+    net_range_pct: float | None
     reason_codes: tuple[str, ...]
 
 
-def evaluate_vol_friction(
-    volatility: Optional[float],
-    friction: Optional[float],
-    policy: VolFrictionPolicy,
-) -> VolFrictionEvidence:
-    """Classify volatility and friction without inventing missing evidence.
-
-    Invalid observations are unavailable.  Excess friction blocks a setup;
-    otherwise insufficient volatility is a valid non-setup.  Observations on
-    either threshold pass, making the comparison deterministic at boundaries.
-    """
+def evaluate_vol_friction(snapshot: Snapshot) -> VolFrictionEvidence:
+    """Return descriptive volatility/friction evidence without prediction."""
 
     reasons: list[str] = []
-    if volatility is None:
-        reasons.append("MISSING_VOLATILITY")
-    elif not _is_non_negative_finite(volatility):
-        reasons.append("INVALID_VOLATILITY")
+    if not snapshot.fresh:
+        reasons.append("STALE_SNAPSHOT")
+    _require_positive_finite(snapshot.last, "LAST", reasons)
+    _require_positive_finite(snapshot.bid, "BID", reasons)
+    _require_positive_finite(snapshot.ask, "ASK", reasons)
 
-    if friction is None:
-        reasons.append("MISSING_FRICTION")
-    elif not _is_non_negative_finite(friction):
-        reasons.append("INVALID_FRICTION")
+    if (
+        _is_positive_finite(snapshot.bid)
+        and _is_positive_finite(snapshot.ask)
+        and snapshot.ask < snapshot.bid
+    ):
+        reasons.append("ASK_BELOW_BID")
 
     if reasons:
         return VolFrictionEvidence(
-            setup_state=SetupState.UNAVAILABLE,
-            volatility=volatility,
-            friction=friction,
+            usable=False,
+            range_pct=None,
+            spread_pct=None,
+            net_range_pct=None,
             reason_codes=tuple(reasons),
         )
 
-    # The checks above narrow both observations to valid floats at runtime.
-    assert volatility is not None
-    assert friction is not None
-    if friction > policy.maximum_friction:
+    # Required evidence has been validated above.
+    assert snapshot.last is not None
+    assert snapshot.bid is not None
+    assert snapshot.ask is not None
+    spread_pct = (snapshot.ask - snapshot.bid) / snapshot.last
+
+    if not _is_positive_finite(snapshot.bar_close):
         return VolFrictionEvidence(
-            SetupState.BLOCKED,
-            volatility,
-            friction,
-            ("FRICTION_TOO_HIGH",),
+            usable=True,
+            range_pct=None,
+            spread_pct=spread_pct,
+            net_range_pct=None,
+            reason_codes=("RANGE_UNAVAILABLE",),
         )
-    if volatility < policy.minimum_volatility:
-        return VolFrictionEvidence(
-            SetupState.NO_SETUP,
-            volatility,
-            friction,
-            ("VOLATILITY_TOO_LOW",),
-        )
+
+    range_pct = abs(snapshot.last - snapshot.bar_close) / snapshot.last
     return VolFrictionEvidence(
-        SetupState.QUALIFIED,
-        volatility,
-        friction,
-        (),
+        usable=True,
+        range_pct=range_pct,
+        spread_pct=spread_pct,
+        net_range_pct=max(range_pct - spread_pct, 0.0),
+        reason_codes=(),
     )
 
 
-def _is_non_negative_finite(value: object) -> bool:
+def _require_positive_finite(
+    value: object, name: str, reasons: list[str]
+) -> None:
+    if value is None:
+        reasons.append(f"MISSING_{name}")
+    elif not _is_positive_finite(value):
+        reasons.append(f"INVALID_{name}")
+
+
+def _is_positive_finite(value: object) -> bool:
     return (
         isinstance(value, (int, float))
         and not isinstance(value, bool)
         and math.isfinite(value)
-        and value >= 0
+        and value > 0
     )
 
 
-__all__ = ["VolFrictionEvidence", "VolFrictionPolicy", "evaluate_vol_friction"]
+__all__ = ["VolFrictionEvidence", "evaluate_vol_friction"]
