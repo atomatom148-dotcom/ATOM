@@ -25,6 +25,21 @@ class ForecastRecord:
     created_epoch: float
 
 
+@dataclass(frozen=True, slots=True)
+class PhaseECohortMetrics:
+    """Foundational resolved quality for one exact forecast cohort."""
+
+    quant_id: str
+    formula_version: str
+    symbol: str
+    horizon: str
+    forecast_count: int
+    matured_count: int
+    resolved_count: int
+    coverage: float | None
+    rmse_bps: float | None
+
+
 class EvidenceStore(Protocol):
     """The deliberately small API has no mutation or deletion operations."""
 
@@ -34,6 +49,10 @@ class EvidenceStore(Protocol):
     ) -> None: ...
 
     def counts(self) -> tuple[int, int]: ...
+
+    def phase_e_cohorts(
+        self, as_of_epoch: float,
+    ) -> tuple[PhaseECohortMetrics, ...]: ...
 
 
 class PostgresEvidenceStore:
@@ -98,6 +117,56 @@ class PostgresEvidenceStore:
                 forecasts, resolved = cursor.fetchone()
         return int(forecasts), int(resolved)
 
+    def phase_e_cohorts(
+        self, as_of_epoch: float,
+    ) -> tuple[PhaseECohortMetrics, ...]:
+        """Read E1 measurements at an explicit, deterministic evaluation time."""
+
+        if not math.isfinite(as_of_epoch):
+            raise ValueError("as_of_epoch must be finite")
+        with self._connect(self._database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT f.quant_id, f.formula_version, f.symbol, f.horizon,
+                           count(*) AS forecast_count,
+                           count(*) FILTER (
+                               WHERE f.maturity_epoch <= %s
+                           ) AS matured_count,
+                           count(o.forecast_id) FILTER (
+                               WHERE f.maturity_epoch <= %s
+                           ) AS resolved_count,
+                           count(o.forecast_id) FILTER (
+                               WHERE f.maturity_epoch <= %s
+                           )::double precision /
+                               NULLIF(count(*) FILTER (
+                                   WHERE f.maturity_epoch <= %s
+                               ), 0) AS coverage,
+                           sqrt(avg(power(f.forecast_bps - o.outcome_bps, 2))
+                               FILTER (WHERE f.maturity_epoch <= %s
+                                      AND o.forecast_id IS NOT NULL)) AS rmse_bps
+                    FROM forecasts AS f
+                    LEFT JOIN forecast_outcomes AS o USING (forecast_id)
+                    GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon
+                    ORDER BY f.quant_id, f.formula_version, f.symbol,
+                             CASE f.horizon
+                                 WHEN '30S' THEN 1 WHEN '1M' THEN 2
+                                 WHEN '5M' THEN 3 WHEN '15M' THEN 4
+                                 WHEN '30M' THEN 5 WHEN '1H' THEN 6
+                             END
+                    """,
+                    (as_of_epoch,) * 5,
+                )
+                rows = cursor.fetchall()
+        return tuple(PhaseECohortMetrics(
+            quant_id=str(row[0]), formula_version=str(row[1]),
+            symbol=str(row[2]), horizon=str(row[3]),
+            forecast_count=int(row[4]), matured_count=int(row[5]),
+            resolved_count=int(row[6]),
+            coverage=None if row[7] is None else float(row[7]),
+            rmse_bps=None if row[8] is None else float(row[8]),
+        ) for row in rows)
+
 
 def records_for_results(*, results: Sequence[object], cycle_id: str,
                         symbol: str, cutoff_epoch: float,
@@ -126,4 +195,7 @@ def records_for_results(*, results: Sequence[object], cycle_id: str,
     return tuple(records)
 
 
-__all__ = ["EvidenceStore", "ForecastRecord", "PostgresEvidenceStore", "records_for_results"]
+__all__ = [
+    "EvidenceStore", "ForecastRecord", "PhaseECohortMetrics",
+    "PostgresEvidenceStore", "records_for_results",
+]
