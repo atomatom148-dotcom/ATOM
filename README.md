@@ -31,5 +31,14 @@ README.md
 python tests/test_phase_a_contracts.py
 ```
 
+## Live Q1-Q3 runtime
+
+Set `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`, then start the single-process
+standard-library HTTPS polling runtime (Render supplies `PORT`):
+
+```
+python -m quant.web --host 0.0.0.0 --port "$PORT"
+```
+
 ## Not included
 Charts, Research OS, Scout/Shadow, Direction Brain, broker, fat migration branch.
