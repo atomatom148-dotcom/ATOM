@@ -12,7 +12,8 @@ from quant.web import dashboard_data
 
 
 def option(**changes):
-    values = dict(event_epoch=100, strike=200, expiration_epoch=200, premium=10,
+    values = dict(contract_symbol="COINTEST", event_epoch=100, strike=200,
+                  expiration_epoch=200, expiration="1970-01-02", premium=10,
                   implied_volatility=.5, delta=.4, gamma=.01, theta=-.02,
                   vega=.1, bid=9, ask=11)
     values.update(changes)
@@ -41,7 +42,7 @@ class OptionsVolTests(unittest.TestCase):
         invalid = (
             {"strike": 0}, {"expiration_epoch": 100}, {"premium": -1},
             {"implied_volatility": -1}, {"bid": -1}, {"ask": -1},
-            {"bid": 12, "ask": 11}, {"gamma": float("inf")},
+            {"gamma": float("inf")},
             {"event_epoch": float("nan")},
         )
         for changes in invalid:

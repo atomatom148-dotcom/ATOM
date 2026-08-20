@@ -24,7 +24,7 @@ from .q6_volume_liquidity import VolumeLiquidityResult, calculate_volume_liquidi
 from .q7_relative_value import RelativeValueResult, calculate_relative_value
 from .q8_cross_asset import CrossAssetResult, calculate_cross_asset
 from .q9_factor import FactorResult, calculate_factor
-from .q10_options_vol import calculate_options_vol
+from .q10_options_vol import OptionObservation, calculate_options_vol
 from .q11_regime import RegimeResult, calculate_regime
 from .q12_event_session import EventSessionResult, calculate_event_session
 
@@ -51,6 +51,7 @@ class LiveSnapshot:
     options_vol: None
     regime: RegimeResult | None
     event_session: EventSessionResult | None
+    option_observation: OptionObservation | None
 
 
 class LiveMarketState:
@@ -64,7 +65,7 @@ class LiveMarketState:
         self._snapshot = LiveSnapshot(
             MidpointHistory(), MidpointHistory(), QuoteHistory(), None,
             None, None, None, None, None, None, None, None, None,
-            None, None, None,
+            None, None, None, None,
         )
 
     def accept_qqq_quote(self, *, bid: float, ask: float, event_epoch: float) -> bool:
@@ -96,7 +97,7 @@ class LiveMarketState:
                 self._snapshot.relative_value, self._snapshot.cross_asset,
                 self._snapshot.factor,
                 self._snapshot.options_vol, self._snapshot.regime,
-                self._snapshot.event_session,
+                self._snapshot.event_session, self._snapshot.option_observation,
             )
         return True
 
@@ -159,6 +160,7 @@ class LiveMarketState:
                 calculate_options_vol(),
                 calculate_regime(history, cutoff_epoch=event_epoch),
                 calculate_event_session(history, cutoff_epoch=event_epoch),
+                self._snapshot.option_observation,
             )
             if self._evidence_store is not None:
                 forecasts = records_for_results(
@@ -188,6 +190,22 @@ class LiveMarketState:
     def snapshot(self) -> LiveSnapshot:
         with self._lock:
             return self._snapshot
+
+    def accept_option_observation(self, observation: OptionObservation) -> None:
+        """Atomically publish a validated option observation without running Q10."""
+
+        if not isinstance(observation, OptionObservation):
+            raise TypeError("observation must be an OptionObservation")
+        with self._lock:
+            current = self._snapshot
+            self._snapshot = LiveSnapshot(
+                current.history, current.qqq_history, current.quote_history,
+                current.last_cycle, current.momentum, current.mean_reversion,
+                current.volatility, current.stat_arb, current.microstructure,
+                current.volume_liquidity, current.relative_value,
+                current.cross_asset, current.factor, current.options_vol,
+                current.regime, current.event_session, observation,
+            )
 
 
 def parse_alpaca_timestamp(value: str) -> float:
@@ -238,4 +256,15 @@ def start_alpaca_poller(state: LiveMarketState) -> threading.Thread:
     return thread
 
 
-__all__ = ["LiveMarketState", "LiveSnapshot", "parse_alpaca_timestamp", "poll_alpaca", "start_alpaca_poller"]
+def start_alpaca_options_poller(state: LiveMarketState) -> threading.Thread:
+    """Start the independent ten-second backend options ingestion loop."""
+
+    from .options_market import poll_alpaca_options
+
+    thread = threading.Thread(target=poll_alpaca_options, args=(state,), daemon=True)
+    thread.start()
+    return thread
+
+
+__all__ = ["LiveMarketState", "LiveSnapshot", "parse_alpaca_timestamp", "poll_alpaca",
+           "start_alpaca_options_poller", "start_alpaca_poller"]
