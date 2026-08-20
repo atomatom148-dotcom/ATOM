@@ -1,14 +1,16 @@
-"""Options observation contract for the intentionally inactive Q10 family."""
+"""Causal directional forecast from the published COIN options surface."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Iterable
 
 
 QUANT_ID = "q10_options_vol"
-FORMULA_VERSION = "options-volatility-v1"
+FORMULA_VERSION = "coin-options-skew-delta-v1"
+HORIZON_SECONDS = (30, 60, 300, 900, 1800, 3600)
+MAX_SIGNAL_BPS = 25.0
+MAX_SURFACE_AGE_SECONDS = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,13 +86,63 @@ class OptionSurface:
             raise ValueError("puts must be sorted by strike and symbol")
 
 
+@dataclass(frozen=True, slots=True)
+class OptionsVolResult:
+    quant_id: str
+    formula_version: str
+    forecast_bps: tuple[float, float, float, float, float, float]
+
+
 def calculate_options_vol(
-    observations: Iterable[OptionObservation] | None = None,
-) -> None:
-    """Return no forecast until a real options equation and live dataset exist."""
+    surface: OptionSurface | None = None, *, cutoff_epoch: float | None = None,
+) -> OptionsVolResult | None:
+    """Calculate Q10 from an already-published, causal, fresh options surface."""
 
-    # Deliberately do not substitute stock volatility or synthesize option fields.
-    return None
+    if surface is None or cutoff_epoch is None:
+        return None
+    if isinstance(cutoff_epoch, bool) or not isinstance(cutoff_epoch, (int, float)):
+        return None
+    cutoff_epoch = float(cutoff_epoch)
+    if not math.isfinite(cutoff_epoch) or not math.isfinite(surface.event_epoch):
+        return None
+    surface_age = cutoff_epoch - surface.event_epoch
+    if surface_age < 0 or surface_age > MAX_SURFACE_AGE_SECONDS:
+        return None
+
+    call_ivs = tuple(float(item.implied_volatility) for item in surface.calls
+                     if item.implied_volatility is not None and
+                     math.isfinite(item.implied_volatility) and item.implied_volatility > 0)
+    put_ivs = tuple(float(item.implied_volatility) for item in surface.puts
+                    if item.implied_volatility is not None and
+                    math.isfinite(item.implied_volatility) and item.implied_volatility > 0)
+    call_deltas = tuple(float(item.delta) for item in surface.calls
+                        if item.delta is not None and math.isfinite(item.delta))
+    put_deltas = tuple(float(item.delta) for item in surface.puts
+                       if item.delta is not None and math.isfinite(item.delta))
+    if min(map(len, (call_ivs, put_ivs, call_deltas, put_deltas))) < 2:
+        return None
+
+    call_iv = sum(call_ivs) / len(call_ivs)
+    put_iv = sum(put_ivs) / len(put_ivs)
+    iv_denominator = call_iv + put_iv
+    call_abs_delta = sum(map(abs, call_deltas)) / len(call_deltas)
+    put_abs_delta = sum(map(abs, put_deltas)) / len(put_deltas)
+    delta_denominator = call_abs_delta + put_abs_delta
+    if iv_denominator <= 0 or delta_denominator <= 0:
+        return None
+
+    iv_asymmetry = (call_iv - put_iv) / iv_denominator
+    delta_asymmetry = (call_abs_delta - put_abs_delta) / delta_denominator
+    options_signal = 0.5 * iv_asymmetry + 0.5 * delta_asymmetry
+    one_hour_bps = MAX_SIGNAL_BPS * options_signal
+    forecasts = tuple(one_hour_bps * seconds / 3600 for seconds in HORIZON_SECONDS)
+    if len(forecasts) != 6 or not all(map(math.isfinite, forecasts)):
+        return None
+    return OptionsVolResult(QUANT_ID, FORMULA_VERSION, forecasts)
 
 
-__all__ = ["OptionObservation", "OptionSurface", "calculate_options_vol"]
+__all__ = [
+    "FORMULA_VERSION", "HORIZON_SECONDS", "MAX_SIGNAL_BPS",
+    "MAX_SURFACE_AGE_SECONDS", "OptionObservation", "OptionSurface",
+    "OptionsVolResult", "QUANT_ID", "calculate_options_vol",
+]
