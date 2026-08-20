@@ -11,6 +11,7 @@ from typing import Callable, Iterable
 from wsgiref.simple_server import make_server
 
 from .history import MidpointHistory
+from .evidence import EvidenceStore, PostgresEvidenceStore
 from .live_market import LiveMarketState, LiveSnapshot, start_alpaca_poller
 from .q1_momentum import calculate_momentum
 from .q2_mean_reversion import calculate_mean_reversion
@@ -44,6 +45,7 @@ EVIDENCE_FIELDS = (
 def dashboard_data(
     history: MidpointHistory | None = None, *, cutoff_epoch: float | None = None,
     snapshot: LiveSnapshot | None = None, now_epoch: float | None = None,
+    evidence_counts: tuple[int, int] | None = None,
 ) -> dict[str, object]:
     """Build the frozen dashboard structure, optionally calculating Q1-Q3."""
 
@@ -79,7 +81,12 @@ def dashboard_data(
         },
         "quant_families": families,
         "options_data": {field: None for field in OPTION_FIELDS},
-        "evidence": {field: None for field in EVIDENCE_FIELDS},
+        "evidence": {
+            "Forecasts": evidence_counts[0] if evidence_counts else None,
+            "Resolved": evidence_counts[1] if evidence_counts else None,
+            "Eligible": None, "RMSE": None, "Coverage": None,
+            "Effective N": None,
+        },
     }
 
 
@@ -143,13 +150,18 @@ def dashboard_page(data: dict[str, object]) -> bytes:
 def create_app(
     history: MidpointHistory | None = None, *, cutoff_epoch: float | None = None,
     state: LiveMarketState | None = None, clock: Callable[[], float] = time.time,
+    evidence_store: EvidenceStore | None = None,
 ) -> Callable:
     """Create the WSGI application, rendering current state on every request."""
 
     def application(environ: dict[str, object], start_response: Callable) -> list[bytes]:
         path = environ.get("PATH_INFO", "")
         snapshot = state.snapshot() if state is not None else None
-        data = dashboard_data(history, cutoff_epoch=cutoff_epoch, snapshot=snapshot, now_epoch=clock())
+        counts = evidence_store.counts() if evidence_store is not None else None
+        data = dashboard_data(
+            history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
+            now_epoch=clock(), evidence_counts=counts,
+        )
         if path == "/":
             status, content_type, body = "200 OK", "text/html; charset=utf-8", dashboard_page(data)
         elif path == "/api/dashboard":
@@ -169,9 +181,11 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
     args = parser.parse_args()
-    state = LiveMarketState()
+    evidence_store = PostgresEvidenceStore(os.environ["DATABASE_URL"])
+    state = LiveMarketState(evidence_store=evidence_store)
     start_alpaca_poller(state)
-    with make_server(args.host, args.port, create_app(state=state)) as server:
+    app = create_app(state=state, evidence_store=evidence_store)
+    with make_server(args.host, args.port, app) as server:
         server.serve_forever()
 
 
