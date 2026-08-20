@@ -24,6 +24,9 @@ from .q6_volume_liquidity import VolumeLiquidityResult, calculate_volume_liquidi
 from .q7_relative_value import RelativeValueResult, calculate_relative_value
 from .q8_cross_asset import CrossAssetResult, calculate_cross_asset
 from .q9_factor import FactorResult, calculate_factor
+from .q10_options_vol import calculate_options_vol
+from .q11_regime import RegimeResult, calculate_regime
+from .q12_event_session import EventSessionResult, calculate_event_session
 
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
@@ -45,6 +48,9 @@ class LiveSnapshot:
     relative_value: RelativeValueResult | None
     cross_asset: CrossAssetResult | None
     factor: FactorResult | None
+    options_vol: None
+    regime: RegimeResult | None
+    event_session: EventSessionResult | None
 
 
 class LiveMarketState:
@@ -58,6 +64,7 @@ class LiveMarketState:
         self._snapshot = LiveSnapshot(
             MidpointHistory(), MidpointHistory(), QuoteHistory(), None,
             None, None, None, None, None, None, None, None, None,
+            None, None, None,
         )
 
     def accept_qqq_quote(self, *, bid: float, ask: float, event_epoch: float) -> bool:
@@ -88,6 +95,8 @@ class LiveMarketState:
                 self._snapshot.microstructure, self._snapshot.volume_liquidity,
                 self._snapshot.relative_value, self._snapshot.cross_asset,
                 self._snapshot.factor,
+                self._snapshot.options_vol, self._snapshot.regime,
+                self._snapshot.event_session,
             )
         return True
 
@@ -147,6 +156,9 @@ class LiveMarketState:
                 calculate_relative_value(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
                 calculate_cross_asset(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
                 calculate_factor(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
+                calculate_options_vol(),
+                calculate_regime(history, cutoff_epoch=event_epoch),
+                calculate_event_session(history, cutoff_epoch=event_epoch),
             )
             if self._evidence_store is not None:
                 forecasts = records_for_results(
