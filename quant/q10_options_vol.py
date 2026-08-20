@@ -61,6 +61,29 @@ class OptionObservation:
         return self.ask - self.bid
 
 
+@dataclass(frozen=True, slots=True)
+class OptionSurface:
+    """One atomically publishable, real-contract COIN options surface."""
+
+    event_epoch: float
+    expiration: str
+    calls: tuple[OptionObservation, ...]
+    puts: tuple[OptionObservation, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.calls) > 5 or len(self.puts) > 5:
+            raise ValueError("an option surface contains at most five contracts per side")
+        if not self.calls and not self.puts:
+            raise ValueError("an option surface must contain a real snapshot")
+        observations = self.calls + self.puts
+        if any(item.expiration != self.expiration for item in observations):
+            raise ValueError("all option observations must use the surface expiration")
+        if tuple(sorted(self.calls, key=lambda item: (item.strike, item.contract_symbol))) != self.calls:
+            raise ValueError("calls must be sorted by strike and symbol")
+        if tuple(sorted(self.puts, key=lambda item: (item.strike, item.contract_symbol))) != self.puts:
+            raise ValueError("puts must be sorted by strike and symbol")
+
+
 def calculate_options_vol(
     observations: Iterable[OptionObservation] | None = None,
 ) -> None:
@@ -70,4 +93,4 @@ def calculate_options_vol(
     return None
 
 
-__all__ = ["OptionObservation", "calculate_options_vol"]
+__all__ = ["OptionObservation", "OptionSurface", "calculate_options_vol"]

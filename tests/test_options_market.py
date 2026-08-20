@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 from quant.live_market import LiveMarketState
-from quant.options_market import (OPTIONS_POLL_INTERVAL, parse_alpaca_option_snapshot,
-                                  poll_alpaca_options, select_coin_option_contract)
+from quant.options_market import (OPTIONS_POLL_INTERVAL, fetch_coin_option_surface,
+                                  parse_alpaca_option_snapshot, poll_alpaca_options,
+                                  select_coin_option_contract, select_coin_option_surface_contracts)
+from quant.q10_options_vol import OptionSurface
 from quant.web import create_app, dashboard_data
 
 
@@ -68,6 +70,52 @@ class ParsingAndSelectionTests(unittest.TestCase):
         picks = [select_coin_option_contract(values, midpoint=200, cutoff_epoch=CUTOFF)["symbol"] for _ in range(10)]
         self.assertEqual(picks, ["LOW-A"] * 10)
 
+    def test_surface_uses_one_nearest_future_expiration_and_filters_contracts(self):
+        values = [contract("EXPIRED", "2026-08-20"), contract("WRONG", underlying_symbol="QQQ"),
+                  contract("INACTIVE", status="inactive"), contract("BAD", strike="0")]
+        for kind, marker in (("call", "C"), ("put", "P")):
+            values.extend(contract(f"{marker}{strike:03}", "2026-09-19", str(strike), kind)
+                          for strike in (180, 190, 195, 205, 210, 220))
+            values.append(contract(f"{marker}FAR", "2026-09-25", "200", kind))
+        expiration, calls, puts = select_coin_option_surface_contracts(
+            values, midpoint=200, cutoff_epoch=CUTOFF)
+        self.assertEqual(expiration.isoformat(), "2026-09-19")
+        self.assertEqual([item["symbol"] for item in calls], ["C180", "C190", "C195", "C205", "C210"])
+        self.assertEqual([item["symbol"] for item in puts], ["P180", "P190", "P195", "P205", "P210"])
+        self.assertTrue(all(item["expiration_date"] == expiration.isoformat() for item in calls + puts))
+
+    def test_surface_returns_only_available_real_contracts_with_lexical_ties(self):
+        values = [contract("C-B", strike="195"), contract("C-A", strike="195"),
+                  contract("P-ONE", strike="201", kind="put")]
+        _, calls, puts = select_coin_option_surface_contracts(values, midpoint=200, cutoff_epoch=CUTOFF)
+        self.assertEqual([item["symbol"] for item in calls], ["C-A", "C-B"])
+        self.assertEqual([item["symbol"] for item in puts], ["P-ONE"])
+
+    @patch.dict("os.environ", {"ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret"})
+    def test_bulk_snapshots_map_by_symbol_and_missing_snapshot_skips_one(self):
+        contracts = [contract(f"C{x}", strike=str(x)) for x in range(198, 203)]
+        contracts += [contract(f"P{x}", strike=str(x), kind="put") for x in range(198, 203)]
+        snapshots = {item["symbol"]: snapshot() for item in contracts}
+        snapshots.pop("C200")
+        snapshots["P200"] = snapshot(impliedVolatility=None, greeks={"delta": None})
+        pages = [{"option_contracts": contracts}, {"snapshots": snapshots}]
+
+        class Response:
+            def __init__(self, value): self.value = value
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+        with patch("quant.options_market.urlopen", side_effect=[Response(page) for page in pages]) as get:
+            with patch("quant.options_market.json.load", side_effect=lambda response: response.value):
+                surface = fetch_coin_option_surface(midpoint=200, cutoff_epoch=CUTOFF)
+        self.assertEqual(get.call_count, 2)  # one discovery page plus one bulk snapshot request
+        self.assertEqual(len(surface.calls), 4)
+        self.assertEqual(len(surface.puts), 5)
+        self.assertNotIn("C200", [item.contract_symbol for item in surface.calls])
+        put = next(item for item in surface.puts if item.contract_symbol == "P200")
+        self.assertIsNone(put.implied_volatility)
+        self.assertIsNone(put.delta)
+        self.assertEqual((put.bid, put.ask, put.premium, put.spread), (9.25, 10.75, 10.0, 1.5))
+
 
 class RuntimeTests(unittest.TestCase):
     def test_options_interval_is_exactly_ten_seconds(self):
@@ -76,7 +124,7 @@ class RuntimeTests(unittest.TestCase):
     def test_browser_requests_do_not_fetch_options(self):
         state = LiveMarketState()
         app = create_app(state=state)
-        with patch("quant.options_market.fetch_coin_option_observation") as fetch:
+        with patch("quant.options_market.fetch_coin_option_surface") as fetch:
             self.assertEqual(request(app, "/")[0], "200 OK")
             self.assertEqual(request(app, "/api/dashboard")[0], "200 OK")
             fetch.assert_not_called()
@@ -85,21 +133,37 @@ class RuntimeTests(unittest.TestCase):
         state = LiveMarketState(clock=lambda: CUTOFF)
         state.accept_quote(bid=199, ask=201, event_epoch=CUTOFF - 1)
         original = parse_alpaca_option_snapshot(contract("KEEP"), snapshot(), cutoff_epoch=CUTOFF)
-        state.accept_option_observation(original)
+        put = parse_alpaca_option_snapshot(contract("KEEP-P", kind="put"), snapshot(), cutoff_epoch=CUTOFF)
+        original_surface = OptionSurface(CUTOFF, "2026-09-19", (original,), (put,))
+        state.accept_option_surface(original_surface, midpoint=200)
         stopped = threading.Event()
         def stop(_):
             stopped.set()
             raise RuntimeError("stop loop")
-        with patch("quant.options_market.fetch_coin_option_observation", side_effect=OSError("transient")), \
+        with patch("quant.options_market.fetch_coin_option_surface", side_effect=OSError("transient")), \
              patch("quant.options_market.time.sleep", side_effect=stop):
             with self.assertRaises(RuntimeError):
                 poll_alpaca_options(state)
         self.assertTrue(stopped.is_set())
         self.assertIs(state.snapshot().option_observation, original)
+        self.assertIs(state.snapshot().option_surface, original_surface)
         self.assertTrue(state.accept_qqq_quote(bid=400, ask=402, event_epoch=CUTOFF))
         self.assertTrue(state.accept_quote(bid=200, ask=202, event_epoch=CUTOFF))
         self.assertIsNotNone(state.snapshot().momentum)
         self.assertIs(state.snapshot().option_observation, original)
+        self.assertIs(state.snapshot().option_surface, original_surface)
+
+    def test_surface_and_representative_are_published_in_one_snapshot(self):
+        state = LiveMarketState()
+        high = parse_alpaca_option_snapshot(contract("HIGH", strike="205"), snapshot(), cutoff_epoch=CUTOFF)
+        low_z = parse_alpaca_option_snapshot(contract("LOW-Z", strike="195"), snapshot(), cutoff_epoch=CUTOFF)
+        low_a = parse_alpaca_option_snapshot(contract("LOW-A", strike="195"), snapshot(), cutoff_epoch=CUTOFF)
+        put = parse_alpaca_option_snapshot(contract("PUT", strike="200", kind="put"), snapshot(), cutoff_epoch=CUTOFF)
+        surface = OptionSurface(CUTOFF, "2026-09-19", (low_a, low_z, high), (put,))
+        state.accept_option_surface(surface, midpoint=200)
+        published = state.snapshot()
+        self.assertIs(published.option_surface, surface)
+        self.assertIs(published.option_observation, low_a)
 
     def test_dashboard_populates_truthfully_and_q10_stays_blank(self):
         state = LiveMarketState()

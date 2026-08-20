@@ -24,7 +24,7 @@ from .q6_volume_liquidity import VolumeLiquidityResult, calculate_volume_liquidi
 from .q7_relative_value import RelativeValueResult, calculate_relative_value
 from .q8_cross_asset import CrossAssetResult, calculate_cross_asset
 from .q9_factor import FactorResult, calculate_factor
-from .q10_options_vol import OptionObservation, calculate_options_vol
+from .q10_options_vol import OptionObservation, OptionSurface, calculate_options_vol
 from .q11_regime import RegimeResult, calculate_regime
 from .q12_event_session import EventSessionResult, calculate_event_session
 
@@ -52,6 +52,7 @@ class LiveSnapshot:
     regime: RegimeResult | None
     event_session: EventSessionResult | None
     option_observation: OptionObservation | None
+    option_surface: OptionSurface | None
 
 
 class LiveMarketState:
@@ -65,7 +66,7 @@ class LiveMarketState:
         self._snapshot = LiveSnapshot(
             MidpointHistory(), MidpointHistory(), QuoteHistory(), None,
             None, None, None, None, None, None, None, None, None,
-            None, None, None, None,
+            None, None, None, None, None,
         )
 
     def accept_qqq_quote(self, *, bid: float, ask: float, event_epoch: float) -> bool:
@@ -98,6 +99,7 @@ class LiveMarketState:
                 self._snapshot.factor,
                 self._snapshot.options_vol, self._snapshot.regime,
                 self._snapshot.event_session, self._snapshot.option_observation,
+                self._snapshot.option_surface,
             )
         return True
 
@@ -161,6 +163,7 @@ class LiveMarketState:
                 calculate_regime(history, cutoff_epoch=event_epoch),
                 calculate_event_session(history, cutoff_epoch=event_epoch),
                 self._snapshot.option_observation,
+                self._snapshot.option_surface,
             )
             if self._evidence_store is not None:
                 forecasts = records_for_results(
@@ -205,6 +208,28 @@ class LiveMarketState:
                 current.volume_liquidity, current.relative_value,
                 current.cross_asset, current.factor, current.options_vol,
                 current.regime, current.event_session, observation,
+                current.option_surface,
+            )
+
+    def accept_option_surface(self, surface: OptionSurface, *, midpoint: float) -> None:
+        """Atomically publish a complete surface and its dashboard anchor call."""
+
+        if not isinstance(surface, OptionSurface):
+            raise TypeError("surface must be an OptionSurface")
+        representative = min(
+            surface.calls,
+            key=lambda item: (abs(item.strike - midpoint), item.strike, item.contract_symbol),
+            default=None,
+        )
+        with self._lock:
+            current = self._snapshot
+            self._snapshot = LiveSnapshot(
+                current.history, current.qqq_history, current.quote_history,
+                current.last_cycle, current.momentum, current.mean_reversion,
+                current.volatility, current.stat_arb, current.microstructure,
+                current.volume_liquidity, current.relative_value,
+                current.cross_asset, current.factor, current.options_vol,
+                current.regime, current.event_session, representative, surface,
             )
 
 
