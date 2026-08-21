@@ -103,6 +103,16 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertEqual(response["status"], "200 OK")
         self.assertEqual(json.loads(response["body"]), {"status": "running"})
 
+    def test_unknown_route_does_not_query_evidence(self):
+        class Store:
+            def counts(self): raise AssertionError("unknown route must not query evidence")
+            def phase_e_cohorts(self, as_of):
+                raise AssertionError("unknown route must not evaluate Phase E")
+
+        response = request(create_app(evidence_store=Store()), "/favicon.ico")
+        self.assertEqual(response["status"], "404 Not Found")
+        self.assertEqual(response["body"], b"Not Found")
+
     def test_page_polls_dashboard_every_second_without_cache_or_reload(self):
         page = request(create_app(), "/")["body"].decode()
 
