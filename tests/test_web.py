@@ -47,7 +47,7 @@ class WebSurfaceTests(unittest.TestCase):
     def test_unavailable_fields_are_null_and_not_fabricated(self):
         payload = dashboard_data()
         self.assertTrue(all(values == [None] * 6 for values in payload["final_numbers"].values()))
-        self.assertTrue(all(value is None for value in payload["options_data"].values()))
+        self.assertEqual(payload["options_data"], {"expiration": None, "calls": [], "puts": []})
         self.assertTrue(all(value is None for value in payload["evidence"].values()))
         self.assertTrue(all(value is None for family in payload["quant_families"] for value in family["values"]))
         self.assertIsNone(payload["market"]["data_age"])
@@ -110,11 +110,13 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertIn('data-dashboard-field="final_numbers.BPS.0"', page)
         self.assertIn('data-dashboard-field="quant_families.Momentum.0"', page)
         self.assertIn('data-dashboard-field="quant_families.Event/Session.5"', page)
-        self.assertIn('data-dashboard-field="options_data.Strike.0"', page)
+        self.assertIn('data-dashboard-field="options_data.expiration"', page)
         self.assertIn('data-dashboard-field="evidence.Forecasts.0"', page)
         self.assertIn("Object.entries(data.final_numbers)", page)
         self.assertIn("data.quant_families.forEach", page)
-        self.assertIn("Object.entries(data.options_data)", page)
+        self.assertIn('["calls", "puts"].forEach', page)
+        self.assertIn("<h3>CALLS</h3>", page)
+        self.assertIn("<h3>PUTS</h3>", page)
         self.assertIn("Object.entries(data.evidence)", page)
 
     def test_live_renderer_blanks_null_values_without_fake_zeroes(self):
