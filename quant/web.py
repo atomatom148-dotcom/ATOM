@@ -8,6 +8,7 @@ import json
 import os
 from html import escape
 import time
+from threading import Lock
 from typing import Callable, Iterable
 from wsgiref.simple_server import make_server
 
@@ -54,6 +55,7 @@ PHASE_E_FAMILY_NAMES = {
     "q12_event_session": "Event/Session",
 }
 PHASE_E_HORIZONS = ("30S", "1M", "5M", "15M", "30M", "1H")
+DASHBOARD_PHASE_E_TTL_SECONDS = 30.0
 
 
 def dashboard_data(
@@ -298,6 +300,29 @@ def create_app(
 ) -> Callable:
     """Create the WSGI application, rendering current state on every request."""
 
+    phase_e_cache: tuple[object, ...] | None = None
+    phase_e_cache_time: float | None = None
+    phase_e_cache_lock = Lock()
+
+    def dashboard_phase_e_cohorts(as_of_epoch: float) -> tuple[object, ...]:
+        nonlocal phase_e_cache, phase_e_cache_time
+        if evidence_store is None:
+            return ()
+        with phase_e_cache_lock:
+            cache_time = time.monotonic()
+            if (phase_e_cache is not None and phase_e_cache_time is not None and
+                    cache_time - phase_e_cache_time < DASHBOARD_PHASE_E_TTL_SECONDS):
+                return phase_e_cache
+            try:
+                refreshed = tuple(evidence_store.phase_e_cohorts(as_of_epoch))
+            except Exception:
+                if phase_e_cache is not None:
+                    return phase_e_cache
+                raise
+            phase_e_cache = refreshed
+            phase_e_cache_time = cache_time
+            return refreshed
+
     def application(environ: dict[str, object], start_response: Callable) -> list[bytes]:
         path = environ.get("PATH_INFO", "")
         if path == "/api/v9-math":
@@ -337,7 +362,11 @@ def create_app(
         as_of_epoch = clock()
         snapshot = state.snapshot() if state is not None else None
         counts = evidence_store.counts() if evidence_store is not None else None
-        cohorts = evidence_store.phase_e_cohorts(as_of_epoch) if evidence_store is not None else ()
+        cohorts = (
+            dashboard_phase_e_cohorts(as_of_epoch)
+            if path in ("/", "/api/dashboard")
+            else evidence_store.phase_e_cohorts(as_of_epoch) if evidence_store is not None else ()
+        )
         data = dashboard_data(
             history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
             now_epoch=as_of_epoch, evidence_counts=counts, phase_e_cohorts=cohorts,
