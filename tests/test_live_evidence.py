@@ -7,6 +7,7 @@ from quant.evidence import (
     ForecastRecord,
     PostgresEvidenceStore,
     SOURCE_SPEC_VERSION,
+    VolatilityForecastRecord,
     records_for_results,
 )
 from quant.live_market import LiveMarketState
@@ -19,8 +20,13 @@ class MemoryEvidence:
     def __init__(self):
         self.forecasts = []
         self.outcomes = {}
+        self.volatility_forecasts = []
+        self.volatility_outcomes = {}
 
-    def record_cycle_and_resolve(self, forecasts, *, observation_epoch, observation_midpoint):
+    def record_cycle_and_resolve(
+        self, forecasts, *, observation_epoch, observation_midpoint,
+        volatility_forecasts=None,
+    ):
         for index, forecast in enumerate(self.forecasts):
             if index not in self.outcomes and forecast.maturity_epoch <= observation_epoch:
                 self.outcomes[index] = (
@@ -39,9 +45,32 @@ class MemoryEvidence:
                 raise ValueError("duplicate forecast identity")
             identities.add(identity)
             self.forecasts.append(forecast)
+        if volatility_forecasts is not None:
+            for index, forecast in enumerate(self.volatility_forecasts):
+                if (index not in self.volatility_outcomes and
+                        forecast.maturity_epoch <= observation_epoch):
+                    self.volatility_outcomes[index] = (
+                        observation_midpoint,
+                        abs(10_000 * math.log(
+                            observation_midpoint / forecast.cutoff_midpoint
+                        )),
+                        observation_epoch,
+                    )
+            identities = {
+                (f.quant_id, f.formula_version, f.cycle_id, f.symbol, f.horizon)
+                for f in self.volatility_forecasts
+            }
+            for forecast in volatility_forecasts:
+                identity = (forecast.quant_id, forecast.formula_version,
+                            forecast.cycle_id, forecast.symbol, forecast.horizon)
+                if identity in identities:
+                    raise ValueError("duplicate volatility forecast identity")
+                identities.add(identity)
+                self.volatility_forecasts.append(forecast)
 
     def counts(self):
-        return len(self.forecasts), len(self.outcomes)
+        return (len(self.forecasts) + len(self.volatility_forecasts),
+                len(self.outcomes) + len(self.volatility_outcomes))
 
 
 class LiveEvidenceTests(unittest.TestCase):
@@ -71,11 +100,49 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertTrue(all(row.created_epoch <= row.maturity_epoch for row in latest))
         self.assertNotIn("q3_volatility", {row.quant_id for row in store.forecasts})
 
+    def test_live_q3_writes_six_separate_non_directional_records(self):
+        _, store, _ = self.populated_state()
+        latest = [row for row in store.volatility_forecasts
+                  if row.cutoff_epoch == 3600]
+
+        self.assertEqual(len(latest), 6)
+        self.assertEqual({row.quant_id for row in latest}, {"q3_volatility"})
+        self.assertEqual(
+            {row.horizon for row in latest},
+            {"30S", "1M", "5M", "15M", "30M", "1H"},
+        )
+        self.assertNotIn("q3_volatility", {row.quant_id for row in store.forecasts})
+        self.assertTrue(all(row.data_schema_version == DATA_SCHEMA_VERSION
+                            for row in latest))
+        self.assertTrue(all(row.source_spec_version == SOURCE_SPEC_VERSION
+                            for row in latest))
+
     def test_unavailable_forecasts_are_not_persisted(self):
         store = MemoryEvidence()
         state = LiveMarketState(clock=lambda: 1.0, evidence_store=store)
         state.accept_quote(bid=99, ask=101, event_epoch=0.0)
         self.assertEqual(store.forecasts, [])
+        self.assertEqual(store.volatility_forecasts, [])
+
+    def test_volatility_outcome_is_absolute_move_not_direction(self):
+        row = VolatilityForecastRecord(
+            "q3_volatility", "v1", "cycle", "COIN", "30S",
+            100, 130, 100, 5, 101,
+        )
+        store = MemoryEvidence()
+        store.record_cycle_and_resolve(
+            (), observation_epoch=100, observation_midpoint=100,
+            volatility_forecasts=(row,),
+        )
+        store.record_cycle_and_resolve(
+            (), observation_epoch=131, observation_midpoint=90,
+            volatility_forecasts=(),
+        )
+
+        self.assertAlmostEqual(
+            store.volatility_outcomes[0][1], abs(10_000 * math.log(.9)),
+        )
+        self.assertGreater(store.volatility_outcomes[0][1], 0)
 
     def test_duplicate_identity_is_rejected(self):
         row = ForecastRecord("q1_momentum", "v1", "cycle", "COIN", "30S",
@@ -222,6 +289,55 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertIn("f.maturity_epoch > %s", resolution_sql)
         self.assertIn("f.maturity_epoch <= %s", resolution_sql)
         self.assertEqual(resolution_parameters, (110, 110, 131, 123.0, 131))
+
+    def test_postgres_q3_uses_separate_append_only_volatility_tables(self):
+        class Cursor:
+            def __init__(self):
+                self.executions = []
+                self.batches = []
+
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def execute(self, statement, parameters):
+                self.executions.append((" ".join(statement.split()), parameters))
+            def fetchone(self): return (-math.inf,)
+            def executemany(self, statement, parameters):
+                self.batches.append((" ".join(statement.split()), parameters))
+
+        class Connection:
+            def __init__(self, cursor): self._cursor = cursor
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def cursor(self): return self._cursor
+
+        cursor = Cursor()
+        store = object.__new__(PostgresEvidenceStore)
+        store._database_url = "postgresql://test"
+        store._connect = lambda _: Connection(cursor)
+        row = VolatilityForecastRecord(
+            "q3_volatility", "realized-volatility-v1", "COIN:100", "COIN",
+            "30S", 100, 130, 100, 5, 101,
+        )
+
+        store.record_cycle_and_resolve(
+            (), observation_epoch=100, observation_midpoint=100,
+            volatility_forecasts=(row,),
+        )
+
+        volatility_resolution_sql, resolution_parameters = cursor.executions[3]
+        volatility_insert_sql, insert_parameters = cursor.batches[1]
+        self.assertIn("INSERT INTO volatility_forecast_outcomes", volatility_resolution_sql)
+        self.assertIn("abs(10000 * ln(%s / f.cutoff_midpoint))", volatility_resolution_sql)
+        self.assertIn("ON CONFLICT (forecast_id) DO NOTHING", volatility_resolution_sql)
+        self.assertEqual(resolution_parameters, (100, 100, 100, -math.inf, 100))
+        self.assertIn("INSERT INTO volatility_forecasts", volatility_insert_sql)
+        self.assertIn("data_schema_version", volatility_insert_sql)
+        self.assertIn("source_spec_version", volatility_insert_sql)
+        self.assertIn("DO NOTHING", volatility_insert_sql)
+        self.assertEqual(
+            insert_parameters[0][-2:],
+            (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION),
+        )
 
     def test_postgres_duplicate_forecast_preserves_first_and_resolves(self):
         class Cursor:
