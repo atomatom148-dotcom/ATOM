@@ -38,6 +38,9 @@ class G2CrossAssetTests(unittest.TestCase):
         self.assertEqual(HORIZON_SECONDS, (30, 60, 300, 900, 1800, 3600))
         self.assertEqual((value.btc_price, value.coin_price, value.qqq_price, value.ndx_price),
                          (100, 200, 400, 20_000))
+        self.assertEqual((value.btc_age_seconds, value.coin_age_seconds,
+                          value.qqq_age_seconds, value.ndx_age_seconds),
+                         (0, 0, 0, 0))
         for actual, current, priors in (
             (value.btc_return_bps, 100, (95, 94, 93, 92, 91, 90)),
             (value.coin_return_bps, 200, (185, 184, 183, 182, 181, 180)),
@@ -55,6 +58,21 @@ class G2CrossAssetTests(unittest.TestCase):
         )
         self.assertEqual(negative.btc_usd_move[1], -100)
 
+    def test_ages_use_each_actual_latest_causal_observation(self):
+        value = synchronize(
+            as_of_epoch=100,
+            btc=history((95, 60_000)),
+            coin=history((96, 200)),
+            qqq=history((97, 400)),
+            ndx=history((80, 20_000)),
+        )
+        self.assertEqual(
+            (value.btc_age_seconds, value.coin_age_seconds,
+             value.qqq_age_seconds, value.ndx_age_seconds),
+            (5, 4, 3, 20),
+        )
+        self.assertGreater(value.ndx_age_seconds, 0)
+
     def test_common_cutoff_rejects_future_and_missing_is_none(self):
         value = synchronize(
             as_of_epoch=100, btc=history((70, 90), (100, 100), (101, 999)),
@@ -64,11 +82,14 @@ class G2CrossAssetTests(unittest.TestCase):
         self.assertEqual(value.btc_price, 100)
         self.assertAlmostEqual(value.btc_return_bps[0], 10_000 * math.log(100 / 90))
         self.assertEqual(value.btc_usd_move[0], 10)
+        self.assertEqual(value.btc_age_seconds, 0)
         self.assertIsNone(value.coin_price)
+        self.assertIsNone(value.coin_age_seconds)
         self.assertEqual(value.coin_return_bps, (None,) * 6)
         self.assertEqual(value.qqq_price, 400)
         self.assertEqual(value.qqq_return_bps, (None,) * 6)
         self.assertIsNone(value.ndx_price)
+        self.assertIsNone(value.ndx_age_seconds)
         self.assertEqual(value.ndx_return_bps, (None,) * 6)
         self.assertNotIn(0, value.coin_return_bps + value.qqq_return_bps + value.ndx_return_bps)
 
@@ -84,10 +105,26 @@ class G2CrossAssetTests(unittest.TestCase):
             supplied[asset] = MidpointHistory()
             value = synchronize(as_of_epoch=1, **supplied)
             self.assertIsNone(getattr(value, price_field))
+            self.assertIsNone(getattr(value, f"{asset}_age_seconds"))
             self.assertEqual(getattr(value, return_field), (None,) * 6)
             for other, other_price, _ in fields:
                 if other != asset:
                     self.assertIsNotNone(getattr(value, other_price))
+
+    def test_future_observation_cannot_create_negative_age_or_change_values(self):
+        causal = synchronize(
+            as_of_epoch=100, btc=history((40, 90), (100, 100)),
+            coin=MidpointHistory(), qqq=MidpointHistory(), ndx=MidpointHistory(),
+        )
+        with_future = synchronize(
+            as_of_epoch=100, btc=history((40, 90), (100, 100), (101, 1_000)),
+            coin=MidpointHistory(), qqq=MidpointHistory(), ndx=MidpointHistory(),
+        )
+        self.assertEqual(with_future.btc_age_seconds, 0)
+        self.assertGreaterEqual(with_future.btc_age_seconds, 0)
+        self.assertEqual(with_future.btc_price, causal.btc_price)
+        self.assertEqual(with_future.btc_return_bps, causal.btc_return_bps)
+        self.assertEqual(with_future.btc_usd_move, causal.btc_usd_move)
 
     def test_state_is_immutable_and_history_is_time_bounded(self):
         value = synchronize(as_of_epoch=0, btc=MidpointHistory(), coin=MidpointHistory(),
@@ -112,6 +149,9 @@ class G2CrossAssetTests(unittest.TestCase):
         self.assertEqual((payload["btc_price"], payload["coin_price"],
                           payload["qqq_price"], payload["ndx_price"]),
                          (60_000, 200, 400, 20_000))
+        self.assertEqual((payload["btc_age_seconds"], payload["coin_age_seconds"],
+                          payload["qqq_age_seconds"], payload["ndx_age_seconds"]),
+                         (2, 0, 1, 3))
         self.assertIs(state.cross_asset_state(), before)
 
     def test_g2_rejections_fail_open_without_changing_atom_snapshot(self):
