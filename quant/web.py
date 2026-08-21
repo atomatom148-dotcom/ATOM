@@ -8,7 +8,7 @@ import json
 import os
 from html import escape
 import time
-from threading import Lock
+from threading import Lock, Thread
 from typing import Callable, Iterable
 from wsgiref.simple_server import make_server
 
@@ -55,7 +55,7 @@ PHASE_E_FAMILY_NAMES = {
     "q12_event_session": "Event/Session",
 }
 PHASE_E_HORIZONS = ("30S", "1M", "5M", "15M", "30M", "1H")
-DASHBOARD_PHASE_E_TTL_SECONDS = 30.0
+DASHBOARD_PHASE_E_TTL_SECONDS = 300.0
 
 
 def dashboard_data(
@@ -346,31 +346,50 @@ def create_app(
 ) -> Callable:
     """Create the WSGI application, rendering current state on every request."""
 
-    phase_e_cache: tuple[object, ...] | None = None
+    phase_e_cache: tuple[object, ...] = ()
     phase_e_cache_time: float | None = None
+    phase_e_refreshing = False
     phase_e_cache_lock = Lock()
 
+    def refresh_phase_e(as_of_epoch: float, cache_time: float) -> None:
+        nonlocal phase_e_cache, phase_e_cache_time, phase_e_refreshing
+        try:
+            refreshed = tuple(evidence_store.phase_e_cohorts(as_of_epoch))
+        except Exception:
+            refreshed = None
+        with phase_e_cache_lock:
+            if refreshed is not None:
+                phase_e_cache = refreshed
+                phase_e_cache_time = cache_time
+            phase_e_refreshing = False
+
     def dashboard_phase_e_cohorts(as_of_epoch: float) -> tuple[object, ...]:
-        nonlocal phase_e_cache, phase_e_cache_time
+        nonlocal phase_e_refreshing
         if evidence_store is None:
             return ()
+        cache_time = time.monotonic()
+        start_refresh = False
         with phase_e_cache_lock:
-            cache_time = time.monotonic()
-            if (phase_e_cache is not None and phase_e_cache_time is not None and
+            if (phase_e_cache_time is not None and
                     cache_time - phase_e_cache_time < DASHBOARD_PHASE_E_TTL_SECONDS):
                 return phase_e_cache
-            try:
-                refreshed = tuple(evidence_store.phase_e_cohorts(as_of_epoch))
-            except Exception:
-                if phase_e_cache is not None:
-                    return phase_e_cache
-                raise
-            phase_e_cache = refreshed
-            phase_e_cache_time = cache_time
-            return refreshed
+            if not phase_e_refreshing:
+                phase_e_refreshing = True
+                start_refresh = True
+            cached = phase_e_cache
+        if start_refresh:
+            Thread(
+                target=refresh_phase_e, args=(as_of_epoch, cache_time), daemon=True,
+            ).start()
+        return cached
 
     def application(environ: dict[str, object], start_response: Callable) -> list[bytes]:
         path = environ.get("PATH_INFO", "")
+        if path == "/health":
+            body = b'{"status":"running"}'
+            start_response("200 OK", [("Content-Type", "application/json"),
+                                      ("Content-Length", str(len(body)))])
+            return [body]
         if path == "/api/g2-cross-asset":
             value = state.cross_asset_state() if state is not None else None
             body = json.dumps(
@@ -430,8 +449,6 @@ def create_app(
             status, content_type, body = "200 OK", "text/html; charset=utf-8", dashboard_page(data)
         elif path == "/api/dashboard":
             status, content_type, body = "200 OK", "application/json", json.dumps(data, separators=(",", ":"), allow_nan=False).encode()
-        elif path == "/health":
-            status, content_type, body = "200 OK", "application/json", b'{"status":"running"}'
         else:
             status, content_type, body = "404 Not Found", "text/plain; charset=utf-8", b"Not Found"
         start_response(status, [("Content-Type", content_type), ("Content-Length", str(len(body)))])

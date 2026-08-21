@@ -120,14 +120,23 @@ class LiveEvidenceTests(unittest.TestCase):
                 pass
 
             def execute(self, statement, parameters):
+                if statement.lstrip().startswith("SELECT"):
+                    self.watermark = max(
+                        (row[2] for row in self.outcomes.values()),
+                        default=-math.inf,
+                    )
+                    return
                 self.assert_conflict_safe(statement)
-                midpoint, _, resolved_epoch, _ = parameters
+                midpoint, _, resolved_epoch, _, _ = parameters
                 if 1 not in self.outcomes:
                     self.outcomes[1] = (
                         midpoint,
                         10_000 * math.log(midpoint / 100),
                         resolved_epoch,
                     )
+
+            def fetchone(self):
+                return (self.watermark,)
 
             def executemany(self, statement, parameters):
                 self.assertEqual(parameters, [])
@@ -173,6 +182,45 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertAlmostEqual(first[1], 10_000 * math.log(1.1))
         self.assertEqual(first[2], 131)
 
+    def test_postgres_resolution_is_bounded_by_latest_resolved_epoch(self):
+        class Cursor:
+            def __init__(self):
+                self.statements = []
+
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+
+            def execute(self, statement, parameters):
+                self.statements.append((" ".join(statement.split()), parameters))
+
+            def fetchone(self):
+                return (123.0,)
+
+            def executemany(self, statement, parameters):
+                self.forecast_parameters = parameters
+
+        class Connection:
+            def __init__(self, cursor): self._cursor = cursor
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def cursor(self): return self._cursor
+
+        cursor = Cursor()
+        store = object.__new__(PostgresEvidenceStore)
+        store._database_url = "postgresql://test"
+        store._connect = lambda _: Connection(cursor)
+        store.record_cycle_and_resolve(
+            (), observation_epoch=131, observation_midpoint=110,
+        )
+
+        watermark_sql, watermark_parameters = cursor.statements[0]
+        resolution_sql, resolution_parameters = cursor.statements[1]
+        self.assertIn("max(resolved_epoch)", watermark_sql)
+        self.assertEqual(watermark_parameters, ())
+        self.assertIn("f.maturity_epoch > %s", resolution_sql)
+        self.assertIn("f.maturity_epoch <= %s", resolution_sql)
+        self.assertEqual(resolution_parameters, (110, 110, 131, 123.0, 131))
+
     def test_postgres_duplicate_forecast_preserves_first_and_resolves(self):
         class Cursor:
             def __init__(self):
@@ -187,15 +235,25 @@ class LiveEvidenceTests(unittest.TestCase):
                 pass
 
             def execute(self, statement, parameters):
-                midpoint, _, resolved_epoch, observation_epoch = parameters
+                if statement.lstrip().startswith("SELECT"):
+                    self.watermark = max(
+                        (row[2] for row in self.outcomes.values()),
+                        default=-math.inf,
+                    )
+                    return
+                midpoint, _, resolved_epoch, watermark, observation_epoch = parameters
                 for forecast_id, values in self.forecasts.values():
                     if (forecast_id not in self.outcomes
+                            and values[6] > watermark
                             and values[6] <= observation_epoch):
                         self.outcomes[forecast_id] = (
                             midpoint,
                             10_000 * math.log(midpoint / values[7]),
                             resolved_epoch,
                         )
+
+            def fetchone(self):
+                return (self.watermark,)
 
             def executemany(self, statement, parameters):
                 normalized = " ".join(statement.split())
