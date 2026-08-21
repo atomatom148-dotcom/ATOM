@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 from quant.live_market import (
     ALPACA_BTC_LATEST_QUOTE_URL, ALPACA_NDX_LATEST_VALUE_URL, LiveMarketState,
-    parse_alpaca_ndx_value, parse_alpaca_timestamp, poll_alpaca_g2,
+    MASSIVE_NDX_SNAPSHOT_URL, parse_alpaca_ndx_value, parse_alpaca_timestamp,
+    parse_massive_ndx_snapshot, poll_alpaca_g2, poll_massive_ndx,
 )
 from quant.web import create_app
 
@@ -65,8 +66,12 @@ class LiveMarketTests(unittest.TestCase):
         self.assertIsNone(before["market"]["symbol"])
 
         state.accept_quote(bid=100.0, ask=102.0, event_epoch=1000.0)
+        state.accept_g2_price(asset="BTC", price=60_000.0, event_epoch=1000.0)
+        state.accept_g2_price(asset="NDX", price=23_812.125, event_epoch=1000.0)
         after = request_json(app)
         self.assertEqual(after["market"]["symbol"], 101.0)
+        self.assertEqual(after["market"]["btc"], 60_000.0)
+        self.assertEqual(after["market"]["ndx"], 23_812.125)
         self.assertEqual(after["market"]["data_age"], 2.0)
         self.assertEqual(after["market"]["last_cycle"], 1001.0)
         self.assertTrue(all(value is None for family in after["quant_families"][:3] for value in family["values"]))
@@ -112,6 +117,42 @@ class LiveMarketTests(unittest.TestCase):
             ):
                 parse_alpaca_ndx_value(payload)
 
+    def test_massive_ndx_snapshot_preserves_real_time_value_and_event_time(self):
+        self.assertEqual(
+            MASSIVE_NDX_SNAPSHOT_URL,
+            "https://api.massive.com/v3/snapshot/indices?ticker=I%3ANDX",
+        )
+        price, event_epoch = parse_massive_ndx_snapshot({
+            "results": [{
+                "ticker": "I:NDX",
+                "timeframe": "REAL-TIME",
+                "value": 23_812.125,
+                "last_updated": 100_250_000_000,
+            }],
+        })
+        self.assertEqual(price, 23_812.125)
+        self.assertEqual(event_epoch, 100.25)
+
+    def test_massive_ndx_snapshot_rejects_delayed_or_malformed_data(self):
+        malformed = (
+            None,
+            {},
+            {"results": []},
+            {"results": [{"ticker": "I:SPX"}]},
+            {"results": [{
+                "ticker": "I:NDX", "timeframe": "DELAYED",
+                "value": 23_812.125, "last_updated": 100_000_000_000,
+            }]},
+            {"results": [{
+                "ticker": "I:NDX", "timeframe": "REAL-TIME",
+                "value": "23812.125", "last_updated": 100_000_000_000,
+            }]},
+        )
+        for payload in malformed:
+            with self.subTest(payload=payload), self.assertRaises(
+                    (TypeError, ValueError)):
+                parse_massive_ndx_snapshot(payload)
+
     def test_future_ndx_provider_timestamp_is_not_synchronized(self):
         state = LiveMarketState(clock=lambda: 100.0)
         self.assertFalse(
@@ -153,6 +194,55 @@ class LiveMarketTests(unittest.TestCase):
         self.assertIsNone(value.ndx_price)
         self.assertIsNone(value.ndx_age_seconds)
         self.assertEqual(value.ndx_return_bps, (None,) * 6)
+
+    def test_massive_ndx_poller_uses_bearer_key_and_accepts_only_fresh_data(self):
+        state = LiveMarketState(clock=lambda: 101.0)
+        response = BytesIO(json.dumps({
+            "results": [{
+                "ticker": "I:NDX",
+                "timeframe": "REAL-TIME",
+                "value": 23_812.125,
+                "last_updated": 100_000_000_000,
+            }],
+        }).encode())
+
+        with patch.dict(os.environ, {"MASSIVE_API_KEY": "key"}), patch(
+            "quant.live_market.urlopen", return_value=response,
+        ) as urlopen, patch(
+            "quant.live_market.time.time", return_value=101.0,
+        ), patch(
+            "quant.live_market.time.sleep", side_effect=RuntimeError("stop"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                poll_massive_ndx(state)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, MASSIVE_NDX_SNAPSHOT_URL)
+        self.assertEqual(request.get_header("Authorization"), "Bearer key")
+        self.assertEqual(state.cross_asset_state().ndx_price, 23_812.125)
+
+    def test_massive_ndx_poller_rejects_ten_second_old_data(self):
+        state = LiveMarketState(clock=lambda: 110.0)
+        response = BytesIO(json.dumps({
+            "results": [{
+                "ticker": "I:NDX",
+                "timeframe": "REAL-TIME",
+                "value": 23_812.125,
+                "last_updated": 100_000_000_000,
+            }],
+        }).encode())
+
+        with patch.dict(os.environ, {"MASSIVE_API_KEY": "key"}), patch(
+            "quant.live_market.urlopen", return_value=response,
+        ), patch(
+            "quant.live_market.time.time", return_value=110.0,
+        ), patch(
+            "quant.live_market.time.sleep", side_effect=RuntimeError("stop"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                poll_massive_ndx(state)
+
+        self.assertIsNone(state.cross_asset_state().ndx_price)
 
 
 if __name__ == "__main__":

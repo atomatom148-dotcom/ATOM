@@ -38,6 +38,10 @@ ALPACA_BTC_LATEST_QUOTE_URL = "https://data.alpaca.markets/v1beta3/crypto/us/lat
 ALPACA_NDX_LATEST_VALUE_URL = (
     "https://data.alpaca.markets/v1beta1/indices/latest/values?index_symbols=NDX"
 )
+MASSIVE_NDX_SNAPSHOT_URL = (
+    "https://api.massive.com/v3/snapshot/indices?ticker=I%3ANDX"
+)
+MAX_NDX_AGE_SECONDS = 10.0
 HISTORY_SECONDS = 3600.0
 
 
@@ -373,6 +377,36 @@ def parse_alpaca_ndx_value(payload: object) -> tuple[float, float]:
     return value, event_epoch
 
 
+def parse_massive_ndx_snapshot(payload: object) -> tuple[float, float]:
+    """Return Massive's real-time NDX value and provider timestamp."""
+
+    if not isinstance(payload, dict):
+        raise TypeError("Massive NDX snapshot response must be an object")
+    results = payload.get("results")
+    if not isinstance(results, list):
+        raise ValueError("Massive NDX snapshot response is missing results")
+    item = next(
+        (result for result in results
+         if isinstance(result, dict) and result.get("ticker") == "I:NDX"),
+        None,
+    )
+    if item is None:
+        raise ValueError("Massive NDX snapshot response is missing I:NDX")
+    if item.get("timeframe") != "REAL-TIME":
+        raise ValueError("Massive NDX snapshot is not real-time")
+    value = item.get("value")
+    last_updated = item.get("last_updated")
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+            isinstance(last_updated, bool) or
+            not isinstance(last_updated, (int, float))):
+        raise ValueError("Massive NDX snapshot has invalid value or last_updated")
+    value = float(value)
+    event_epoch = float(last_updated) / 1_000_000_000.0
+    if not math.isfinite(value) or value <= 0 or not math.isfinite(event_epoch):
+        raise ValueError("Massive NDX snapshot has invalid value or last_updated")
+    return value, event_epoch
+
+
 def poll_alpaca(state: LiveMarketState, *, interval: float = 1.0) -> None:
     """Continuously fetch latest COIN and QQQ quotes in one Alpaca request."""
 
@@ -432,6 +466,27 @@ def poll_alpaca_g2(state: LiveMarketState, *, interval: float = 1.0) -> None:
         time.sleep(interval)
 
 
+def poll_massive_ndx(state: LiveMarketState, *, interval: float = 1.0) -> None:
+    """Maintain the independent real-time NDX input without blocking ATOM."""
+
+    headers = {"Authorization": f"Bearer {os.environ['MASSIVE_API_KEY']}"}
+    while True:
+        try:
+            with urlopen(Request(MASSIVE_NDX_SNAPSHOT_URL, headers=headers),
+                         timeout=10) as response:
+                payload = json.load(response)
+            price, event_epoch = parse_massive_ndx_snapshot(payload)
+            age = time.time() - event_epoch
+            if age < 0 or age >= MAX_NDX_AGE_SECONDS:
+                raise ValueError("Massive NDX snapshot is stale")
+            if not state.accept_g2_price(
+                    asset="NDX", price=price, event_epoch=event_epoch):
+                raise ValueError("Massive NDX snapshot was rejected")
+        except Exception as error:
+            print(f"Massive NDX snapshot poll failed: {error}", flush=True)
+        time.sleep(interval)
+
+
 def start_alpaca_poller(state: LiveMarketState) -> threading.Thread:
     thread = threading.Thread(target=poll_alpaca, args=(state,), daemon=True)
     thread.start()
@@ -440,6 +495,12 @@ def start_alpaca_poller(state: LiveMarketState) -> threading.Thread:
 
 def start_alpaca_g2_poller(state: LiveMarketState) -> threading.Thread:
     thread = threading.Thread(target=poll_alpaca_g2, args=(state,), daemon=True)
+    thread.start()
+    return thread
+
+
+def start_massive_ndx_poller(state: LiveMarketState) -> threading.Thread:
+    thread = threading.Thread(target=poll_massive_ndx, args=(state,), daemon=True)
     thread.start()
     return thread
 
@@ -455,6 +516,7 @@ def start_alpaca_options_poller(state: LiveMarketState) -> threading.Thread:
 
 
 __all__ = ["LiveMarketState", "LiveSnapshot", "parse_alpaca_ndx_value",
-           "parse_alpaca_timestamp", "poll_alpaca",
-           "poll_alpaca_g2", "start_alpaca_g2_poller", "start_alpaca_options_poller",
-           "start_alpaca_poller"]
+           "parse_alpaca_timestamp", "parse_massive_ndx_snapshot", "poll_alpaca",
+           "poll_alpaca_g2", "poll_massive_ndx", "start_alpaca_g2_poller",
+           "start_alpaca_options_poller", "start_alpaca_poller",
+           "start_massive_ndx_poller"]

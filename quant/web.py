@@ -12,10 +12,12 @@ from threading import Lock, Thread
 from typing import Callable, Iterable
 from wsgiref.simple_server import make_server
 
+from .g2_cross_asset import CrossAssetState
 from .history import MidpointHistory
 from .evidence import EvidenceStore, PostgresEvidenceStore
 from .live_market import (LiveMarketState, LiveSnapshot, start_alpaca_g2_poller,
-                          start_alpaca_options_poller, start_alpaca_poller)
+                          start_alpaca_options_poller, start_alpaca_poller,
+                          start_massive_ndx_poller)
 from .q1_momentum import calculate_momentum
 from .q2_mean_reversion import calculate_mean_reversion
 from .q3_volatility import calculate_volatility
@@ -64,6 +66,7 @@ def dashboard_data(
     snapshot: LiveSnapshot | None = None, now_epoch: float | None = None,
     evidence_counts: tuple[int, int] | None = None,
     phase_e_cohorts: Iterable[object] = (),
+    cross_asset_state: CrossAssetState | None = None,
 ) -> dict[str, object]:
     """Build the frozen dashboard structure, optionally using live quant results."""
 
@@ -151,9 +154,9 @@ def dashboard_data(
         "market": {
             "symbol": history.latest.midpoint if history.latest else None,
             "benchmarks": ["BTC", "QQQ", "NDX"],
-            "btc": None,
+            "btc": cross_asset_state.btc_price if cross_asset_state else None,
             "qqq": snapshot.qqq_history.latest.midpoint if snapshot and snapshot.qqq_history.latest else None,
-            "ndx": None,
+            "ndx": cross_asset_state.ndx_price if cross_asset_state else None,
             "data_age": max(0.0, (time.time() if now_epoch is None else now_epoch) - history.latest.event_epoch) if history.latest else None,
             "last_cycle": snapshot.last_cycle if snapshot else (cutoff_epoch if supplied else None),
         },
@@ -452,6 +455,7 @@ def create_app(
             return [body]
         as_of_epoch = clock()
         snapshot = state.snapshot() if state is not None else None
+        cross_asset_state = state.cross_asset_state() if state is not None else None
         counts = evidence_store.counts() if evidence_store is not None else None
         cohorts = (
             dashboard_phase_e_cohorts(as_of_epoch)
@@ -461,6 +465,7 @@ def create_app(
         data = dashboard_data(
             history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
             now_epoch=as_of_epoch, evidence_counts=counts, phase_e_cohorts=cohorts,
+            cross_asset_state=cross_asset_state,
         )
         if path == "/":
             status, content_type, body = "200 OK", "text/html; charset=utf-8", dashboard_page(data)
@@ -481,6 +486,7 @@ def main() -> None:
     state = LiveMarketState(evidence_store=evidence_store)
     start_alpaca_poller(state)
     start_alpaca_g2_poller(state)
+    start_massive_ndx_poller(state)
     start_alpaca_options_poller(state)
     app = create_app(state=state, evidence_store=evidence_store)
     with make_server(args.host, args.port, app) as server:
