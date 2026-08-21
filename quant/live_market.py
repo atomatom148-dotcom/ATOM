@@ -403,31 +403,25 @@ def poll_alpaca(state: LiveMarketState, *, interval: float = 1.0) -> None:
 
 
 def poll_alpaca_g2(state: LiveMarketState, *, interval: float = 1.0) -> None:
-    """Maintain independent BTC and NDX inputs without blocking the ATOM cycle."""
+    """Maintain the independent BTC input without blocking the ATOM cycle."""
 
     headers = {
         "APCA-API-KEY-ID": os.environ["ALPACA_API_KEY"],
         "APCA-API-SECRET-KEY": os.environ["ALPACA_SECRET_KEY"],
     }
     while True:
-        for asset, url in (
-            ("BTC", ALPACA_BTC_LATEST_QUOTE_URL),
-            ("NDX", ALPACA_NDX_LATEST_VALUE_URL),
-        ):
-            try:
-                with urlopen(Request(url, headers=headers), timeout=10) as response:
-                    payload = json.load(response)
-                if asset == "BTC":
-                    item = payload["quotes"]["BTC/USD"]
-                    price = (float(item["bp"]) + float(item["ap"])) / 2.0
-                    event_epoch = parse_alpaca_timestamp(item["t"])
-                else:
-                    price, event_epoch = parse_alpaca_ndx_value(payload)
-                state.accept_g2_price(
-                    asset=asset, price=price, event_epoch=event_epoch,
-                )
-            except Exception as error:
-                print(f"Alpaca {asset} quote poll failed: {error}", flush=True)
+        try:
+            with urlopen(Request(ALPACA_BTC_LATEST_QUOTE_URL, headers=headers),
+                         timeout=10) as response:
+                payload = json.load(response)
+            item = payload["quotes"]["BTC/USD"]
+            price = (float(item["bp"]) + float(item["ap"])) / 2.0
+            event_epoch = parse_alpaca_timestamp(item["t"])
+            state.accept_g2_price(
+                asset="BTC", price=price, event_epoch=event_epoch,
+            )
+        except Exception as error:
+            print(f"Alpaca BTC quote poll failed: {error}", flush=True)
         time.sleep(interval)
 
 

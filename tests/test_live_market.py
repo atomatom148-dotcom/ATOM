@@ -1,9 +1,12 @@
 import json
+from io import BytesIO
+import os
 import unittest
+from unittest.mock import patch
 
 from quant.live_market import (
-    ALPACA_NDX_LATEST_VALUE_URL, LiveMarketState, parse_alpaca_ndx_value,
-    parse_alpaca_timestamp,
+    ALPACA_BTC_LATEST_QUOTE_URL, ALPACA_NDX_LATEST_VALUE_URL, LiveMarketState,
+    parse_alpaca_ndx_value, parse_alpaca_timestamp, poll_alpaca_g2,
 )
 from quant.web import create_app
 
@@ -117,6 +120,39 @@ class LiveMarketTests(unittest.TestCase):
         value = state.cross_asset_state()
         self.assertIsNone(value.ndx_price)
         self.assertIsNone(value.ndx_age_seconds)
+
+    def test_g2_poller_requests_only_btc_and_leaves_ndx_missing(self):
+        state = LiveMarketState(clock=lambda: 2.0)
+        response = BytesIO(json.dumps({
+            "quotes": {
+                "BTC/USD": {
+                    "bp": 100.0,
+                    "ap": 102.0,
+                    "t": "1970-01-01T00:00:01Z",
+                },
+            },
+        }).encode())
+
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key",
+            "ALPACA_SECRET_KEY": "secret",
+        }), patch(
+            "quant.live_market.urlopen", return_value=response,
+        ) as urlopen, patch(
+            "quant.live_market.time.sleep", side_effect=RuntimeError("stop"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                poll_alpaca_g2(state)
+
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(
+            urlopen.call_args.args[0].full_url, ALPACA_BTC_LATEST_QUOTE_URL,
+        )
+        value = state.cross_asset_state()
+        self.assertEqual(value.btc_price, 101.0)
+        self.assertIsNone(value.ndx_price)
+        self.assertIsNone(value.ndx_age_seconds)
+        self.assertEqual(value.ndx_return_bps, (None,) * 6)
 
 
 if __name__ == "__main__":
