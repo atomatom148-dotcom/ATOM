@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import patch
 
 from quant.history import MidpointHistory, MidpointObservation
 from quant.evidence import PhaseECohortMetrics
@@ -176,6 +177,99 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertIn(">1.23<", page)
         self.assertIn(">-0.13<", page)
         self.assertNotIn(">None<", page)
+
+    def test_dashboard_caches_phase_e_for_30_seconds_only(self):
+        first = PhaseECohortMetrics(
+            "q1_momentum", "v1", "COIN", "30S", 1, 1, 1,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1, False,
+        )
+        refreshed = PhaseECohortMetrics(
+            "q1_momentum", "v1", "COIN", "30S", 2, 2, 2,
+            1.0, 2.0, 1.0, 2.0, 1.0, 2, False,
+        )
+
+        class Store:
+            def __init__(self):
+                self.phase_calls = []
+                self.count_calls = 0
+
+            def counts(self):
+                self.count_calls += 1
+                return (self.count_calls, self.count_calls)
+
+            def phase_e_cohorts(self, as_of):
+                self.phase_calls.append(as_of)
+                return (first,) if len(self.phase_calls) == 1 else (refreshed,)
+
+        request_times = iter((100.0, 101.0, 129.999, 130.0))
+        store = Store()
+        history = MidpointHistory((MidpointObservation(90.0, 100.0),))
+        app = create_app(history, evidence_store=store, clock=lambda: next(request_times))
+        with patch("quant.web.time.monotonic", side_effect=(10.0, 11.0, 39.999, 40.0)):
+            payloads = [json.loads(request(app, "/api/dashboard")["body"]) for _ in range(4)]
+
+        self.assertEqual(store.phase_calls, [100.0, 130.0])
+        self.assertEqual([payload["phase_e_cohorts"][0]["effective_n"] for payload in payloads],
+                         [1, 1, 1, 2])
+        self.assertEqual([payload["evidence"]["Forecasts"] for payload in payloads],
+                         [1, 2, 3, 4])
+        for payload, expected_age in zip(payloads, (10.0, 11.0, 39.999, 40.0)):
+            self.assertAlmostEqual(payload["market"]["data_age"], expected_age)
+
+    def test_dashboard_phase_e_refresh_fails_open_only_with_cached_result(self):
+        cohort = PhaseECohortMetrics(
+            "q1_momentum", "v1", "COIN", "30S", 1, 1, 1,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1, False,
+        )
+
+        class Store:
+            def __init__(self, fail_first=False):
+                self.calls = 0
+                self.fail_first = fail_first
+
+            def counts(self): return (0, 0)
+
+            def phase_e_cohorts(self, as_of):
+                self.calls += 1
+                if self.fail_first or self.calls > 1:
+                    raise RuntimeError("phase e unavailable")
+                return (cohort,)
+
+        stale_store = Store()
+        stale_app = create_app(evidence_store=stale_store, clock=lambda: 100.0)
+        with patch("quant.web.time.monotonic", side_effect=(0.0, 30.0)):
+            first = json.loads(request(stale_app, "/api/dashboard")["body"])
+            stale = json.loads(request(stale_app, "/api/dashboard")["body"])
+        self.assertEqual(stale["phase_e_cohorts"], first["phase_e_cohorts"])
+        self.assertEqual(stale_store.calls, 2)
+
+        empty_app = create_app(evidence_store=Store(fail_first=True), clock=lambda: 100.0)
+        with patch("quant.web.time.monotonic", return_value=0.0):
+            with self.assertRaisesRegex(RuntimeError, "phase e unavailable"):
+                request(empty_app, "/api/dashboard")
+
+    def test_phase_e_endpoint_bypasses_dashboard_cache(self):
+        cohort = PhaseECohortMetrics(
+            "q1_momentum", "v1", "COIN", "30S", 1, 1, 1,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1, False,
+        )
+
+        class Store:
+            def __init__(self): self.calls = []
+            def counts(self): return (0, 0)
+            def phase_e_cohorts(self, as_of):
+                self.calls.append(as_of)
+                return (cohort,)
+
+        times = iter((100.0, 101.0))
+        store = Store()
+        app = create_app(evidence_store=store, clock=lambda: next(times))
+        with patch("quant.web.time.monotonic", return_value=0.0):
+            request(app, "/api/dashboard")
+            response = request(app, "/api/phase-e")
+
+        self.assertEqual(store.calls, [100.0, 101.0])
+        self.assertEqual(json.loads(response["body"])["as_of_epoch"], 101.0)
 
     def test_phase_e_horizons_have_fixed_display_order(self):
         cohorts = tuple(
