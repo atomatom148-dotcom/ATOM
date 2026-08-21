@@ -1,4 +1,5 @@
 import json
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -116,6 +117,7 @@ class WebSurfaceTests(unittest.TestCase):
 
     def test_page_uses_non_overlapping_live_and_evidence_loops(self):
         page = request(create_app(), "/")["body"].decode()
+        script = page.split("<script>", 1)[1].split("</script>", 1)[0]
 
         self.assertIn('fetch("/api/live", {cache: "no-store"})', page)
         self.assertIn('fetch("/api/dashboard", {cache: "no-store"})', page)
@@ -124,6 +126,9 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertNotIn("setInterval", page)
         self.assertNotIn("location.reload", page)
         self.assertNotIn("window.location", page)
+        syntax_check = subprocess.run(
+            ["node", "--check", "-"], input=script, text=True, capture_output=True)
+        self.assertEqual(syntax_check.returncode, 0, syntax_check.stderr)
 
     def test_live_endpoint_is_read_only_and_uses_provider_time_for_age(self):
         class Store:
