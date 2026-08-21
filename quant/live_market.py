@@ -13,6 +13,7 @@ from typing import Callable
 from urllib.request import Request, urlopen
 
 from .history import MidpointHistory, MidpointObservation
+from .g2_cross_asset import CrossAssetState, append_bounded, synchronize
 from .quote_history import QuoteHistory, QuoteObservation
 from .evidence import EvidenceStore, records_for_results
 from .q1_momentum import MomentumResult, calculate_momentum
@@ -33,6 +34,8 @@ from .v9_telemetry import record_v9_observation
 
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
+ALPACA_BTC_LATEST_QUOTE_URL = "https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes?symbols=BTC%2FUSD"
+ALPACA_NDX_SNAPSHOT_URL = "https://data.alpaca.markets/v1beta1/indices/snapshots?symbols=NDX"
 HISTORY_SECONDS = 3600.0
 
 
@@ -112,6 +115,12 @@ class LiveMarketState:
         self._clock = clock
         self._evidence_store = evidence_store
         self._lock = threading.Lock()
+        self._btc_history = MidpointHistory()
+        self._ndx_history = MidpointHistory()
+        self._g2_state = synchronize(
+            as_of_epoch=0.0, btc=self._btc_history, coin=MidpointHistory(),
+            qqq=MidpointHistory(), ndx=self._ndx_history,
+        )
         self._snapshot = LiveSnapshot(
             MidpointHistory(), MidpointHistory(), QuoteHistory(), None,
             None, None, None, None, None, None, None, None, None,
@@ -150,7 +159,46 @@ class LiveMarketState:
                 self._snapshot.event_session, self._snapshot.option_observation,
                 self._snapshot.option_surface,
             )
+            self._refresh_g2(event_epoch)
         return True
+
+    def accept_g2_price(self, *, asset: str, price: float, event_epoch: float) -> bool:
+        """Accept a validated BTC or NDX observation without affecting ATOM."""
+
+        values = (price, event_epoch)
+        if (asset not in ("BTC", "NDX") or
+                any(isinstance(value, bool) or not isinstance(value, (int, float))
+                    for value in values)):
+            return False
+        price, event_epoch = map(float, values)
+        if not math.isfinite(price) or price <= 0 or not math.isfinite(event_epoch):
+            return False
+        with self._lock:
+            history = self._btc_history if asset == "BTC" else self._ndx_history
+            try:
+                updated = append_bounded(history, MidpointObservation(event_epoch, price))
+            except ValueError:
+                return False
+            if asset == "BTC":
+                self._btc_history = updated
+            else:
+                self._ndx_history = updated
+            self._refresh_g2(event_epoch)
+        return True
+
+    def _refresh_g2(self, event_epoch: float) -> None:
+        cutoff = max(self._g2_state.as_of_epoch, event_epoch)
+        self._g2_state = synchronize(
+            as_of_epoch=cutoff, btc=self._btc_history,
+            coin=self._snapshot.history, qqq=self._snapshot.qqq_history,
+            ndx=self._ndx_history,
+        )
+
+    def cross_asset_state(self) -> CrossAssetState:
+        """Return the latest already-maintained immutable G2-A state."""
+
+        with self._lock:
+            return self._g2_state
 
     def accept_quote(
         self, *, bid: float, ask: float, event_epoch: float,
@@ -239,6 +287,7 @@ class LiveMarketState:
                     observation_midpoint=observation.midpoint,
                 )
             self._snapshot = next_snapshot
+            self._refresh_g2(event_epoch)
         return True
 
     def snapshot(self) -> LiveSnapshot:
@@ -326,8 +375,45 @@ def poll_alpaca(state: LiveMarketState, *, interval: float = 1.0) -> None:
         time.sleep(interval)
 
 
+def poll_alpaca_g2(state: LiveMarketState, *, interval: float = 1.0) -> None:
+    """Maintain independent BTC and NDX inputs without blocking the ATOM cycle."""
+
+    headers = {
+        "APCA-API-KEY-ID": os.environ["ALPACA_API_KEY"],
+        "APCA-API-SECRET-KEY": os.environ["ALPACA_SECRET_KEY"],
+    }
+    while True:
+        for asset, url in (
+            ("BTC", ALPACA_BTC_LATEST_QUOTE_URL),
+            ("NDX", ALPACA_NDX_SNAPSHOT_URL),
+        ):
+            try:
+                with urlopen(Request(url, headers=headers), timeout=10) as response:
+                    payload = json.load(response)
+                if asset == "BTC":
+                    item = payload["quotes"]["BTC/USD"]
+                    price = (float(item["bp"]) + float(item["ap"])) / 2.0
+                    event_epoch = parse_alpaca_timestamp(item["t"])
+                else:
+                    item = payload["snapshots"]["NDX"]["latestTrade"]
+                    price = float(item["p"])
+                    event_epoch = parse_alpaca_timestamp(item["t"])
+                state.accept_g2_price(
+                    asset=asset, price=price, event_epoch=event_epoch,
+                )
+            except Exception as error:
+                print(f"Alpaca {asset} quote poll failed: {error}", flush=True)
+        time.sleep(interval)
+
+
 def start_alpaca_poller(state: LiveMarketState) -> threading.Thread:
     thread = threading.Thread(target=poll_alpaca, args=(state,), daemon=True)
+    thread.start()
+    return thread
+
+
+def start_alpaca_g2_poller(state: LiveMarketState) -> threading.Thread:
+    thread = threading.Thread(target=poll_alpaca_g2, args=(state,), daemon=True)
     thread.start()
     return thread
 
@@ -343,4 +429,5 @@ def start_alpaca_options_poller(state: LiveMarketState) -> threading.Thread:
 
 
 __all__ = ["LiveMarketState", "LiveSnapshot", "parse_alpaca_timestamp", "poll_alpaca",
-           "start_alpaca_options_poller", "start_alpaca_poller"]
+           "poll_alpaca_g2", "start_alpaca_g2_poller", "start_alpaca_options_poller",
+           "start_alpaca_poller"]

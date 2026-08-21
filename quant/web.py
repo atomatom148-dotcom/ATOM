@@ -14,8 +14,8 @@ from wsgiref.simple_server import make_server
 
 from .history import MidpointHistory
 from .evidence import EvidenceStore, PostgresEvidenceStore
-from .live_market import (LiveMarketState, LiveSnapshot, start_alpaca_options_poller,
-                          start_alpaca_poller)
+from .live_market import (LiveMarketState, LiveSnapshot, start_alpaca_g2_poller,
+                          start_alpaca_options_poller, start_alpaca_poller)
 from .q1_momentum import calculate_momentum
 from .q2_mean_reversion import calculate_mean_reversion
 from .q3_volatility import calculate_volatility
@@ -371,6 +371,15 @@ def create_app(
 
     def application(environ: dict[str, object], start_response: Callable) -> list[bytes]:
         path = environ.get("PATH_INFO", "")
+        if path == "/api/g2-cross-asset":
+            value = state.cross_asset_state() if state is not None else None
+            body = json.dumps(
+                asdict(value) if value is not None else None,
+                separators=(",", ":"), allow_nan=False,
+            ).encode()
+            start_response("200 OK", [("Content-Type", "application/json"),
+                                      ("Content-Length", str(len(body)))])
+            return [body]
         if path == "/api/v9-math":
             enabled = os.environ.get("V9_MATH_CORE_ENABLED", "false").lower() == "true"
             telemetry = latest_v9_observation() if enabled else None
@@ -439,6 +448,7 @@ def main() -> None:
     evidence_store = PostgresEvidenceStore(os.environ["DATABASE_URL"])
     state = LiveMarketState(evidence_store=evidence_store)
     start_alpaca_poller(state)
+    start_alpaca_g2_poller(state)
     start_alpaca_options_poller(state)
     app = create_app(state=state, evidence_store=evidence_store)
     with make_server(args.host, args.port, app) as server:
