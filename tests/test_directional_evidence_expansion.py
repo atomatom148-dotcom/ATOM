@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from quant.evidence import HORIZONS, HORIZON_SECONDS, records_for_results
 from quant.live_market import LiveMarketState
+from quant.q3_volatility import VolatilityResult
 
 
 DIRECTIONAL_QUANTS = (
@@ -71,8 +72,13 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
             "quant.live_market",
             **{name: Mock(return_value=value)
                for name, value in directional_results.items()},
-        ), patch("quant.live_market.calculate_volatility",
-                 return_value=result("q3_volatility")):
+        ), patch(
+            "quant.live_market.calculate_volatility",
+            return_value=VolatilityResult(
+                "q3_volatility", "realized-volatility-v1", 1.0,
+                (1, 2, 3, 4, 5, 6),
+            ),
+        ):
             state = LiveMarketState(clock=lambda: 2.0, evidence_store=store)
             self.assertTrue(state.accept_quote(bid=100, ask=102, event_epoch=1))
 

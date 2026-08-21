@@ -42,6 +42,31 @@ def store_with(cursor):
 
 
 class PhaseEStoreTests(unittest.TestCase):
+    def test_volatility_cohorts_use_move_size_metrics_without_direction(self):
+        metrics = ((
+            "q3_volatility", "realized-volatility-v1", "COIN", "30S",
+            3, 2, 1, .5, 4.0, None, 3.0, 2.0,
+        ),)
+        resolved = ((
+            "q3_volatility", "realized-volatility-v1", "COIN", "30S", 0, 1,
+        ),)
+        cursor = Cursor(metrics, resolved)
+
+        values = store_with(cursor).volatility_phase_e_cohorts(100.0)
+
+        self.assertEqual(values, (
+            PhaseECohortMetrics(
+                "q3_volatility", "realized-volatility-v1", "COIN", "30S",
+                3, 2, 1, .5, 4.0, None, 3.0, 2.0, 1, False,
+            ),
+        ))
+        metric_sql, metric_parameters = cursor.executions[0]
+        self.assertIn("FROM volatility_forecasts AS f", metric_sql)
+        self.assertIn("o.realized_move_bps", metric_sql)
+        self.assertIn("NULL::double precision AS directional_accuracy", metric_sql)
+        self.assertNotIn("outcome_bps", metric_sql)
+        self.assertEqual(metric_parameters, (100.0,) * 12)
+
     def test_result_is_frozen_and_exact_cohort_fields_are_preserved(self):
         cursor = Cursor((
             ("q1", "v1", "COIN", "30S", 3, 2, 1, .5, 4.25, 1.0, 4.0, 2.0),

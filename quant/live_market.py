@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 from .history import MidpointHistory, MidpointObservation
 from .g2_cross_asset import CrossAssetState, append_bounded, synchronize
 from .quote_history import QuoteHistory, QuoteObservation
-from .evidence import EvidenceStore, records_for_results
+from .evidence import EvidenceStore, records_for_results, records_for_volatility
 from .q1_momentum import MomentumResult, calculate_momentum
 from .q2_mean_reversion import MeanReversionResult, calculate_mean_reversion
 from .q3_volatility import VolatilityResult, calculate_volatility
@@ -286,9 +286,16 @@ class LiveMarketState:
                     cutoff_epoch=event_epoch, cutoff_midpoint=observation.midpoint,
                     created_epoch=cycle,
                 )
+                volatility_forecasts = records_for_volatility(
+                    result=next_snapshot.volatility,
+                    cycle_id=f"COIN:{event_epoch:.9f}", symbol="COIN",
+                    cutoff_epoch=event_epoch, cutoff_midpoint=observation.midpoint,
+                    created_epoch=cycle,
+                )
                 self._evidence_store.record_cycle_and_resolve(
                     forecasts, observation_epoch=event_epoch,
                     observation_midpoint=observation.midpoint,
+                    volatility_forecasts=volatility_forecasts,
                 )
             self._snapshot = next_snapshot
             self._refresh_g2(event_epoch)
