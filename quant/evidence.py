@@ -10,6 +10,8 @@ from typing import Protocol, Sequence
 HORIZONS = ("30S", "1M", "5M", "15M", "30M", "1H")
 HORIZON_SECONDS = (30, 60, 300, 900, 1800, 3600)
 MIN_EFFECTIVE_N = 20
+DATA_SCHEMA_VERSION = "atom-market-input-v1"
+SOURCE_SPEC_VERSION = "alpaca-market-data-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +26,8 @@ class ForecastRecord:
     cutoff_midpoint: float
     forecast_bps: float
     created_epoch: float
+    data_schema_version: str = DATA_SCHEMA_VERSION
+    source_spec_version: str = SOURCE_SPEC_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,8 +116,9 @@ class PostgresEvidenceStore:
                     INSERT INTO forecasts
                         (quant_id, formula_version, cycle_id, symbol, horizon,
                          cutoff_epoch, maturity_epoch, cutoff_midpoint,
-                         forecast_bps, created_epoch)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         forecast_bps, created_epoch, data_schema_version,
+                         source_spec_version)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT
                         (quant_id, formula_version, cycle_id, symbol, horizon)
                     DO NOTHING
@@ -123,6 +128,7 @@ class PostgresEvidenceStore:
                         row.symbol, row.horizon, row.cutoff_epoch,
                         row.maturity_epoch, row.cutoff_midpoint,
                         row.forecast_bps, row.created_epoch,
+                        row.data_schema_version, row.source_spec_version,
                     ) for row in forecasts],
                 )
 
@@ -278,6 +284,7 @@ def records_for_results(*, results: Sequence[object], cycle_id: str,
 
 
 __all__ = [
-    "EvidenceStore", "ForecastRecord", "MIN_EFFECTIVE_N", "PhaseECohortMetrics",
-    "PostgresEvidenceStore", "records_for_results",
+    "DATA_SCHEMA_VERSION", "EvidenceStore", "ForecastRecord", "MIN_EFFECTIVE_N",
+    "PhaseECohortMetrics", "PostgresEvidenceStore", "SOURCE_SPEC_VERSION",
+    "records_for_results",
 ]
