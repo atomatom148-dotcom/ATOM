@@ -330,7 +330,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
         }}));
         return row;
       }}));
-    }}));
+    }});
   }};
   const renderEvidence = data => {{
     Object.entries(data.evidence).forEach(([name, value]) =>
