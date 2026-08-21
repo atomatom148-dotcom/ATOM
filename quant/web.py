@@ -433,6 +433,13 @@ def create_app(
             start_response(status, [("Content-Type", content_type),
                                     ("Content-Length", str(len(body)))])
             return [body]
+        if path not in ("/", "/api/dashboard"):
+            body = b"Not Found"
+            start_response("404 Not Found", [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+            ])
+            return [body]
         as_of_epoch = clock()
         snapshot = state.snapshot() if state is not None else None
         counts = evidence_store.counts() if evidence_store is not None else None
@@ -449,8 +456,6 @@ def create_app(
             status, content_type, body = "200 OK", "text/html; charset=utf-8", dashboard_page(data)
         elif path == "/api/dashboard":
             status, content_type, body = "200 OK", "application/json", json.dumps(data, separators=(",", ":"), allow_nan=False).encode()
-        else:
-            status, content_type, body = "404 Not Found", "text/plain; charset=utf-8", b"Not Found"
         start_response(status, [("Content-Type", content_type), ("Content-Length", str(len(body)))])
         return [body]
 
