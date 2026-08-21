@@ -2,9 +2,11 @@ import math
 import unittest
 
 from quant.evidence import (
+    DATA_SCHEMA_VERSION,
     EvidenceStore,
     ForecastRecord,
     PostgresEvidenceStore,
+    SOURCE_SPEC_VERSION,
     records_for_results,
 )
 from quant.live_market import LiveMarketState
@@ -257,6 +259,7 @@ class LiveEvidenceTests(unittest.TestCase):
 
             def executemany(self, statement, parameters):
                 normalized = " ".join(statement.split())
+                self.forecast_statement = normalized
                 conflict_clause = (
                     "ON CONFLICT (quant_id, formula_version, cycle_id, "
                     "symbol, horizon) DO NOTHING"
@@ -313,7 +316,13 @@ class LiveEvidenceTests(unittest.TestCase):
         authoritative_forecast_id, authoritative_values = cursor.forecasts[identity]
         self.assertEqual(authoritative_forecast_id, first_forecast_id)
         self.assertEqual(authoritative_values, first_values)
-        self.assertEqual(authoritative_values[5:], (100, 130, 100, 5, 101))
+        self.assertEqual(
+            authoritative_values[5:],
+            (100, 130, 100, 5, 101,
+             DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION),
+        )
+        self.assertIn("data_schema_version", cursor.forecast_statement)
+        self.assertIn("source_spec_version", cursor.forecast_statement)
         self.assertEqual(len(cursor.outcomes), 1)
         outcome = cursor.outcomes[first_forecast_id]
         self.assertEqual(outcome[0], 110)
