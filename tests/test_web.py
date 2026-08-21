@@ -160,7 +160,10 @@ class WebSurfaceTests(unittest.TestCase):
 
     @patch("quant.web.Thread", new=ImmediateThread)
     def test_phase_e_dashboard_mapping_order_format_and_raw_precision(self):
-        quant_ids = tuple(PHASE_E_FAMILY_NAMES)
+        quant_ids = tuple(
+            quant_id for quant_id in PHASE_E_FAMILY_NAMES
+            if quant_id != "q3_volatility"
+        )
         cohorts = tuple(
             PhaseECohortMetrics(
                 quant_id, "v1", "COIN", "1H" if index == 0 else "30S",
@@ -175,7 +178,10 @@ class WebSurfaceTests(unittest.TestCase):
             def counts(self): return (123, 98)
             def phase_e_cohorts(self, as_of):
                 self.phase_calls.append(as_of)
-                return cohorts + (PhaseECohortMetrics(
+                return cohorts
+            def volatility_phase_e_cohorts(self, as_of):
+                self.phase_calls.append(as_of)
+                return (PhaseECohortMetrics(
                     "q3_volatility", "v1", "COIN", "30S", 1, 1, 1,
                     1.0, 0.0, None, None, None, 1, False,
                 ),)
@@ -186,10 +192,10 @@ class WebSurfaceTests(unittest.TestCase):
         payload = json.loads(request(app, "/api/dashboard")["body"])
         rows = payload["phase_e_cohorts"]
 
-        self.assertEqual(store.phase_calls, [456.75])
+        self.assertEqual(store.phase_calls, [456.75, 456.75])
         self.assertEqual(payload["evidence"], {"Forecasts": 123, "Resolved": 98})
         self.assertEqual([row["family"] for row in rows], list(PHASE_E_FAMILY_NAMES.values()))
-        self.assertNotIn("q3_volatility", [row["quant_id"] for row in rows])
+        self.assertIn("q3_volatility", [row["quant_id"] for row in rows])
         self.assertEqual(rows[0]["directional_accuracy"], 0.514)
         self.assertEqual(rows[0]["coverage"], 0.999123)
         self.assertEqual(rows[0]["rmse_bps"], 2.3456)
