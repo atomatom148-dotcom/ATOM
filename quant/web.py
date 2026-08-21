@@ -18,6 +18,7 @@ from .live_market import (LiveMarketState, LiveSnapshot, start_alpaca_options_po
 from .q1_momentum import calculate_momentum
 from .q2_mean_reversion import calculate_mean_reversion
 from .q3_volatility import calculate_volatility
+from .v9_telemetry import latest_v9_observation
 
 
 HORIZON_LABELS = ("30S", "1M", "5M", "15M", "30M", "60M")
@@ -299,6 +300,23 @@ def create_app(
 
     def application(environ: dict[str, object], start_response: Callable) -> list[bytes]:
         path = environ.get("PATH_INFO", "")
+        if path == "/api/v9-math":
+            enabled = os.environ.get("V9_MATH_CORE_ENABLED", "false").lower() == "true"
+            telemetry = latest_v9_observation() if enabled else None
+            body = json.dumps({
+                "enabled": enabled,
+                "status": telemetry.status if telemetry else (
+                    "NO_OBSERVATION_YET" if enabled else "DISABLED"
+                ),
+                "family_count": telemetry.family_count if telemetry else 0,
+                "non_null_variable_count": (
+                    telemetry.non_null_variable_count if telemetry else 0
+                ),
+                "as_of_epoch": telemetry.as_of_epoch if telemetry else None,
+            }, separators=(",", ":"), allow_nan=False).encode()
+            start_response("200 OK", [("Content-Type", "application/json"),
+                                      ("Content-Length", str(len(body)))])
+            return [body]
         if path == "/api/phase-e":
             if evidence_store is None:
                 status, content_type, body = (

@@ -29,6 +29,7 @@ from .q10_options_vol import (OptionObservation, OptionSurface, OptionsVolResult
 from .q11_regime import RegimeResult, calculate_regime
 from .q12_event_session import EventSessionResult, calculate_event_session
 from .v9_math_core import V9MathCore, V9MathInput, V9QuantFamily
+from .v9_telemetry import record_v9_observation
 
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
@@ -71,9 +72,11 @@ def _observe_v9(snapshot: "LiveSnapshot", *, symbol: str, as_of_epoch: float) ->
     if not v9_math_core_enabled():
         return
     try:
-        V9MathCore.evaluate(build_v9_quant_snapshot(
+        value = build_v9_quant_snapshot(
             snapshot, symbol=symbol, as_of_epoch=as_of_epoch,
-        ))
+        )
+        state = V9MathCore.evaluate(value)
+        record_v9_observation(value, state)
     except Exception:
         # V9 is downstream and observer-only; its failure cannot fail the cycle.
         return
