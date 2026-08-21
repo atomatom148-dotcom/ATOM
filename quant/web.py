@@ -44,6 +44,7 @@ OPTION_FIELDS = (
 PHASE_E_FAMILY_NAMES = {
     "q1_momentum": "Momentum",
     "q2_mean_reversion": "Mean Reversion",
+    "q3_volatility": "Volatility",
     "q4_stat_arb": "Stat Arb",
     "q5_microstructure": "Microstructure",
     "q6_volume_liquidity": "Volume/Liquidity",
@@ -351,10 +352,19 @@ def create_app(
     phase_e_refreshing = False
     phase_e_cache_lock = Lock()
 
+    def all_phase_e_cohorts(as_of_epoch: float) -> tuple[object, ...]:
+        cohorts = tuple(evidence_store.phase_e_cohorts(as_of_epoch))
+        volatility_reader = getattr(
+            evidence_store, "volatility_phase_e_cohorts", None,
+        )
+        if callable(volatility_reader):
+            cohorts += tuple(volatility_reader(as_of_epoch))
+        return cohorts
+
     def refresh_phase_e(as_of_epoch: float, cache_time: float) -> None:
         nonlocal phase_e_cache, phase_e_cache_time, phase_e_refreshing
         try:
-            refreshed = tuple(evidence_store.phase_e_cohorts(as_of_epoch))
+            refreshed = all_phase_e_cohorts(as_of_epoch)
         except Exception:
             refreshed = None
         with phase_e_cache_lock:
@@ -424,7 +434,7 @@ def create_app(
                 )
             else:
                 as_of_epoch = clock()
-                cohorts = evidence_store.phase_e_cohorts(as_of_epoch)
+                cohorts = all_phase_e_cohorts(as_of_epoch)
                 body = json.dumps({
                     "as_of_epoch": as_of_epoch,
                     "cohorts": [asdict(cohort) for cohort in cohorts],
