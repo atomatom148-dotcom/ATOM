@@ -2,7 +2,7 @@ import json
 import unittest
 
 from quant.live_market import (
-    ALPACA_NDX_LATEST_BAR_URL, LiveMarketState, parse_alpaca_ndx_bar,
+    ALPACA_NDX_LATEST_VALUE_URL, LiveMarketState, parse_alpaca_ndx_value,
     parse_alpaca_timestamp,
 )
 from quant.web import create_app
@@ -74,18 +74,15 @@ class LiveMarketTests(unittest.TestCase):
     def test_alpaca_event_timestamp_parser(self):
         self.assertEqual(parse_alpaca_timestamp("1970-01-01T00:00:01Z"), 1.0)
 
-    def test_alpaca_ndx_latest_bar_contract_preserves_price_and_event_time(self):
+    def test_alpaca_ndx_latest_value_contract_preserves_value_and_event_time(self):
         self.assertEqual(
-            ALPACA_NDX_LATEST_BAR_URL,
-            "https://data.alpaca.markets/v1beta1/indices/bars/latest?symbols=NDX",
+            ALPACA_NDX_LATEST_VALUE_URL,
+            "https://data.alpaca.markets/v1beta1/indices/latest/values?index_symbols=NDX",
         )
-        price, event_epoch = parse_alpaca_ndx_bar({
-            "bars": {
+        price, event_epoch = parse_alpaca_ndx_value({
+            "values": {
                 "NDX": {
-                    "c": 23_812.125,
-                    "h": 23_815.0,
-                    "l": 23_800.0,
-                    "o": 23_805.0,
+                    "v": 23_812.125,
                     "t": "2026-08-21T14:30:05.123456Z",
                 },
             },
@@ -96,21 +93,30 @@ class LiveMarketTests(unittest.TestCase):
             parse_alpaca_timestamp("2026-08-21T14:30:05.123456Z"),
         )
 
-    def test_malformed_or_unavailable_alpaca_ndx_bar_is_rejected(self):
+    def test_malformed_or_unavailable_alpaca_ndx_value_is_rejected(self):
         malformed = (
             None,
             {},
-            {"bars": {}},
-            {"bars": {"NDX": None}},
-            {"bars": {"NDX": {"t": "2026-08-21T14:30:05Z"}}},
-            {"bars": {"NDX": {"c": "bad", "t": "2026-08-21T14:30:05Z"}}},
-            {"bars": {"NDX": {"c": 23_812.125, "t": "bad"}}},
+            {"values": {}},
+            {"values": {"NDX": None}},
+            {"values": {"NDX": {"t": "2026-08-21T14:30:05Z"}}},
+            {"values": {"NDX": {"v": "23812.125", "t": "2026-08-21T14:30:05Z"}}},
+            {"values": {"NDX": {"v": 23_812.125, "t": "bad"}}},
         )
         for payload in malformed:
             with self.subTest(payload=payload), self.assertRaises(
                 (KeyError, TypeError, ValueError),
             ):
-                parse_alpaca_ndx_bar(payload)
+                parse_alpaca_ndx_value(payload)
+
+    def test_future_ndx_provider_timestamp_is_not_synchronized(self):
+        state = LiveMarketState(clock=lambda: 100.0)
+        self.assertFalse(
+            state.accept_g2_price(asset="NDX", price=23_812.125, event_epoch=100.001)
+        )
+        value = state.cross_asset_state()
+        self.assertIsNone(value.ndx_price)
+        self.assertIsNone(value.ndx_age_seconds)
 
 
 if __name__ == "__main__":
