@@ -68,7 +68,7 @@ class OptionsVolTests(unittest.TestCase):
         self.assertIsNone(calculate_options_vol())
         payload = dashboard_data()
         self.assertEqual(payload["quant_families"][9]["values"], [None] * 6)
-        self.assertTrue(all(value is None for value in payload["options_data"].values()))
+        self.assertEqual(payload["options_data"], {"expiration": None, "calls": [], "puts": []})
 
     def test_deterministic_means_asymmetries_and_equal_weighting(self):
         result = calculate_options_vol(self.surface(), cutoff_epoch=100)
@@ -147,8 +147,54 @@ class OptionsVolTests(unittest.TestCase):
         payload = dashboard_data(snapshot=snapshot)
         self.assertEqual(payload["quant_families"][9]["values"],
                          list(snapshot.options_vol.forecast_bps))
-        self.assertEqual(payload["options_data"]["Strike"], 200)
-        self.assertEqual(payload["options_data"]["Gamma"], .01)
+        self.assertEqual(payload["options_data"]["calls"][0]["Strike"], 200)
+        self.assertEqual(payload["options_data"]["calls"][0]["Gamma"], .01)
+
+    def test_dashboard_options_read_model_is_nearest_five_per_side(self):
+        calls = tuple(option(contract_symbol=f"CALL-{strike}", strike=strike,
+                             expiration="1970-01-02")
+                      for strike in (190, 195, 199, 201, 205))
+        puts = tuple(option(contract_symbol=f"PUT-{strike}", strike=strike,
+                            expiration="1970-01-02")
+                     for strike in (190, 195, 199, 201, 205))
+        surface = OptionSurface(100, "1970-01-02", calls, puts)
+        state = LiveMarketState(clock=lambda: 100)
+        state.accept_option_surface(surface, midpoint=200)
+        self.assertTrue(state.accept_quote(bid=199, ask=201, event_epoch=100))
+
+        options = dashboard_data(snapshot=state.snapshot())["options_data"]
+
+        self.assertEqual(options["expiration"], "1970-01-02")
+        self.assertEqual([row["Strike"] for row in options["calls"]], [199, 201, 195, 205, 190])
+        self.assertEqual([row["Strike"] for row in options["puts"]], [199, 201, 195, 205, 190])
+        self.assertEqual(len(options["calls"]), 5)
+        self.assertEqual(len(options["puts"]), 5)
+        self.assertTrue(all(row["Symbol"].startswith("CALL-") for row in options["calls"]))
+        self.assertTrue(all(row["Symbol"].startswith("PUT-") for row in options["puts"]))
+        expected_fields = {"Symbol", "Strike", "Expiration", "Premium", "IV", "Delta",
+                           "Gamma", "Theta", "Vega", "Bid", "Ask", "Spread"}
+        self.assertTrue(all(set(row) == expected_fields
+                            for row in options["calls"] + options["puts"]))
+
+    def test_dashboard_options_partial_and_duplicate_strikes_are_honest(self):
+        calls = (
+            option(contract_symbol="CALL-A", strike=199, premium=None,
+                   implied_volatility=None, delta=None, gamma=None, theta=None, vega=None,
+                   bid=None, ask=None),
+            option(contract_symbol="CALL-B", strike=199),
+            option(contract_symbol="CALL-C", strike=205),
+        )
+        puts = (option(contract_symbol="PUT-A", strike=198),)
+        state = LiveMarketState()
+        state.accept_option_surface(OptionSurface(100, "1970-01-02", calls, puts), midpoint=200)
+        self.assertTrue(state.accept_quote(bid=199, ask=201, event_epoch=100))
+
+        options = dashboard_data(snapshot=state.snapshot())["options_data"]
+
+        self.assertEqual([row["Symbol"] for row in options["calls"]], ["CALL-A", "CALL-C"])
+        self.assertEqual([row["Symbol"] for row in options["puts"]], ["PUT-A"])
+        for field in ("Premium", "IV", "Delta", "Gamma", "Theta", "Vega", "Bid", "Ask", "Spread"):
+            self.assertIsNone(options["calls"][0][field])
 
     def test_live_cycle_leaves_q10_row_blank_for_stale_surface(self):
         state = LiveMarketState(clock=lambda: 131)

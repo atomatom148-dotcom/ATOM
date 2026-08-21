@@ -38,7 +38,7 @@ FAMILY_NAMES = (
     "Event/Session",
 )
 OPTION_FIELDS = (
-    "Strike", "Expiration", "Premium", "IV", "Delta", "Gamma",
+    "Symbol", "Strike", "Expiration", "Premium", "IV", "Delta", "Gamma",
     "Theta", "Vega", "Bid", "Ask", "Spread",
 )
 PHASE_E_FAMILY_NAMES = {
@@ -104,16 +104,38 @@ def dashboard_data(
         }
         for index, name in enumerate(FAMILY_NAMES)
     ]
-    option = snapshot.option_observation if snapshot else None
-    options_data = {field: None for field in OPTION_FIELDS}
-    if option is not None:
-        options_data.update({
-            "Strike": option.strike, "Expiration": option.expiration,
-            "Premium": option.premium, "IV": option.implied_volatility,
-            "Delta": option.delta, "Gamma": option.gamma, "Theta": option.theta,
-            "Vega": option.vega, "Bid": option.bid, "Ask": option.ask,
-            "Spread": option.spread,
-        })
+    surface = snapshot.option_surface if snapshot else None
+    midpoint = history.latest.midpoint if history.latest else None
+
+    def option_rows(observations: Iterable[object]) -> list[dict[str, object]]:
+        """Build a detached display slice without changing the Q10 surface."""
+
+        ordered = sorted(
+            observations,
+            key=lambda item: (abs(item.strike - midpoint), item.strike, item.contract_symbol),
+        ) if midpoint is not None else list(observations)
+        rows: list[dict[str, object]] = []
+        strikes: set[float] = set()
+        for option in ordered:
+            if option.strike in strikes:
+                continue
+            strikes.add(option.strike)
+            rows.append({
+                "Symbol": option.contract_symbol, "Strike": option.strike,
+                "Expiration": option.expiration, "Premium": option.premium,
+                "IV": option.implied_volatility, "Delta": option.delta,
+                "Gamma": option.gamma, "Theta": option.theta, "Vega": option.vega,
+                "Bid": option.bid, "Ask": option.ask, "Spread": option.spread,
+            })
+            if len(rows) == 5:
+                break
+        return rows
+
+    options_data = {
+        "expiration": surface.expiration if surface else None,
+        "calls": option_rows(surface.calls) if surface else [],
+        "puts": option_rows(surface.puts) if surface else [],
+    }
     family_order = {quant_id: index for index, quant_id in enumerate(PHASE_E_FAMILY_NAMES)}
     horizon_order = {horizon: index for index, horizon in enumerate(PHASE_E_HORIZONS)}
     visible_cohorts = sorted(
@@ -215,6 +237,18 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     phase_e_table = ("<div class=scroll><table><thead><tr>" +
                      "".join(f"<th>{header}</th>" for header in phase_e_headers) +
                      f"</tr></thead><tbody id=phase-e-body>{phase_e_body}</tbody></table></div>")
+    option_columns = ("Symbol", "Strike", "Bid", "Ask", "Premium", "IV", "Delta",
+                      "Gamma", "Theta", "Vega", "Spread")
+    def option_table(side: str) -> str:
+        body = "".join(
+            "<tr>" + "".join(
+                f'<td data-dashboard-field="options_data.{side}.{row_index}.{field}">{_cell(row[field])}</td>'
+                for field in option_columns
+            ) + "</tr>"
+            for row_index, row in enumerate(options[side])
+        )
+        headers = "".join(f"<th>{field}</th>" for field in option_columns)
+        return f"<h3>{side.upper()}</h3><div class=scroll><table><thead><tr>{headers}</tr></thead><tbody id=options-{side}>{body}</tbody></table></div>"
     document = f"""<!doctype html>
 <html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>ATOM QUANT</title><style>
@@ -226,7 +260,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
 <div><div class=label>DATA AGE</div><div class=value data-dashboard-field="market.data_age">{_decimal_cell(market['data_age'], 's')}</div></div><div><div class=label>LAST CYCLE</div><div class=value data-dashboard-field="market.last_cycle">{_cycle_cell(market['last_cycle'])}</div></div></div>
 <h2>FINAL NUMBERS</h2>{_table(horizons, final_numbers.items(), section='final_numbers', decimal=True)}
 <h2>12 QUANT FAMILIES</h2>{_table(horizons, ((item['name'], item['values']) for item in families), section='quant_families', decimal=True)}
-<h2>OPTIONS DATA</h2>{_table((), ((key, (value,)) for key, value in options.items()), section='options_data')}
+<h2>OPTIONS DATA</h2><div>EXPIRATION: <span data-dashboard-field="options_data.expiration">{_cell(options['expiration'])}</span></div>{option_table('calls')}{option_table('puts')}
 <h2>EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in evidence.items()), section='evidence')}{phase_e_table}
 </main><script>
 (() => {{
@@ -256,8 +290,20 @@ def dashboard_page(data: dict[str, object]) -> bytes:
       values.forEach((value, index) => set(`final_numbers.${{name}}.${{index}}`, value, decimal)));
     data.quant_families.forEach(family => family.values.forEach((value, index) =>
       set(`quant_families.${{family.name}}.${{index}}`, value, decimal)));
-    Object.entries(data.options_data).forEach(([name, value]) =>
-      set(`options_data.${{name}}.0`, value));
+    set("options_data.expiration", data.options_data.expiration);
+    ["calls", "puts"].forEach(side => {{
+      const body = document.getElementById(`options-${{side}}`);
+      const fields = {json.dumps(list(option_columns))};
+      body.replaceChildren(...data.options_data[side].map(contract => {{
+        const row = document.createElement("tr");
+        row.replaceChildren(...fields.map(field => {{
+          const cell = document.createElement("td");
+          cell.textContent = text(contract[field]);
+          return cell;
+        }}));
+        return row;
+      }}));
+    }}));
     Object.entries(data.evidence).forEach(([name, value]) =>
       set(`evidence.${{name}}.0`, value));
     const phaseEBody = document.getElementById("phase-e-body");

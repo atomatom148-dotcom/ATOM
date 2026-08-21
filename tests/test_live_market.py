@@ -66,7 +66,7 @@ class LiveMarketTests(unittest.TestCase):
         self.assertTrue(all(value is None for family in after["quant_families"][:3] for value in family["values"]))
         self.assertTrue(all(family["values"] == [None] * 6 for family in after["quant_families"][3:]))
         self.assertTrue(all(values == [None] * 6 for values in after["final_numbers"].values()))
-        self.assertTrue(all(value is None for value in after["options_data"].values()))
+        self.assertEqual(after["options_data"], {"expiration": None, "calls": [], "puts": []})
 
     def test_alpaca_event_timestamp_parser(self):
         self.assertEqual(parse_alpaca_timestamp("1970-01-01T00:00:01Z"), 1.0)
