@@ -173,6 +173,42 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertAlmostEqual(first[1], 10_000 * math.log(1.1))
         self.assertEqual(first[2], 131)
 
+    def test_postgres_resolution_is_bounded_by_latest_resolved_epoch(self):
+        class Cursor:
+            def __init__(self):
+                self.statement = None
+
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+
+            def execute(self, statement, parameters):
+                self.statement = " ".join(statement.split())
+                self.parameters = parameters
+
+            def executemany(self, statement, parameters):
+                self.forecast_parameters = parameters
+
+        class Connection:
+            def __init__(self, cursor): self._cursor = cursor
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def cursor(self): return self._cursor
+
+        cursor = Cursor()
+        store = object.__new__(PostgresEvidenceStore)
+        store._database_url = "postgresql://test"
+        store._connect = lambda _: Connection(cursor)
+        store.record_cycle_and_resolve(
+            (), observation_epoch=131, observation_midpoint=110,
+        )
+
+        self.assertIn("max(resolved_epoch)", cursor.statement)
+        self.assertIn(
+            "f.maturity_epoch > watermark.resolved_epoch", cursor.statement,
+        )
+        self.assertIn("f.maturity_epoch <= %s", cursor.statement)
+        self.assertEqual(cursor.parameters, (110, 110, 131, 131))
+
     def test_postgres_duplicate_forecast_preserves_first_and_resolves(self):
         class Cursor:
             def __init__(self):

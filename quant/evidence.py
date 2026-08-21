@@ -82,13 +82,23 @@ class PostgresEvidenceStore:
                 # eligible observation seen by this single-process resolver.
                 cursor.execute(
                     """
+                    WITH resolution_watermark AS (
+                        SELECT COALESCE(
+                            max(resolved_epoch),
+                            '-Infinity'::double precision
+                        ) AS resolved_epoch
+                        FROM forecast_outcomes
+                    )
                     INSERT INTO forecast_outcomes
                         (forecast_id, maturity_midpoint, outcome_bps, resolved_epoch)
                     SELECT f.forecast_id, %s,
                            10000 * ln(%s / f.cutoff_midpoint), %s
                     FROM forecasts AS f
+                    CROSS JOIN resolution_watermark AS watermark
                     LEFT JOIN forecast_outcomes AS o USING (forecast_id)
-                    WHERE o.forecast_id IS NULL AND f.maturity_epoch <= %s
+                    WHERE o.forecast_id IS NULL
+                      AND f.maturity_epoch > watermark.resolved_epoch
+                      AND f.maturity_epoch <= %s
                     ON CONFLICT (forecast_id) DO NOTHING
                     """,
                     (observation_midpoint, observation_midpoint,
