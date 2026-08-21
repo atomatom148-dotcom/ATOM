@@ -35,7 +35,9 @@ from .v9_telemetry import record_v9_observation
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
 ALPACA_BTC_LATEST_QUOTE_URL = "https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes?symbols=BTC%2FUSD"
-ALPACA_NDX_LATEST_BAR_URL = "https://data.alpaca.markets/v1beta1/indices/bars/latest?symbols=NDX"
+ALPACA_NDX_LATEST_VALUE_URL = (
+    "https://data.alpaca.markets/v1beta1/indices/latest/values?index_symbols=NDX"
+)
 HISTORY_SECONDS = 3600.0
 
 
@@ -172,6 +174,8 @@ class LiveMarketState:
             return False
         price, event_epoch = map(float, values)
         if not math.isfinite(price) or price <= 0 or not math.isfinite(event_epoch):
+            return False
+        if asset == "NDX" and event_epoch > self._clock():
             return False
         with self._lock:
             history = self._btc_history if asset == "BTC" else self._ndx_history
@@ -339,18 +343,27 @@ def parse_alpaca_timestamp(value: str) -> float:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
 
 
-def parse_alpaca_ndx_bar(payload: object) -> tuple[float, float]:
-    """Return Alpaca's NDX latest-bar close and event timestamp."""
+def parse_alpaca_ndx_value(payload: object) -> tuple[float, float]:
+    """Return Alpaca's latest NDX index value and provider timestamp."""
 
     if not isinstance(payload, dict):
-        raise TypeError("NDX latest-bar response must be an object")
-    bars = payload.get("bars")
-    if not isinstance(bars, dict):
-        raise ValueError("NDX latest-bar response is missing bars")
-    item = bars.get("NDX")
+        raise TypeError("NDX latest-value response must be an object")
+    values = payload.get("values")
+    if not isinstance(values, dict):
+        raise ValueError("NDX latest-value response is missing values")
+    item = values.get("NDX")
     if not isinstance(item, dict):
-        raise ValueError("NDX latest-bar response is missing NDX")
-    return float(item["c"]), parse_alpaca_timestamp(item["t"])
+        raise ValueError("NDX latest-value response is missing NDX")
+    value = item.get("v")
+    timestamp = item.get("t")
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+            not isinstance(timestamp, str)):
+        raise ValueError("NDX latest-value response has invalid v or t")
+    value = float(value)
+    event_epoch = parse_alpaca_timestamp(timestamp)
+    if not math.isfinite(value) or value <= 0 or not math.isfinite(event_epoch):
+        raise ValueError("NDX latest-value response has invalid v or t")
+    return value, event_epoch
 
 
 def poll_alpaca(state: LiveMarketState, *, interval: float = 1.0) -> None:
@@ -399,7 +412,7 @@ def poll_alpaca_g2(state: LiveMarketState, *, interval: float = 1.0) -> None:
     while True:
         for asset, url in (
             ("BTC", ALPACA_BTC_LATEST_QUOTE_URL),
-            ("NDX", ALPACA_NDX_LATEST_BAR_URL),
+            ("NDX", ALPACA_NDX_LATEST_VALUE_URL),
         ):
             try:
                 with urlopen(Request(url, headers=headers), timeout=10) as response:
@@ -409,7 +422,7 @@ def poll_alpaca_g2(state: LiveMarketState, *, interval: float = 1.0) -> None:
                     price = (float(item["bp"]) + float(item["ap"])) / 2.0
                     event_epoch = parse_alpaca_timestamp(item["t"])
                 else:
-                    price, event_epoch = parse_alpaca_ndx_bar(payload)
+                    price, event_epoch = parse_alpaca_ndx_value(payload)
                 state.accept_g2_price(
                     asset=asset, price=price, event_epoch=event_epoch,
                 )
@@ -440,7 +453,7 @@ def start_alpaca_options_poller(state: LiveMarketState) -> threading.Thread:
     return thread
 
 
-__all__ = ["LiveMarketState", "LiveSnapshot", "parse_alpaca_ndx_bar",
+__all__ = ["LiveMarketState", "LiveSnapshot", "parse_alpaca_ndx_value",
            "parse_alpaca_timestamp", "poll_alpaca",
            "poll_alpaca_g2", "start_alpaca_g2_poller", "start_alpaca_options_poller",
            "start_alpaca_poller"]
