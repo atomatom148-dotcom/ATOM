@@ -43,6 +43,8 @@ MASSIVE_NDX_SNAPSHOT_URL = (
 )
 MAX_NDX_AGE_SECONDS = 10.0
 HISTORY_SECONDS = 3600.0
+MARKET_DISPLAY_FETCH_SECONDS = 0.25
+QUANT_CYCLE_SECONDS = 1.0
 
 
 def v9_math_core_enabled() -> bool:
@@ -113,6 +115,16 @@ class LiveSnapshot:
     option_surface: OptionSurface | None
 
 
+@dataclass(frozen=True, slots=True)
+class LatestMarketDisplay:
+    """Immutable provider-time values used only by the fast presentation path."""
+
+    coin_midpoint: float | None = None
+    coin_event_epoch: float | None = None
+    qqq_midpoint: float | None = None
+    qqq_event_epoch: float | None = None
+
+
 class LiveMarketState:
     """Thread-safe causal live state with separate COIN and QQQ histories."""
 
@@ -132,6 +144,50 @@ class LiveMarketState:
             None, None, None, None, None, None, None, None, None,
             None, None, None, None, None,
         )
+        self._market_display = LatestMarketDisplay()
+
+    def update_market_display(
+        self, *, coin_midpoint: float | None = None,
+        coin_event_epoch: float | None = None, qqq_midpoint: float | None = None,
+        qqq_event_epoch: float | None = None,
+    ) -> bool:
+        """Publish only valid values with provider timestamps newer than current."""
+
+        pairs = ((coin_midpoint, coin_event_epoch), (qqq_midpoint, qqq_event_epoch))
+        for midpoint, event_epoch in pairs:
+            if (midpoint is None) != (event_epoch is None):
+                return False
+            if midpoint is not None and (
+                    isinstance(midpoint, bool) or isinstance(event_epoch, bool) or
+                    not isinstance(midpoint, (int, float)) or
+                    not isinstance(event_epoch, (int, float)) or
+                    not math.isfinite(float(midpoint)) or float(midpoint) <= 0 or
+                    not math.isfinite(float(event_epoch))):
+                return False
+        changed = False
+        with self._lock:
+            current = self._market_display
+            coin_newer = (coin_event_epoch is not None and
+                          (current.coin_event_epoch is None or
+                           coin_event_epoch > current.coin_event_epoch))
+            qqq_newer = (qqq_event_epoch is not None and
+                         (current.qqq_event_epoch is None or
+                          qqq_event_epoch > current.qqq_event_epoch))
+            if coin_newer or qqq_newer:
+                self._market_display = LatestMarketDisplay(
+                    float(coin_midpoint) if coin_newer else current.coin_midpoint,
+                    float(coin_event_epoch) if coin_newer else current.coin_event_epoch,
+                    float(qqq_midpoint) if qqq_newer else current.qqq_midpoint,
+                    float(qqq_event_epoch) if qqq_newer else current.qqq_event_epoch,
+                )
+                changed = True
+        return changed
+
+    def market_display(self) -> LatestMarketDisplay:
+        """Return the current immutable display snapshot."""
+
+        with self._lock:
+            return self._market_display
 
     def accept_qqq_quote(self, *, bid: float, ask: float, event_epoch: float) -> bool:
         """Store one validated QQQ midpoint without inventing or resampling data."""
@@ -407,7 +463,10 @@ def parse_massive_ndx_snapshot(payload: object) -> tuple[float, float]:
     return value, event_epoch
 
 
-def poll_alpaca(state: LiveMarketState, *, interval: float = 1.0) -> None:
+def poll_alpaca(
+    state: LiveMarketState, *, interval: float = MARKET_DISPLAY_FETCH_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
     """Continuously fetch latest COIN and QQQ quotes in one Alpaca request."""
 
     api_key = os.environ["ALPACA_API_KEY"]
@@ -416,28 +475,44 @@ def poll_alpaca(state: LiveMarketState, *, interval: float = 1.0) -> None:
         "APCA-API-KEY-ID": api_key,
         "APCA-API-SECRET-KEY": secret_key,
     }
+    last_quant_cycle: float | None = None
     while True:
         try:
             request = Request(ALPACA_LATEST_QUOTES_URL, headers=headers)
             with urlopen(request, timeout=10) as response:
                 quotes = json.load(response)["quotes"]
             qqq = quotes.get("QQQ")
+            qqq_values = None
             if qqq is not None:
                 try:
-                    state.accept_qqq_quote(
-                        bid=qqq["bp"], ask=qqq["ap"],
-                        event_epoch=parse_alpaca_timestamp(qqq["t"]),
-                    )
+                    qqq_values = (float(qqq["bp"]), float(qqq["ap"]),
+                                  parse_alpaca_timestamp(qqq["t"]))
                 except (KeyError, TypeError, ValueError) as error:
                     print(f"Alpaca QQQ quote rejected: {error}", flush=True)
             quote = quotes["COIN"]
-            state.accept_quote(
-                bid=quote["bp"],
-                ask=quote["ap"],
-                bid_size=quote["bs"],
-                ask_size=quote["as"],
-                event_epoch=parse_alpaca_timestamp(quote["t"]),
+            coin_values = (float(quote["bp"]), float(quote["ap"]),
+                           parse_alpaca_timestamp(quote["t"]))
+            state.update_market_display(
+                coin_midpoint=(coin_values[0] + coin_values[1]) / 2.0,
+                coin_event_epoch=coin_values[2],
+                qqq_midpoint=((qqq_values[0] + qqq_values[1]) / 2.0
+                              if qqq_values else None),
+                qqq_event_epoch=qqq_values[2] if qqq_values else None,
             )
+            cycle_time = monotonic()
+            if (last_quant_cycle is None or
+                    cycle_time - last_quant_cycle >= QUANT_CYCLE_SECONDS):
+                last_quant_cycle = cycle_time
+                if qqq_values:
+                    state.accept_qqq_quote(
+                        bid=qqq_values[0], ask=qqq_values[1],
+                        event_epoch=qqq_values[2],
+                    )
+                state.accept_quote(
+                    bid=coin_values[0], ask=coin_values[1],
+                    bid_size=quote["bs"], ask_size=quote["as"],
+                    event_epoch=coin_values[2],
+                )
         except Exception as error:  # Keep web-process health independent of market data.
             print(f"Alpaca quote poll failed: {error}", flush=True)
         time.sleep(interval)
@@ -515,7 +590,8 @@ def start_alpaca_options_poller(state: LiveMarketState) -> threading.Thread:
     return thread
 
 
-__all__ = ["LiveMarketState", "LiveSnapshot", "parse_alpaca_ndx_value",
+__all__ = ["LatestMarketDisplay", "LiveMarketState", "LiveSnapshot",
+           "MARKET_DISPLAY_FETCH_SECONDS", "QUANT_CYCLE_SECONDS", "parse_alpaca_ndx_value",
            "parse_alpaca_timestamp", "parse_massive_ndx_snapshot", "poll_alpaca",
            "poll_alpaca_g2", "poll_massive_ndx", "start_alpaca_g2_poller",
            "start_alpaca_options_poller", "start_alpaca_poller",

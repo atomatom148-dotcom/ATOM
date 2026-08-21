@@ -1,13 +1,15 @@
 import json
+from dataclasses import FrozenInstanceError
 from io import BytesIO
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from quant.live_market import (
-    ALPACA_BTC_LATEST_QUOTE_URL, ALPACA_NDX_LATEST_VALUE_URL, LiveMarketState,
+    ALPACA_BTC_LATEST_QUOTE_URL, ALPACA_LATEST_QUOTES_URL,
+    ALPACA_NDX_LATEST_VALUE_URL, MARKET_DISPLAY_FETCH_SECONDS, LiveMarketState,
     MASSIVE_NDX_SNAPSHOT_URL, parse_alpaca_ndx_value, parse_alpaca_timestamp,
-    parse_massive_ndx_snapshot, poll_alpaca_g2, poll_massive_ndx,
+    parse_massive_ndx_snapshot, poll_alpaca, poll_alpaca_g2, poll_massive_ndx,
 )
 from quant.web import create_app
 
@@ -23,6 +25,60 @@ def request_json(app):
 
 
 class LiveMarketTests(unittest.TestCase):
+    def test_market_display_accepts_only_newer_provider_values_and_is_frozen(self):
+        state = LiveMarketState()
+        self.assertEqual(MARKET_DISPLAY_FETCH_SECONDS, 0.25)
+        self.assertTrue(state.update_market_display(
+            coin_midpoint=100.01, coin_event_epoch=10.0,
+            qqq_midpoint=500.01, qqq_event_epoch=20.0,
+        ))
+        self.assertFalse(state.update_market_display(
+            coin_midpoint=999.0, coin_event_epoch=10.0,
+            qqq_midpoint=999.0, qqq_event_epoch=19.0,
+        ))
+        display = state.market_display()
+        self.assertEqual(display.coin_midpoint, 100.01)
+        self.assertEqual(display.qqq_midpoint, 500.01)
+        with self.assertRaises(FrozenInstanceError):
+            display.coin_midpoint = 1.0
+
+    def test_combined_alpaca_poll_updates_display_each_fetch_but_quant_once_per_second(self):
+        payloads = iter((
+            {"quotes": {
+                "COIN": {"bp": 100.00, "ap": 100.00, "bs": 1, "as": 1,
+                         "t": "1970-01-01T00:00:10Z"},
+                "QQQ": {"bp": 500.00, "ap": 500.00,
+                        "t": "1970-01-01T00:00:10Z"},
+            }},
+            {"quotes": {
+                "COIN": {"bp": 100.01, "ap": 100.01, "bs": 1, "as": 1,
+                         "t": "1970-01-01T00:00:10.250000Z"},
+                "QQQ": {"bp": 500.01, "ap": 500.01,
+                        "t": "1970-01-01T00:00:10.250000Z"},
+            }},
+        ))
+        state = MagicMock(spec=LiveMarketState)
+
+        def response(*args, **kwargs):
+            return BytesIO(json.dumps(next(payloads)).encode())
+
+        with patch.dict(os.environ, {"ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret"}), \
+                patch("quant.live_market.urlopen", side_effect=response) as urlopen, \
+                patch("quant.live_market.time.sleep", side_effect=[None, RuntimeError("stop")]):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                poll_alpaca(state, monotonic=iter((0.0, 0.25)).__next__)
+
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertTrue(all(call.args[0].full_url == ALPACA_LATEST_QUOTES_URL
+                            for call in urlopen.call_args_list))
+        self.assertEqual(state.update_market_display.call_count, 2)
+        self.assertEqual(state.accept_quote.call_count, 1)
+        self.assertEqual(state.accept_qqq_quote.call_count, 1)
+        self.assertEqual(
+            state.update_market_display.call_args_list[1].kwargs["coin_midpoint"],
+            100.01,
+        )
+
     def test_valid_quote_creates_midpoint_and_preserves_timestamp(self):
         state = LiveMarketState(clock=lambda: 101.0)
         self.assertTrue(state.accept_quote(bid=99.0, ask=101.0, event_epoch=100.25))
