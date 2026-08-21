@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from quant.history import MidpointHistory, MidpointObservation
 from quant.evidence import PhaseECohortMetrics
+from quant.live_market import LiveMarketState
 from quant.web import (FAMILY_NAMES, HORIZON_LABELS, PHASE_E_FAMILY_NAMES,
                        create_app, dashboard_data)
 
@@ -113,13 +114,40 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertEqual(response["status"], "404 Not Found")
         self.assertEqual(response["body"], b"Not Found")
 
-    def test_page_polls_dashboard_every_second_without_cache_or_reload(self):
+    def test_page_uses_non_overlapping_live_and_evidence_loops(self):
         page = request(create_app(), "/")["body"].decode()
 
+        self.assertIn('fetch("/api/live", {cache: "no-store"})', page)
         self.assertIn('fetch("/api/dashboard", {cache: "no-store"})', page)
-        self.assertIn("setInterval(refreshDashboard, 1000)", page)
+        self.assertIn("setTimeout(refreshLive, 250)", page)
+        self.assertIn("setTimeout(refreshEvidence, 30000)", page)
+        self.assertNotIn("setInterval", page)
         self.assertNotIn("location.reload", page)
         self.assertNotIn("window.location", page)
+
+    def test_live_endpoint_is_read_only_and_uses_provider_time_for_age(self):
+        class Store:
+            def counts(self): raise AssertionError("live must not read evidence")
+            def phase_e_cohorts(self, as_of):
+                raise AssertionError("live must not calculate Phase E")
+
+        state = LiveMarketState()
+        state.update_market_display(
+            coin_midpoint=100.01, coin_event_epoch=100.0,
+            qqq_midpoint=500.01, qqq_event_epoch=101.0,
+        )
+        app = create_app(state=state, evidence_store=Store(), clock=lambda: 105.0)
+        first = request(app, "/api/live")
+        second = request(app, "/api/live")
+        self.assertEqual(first["status"], "200 OK")
+        payload = json.loads(first["body"])
+        self.assertEqual(set(payload), {
+            "market", "final_numbers", "quant_families", "options_data",
+        })
+        self.assertEqual(payload["market"]["symbol"], 100.01)
+        self.assertEqual(payload["market"]["qqq"], 500.01)
+        self.assertEqual(payload["market"]["data_age"], 5.0)
+        self.assertEqual(json.loads(second["body"])["market"]["data_age"], 5.0)
 
     def test_live_renderer_updates_every_market_field(self):
         page = request(create_app(), "/")["body"].decode()
@@ -150,13 +178,13 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertIn('value == null ? "" : Number(value).toFixed(2)', page)
         self.assertNotIn('value || 0', page)
 
-    def test_poll_failure_keeps_values_and_allows_interval_to_retry(self):
+    def test_poll_failure_keeps_values_and_allows_timeout_to_retry(self):
         page = request(create_app(), "/")["body"].decode()
 
         failure_handler = page.split("} catch (_) {", 1)[1].split("}", 1)[0]
         self.assertNotIn("render", failure_handler)
         self.assertNotIn("textContent", failure_handler)
-        self.assertIn("setInterval(refreshDashboard, 1000)", page)
+        self.assertIn("setTimeout(refreshLive, 250)", page)
 
     @patch("quant.web.Thread", new=ImmediateThread)
     def test_phase_e_dashboard_mapping_order_format_and_raw_precision(self):

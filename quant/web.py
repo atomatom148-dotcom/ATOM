@@ -15,9 +15,10 @@ from wsgiref.simple_server import make_server
 from .g2_cross_asset import CrossAssetState
 from .history import MidpointHistory
 from .evidence import EvidenceStore, PostgresEvidenceStore
-from .live_market import (LiveMarketState, LiveSnapshot, start_alpaca_g2_poller,
-                          start_alpaca_options_poller, start_alpaca_poller,
-                          start_massive_ndx_poller)
+from .live_market import (
+    LatestMarketDisplay, LiveMarketState, LiveSnapshot, start_alpaca_g2_poller,
+    start_alpaca_options_poller, start_alpaca_poller, start_massive_ndx_poller,
+)
 from .q1_momentum import calculate_momentum
 from .q2_mean_reversion import calculate_mean_reversion
 from .q3_volatility import calculate_volatility
@@ -67,6 +68,8 @@ def dashboard_data(
     evidence_counts: tuple[int, int] | None = None,
     phase_e_cohorts: Iterable[object] = (),
     cross_asset_state: CrossAssetState | None = None,
+    market_display: LatestMarketDisplay | None = None,
+    calculate_missing: bool = True,
 ) -> dict[str, object]:
     """Build the frozen dashboard structure, optionally using live quant results."""
 
@@ -77,9 +80,18 @@ def dashboard_data(
     if cutoff_epoch is None:
         cutoff_epoch = history.latest.event_epoch if history.latest else 0.0
 
-    q1 = snapshot.momentum if snapshot and snapshot.momentum else calculate_momentum(history, cutoff_epoch=cutoff_epoch)
-    q2 = snapshot.mean_reversion if snapshot and snapshot.mean_reversion else calculate_mean_reversion(history, cutoff_epoch=cutoff_epoch)
-    q3 = snapshot.volatility if snapshot and snapshot.volatility else calculate_volatility(history, cutoff_epoch=cutoff_epoch)
+    q1 = snapshot.momentum if snapshot and snapshot.momentum else (
+        calculate_momentum(history, cutoff_epoch=cutoff_epoch)
+        if calculate_missing else None
+    )
+    q2 = snapshot.mean_reversion if snapshot and snapshot.mean_reversion else (
+        calculate_mean_reversion(history, cutoff_epoch=cutoff_epoch)
+        if calculate_missing else None
+    )
+    q3 = snapshot.volatility if snapshot and snapshot.volatility else (
+        calculate_volatility(history, cutoff_epoch=cutoff_epoch)
+        if calculate_missing else None
+    )
     q4 = snapshot.stat_arb if snapshot else None
     q5 = snapshot.microstructure if snapshot else None
     q6 = snapshot.volume_liquidity if snapshot else None
@@ -90,7 +102,9 @@ def dashboard_data(
     q11 = snapshot.regime if snapshot else None
     q12 = snapshot.event_session if snapshot else None
     populated = (
-        q1.forecast_bps, q2.forecast_bps, q3.volatility_bps,
+        q1.forecast_bps if q1 else (None,) * 6,
+        q2.forecast_bps if q2 else (None,) * 6,
+        q3.volatility_bps if q3 else (None,) * 6,
         q4.forecast_bps if q4 else (None,) * 6,
         q5.forecast_bps if q5 else (None,) * 6,
         q6.forecast_bps if q6 else (None,) * 6,
@@ -152,12 +166,21 @@ def dashboard_data(
     return {
         "title": "ATOM QUANT",
         "market": {
-            "symbol": history.latest.midpoint if history.latest else None,
+            "symbol": (market_display.coin_midpoint if market_display else
+                       history.latest.midpoint if history.latest else None),
             "benchmarks": ["BTC", "QQQ", "NDX"],
             "btc": cross_asset_state.btc_price if cross_asset_state else None,
-            "qqq": snapshot.qqq_history.latest.midpoint if snapshot and snapshot.qqq_history.latest else None,
+            "qqq": (market_display.qqq_midpoint if market_display else
+                    snapshot.qqq_history.latest.midpoint
+                    if snapshot and snapshot.qqq_history.latest else None),
             "ndx": cross_asset_state.ndx_price if cross_asset_state else None,
-            "data_age": max(0.0, (time.time() if now_epoch is None else now_epoch) - history.latest.event_epoch) if history.latest else None,
+            "data_age": (
+                max(0.0, (time.time() if now_epoch is None else now_epoch) -
+                    market_display.coin_event_epoch)
+                if market_display and market_display.coin_event_epoch is not None
+                else max(0.0, (time.time() if now_epoch is None else now_epoch) -
+                         history.latest.event_epoch) if history.latest else None
+            ),
             "last_cycle": snapshot.last_cycle if snapshot else (cutoff_epoch if supplied else None),
         },
         "horizons": list(HORIZON_LABELS),
@@ -283,7 +306,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     const cell = cells.get(field);
     if (cell) cell.textContent = format(value);
   }};
-  const render = data => {{
+  const renderLive = data => {{
     set("market.symbol", data.market.symbol, decimal);
     set("market.btc", data.market.btc, decimal);
     set("market.qqq", data.market.qqq, decimal);
@@ -308,6 +331,8 @@ def dashboard_page(data: dict[str, object]) -> bytes:
         return row;
       }}));
     }}));
+  }};
+  const renderEvidence = data => {{
     Object.entries(data.evidence).forEach(([name, value]) =>
       set(`evidence.${{name}}.0`, value));
     const phaseEBody = document.getElementById("phase-e-body");
@@ -328,16 +353,30 @@ def dashboard_page(data: dict[str, object]) -> bytes:
       return row;
     }}));
   }};
-  const refreshDashboard = async () => {{
+  const refreshLive = async () => {{
+    try {{
+      const response = await fetch("/api/live", {{cache: "no-store"}});
+      if (!response.ok) throw new Error(`live request failed: ${{response.status}}`);
+      renderLive(await response.json());
+    }} catch (_) {{
+      // Preserve the last successful display and retry after the target delay.
+    }} finally {{
+      setTimeout(refreshLive, 250);
+    }}
+  }};
+  const refreshEvidence = async () => {{
     try {{
       const response = await fetch("/api/dashboard", {{cache: "no-store"}});
       if (!response.ok) throw new Error(`dashboard request failed: ${{response.status}}`);
-      render(await response.json());
+      renderEvidence(await response.json());
     }} catch (_) {{
-      // Preserve the last successful display; the interval performs the next retry.
+      // Preserve the last successful evidence presentation.
+    }} finally {{
+      setTimeout(refreshEvidence, 30000);
     }}
   }};
-  setInterval(refreshDashboard, 1000);
+  setTimeout(refreshLive, 250);
+  setTimeout(refreshEvidence, 30000);
 }})();
 </script></body></html>"""
     return document.encode("utf-8")
@@ -445,6 +484,25 @@ def create_app(
                 status, content_type = "200 OK", "application/json"
             start_response(status, [("Content-Type", content_type),
                                     ("Content-Length", str(len(body)))])
+            return [body]
+        if path == "/api/live":
+            as_of_epoch = clock()
+            snapshot = state.snapshot() if state is not None else None
+            cross_asset_state = state.cross_asset_state() if state is not None else None
+            market_display = state.market_display() if state is not None else None
+            data = dashboard_data(
+                history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
+                now_epoch=as_of_epoch, cross_asset_state=cross_asset_state,
+                market_display=market_display, calculate_missing=False,
+            )
+            live = {key: data[key] for key in (
+                "market", "final_numbers", "quant_families", "options_data",
+            )}
+            body = json.dumps(
+                live, separators=(",", ":"), allow_nan=False,
+            ).encode()
+            start_response("200 OK", [("Content-Type", "application/json"),
+                                      ("Content-Length", str(len(body)))])
             return [body]
         if path not in ("/", "/api/dashboard"):
             body = b"Not Found"
