@@ -35,7 +35,7 @@ from .v9_telemetry import record_v9_observation
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
 ALPACA_BTC_LATEST_QUOTE_URL = "https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes?symbols=BTC%2FUSD"
-ALPACA_NDX_SNAPSHOT_URL = "https://data.alpaca.markets/v1beta1/indices/snapshots?symbols=NDX"
+ALPACA_NDX_LATEST_BAR_URL = "https://data.alpaca.markets/v1beta1/indices/bars/latest?symbols=NDX"
 HISTORY_SECONDS = 3600.0
 
 
@@ -339,6 +339,20 @@ def parse_alpaca_timestamp(value: str) -> float:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
 
 
+def parse_alpaca_ndx_bar(payload: object) -> tuple[float, float]:
+    """Return Alpaca's NDX latest-bar close and event timestamp."""
+
+    if not isinstance(payload, dict):
+        raise TypeError("NDX latest-bar response must be an object")
+    bars = payload.get("bars")
+    if not isinstance(bars, dict):
+        raise ValueError("NDX latest-bar response is missing bars")
+    item = bars.get("NDX")
+    if not isinstance(item, dict):
+        raise ValueError("NDX latest-bar response is missing NDX")
+    return float(item["c"]), parse_alpaca_timestamp(item["t"])
+
+
 def poll_alpaca(state: LiveMarketState, *, interval: float = 1.0) -> None:
     """Continuously fetch latest COIN and QQQ quotes in one Alpaca request."""
 
@@ -385,7 +399,7 @@ def poll_alpaca_g2(state: LiveMarketState, *, interval: float = 1.0) -> None:
     while True:
         for asset, url in (
             ("BTC", ALPACA_BTC_LATEST_QUOTE_URL),
-            ("NDX", ALPACA_NDX_SNAPSHOT_URL),
+            ("NDX", ALPACA_NDX_LATEST_BAR_URL),
         ):
             try:
                 with urlopen(Request(url, headers=headers), timeout=10) as response:
@@ -395,9 +409,7 @@ def poll_alpaca_g2(state: LiveMarketState, *, interval: float = 1.0) -> None:
                     price = (float(item["bp"]) + float(item["ap"])) / 2.0
                     event_epoch = parse_alpaca_timestamp(item["t"])
                 else:
-                    item = payload["snapshots"]["NDX"]["latestTrade"]
-                    price = float(item["p"])
-                    event_epoch = parse_alpaca_timestamp(item["t"])
+                    price, event_epoch = parse_alpaca_ndx_bar(payload)
                 state.accept_g2_price(
                     asset=asset, price=price, event_epoch=event_epoch,
                 )
@@ -428,6 +440,7 @@ def start_alpaca_options_poller(state: LiveMarketState) -> threading.Thread:
     return thread
 
 
-__all__ = ["LiveMarketState", "LiveSnapshot", "parse_alpaca_timestamp", "poll_alpaca",
+__all__ = ["LiveMarketState", "LiveSnapshot", "parse_alpaca_ndx_bar",
+           "parse_alpaca_timestamp", "poll_alpaca",
            "poll_alpaca_g2", "start_alpaca_g2_poller", "start_alpaca_options_poller",
            "start_alpaca_poller"]
