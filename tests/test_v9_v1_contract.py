@@ -89,6 +89,7 @@ class V9V1ContractTests(unittest.TestCase):
         cases = (
             ({"numerical_type": MAGNITUDE_BPS}, "WRONG_NUMERICAL_TYPE"),
             ({"horizon_seconds": 31}, "WRONG_HORIZON_SECONDS"),
+            ({"data_schema_version": "schema-2"}, "VERSION_MISMATCH"),
             ({"value_bps": math.nan}, "INVALID_NUMERIC_VALUE"),
             ({"value_bps": math.inf}, "INVALID_NUMERIC_VALUE"),
             ({"value_bps": -math.inf}, "INVALID_NUMERIC_VALUE"),
@@ -104,10 +105,12 @@ class V9V1ContractTests(unittest.TestCase):
                 slot = self.build(self.with_slot(**changes)).slots[0]
                 self.assertEqual((slot.availability_state, slot.reason_code),
                                  ("INVALID", reason))
+                self.assertIsNone(slot.value_bps)
         q3_index = 2 * len(HORIZONS)
         q3 = self.build(self.with_slot(q3_index, value_bps=-0.01)).slots[q3_index]
         self.assertEqual((q3.availability_state, q3.reason_code),
                          ("INVALID", "NEGATIVE_MAGNITUDE"))
+        self.assertIsNone(q3.value_bps)
 
     def test_structural_and_causality_rejections(self) -> None:
         cases = (

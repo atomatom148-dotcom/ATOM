@@ -176,6 +176,9 @@ def _classify(raw: V1SlotObservation, cutoff_at: datetime,
     else:
         reason = raw.reason_code
 
+    if state == "INVALID":
+        value_bps = None
+
     return V1Slot(
         raw.quant_id, raw.formula_version, raw.horizon, raw.horizon_seconds,
         raw.numerical_type, value_bps, raw.forecast_cutoff_at,
