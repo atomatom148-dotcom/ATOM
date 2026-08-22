@@ -1,5 +1,6 @@
 import dataclasses
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -25,7 +26,9 @@ def upstream():
     v2 = SimpleNamespace(v2a_method_version="a", v2b_method_version="b",
         v2c_method_version="c", effective_n_method_version="n",
         calibration_method_version="cal", covariance_method_version="cov",
-        numerical_canonicalization_version="hex")
+        numerical_canonicalization_version="hex", state_id="v2-state:one",
+        state_version="V9-V2D-2", state_hash="1" * 64,
+        state_as_of=T0.timestamp())
     result = V3HorizonResult("1M", 60, 1.25, 4.0, "AVAILABLE",
                              ("q1_momentum",), (1.0,), 1, "FULL",
                              q3_diagnostic_magnitude_bps=None)
@@ -36,10 +39,12 @@ class FakeCursor:
     def __init__(self, rows):
         self.rows = rows
         self.insert_count = 0
+        self.last_insert_parameters = None
 
     def execute(self, sql, _parameters):
         if sql.startswith("INSERT"):
             self.insert_count += 1
+            self.last_insert_parameters = _parameters
 
     def fetchall(self):
         return self.rows
@@ -70,6 +75,47 @@ class V4AContractTests(unittest.TestCase):
         self.assertIsNone(f.q3_diagnostic_magnitude_bps)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             f.status = "changed"
+
+    def test_forecast_preserves_exact_v2_state_provenance(self):
+        f = self.forecast()
+        self.assertEqual(f.v2_state_id, "v2-state:one")
+        self.assertEqual(f.v2_state_version, "V9-V2D-2")
+        self.assertEqual(f.v2_state_hash, "1" * 64)
+        self.assertEqual(f.v2_state_as_of, T0.timestamp())
+
+        cursor = FakeCursor([])
+        V4AWriter(FakeConnection(cursor)).persist_forecast(f, T0)
+        record_json = json.loads(cursor.last_insert_parameters[7])
+        self.assertEqual(record_json["v2_state_id"], f.v2_state_id)
+        self.assertEqual(record_json["v2_state_version"], f.v2_state_version)
+        self.assertEqual(record_json["v2_state_hash"], f.v2_state_hash)
+        self.assertEqual(record_json["v2_state_as_of"],
+                         {"$float64": f.v2_state_as_of.hex()})
+
+    def test_v2_state_provenance_changes_record_but_not_cohort_identity(self):
+        v1, v2, result = upstream()
+        original = build_forecast(v1=v1, v2=v2, result=result,
+                                  evidence_origin="PRODUCTION")
+
+        variants = []
+        for changes in (
+            {"state_id": "v2-state:two"},
+            {"state_hash": "2" * 64},
+            {"state_as_of": v2.state_as_of + 1.0},
+        ):
+            values = vars(v2).copy()
+            values.update(changes)
+            variants.append(build_forecast(
+                v1=v1, v2=SimpleNamespace(**values), result=result,
+                evidence_origin="PRODUCTION"))
+
+        for variant in variants:
+            self.assertEqual(variant.cohort_id, original.cohort_id)
+            self.assertEqual(variant.cohort_hash, original.cohort_hash)
+            self.assertNotEqual(variant.forecast_record_hash,
+                                original.forecast_record_hash)
+            self.assertNotEqual(variant.forecast_record_id,
+                                original.forecast_record_id)
 
     def test_forecast_hash_deterministic_and_metadata_excluded(self):
         f = self.forecast()

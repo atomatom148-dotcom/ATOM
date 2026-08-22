@@ -106,6 +106,10 @@ class ForecastRecord:
     cycle_id: str
     v3_contract_version: None
     v3_model_version: str
+    v2_state_id: str
+    v2_state_version: str
+    v2_state_hash: str
+    v2_state_as_of: float
     expected_return_bps: float | None
     predictive_variance_bps2: float | None
     q3_diagnostic_magnitude_bps: float | None
@@ -140,6 +144,7 @@ def build_forecast(*, v1: V1Input, v2: V2EvidenceState, result: V3HorizonResult,
         evidence_origin, cohort.cohort_id, cohort.cohort_hash, v1.symbol,
         v1.cutoff_at, v1.cutoff_at + timedelta(seconds=result.horizon_seconds),
         result.horizon, result.horizon_seconds, v1.cycle_id, None, MODEL_VERSION,
+        v2.state_id, v2.state_version, v2.state_hash, v2.state_as_of,
         result.expected_return_bps, result.predictive_variance_bps2,
         result.q3_diagnostic_magnitude_bps, result.status, result.reason_codes)
     digest = canonical_sha256(_forecast_math(record))
