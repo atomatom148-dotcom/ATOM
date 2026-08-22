@@ -69,6 +69,25 @@ def test_causal_resolution_boundaries_and_family_validity():
     assert reasons(dataset)["NONFINITE_VALUE"] == 1
 
 
+@pytest.mark.parametrize("quant", ["q1_momentum", Q3])
+def test_only_fresh_family_observations_can_enter_subsets(quant):
+    t = target(1, 10)
+    observations = [
+        observation(1, t, quant=quant, value=2, state="FRESH"),
+        observation(2, t, quant=quant, value=2, state="MISSING"),
+        observation(3, t, quant=quant, value=2, state="STALE"),
+        observation(4, t, quant=quant, value=2, state="INVALID"),
+    ]
+
+    result = build([t], observations)
+    subset = (result.q3_subset if quant == Q3 else
+              result.directional_subsets[0])
+
+    assert [row.record_id for row in subset.observations] == [1]
+    assert subset.observations[0].value_bps == 2
+    assert reasons(result)["FORECAST_NOT_CAUSAL"] == 3
+
+
 def test_exact_versions_are_isolated():
     rows = [target(1, 10), target(2, 40, schema="other")]
     obs = [observation(1, rows[0], formula="wrong"),

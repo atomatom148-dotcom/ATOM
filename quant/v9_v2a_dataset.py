@@ -264,7 +264,7 @@ def build_v2a_dataset(
             exclude("FUTURE_INPUT"); continue
         if row.source_as_of_epoch > row.forecast_cutoff_epoch:
             exclude("FORECAST_NOT_CAUSAL"); continue
-        if row.availability_state == "INVALID":
+        if row.availability_state != "FRESH":
             exclude("FORECAST_NOT_CAUSAL"); continue
         eligible.setdefault((row.quant_id, row.target_identity), []).append(row)
 
