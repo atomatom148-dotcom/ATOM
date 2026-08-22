@@ -24,8 +24,8 @@ from quant.v9_v2b_calibration import (
 from quant.v9_v2c_covariance import METHOD_VERSION as V2C_METHOD_VERSION, V2CCovariance
 
 
-STATE_SCHEMA_VERSION = "V9-V2D-STATE-1"
-STATE_VERSION = "V9-V2D-1"
+STATE_SCHEMA_VERSION = "V9-V2D-STATE-2"
+STATE_VERSION = "V9-V2D-2"
 MODEL_FAMILY = "V9-V2"
 EFFECTIVE_N_METHOD_VERSION = "V9-V2B-PAIRED-IPS-1"
 CALIBRATION_METHOD_VERSION = V2B_METHOD_VERSION
@@ -71,7 +71,8 @@ class HorizonEvidenceState:
     status: str
     reason_codes: tuple[str, ...]
     directional_calibrations: tuple[DirectionalCalibrationState, ...]
-    ordered_directional_quant_ids: tuple[str, ...]
+    ordered_quant_ids: tuple[str, ...]
+    pair_support_boolean_matrix: tuple[tuple[bool, ...], ...]
     stabilized_covariance_matrix: tuple[tuple[float, ...], ...] | None
     dependence_modeled: bool
     covariance_status: str
@@ -82,6 +83,11 @@ class HorizonEvidenceState:
     range_preparation_status: str = "PENDING_V3_REPLAY"
     range_score_count: int = 0
     range_quantile: None = None
+
+    @property
+    def ordered_directional_quant_ids(self) -> tuple[str, ...]:
+        """Backward-compatible name for the covariance quant ordering."""
+        return self.ordered_quant_ids
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -165,7 +171,7 @@ def _reasons(*groups: Iterable[str]) -> tuple[str, ...]:
 
 def _missing(horizon: str, reason: str = "HORIZON_EVIDENCE_UNAVAILABLE") -> HorizonEvidenceState:
     return HorizonEvidenceState(
-        horizon, HORIZON_SECONDS[horizon], "UNAVAILABLE", (reason,), (), (), None,
+        horizon, HORIZON_SECONDS[horizon], "UNAVAILABLE", (reason,), (), (), (), None,
         False, "UNAVAILABLE", (("COVARIANCE_UNAVAILABLE",) if reason != "COVARIANCE_UNAVAILABLE" else (reason,)),
         Q3MagnitudeState("UNAVAILABLE", ("Q3_EVIDENCE_UNAVAILABLE",)),
     )
@@ -215,6 +221,15 @@ def _assemble_horizon(dataset: V2ADataset, calibration: V2BCalibration,
         len(b_items) == len(expected_ids) and all(ordered_b) and
         covariance.ordered_quant_ids == expected_ids and
         covariance.ordered_formula_versions == expected_formulas and
+        isinstance(covariance.pair_support_boolean_matrix, tuple) and
+        len(covariance.pair_support_boolean_matrix) == len(covariance.ordered_quant_ids) and
+        all(isinstance(row, tuple) and
+            len(row) == len(covariance.ordered_quant_ids) and
+            all(isinstance(value, bool) for value in row)
+            for row in covariance.pair_support_boolean_matrix) and
+        len(covariance.stabilized_covariance_matrix) == len(covariance.ordered_quant_ids) and
+        all(len(row) == len(covariance.ordered_quant_ids)
+            for row in covariance.stabilized_covariance_matrix) and
         Q3 not in expected_ids and Q3 not in covariance.ordered_quant_ids and
         ((q3_subset is None and not q3_items) or
          (q3_subset is not None and len(q3_items) == 1 and q3_item is not None))
@@ -251,6 +266,7 @@ def _assemble_horizon(dataset: V2ADataset, calibration: V2BCalibration,
     return HorizonEvidenceState(
         horizon, HORIZON_SECONDS[horizon], status, tuple(sorted(reasons)), directional,
         covariance.ordered_quant_ids,
+        covariance.pair_support_boolean_matrix,
         covariance.stabilized_covariance_matrix if covariance_usable else None,
         covariance.dependence_modeled if covariance_usable else False,
         covariance.status, tuple(sorted(covariance.reason_codes)), q3_state,
