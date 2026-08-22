@@ -4,6 +4,7 @@ from io import BytesIO
 import os
 import unittest
 from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
 
 from quant.live_market import (
     ALPACA_BTC_LATEST_QUOTE_URL, ALPACA_LATEST_QUOTES_URL,
@@ -250,6 +251,45 @@ class LiveMarketTests(unittest.TestCase):
         self.assertIsNone(value.ndx_price)
         self.assertIsNone(value.ndx_age_seconds)
         self.assertEqual(value.ndx_return_bps, (None,) * 6)
+
+    def test_massive_ndx_poller_stops_after_one_forbidden_response(self):
+        state = LiveMarketState(clock=lambda: 101.0)
+        forbidden = HTTPError(
+            MASSIVE_NDX_SNAPSHOT_URL, 403, "Forbidden", {}, None,
+        )
+
+        with patch.dict(os.environ, {"MASSIVE_API_KEY": "key"}), patch(
+            "quant.live_market.urlopen", side_effect=forbidden,
+        ) as urlopen, patch(
+            "quant.live_market.time.sleep",
+        ) as sleep, patch(
+            "builtins.print",
+        ) as print_message:
+            poll_massive_ndx(state)
+
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
+        print_message.assert_called_once_with(
+            "Massive NDX access is forbidden/unavailable", flush=True,
+        )
+        self.assertIsNone(state.cross_asset_state().ndx_price)
+
+    def test_massive_ndx_poller_retries_non_forbidden_http_failure(self):
+        state = LiveMarketState(clock=lambda: 101.0)
+        transient = HTTPError(
+            MASSIVE_NDX_SNAPSHOT_URL, 503, "Unavailable", {}, None,
+        )
+
+        with patch.dict(os.environ, {"MASSIVE_API_KEY": "key"}), patch(
+            "quant.live_market.urlopen", side_effect=transient,
+        ) as urlopen, patch(
+            "quant.live_market.time.sleep", side_effect=[None, RuntimeError("stop")],
+        ), patch("builtins.print"):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                poll_massive_ndx(state)
+
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertIsNone(state.cross_asset_state().ndx_price)
 
     def test_massive_ndx_poller_uses_bearer_key_and_accepts_only_fresh_data(self):
         state = LiveMarketState(clock=lambda: 101.0)
