@@ -186,6 +186,44 @@ def test_source_and_availability_before_cutoff_remain_allowed(timestamp_field):
     assert _first(v1, v2).used_quant_ids == CANONICAL_FAMILIES[:2]
 
 
+@pytest.mark.parametrize("age", (timedelta(days=30), timedelta(0)))
+def test_v2_state_at_or_before_current_cutoff_is_accepted(age):
+    v1, v2 = _inputs()
+    state_as_of = v1.cutoff_at - age
+    v1.evidence_state_as_of = state_as_of
+    v2.state_as_of = state_as_of.timestamp()
+    assert _first(v1, v2).used_quant_ids == CANONICAL_FAMILIES[:2]
+
+
+def test_v2_state_after_current_cutoff_is_rejected():
+    v1, v2 = _inputs()
+    state_as_of = v1.cutoff_at + timedelta(microseconds=1)
+    v1.evidence_state_as_of = state_as_of
+    v2.state_as_of = state_as_of.timestamp()
+    assert all(result.status == "UNAVAILABLE"
+               for result in synthesize_v3(v1, v2).horizon_results)
+
+
+@pytest.mark.parametrize("field", ("evidence_state_id", "evidence_state_hash"))
+def test_captured_v2_state_identity_remains_mandatory(field):
+    v1, v2 = _inputs()
+    setattr(v1, field, "wrong")
+    assert all(result.status == "UNAVAILABLE"
+               for result in synthesize_v3(v1, v2).horizon_results)
+
+
+def test_old_v2_state_does_not_change_missing_family_independence():
+    v1, v2 = _inputs()
+    old = v1.cutoff_at - timedelta(days=30)
+    v1.evidence_state_as_of = old
+    v2.state_as_of = old.timestamp()
+    missing = next(item for item in v1.slots
+                   if item.horizon == "30S" and item.quant_id == "q2_mean_reversion")
+    missing.availability_state = "MISSING"
+    missing.value_bps = None
+    assert _first(v1, v2).used_quant_ids == ("q1_momentum",)
+
+
 @pytest.mark.parametrize(
     ("owner", "field", "value"),
     (("v1", "evidence_state_as_of", datetime(2025, 1, 1, tzinfo=timezone.utc)),

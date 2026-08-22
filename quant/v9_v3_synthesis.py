@@ -197,6 +197,10 @@ def _v1_evidence_compatible(v1: V1Input, v2: V2EvidenceState) -> bool:
         v1.evidence_state_version == v2.state_version and
         v1.evidence_state_hash == v2.state_hash and
         _same_instant(v1.evidence_state_as_of, v2.state_as_of) and
+        isinstance(v2.state_as_of, (int, float)) and
+        not isinstance(v2.state_as_of, bool) and
+        math.isfinite(v2.state_as_of) and
+        v2.state_as_of <= v1.cutoff_at.timestamp() and
         v1.target_spec_id == v2.target_spec_id and
         v1.data_schema_version == v2.target_data_schema_version and
         v1.source_spec_version == v2.target_source_spec_version
