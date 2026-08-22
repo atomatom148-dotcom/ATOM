@@ -66,6 +66,47 @@ def test_assembly_has_six_canonical_slots_and_no_forecast_or_range():
                    for name in state.__dataclass_fields__)
 
 
+def test_covariance_pair_support_is_forwarded_verbatim_and_immutable():
+    component = _components()
+    slot = _state((component,)).horizon_state_tuple[0]
+
+    assert slot.ordered_quant_ids is component[2].ordered_quant_ids
+    assert slot.pair_support_boolean_matrix is component[2].pair_support_boolean_matrix
+    assert slot.ordered_directional_quant_ids == slot.ordered_quant_ids
+    assert isinstance(slot.pair_support_boolean_matrix, tuple)
+    assert all(isinstance(row, tuple) for row in slot.pair_support_boolean_matrix)
+    assert all(isinstance(value, bool)
+               for row in slot.pair_support_boolean_matrix for value in row)
+
+
+@pytest.mark.parametrize(
+    "matrix",
+    (
+        (),
+        ((True, False),),
+        ([True],),
+        ((1,),),
+    ),
+)
+def test_pair_support_contract_rejects_dimension_and_type_mismatches(matrix):
+    dataset, calibration, covariance = _components()
+    covariance = replace(covariance, pair_support_boolean_matrix=matrix)
+    slot = _state(((dataset, calibration, covariance),)).horizon_state_tuple[0]
+
+    assert slot.status == "UNAVAILABLE"
+    assert slot.reason_codes == ("CROSS_LAYER_INTEGRITY_FAILURE",)
+
+
+def test_pair_support_changes_state_hash_without_changing_mathematical_status():
+    dataset, calibration, covariance = _components()
+    baseline = _state(((dataset, calibration, covariance),))
+    amended_covariance = replace(covariance, pair_support_boolean_matrix=((False,),))
+    amended = _state(((dataset, calibration, amended_covariance),))
+
+    assert baseline.horizon_state_tuple[0].status == amended.horizon_state_tuple[0].status
+    assert baseline.state_hash != amended.state_hash
+
+
 def test_input_order_is_irrelevant_and_all_mature_can_make_top_mature():
     components = tuple(_components(horizon) for horizon in HORIZONS)
     left = _state(components)
