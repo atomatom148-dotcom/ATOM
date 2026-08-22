@@ -8,8 +8,7 @@ CREATE TABLE public.atom_v9_v4_forecasts (
     cycle_id text NOT NULL,
     v3_model_version text NOT NULL,
     record_json jsonb NOT NULL,
-    persisted_at timestamptz NOT NULL,
-    UNIQUE (symbol, cutoff_at, horizon, cycle_id, v3_model_version)
+    persisted_at timestamptz NOT NULL
 );
 
 CREATE TABLE public.atom_v9_v4_outcomes (
@@ -18,9 +17,13 @@ CREATE TABLE public.atom_v9_v4_outcomes (
     forecast_record_id text NOT NULL REFERENCES public.atom_v9_v4_forecasts(forecast_record_id),
     target_identity text NOT NULL,
     record_json jsonb NOT NULL,
-    created_at timestamptz NOT NULL,
-    UNIQUE (forecast_record_id, target_identity)
+    created_at timestamptz NOT NULL
 );
+
+CREATE INDEX atom_v9_v4_forecasts_logical_key_idx
+ON public.atom_v9_v4_forecasts (symbol, cutoff_at, horizon, cycle_id, v3_model_version);
+CREATE INDEX atom_v9_v4_outcomes_logical_key_idx
+ON public.atom_v9_v4_outcomes (forecast_record_id, target_identity);
 
 CREATE FUNCTION public.atom_v9_v4_reject_mutation() RETURNS trigger
 LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'V4A evidence is append-only'; END $$;

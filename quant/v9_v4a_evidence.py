@@ -16,7 +16,7 @@ from typing import Iterable, Mapping
 
 from quant.v9_v1_contract import HORIZON_SECONDS, V1Input
 from quant.v9_v2d_evidence_state import V2EvidenceState
-from quant.v9_v3_synthesis import MODEL_VERSION, V3HorizonResult
+from quant.v9_v3_synthesis import CANONICAL_FAMILIES, MODEL_VERSION, V3HorizonResult
 
 
 CONTRACT_VERSION = "ATOM_TRUE_V9_V4_1"
@@ -76,7 +76,10 @@ def build_cohort(*, v1: V1Input, v2: V2EvidenceState, horizon: str,
         ("symbol", v1.symbol), ("horizon", horizon),
         ("v3_contract_version", V3_CONTRACT_VERSION),
         ("v3_model_version", MODEL_VERSION),
-        ("compatible_family_formula_map", tuple(sorted(family_formula_map.items()))),
+        ("compatible_family_formula_map", tuple(
+            (family, family_formula_map[family]) for family in CANONICAL_FAMILIES
+            if family in family_formula_map
+        )),
         ("v2_method_lineage", lineage), ("target_spec_id", v1.target_spec_id),
         ("data_schema_version", v1.data_schema_version),
         ("source_spec_version", v1.source_spec_version),
@@ -239,6 +242,7 @@ class V4AWriter:
 
     def __init__(self, connection):
         self.connection = connection
+        self.last_write_status: str | None = None
 
     def persist_forecast(self, record: ForecastRecord, persisted_at: datetime) -> ForecastRecord:
         eligible = persisted_at <= record.target_endpoint
@@ -247,23 +251,34 @@ class V4AWriter:
                          persistence_reason=None if eligible else "FORECAST_PERSISTED_AFTER_TARGET_ENDPOINT")
         cursor = self.connection.cursor()
         cursor.execute("SELECT forecast_record_hash FROM atom_v9_v4_forecasts WHERE symbol=%s AND cutoff_at=%s AND horizon=%s AND cycle_id=%s AND v3_model_version=%s", record.logical_key)
-        row = cursor.fetchone()
-        if classify_duplicate(row[0] if row else None, record.forecast_record_hash) == "INSERT":
-            cursor.execute("INSERT INTO atom_v9_v4_forecasts (forecast_record_id, forecast_record_hash, symbol, cutoff_at, horizon, cycle_id, v3_model_version, record_json, persisted_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                           (record.forecast_record_id, record.forecast_record_hash,
-                            record.symbol, record.cutoff_at, record.horizon,
-                            record.cycle_id, record.v3_model_version,
-                            json.dumps(_canonical(asdict(stored)), sort_keys=True), persisted_at))
+        hashes = tuple(row[0] for row in cursor.fetchall())
+        if record.forecast_record_hash in hashes:
+            self.last_write_status = "IDEMPOTENT"
+            return stored
+        if hashes:
+            self.last_write_status = "FORECAST_DUPLICATE_CONFLICT"
+            stored = replace(stored, persistence_proof_eligible=False,
+                             persistence_reason="FORECAST_DUPLICATE_CONFLICT")
+        else:
+            self.last_write_status = "INSERT"
+        cursor.execute("INSERT INTO atom_v9_v4_forecasts (forecast_record_id, forecast_record_hash, symbol, cutoff_at, horizon, cycle_id, v3_model_version, record_json, persisted_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                       (record.forecast_record_id, record.forecast_record_hash,
+                        record.symbol, record.cutoff_at, record.horizon,
+                        record.cycle_id, record.v3_model_version,
+                        json.dumps(_canonical(asdict(stored)), sort_keys=True), persisted_at))
         return stored
 
     def persist_outcome(self, record: OutcomeRecord, created_at: datetime) -> OutcomeRecord:
         stored = replace(record, created_at=created_at)
         cursor = self.connection.cursor()
         cursor.execute("SELECT outcome_record_hash FROM atom_v9_v4_outcomes WHERE forecast_record_id=%s AND target_identity=%s", record.logical_key)
-        row = cursor.fetchone()
-        if classify_duplicate(row[0] if row else None, record.outcome_record_hash, outcome=True) == "INSERT":
-            cursor.execute("INSERT INTO atom_v9_v4_outcomes (outcome_record_id, outcome_record_hash, forecast_record_id, target_identity, record_json, created_at) VALUES (%s,%s,%s,%s,%s,%s)",
-                           (record.outcome_record_id, record.outcome_record_hash,
-                            record.forecast_record_id, record.target_identity,
-                            json.dumps(_canonical(asdict(stored)), sort_keys=True), created_at))
+        hashes = tuple(row[0] for row in cursor.fetchall())
+        if record.outcome_record_hash in hashes:
+            self.last_write_status = "IDEMPOTENT"
+            return stored
+        self.last_write_status = "OUTCOME_CONFLICT" if hashes else "INSERT"
+        cursor.execute("INSERT INTO atom_v9_v4_outcomes (outcome_record_id, outcome_record_hash, forecast_record_id, target_identity, record_json, created_at) VALUES (%s,%s,%s,%s,%s,%s)",
+                       (record.outcome_record_id, record.outcome_record_hash,
+                        record.forecast_record_id, record.target_identity,
+                        json.dumps(_canonical(asdict(stored)), sort_keys=True), created_at))
         return stored

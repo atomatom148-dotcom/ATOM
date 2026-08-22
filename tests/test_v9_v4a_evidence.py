@@ -8,7 +8,7 @@ from quant.v9_v3_synthesis import MODEL_VERSION, V3HorizonResult
 from quant.v9_v4a_evidence import (
     CONTRACT_VERSION, EVIDENCE_VERSION, REPLAY_METHOD_VERSION,
     DuplicateConflict, build_cohort, build_forecast, build_outcome,
-    canonical_sha256, classify_duplicate, select_non_overlapping,
+    V4AWriter, canonical_sha256, classify_duplicate, select_non_overlapping,
 )
 
 
@@ -30,6 +30,27 @@ def upstream():
                              ("q1_momentum",), (1.0,), 1, "FULL",
                              q3_diagnostic_magnitude_bps=None)
     return v1, v2, result
+
+
+class FakeCursor:
+    def __init__(self, rows):
+        self.rows = rows
+        self.insert_count = 0
+
+    def execute(self, sql, _parameters):
+        if sql.startswith("INSERT"):
+            self.insert_count += 1
+
+    def fetchall(self):
+        return self.rows
+
+
+class FakeConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def cursor(self):
+        return self._cursor
 
 
 class V4AContractTests(unittest.TestCase):
@@ -68,12 +89,19 @@ class V4AContractTests(unittest.TestCase):
     def test_cohort_is_deterministic_and_map_is_order_independent(self):
         v1, v2, _ = upstream()
         one = build_cohort(v1=v1, v2=v2, horizon="1M",
-                           family_formula_map={"q2": "f2", "q1": "f1"})
+                           family_formula_map={"q10_options_vol": "f10",
+                                               "q2_mean_reversion": "f2",
+                                               "q9_factor": "f9"})
         two = build_cohort(v1=v1, v2=v2, horizon="1M",
-                           family_formula_map={"q1": "f1", "q2": "f2"})
+                           family_formula_map={"q9_factor": "f9",
+                                               "q10_options_vol": "f10",
+                                               "q2_mean_reversion": "f2"})
         self.assertEqual(one, two)
         self.assertTrue(one.cohort_id.startswith("v9v4cohort:"))
         payload = dict(one.payload)
+        self.assertEqual(payload["compatible_family_formula_map"], (
+            ("q2_mean_reversion", "f2"), ("q9_factor", "f9"),
+            ("q10_options_vol", "f10")))
         self.assertEqual(payload["v2_method_lineage"], ("a", "b", "c", "n", "cal", "cov", "hex"))
         self.assertEqual(payload["replay_method_version"], REPLAY_METHOD_VERSION)
 
@@ -137,6 +165,42 @@ class V4AContractTests(unittest.TestCase):
         self.assertEqual(a.selected_digest, b.selected_digest)
         self.assertEqual((a.raw_resolved_n, a.non_overlapping_n), (4, 3))
 
+    def test_writer_preserves_forecast_conflicts_and_idempotency(self):
+        f = self.forecast()
+        cursor = FakeCursor([(f.forecast_record_hash,)])
+        writer = V4AWriter(FakeConnection(cursor))
+        writer.persist_forecast(f, T0)
+        self.assertEqual(writer.last_write_status, "IDEMPOTENT")
+        self.assertEqual(cursor.insert_count, 0)
+
+        conflicting = dataclasses.replace(f, forecast_record_hash="f" * 64,
+                                           forecast_record_id="v9v4f:" + "f" * 64)
+        cursor = FakeCursor([(f.forecast_record_hash,)])
+        writer = V4AWriter(FakeConnection(cursor))
+        stored = writer.persist_forecast(conflicting, T0)
+        self.assertEqual(writer.last_write_status, "FORECAST_DUPLICATE_CONFLICT")
+        self.assertEqual(cursor.insert_count, 1)
+        self.assertFalse(stored.persistence_proof_eligible)
+
+    def test_writer_preserves_outcome_conflicts_and_idempotency(self):
+        f = dataclasses.replace(self.forecast(), persisted_at=T0)
+        o = build_outcome(forecast=f, target_identity="target",
+                          endpoint_observation_at=f.target_endpoint,
+                          target_resolved_at=f.target_endpoint, actual_return_bps=1.0)
+        cursor = FakeCursor([(o.outcome_record_hash,)])
+        writer = V4AWriter(FakeConnection(cursor))
+        writer.persist_outcome(o, T0)
+        self.assertEqual(writer.last_write_status, "IDEMPOTENT")
+        self.assertEqual(cursor.insert_count, 0)
+
+        conflicting = dataclasses.replace(o, outcome_record_hash="e" * 64,
+                                           outcome_record_id="v9v4o:" + "e" * 64)
+        cursor = FakeCursor([(o.outcome_record_hash,)])
+        writer = V4AWriter(FakeConnection(cursor))
+        writer.persist_outcome(conflicting, T0)
+        self.assertEqual(writer.last_write_status, "OUTCOME_CONFLICT")
+        self.assertEqual(cursor.insert_count, 1)
+
 
 class V4AMigrationTests(unittest.TestCase):
     @classmethod
@@ -151,6 +215,12 @@ class V4AMigrationTests(unittest.TestCase):
         self.assertIn("CREATE TABLE PUBLIC.ATOM_V9_V4_OUTCOMES", self.upper)
         self.assertNotIn("ALTER TABLE PUBLIC.FORECASTS", self.upper)
         self.assertNotIn("ALTER TABLE PUBLIC.FORECAST_OUTCOMES", self.upper)
+        self.assertNotIn("UNIQUE (SYMBOL, CUTOFF_AT, HORIZON, CYCLE_ID, V3_MODEL_VERSION)", self.upper)
+        self.assertNotIn("UNIQUE (FORECAST_RECORD_ID, TARGET_IDENTITY)", self.upper)
+        self.assertIn("FORECAST_RECORD_ID TEXT PRIMARY KEY", self.upper)
+        self.assertIn("FORECAST_RECORD_HASH TEXT NOT NULL UNIQUE", self.upper)
+        self.assertIn("OUTCOME_RECORD_ID TEXT PRIMARY KEY", self.upper)
+        self.assertIn("OUTCOME_RECORD_HASH TEXT NOT NULL UNIQUE", self.upper)
 
     def test_database_mutation_rejection_and_least_privilege(self):
         self.assertEqual(self.upper.count("BEFORE UPDATE OR DELETE OR TRUNCATE"), 2)
