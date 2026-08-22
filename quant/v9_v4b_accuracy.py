@@ -151,8 +151,12 @@ def _horizon_state(horizon: str, cohort_id: str, cohort_hash: str, as_of: dateti
                       key=lambda pair:(pair[0].cutoff_at,pair[0].forecast_record_id))
     signed = [f.expected_return_bps-o.actual_return_bps for f,o in selected]
     absolute = [abs(x) for x in signed]; squared = [x*x for x in signed]
-    directional = [float((f.expected_return_bps > 0) == (o.actual_return_bps > 0))
-                   for f,o in selected if o.actual_return_bps != 0]
+    directional = [
+        0.0 if f.expected_return_bps == 0 else
+        float((f.expected_return_bps > 0 and o.actual_return_bps > 0) or
+              (f.expected_return_bps < 0 and o.actual_return_bps < 0))
+        for f, o in selected if o.actual_return_bps != 0
+    ]
     zeros = sum(o.actual_return_bps == 0 for _,o in selected)
     wins = sum(directional); losses = len(directional)-wins
     bn, br = effective_n(signed); mn, mr = effective_n(absolute)

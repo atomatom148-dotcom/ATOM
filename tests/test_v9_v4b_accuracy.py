@@ -104,6 +104,38 @@ def test_metrics_zero_conventions_hash_order_and_immutability():
         cohorts=cohorts(),evidence=changed).state_hash != state.state_hash
 
 
+def test_directional_sign_matrix_and_zero_realized_return():
+    samples = [
+        (0.0, 2.0), (0.0, -2.0),
+        (2.0, 2.0), (2.0, -2.0),
+        (-2.0, -2.0), (-2.0, 2.0),
+        (2.0, 0.0),
+    ]
+    evidence = []
+    for i, (mu, y) in enumerate(samples):
+        f = forecast("1M", i, mu)
+        evidence.append((f, outcome(f, y)))
+    horizon = build_accuracy_state(
+        symbol="COIN", state_as_of=NOW + timedelta(days=1),
+        cohorts=cohorts(), evidence=evidence,
+    ).horizon_states[1]
+
+    assert horizon.directional_wins == 2
+    assert horizon.directional_losses == 4
+    assert horizon.zero_realized_return_count == 1
+    assert horizon.directional_accuracy == pytest.approx(1 / 3)
+    assert horizon.directional_effective_n == 6
+    assert horizon.effective_wins == pytest.approx(2)
+    assert horizon.effective_losses == pytest.approx(4)
+    assert horizon.jeffreys_posterior_mean == pytest.approx(2.5 / 7)
+    assert horizon.jeffreys_lower is not None
+    assert horizon.jeffreys_upper is not None
+    assert horizon.jeffreys_interval_width == pytest.approx(
+        horizon.jeffreys_upper - horizon.jeffreys_lower
+    )
+    assert horizon.status == "PROVISIONAL"
+
+
 def test_unverified_evidence_excluded_and_horizons_degrade_independently():
     f=forecast("1M",0,2); pair=(f,outcome(f,1,False))
     state=build_accuracy_state(symbol="COIN",state_as_of=NOW+timedelta(days=1),cohorts=cohorts(),evidence=[pair])
@@ -132,6 +164,23 @@ def test_maturity_requires_both_effective_n_and_interval_width():
     provisional=build_accuracy_state(symbol="COIN",state_as_of=NOW+timedelta(days=1),
         cohorts=cohorts(),evidence=evidence[:384]).horizon_states[0]
     assert provisional.status == "PROVISIONAL"
+
+
+def test_zero_forecast_loss_propagates_through_mature_state():
+    evidence=[]
+    for i in range(385):
+        mu, y = (0.0, -1.0) if i == 0 else (1.0, 1.0)
+        f=forecast("30S",i,mu); evidence.append((f,outcome(f,y)))
+    horizon=build_accuracy_state(symbol="COIN",state_as_of=NOW+timedelta(days=1),
+        cohorts=cohorts(),evidence=evidence).horizon_states[0]
+    assert (horizon.directional_wins, horizon.directional_losses) == (384, 1)
+    assert horizon.directional_accuracy == pytest.approx(384 / 385)
+    assert horizon.directional_effective_n == 385
+    assert horizon.effective_wins == pytest.approx(384)
+    assert horizon.effective_losses == pytest.approx(1)
+    assert horizon.jeffreys_posterior_mean == pytest.approx(384.5 / 386)
+    assert horizon.jeffreys_interval_width <= .10
+    assert horizon.status == "MATURE"
 
 
 class Cursor:
