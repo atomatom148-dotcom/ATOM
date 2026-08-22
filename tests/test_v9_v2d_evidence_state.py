@@ -4,7 +4,7 @@ import re
 import pytest
 
 from quant.v9_v2a_dataset import (
-    DIRECTIONAL_BPS, HORIZON_SECONDS, RawFamilyObservation, RawTarget,
+    DIRECTIONAL_BPS, ExclusionCount, HORIZON_SECONDS, RawFamilyObservation, RawTarget,
     TargetIdentity, build_v2a_dataset,
 )
 from quant.v9_v2b_calibration import calibrate_v2b
@@ -181,3 +181,73 @@ def test_every_published_collection_is_immutable_and_build_has_no_side_effects(t
         slot.status = "MATURE"
     # V2D exposes only a pure constructor: no publisher, database, API, or file path.
     assert tuple(tmp_path.iterdir()) == ()
+
+
+def _rejected_bundle_fixture(kind):
+    valid = _components("30S", state_as_of=10000.0)
+    rejected = _components("1M", state_as_of=10000.0)
+    rejected_dataset = replace(
+        rejected[0], training_start=-500.0, training_end=9999.0,
+        target_spec_id="must-not-aggregate",
+        target_data_schema_version="must-not-aggregate",
+        target_source_spec_version="must-not-aggregate",
+        exclusions=(ExclusionCount("REJECTED_ONLY_EXCLUSION", 77),),
+    )
+    if kind == "nonfinite":
+        item = replace(rejected[1].directional[0], calibration_slope=float("nan"))
+        rejected = (rejected_dataset, replace(rejected[1], directional=(item,)), rejected[2])
+    elif kind == "integrity":
+        rejected = (rejected_dataset, rejected[1], replace(
+            rejected[2], ordered_formula_versions=("wrong-formula",)))
+    elif kind == "future":
+        rejected = (replace(rejected_dataset, state_as_of=10001.0), rejected[1], rejected[2])
+    else:  # pragma: no cover - protects the test helper itself
+        raise AssertionError(kind)
+    return valid, rejected
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason"),
+    (("nonfinite", "NONFINITE_COMPONENT_STATE"),
+     ("integrity", "CROSS_LAYER_INTEGRITY_FAILURE"),
+     ("future", "CROSS_LAYER_INTEGRITY_FAILURE")),
+)
+def test_rejected_bundle_does_not_contribute_top_level_metadata(kind, reason):
+    valid, rejected = _rejected_bundle_fixture(kind)
+    baseline = _state((valid,))
+    state = _state((valid, rejected))
+
+    assert state.horizon_state_tuple[0] == baseline.horizon_state_tuple[0]
+    assert state.horizon_state_tuple[1].status == "UNAVAILABLE"
+    assert state.horizon_state_tuple[1].reason_codes == (reason,)
+    assert (state.training_start, state.training_end) == (
+        baseline.training_start, baseline.training_end)
+    assert state.evidence_manifest_hash == baseline.evidence_manifest_hash
+    assert state.component_hash_tuple == baseline.component_hash_tuple
+    assert state.exclusion_count_tuple == baseline.exclusion_count_tuple
+    assert (state.target_spec_id, state.target_data_schema_version,
+            state.target_source_spec_version) == (
+                baseline.target_spec_id, baseline.target_data_schema_version,
+                baseline.target_source_spec_version)
+
+
+def test_fixed_rejected_bundle_participates_and_changes_state_identity():
+    valid, rejected = _rejected_bundle_fixture("nonfinite")
+    rejected_state = _state((valid, rejected))
+    fixed = _components("1M", state_as_of=10000.0)
+    fixed_dataset = replace(
+        fixed[0], training_start=-500.0, training_end=9999.0,
+        exclusions=(ExclusionCount("FIXED_BUNDLE_EXCLUSION", 3),),
+        dataset_hash="f" * 64,
+    )
+    fixed_state = _state((valid, (fixed_dataset, fixed[1], fixed[2])))
+
+    assert fixed_state.horizon_state_tuple[1].status == "MATURE"
+    assert fixed_state.training_start == -500.0
+    assert fixed_state.training_end == 9999.0
+    assert ("FIXED_BUNDLE_EXCLUSION", 3) in fixed_state.exclusion_count_tuple
+    assert fixed_state.component_hash_tuple != rejected_state.component_hash_tuple
+    assert fixed_state.evidence_manifest_hash != rejected_state.evidence_manifest_hash
+    assert fixed_state.state_hash != rejected_state.state_hash
+    assert not any("forecast" in field.lower() or "final_bps" in field.lower()
+                   for field in fixed_state.__dataclass_fields__)

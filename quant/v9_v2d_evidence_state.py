@@ -192,7 +192,8 @@ def _q3(item: Q3MagnitudeCalibration | None) -> Q3MagnitudeState:
 
 
 def _assemble_horizon(dataset: V2ADataset, calibration: V2BCalibration,
-                      covariance: V2CCovariance, heterogeneous: bool) -> HorizonEvidenceState:
+                      covariance: V2CCovariance,
+                      heterogeneous: bool) -> tuple[HorizonEvidenceState, bool]:
     horizon = dataset.horizon
     subsets = tuple(dataset.directional_subsets)
     expected_ids = tuple(item.quant_id for item in subsets)
@@ -220,9 +221,9 @@ def _assemble_horizon(dataset: V2ADataset, calibration: V2BCalibration,
     )
     components = (dataset, calibration, covariance)
     if not _all_finite(components):
-        return _missing(horizon, "NONFINITE_COMPONENT_STATE")
+        return _missing(horizon, "NONFINITE_COMPONENT_STATE"), False
     if not integrity:
-        return _missing(horizon, "CROSS_LAYER_INTEGRITY_FAILURE")
+        return _missing(horizon, "CROSS_LAYER_INTEGRITY_FAILURE"), False
 
     directional = tuple(_directional(item) for item in ordered_b if item is not None)
     usable = tuple(item for item in directional if item.status != "UNAVAILABLE")
@@ -253,7 +254,7 @@ def _assemble_horizon(dataset: V2ADataset, calibration: V2BCalibration,
         covariance.stabilized_covariance_matrix if covariance_usable else None,
         covariance.dependence_modeled if covariance_usable else False,
         covariance.status, tuple(sorted(covariance.reason_codes)), q3_state,
-    )
+    ), True
 
 
 def build_v2d_evidence_state(*, state_as_of: float,
@@ -269,14 +270,10 @@ def build_v2d_evidence_state(*, state_as_of: float,
     ds_by_h = {item.horizon: item for item in ds_items}
     cov_by_h = {item.horizon: item for item in cov_items}
     duplicate_horizons = (len(ds_by_h) != len(ds_items) or len(cov_by_h) != len(cov_items))
-    cutoffs = {item.state_as_of for item in ds_items if item.state_as_of <= state_as_of}
-    heterogeneous = len(cutoffs) > 1
-    identities = {(item.target_spec_id, item.target_data_schema_version,
-                   item.target_source_spec_version) for item in ds_items
-                  if item.state_as_of <= state_as_of}
-    identity = next(iter(identities)) if len(identities) == 1 else (None, None, None)
     horizon_states = []
     hashes: list[ComponentHash] = []
+    accepted_datasets: list[V2ADataset] = []
+    accepted_indexes: list[int] = []
     for horizon in HORIZONS:
         dataset = ds_by_h.get(horizon)
         covariance = cov_by_h.get(horizon)
@@ -289,12 +286,14 @@ def build_v2d_evidence_state(*, state_as_of: float,
             horizon_states.append(_missing(horizon, "CROSS_LAYER_INTEGRITY_FAILURE")); continue
         if dataset.state_as_of > state_as_of:
             horizon_states.append(_missing(horizon, "CROSS_LAYER_INTEGRITY_FAILURE")); continue
-        if len(identities) != 1 or duplicate_horizons:
+        if duplicate_horizons:
             horizon_states.append(_missing(horizon, "CROSS_LAYER_INTEGRITY_FAILURE")); continue
         calibration = matching_calibrations[0]
-        state = _assemble_horizon(dataset, calibration, covariance, heterogeneous)
+        state, accepted = _assemble_horizon(dataset, calibration, covariance, False)
         horizon_states.append(state)
-        if _all_finite((dataset, calibration, covariance)):
+        if accepted:
+            accepted_datasets.append(dataset)
+            accepted_indexes.append(len(horizon_states) - 1)
             hashes.extend((
                 ComponentHash(horizon, "V2A", dataset.dataset_hash),
                 ComponentHash(horizon, "V2B", _digest((
@@ -305,18 +304,41 @@ def build_v2d_evidence_state(*, state_as_of: float,
                 ))),
                 ComponentHash(horizon, "V2C", _digest(covariance)),
             ))
+    accepted_identities = {
+        (item.target_spec_id, item.target_data_schema_version,
+         item.target_source_spec_version) for item in accepted_datasets
+    }
+    if len(accepted_identities) > 1:
+        for index in accepted_indexes:
+            horizon_states[index] = _missing(
+                horizon_states[index].horizon, "CROSS_LAYER_INTEGRITY_FAILURE")
+        accepted_datasets.clear()
+        accepted_indexes.clear()
+        hashes.clear()
+    heterogeneous = len({item.state_as_of for item in accepted_datasets}) > 1
+    if heterogeneous:
+        for index in accepted_indexes:
+            state = horizon_states[index]
+            horizon_states[index] = replace(
+                state,
+                status="PROVISIONAL" if state.status == "MATURE" else state.status,
+                reason_codes=_reasons(state.reason_codes,
+                                      ("HETEROGENEOUS_COMPONENT_CUTOFF",)),
+            )
     horizon_tuple = tuple(horizon_states)
     component_tuple = tuple(sorted(set(hashes)))
     manifest = _digest(tuple((item.horizon, item.layer, item.digest) for item in component_tuple))
-    starts = [item.training_start for item in ds_items
-              if item.state_as_of <= state_as_of and item.training_start is not None]
-    ends = [item.training_end for item in ds_items
-            if item.state_as_of <= state_as_of and item.training_end is not None]
+    starts = [item.training_start for item in accepted_datasets
+              if item.training_start is not None]
+    ends = [item.training_end for item in accepted_datasets
+            if item.training_end is not None]
+    identities = {(item.target_spec_id, item.target_data_schema_version,
+                   item.target_source_spec_version) for item in accepted_datasets}
+    identity = next(iter(identities)) if len(identities) == 1 else (None, None, None)
     exclusion: dict[str, int] = {}
-    for item in ds_items:
-        if item.state_as_of <= state_as_of:
-            for count in item.exclusions:
-                exclusion[count.reason_code] = exclusion.get(count.reason_code, 0) + count.count
+    for item in accepted_datasets:
+        for count in item.exclusions:
+            exclusion[count.reason_code] = exclusion.get(count.reason_code, 0) + count.count
     statuses = tuple(item.status for item in horizon_tuple)
     top = ("MATURE" if all(item == "MATURE" for item in statuses) else
            "UNAVAILABLE" if all(item == "UNAVAILABLE" for item in statuses) else "PROVISIONAL")
