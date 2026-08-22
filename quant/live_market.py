@@ -10,6 +10,7 @@ import os
 import threading
 import time
 from typing import Callable
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .history import MidpointHistory, MidpointObservation
@@ -557,6 +558,11 @@ def poll_massive_ndx(state: LiveMarketState, *, interval: float = 1.0) -> None:
             if not state.accept_g2_price(
                     asset="NDX", price=price, event_epoch=event_epoch):
                 raise ValueError("Massive NDX snapshot was rejected")
+        except HTTPError as error:
+            if error.code == 403:
+                print("Massive NDX access is forbidden/unavailable", flush=True)
+                return
+            print(f"Massive NDX snapshot poll failed: {error}", flush=True)
         except Exception as error:
             print(f"Massive NDX snapshot poll failed: {error}", flush=True)
         time.sleep(interval)
