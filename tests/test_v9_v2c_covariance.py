@@ -150,18 +150,32 @@ def test_complete_case_fallback_and_no_scale_unavailable():
     assert unavailable.status == "UNAVAILABLE" and unavailable.numerical_ridge is None
 
 
-def test_complete_case_integrity_and_provisional_calibration_status():
+def test_rejected_complete_case_retains_finite_covariance_but_blocks_maturity():
     dataset, calibration = _inputs(
         (1, 3, 6), {"q1_momentum": (0, 0, 0), "q2_mean_reversion": (0, 0, 0)})
     missing = dict(enumerate(dataset.directional_subsets))
     subset = missing[0]
     broken = replace(dataset, directional_subsets=(replace(subset, observations=subset.observations[:-1]),
                                                     dataset.directional_subsets[1]))
-    result = build_v2c_covariance(broken, _identity_calibrations(dataset, calibration, "PROVISIONAL"))
+    result = build_v2c_covariance(broken, _identity_calibrations(dataset, calibration, "MATURE"))
     assert result.complete_case_n == 2
     assert "COMPLETE_CASE_INTEGRITY_REJECTED" in result.reason_codes
     assert result.status == "PROVISIONAL"
     assert result.shrinkage_method == OAS_METHOD
+    assert result.dependence_modeled
+    assert all(math.isfinite(value)
+               for row in result.stabilized_covariance_matrix for value in row)
+
+
+def test_intact_complete_case_with_mature_calibrations_can_remain_mature():
+    dataset, calibration = _inputs(
+        (2.0, 5.0, 9.0, 14.0),
+        {"q1_momentum": (1.0, 3.0, 6.0, 10.0),
+         "q2_mean_reversion": (0.0, 1.0, 3.0, 6.0)})
+    result = build_v2c_covariance(
+        dataset, _identity_calibrations(dataset, calibration, "MATURE"))
+    assert result.status == "MATURE"
+    assert "COMPLETE_CASE_INTEGRITY_REJECTED" not in result.reason_codes
 
 
 def test_nonfinite_residual_is_rejected_without_manufacturing_scale():

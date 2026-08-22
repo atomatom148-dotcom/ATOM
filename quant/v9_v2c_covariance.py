@@ -259,7 +259,8 @@ def build_v2c_covariance(dataset: V2ADataset, calibration: V2BCalibration) -> V2
                       all(item.status == "MATURE" for item in selected if item) and
                       all(support[i][j] for i in range(p) for j in range(p)) and
                       pooled is not None and math.isfinite(pooled) and pooled > 0.0 and
-                      not material)
+                      not material and
+                      "COMPLETE_CASE_INTEGRITY_REJECTED" not in reasons)
             status = "MATURE" if mature else "PROVISIONAL"
     if status == "UNAVAILABLE":
         reasons.add("SUPPORTED_POSITIVE_SCALE_UNAVAILABLE")
