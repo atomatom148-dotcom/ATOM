@@ -63,9 +63,23 @@ def test_largest_supported_subset_and_canonical_tie_are_deterministic():
 
     ties = ((True, True, False, False), (True, True, False, False),
             (False, False, True, True), (False, False, True, True))
-    # Hard degradation maps a maximum clique of two to one, preserving its
-    # canonically first member.
-    assert _first(*_inputs(ids, support=ties)).used_quant_ids == ids[:1]
+    assert _first(*_inputs(ids, support=ties)).used_quant_ids == ids[:2]
+
+
+@pytest.mark.parametrize("count", (9, 8, 6, 5, 4, 2))
+def test_every_supported_family_is_used_without_cardinality_bucketing(count):
+    ids = CANONICAL_FAMILIES[:count]
+    result = _first(*_inputs(ids))
+    assert result.used_quant_ids == ids
+    assert len(result.weights) == count
+
+
+def test_largest_supported_subset_remains_intact_and_unsupported_family_is_excluded():
+    ids = CANONICAL_FAMILIES[:6]
+    support = tuple(tuple(i < 5 and j < 5 for j in range(6)) for i in range(6))
+    result = _first(*_inputs(ids, support=support))
+    assert result.used_quant_ids == ids[:5]
+    assert ids[5] not in result.used_quant_ids
 
 
 def test_single_family_uses_frozen_residual_variance_without_covariance():

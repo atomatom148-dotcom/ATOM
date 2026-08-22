@@ -23,7 +23,6 @@ CANONICAL_FAMILIES = (
     "q6_volume_liquidity", "q7_relative_value", "q8_cross_asset", "q9_factor",
     "q10_options_vol", "q11_regime", "q12_event_session",
 )
-_DEGRADATION = (11, 10, 7, 3, 1)
 _TOL = 1e-10
 
 
@@ -170,8 +169,7 @@ def _largest_supported(ids: tuple[str, ...], state: HorizonEvidenceState) -> tup
         candidate_rank = tuple(ids.index(item) for item in candidate)
         best_rank = tuple(ids.index(item) for item in best)
         if ok and (len(candidate) > len(best) or candidate_rank < best_rank): best = candidate
-    target = next((size for size in _DEGRADATION if size <= len(best)), 0)
-    return best[:target]
+    return best
 
 
 def _unavailable(horizon: str, *reasons: str) -> V3HorizonResult:
