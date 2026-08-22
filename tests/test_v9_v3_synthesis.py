@@ -76,9 +76,17 @@ def test_largest_supported_subset_and_canonical_tie_are_deterministic():
 
     ties = ((True, True, False, False), (True, True, False, False),
             (False, False, True, True), (False, False, True, True))
-    # Hard degradation maps a maximum clique of two to one, preserving its
-    # canonically first member.
-    assert _first(*_inputs(ids, support=ties)).used_quant_ids == ids[:1]
+    # An equally large supported pair remains complete; canonical ordering
+    # chooses the first pair deterministically.
+    assert _first(*_inputs(ids, support=ties)).used_quant_ids == ids[:2]
+
+
+@pytest.mark.parametrize("family_count", (9, 8, 6, 5, 4, 2))
+def test_every_covariance_compatible_family_is_retained(family_count):
+    ids = CANONICAL_FAMILIES[:family_count]
+    result = _first(*_inputs(ids))
+    assert result.used_quant_ids == ids
+    assert len(result.weights) == family_count
 
 
 def test_single_family_uses_frozen_residual_variance_without_covariance():
