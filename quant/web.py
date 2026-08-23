@@ -23,6 +23,7 @@ from .q1_momentum import calculate_momentum
 from .q2_mean_reversion import calculate_mean_reversion
 from .q3_volatility import calculate_volatility
 from .v9_telemetry import latest_v9_observation
+from .v9_v4d_integration import OperationalMetrics
 
 
 HORIZON_LABELS = ("30S", "1M", "5M", "15M", "30M", "60M")
@@ -464,13 +465,30 @@ def create_app(
     state: LiveMarketState | None = None, clock: Callable[[], float] = time.time,
     evidence_store: EvidenceStore | None = None,
     evidence_cache: DashboardEvidenceCache | None = None,
+    metrics: OperationalMetrics | None = None,
+    monotonic_clock: Callable[[], float] = time.perf_counter,
 ) -> Callable:
     """Create the WSGI application, rendering current state on every request."""
 
     del evidence_store  # retained only for backward-compatible construction
+    metrics = metrics or getattr(state, "metrics", None) or OperationalMetrics()
 
     def application(environ: dict[str, object], start_response: Callable) -> list[bytes]:
         path = environ.get("PATH_INFO", "")
+        request_started = monotonic_clock()
+        original_start_response = start_response
+
+        def measured_start_response(status: str, headers: list[tuple[str, str]],
+                                    exc_info: object = None) -> object:
+            metrics.observe(
+                "web_endpoint." + str(path or "unknown") + ".duration_ms",
+                (monotonic_clock() - request_started) * 1000,
+            )
+            if exc_info is None:
+                return original_start_response(status, headers)
+            return original_start_response(status, headers, exc_info)
+
+        start_response = measured_start_response
         if path == "/health":
             body = b'{"status":"running"}'
             start_response("200 OK", [("Content-Type", "application/json"),
@@ -499,6 +517,13 @@ def create_app(
                 ),
                 "as_of_epoch": telemetry.as_of_epoch if telemetry else None,
             }, separators=(",", ":"), allow_nan=False).encode()
+            start_response("200 OK", [("Content-Type", "application/json"),
+                                      ("Content-Length", str(len(body)))])
+            return [body]
+        if path == "/api/performance":
+            telemetry = metrics.snapshot()
+            body = json.dumps(asdict(telemetry), separators=(",", ":"),
+                              allow_nan=False).encode()
             start_response("200 OK", [("Content-Type", "application/json"),
                                       ("Content-Length", str(len(body)))])
             return [body]
@@ -581,16 +606,20 @@ def main() -> None:
     from .v9_production import (
         ImmutableV2StateProvider, PostgresV2StateBuilder, ProductionV9Runtime,
     )
-    v2_provider = ImmutableV2StateProvider(PostgresV2StateBuilder(database_url))
+    metrics = OperationalMetrics()
+    v2_provider = ImmutableV2StateProvider(
+        PostgresV2StateBuilder(database_url), metrics=metrics,
+    )
     v2_provider.start()
-    v9_runtime = ProductionV9Runtime(database_url, v2_provider)
+    v9_runtime = ProductionV9Runtime(database_url, v2_provider, metrics=metrics)
     state = LiveMarketState(evidence_store=evidence_store,
-                            v9_cycle_handler=v9_runtime.on_quote)
+                            v9_cycle_handler=v9_runtime.on_quote,
+                            metrics=metrics)
     start_alpaca_poller(state)
     start_alpaca_g2_poller(state)
     start_massive_ndx_poller(state)
     start_alpaca_options_poller(state)
-    app = create_app(state=state, evidence_cache=evidence_cache)
+    app = create_app(state=state, evidence_cache=evidence_cache, metrics=metrics)
     with make_server(args.host, args.port, app) as server:
         server.serve_forever()
 

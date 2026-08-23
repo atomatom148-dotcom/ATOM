@@ -32,6 +32,7 @@ from .q11_regime import RegimeResult, calculate_regime
 from .q12_event_session import EventSessionResult, calculate_event_session
 from .v9_math_core import V9MathCore, V9MathInput, V9QuantFamily
 from .v9_telemetry import record_v9_observation
+from .v9_v4d_integration import OperationalMetrics
 
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
@@ -46,6 +47,7 @@ MAX_NDX_AGE_SECONDS = 10.0
 HISTORY_SECONDS = 3600.0
 MARKET_DISPLAY_FETCH_SECONDS = 0.25
 QUANT_CYCLE_SECONDS = 1.0
+FAMILY_RUNTIME_LIMIT_MS = 100.0
 
 
 def v9_math_core_enabled() -> bool:
@@ -132,10 +134,14 @@ class LiveMarketState:
     def __init__(self, *, clock: Callable[[], float] = time.time,
                  evidence_store: EvidenceStore | None = None,
                  v9_cycle_handler: Callable[["LiveSnapshot", MidpointObservation | None,
-                                             MidpointObservation], object | None] | None = None) -> None:
+                                             MidpointObservation], object | None] | None = None,
+                 metrics: OperationalMetrics | None = None,
+                 monotonic_clock: Callable[[], float] = time.perf_counter) -> None:
         self._clock = clock
         self._evidence_store = evidence_store
         self._v9_cycle_handler = v9_cycle_handler
+        self.metrics = metrics or OperationalMetrics()
+        self._monotonic = monotonic_clock
         self._lock = threading.Lock()
         self._btc_history = MidpointHistory()
         self._ndx_history = MidpointHistory()
@@ -285,7 +291,12 @@ class LiveMarketState:
         if bid <= 0 or ask <= 0 or ask < bid:
             return False
 
-        observation = MidpointObservation(event_epoch, (bid + ask) / 2.0)
+        update_started = self._monotonic()
+        # Provider quotes use decimal prices; suppress binary representation noise
+        # without changing the mathematical midpoint.
+        observation = MidpointObservation(
+            event_epoch, round(bid + (ask - bid) / 2.0, 12),
+        )
         previous_observation: MidpointObservation | None = None
         with self._lock:
             old = self._snapshot.history.observations
@@ -314,23 +325,37 @@ class LiveMarketState:
                 )
                 quote_history = QuoteHistory(quote_observations)
             cycle = self._clock()
+            def family(name: str, calculation: Callable[[], object]) -> object | None:
+                started = self._monotonic()
+                try:
+                    result = calculation()
+                except Exception:
+                    result = None
+                    self.metrics.increment(f"family.{name}.failure")
+                elapsed = (self._monotonic() - started) * 1000
+                self.metrics.observe(f"family.{name}.runtime_ms", elapsed)
+                if elapsed > FAMILY_RUNTIME_LIMIT_MS:
+                    self.metrics.increment(f"family.{name}.slow_excluded")
+                    return None
+                return result
+
             next_snapshot = LiveSnapshot(
                 history,
                 self._snapshot.qqq_history,
                 quote_history,
                 cycle,
-                calculate_momentum(history, cutoff_epoch=event_epoch),
-                calculate_mean_reversion(history, cutoff_epoch=event_epoch),
-                calculate_volatility(history, cutoff_epoch=event_epoch),
-                calculate_stat_arb(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
-                calculate_microstructure(quote_history, cutoff_epoch=event_epoch),
-                calculate_volume_liquidity(quote_history, cutoff_epoch=event_epoch),
-                calculate_relative_value(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
-                calculate_cross_asset(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
-                calculate_factor(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch),
-                calculate_options_vol(self._snapshot.option_surface, cutoff_epoch=event_epoch),
-                calculate_regime(history, cutoff_epoch=event_epoch),
-                calculate_event_session(history, cutoff_epoch=event_epoch),
+                family("q1_momentum", lambda: calculate_momentum(history, cutoff_epoch=event_epoch)),
+                family("q2_mean_reversion", lambda: calculate_mean_reversion(history, cutoff_epoch=event_epoch)),
+                family("q3_volatility", lambda: calculate_volatility(history, cutoff_epoch=event_epoch)),
+                family("q4_stat_arb", lambda: calculate_stat_arb(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch)),
+                family("q5_microstructure", lambda: calculate_microstructure(quote_history, cutoff_epoch=event_epoch)),
+                family("q6_volume_liquidity", lambda: calculate_volume_liquidity(quote_history, cutoff_epoch=event_epoch)),
+                family("q7_relative_value", lambda: calculate_relative_value(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch)),
+                family("q8_cross_asset", lambda: calculate_cross_asset(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch)),
+                family("q9_factor", lambda: calculate_factor(history, self._snapshot.qqq_history, cutoff_epoch=event_epoch)),
+                family("q10_options_vol", lambda: calculate_options_vol(self._snapshot.option_surface, cutoff_epoch=event_epoch)),
+                family("q11_regime", lambda: calculate_regime(history, cutoff_epoch=event_epoch)),
+                family("q12_event_session", lambda: calculate_event_session(history, cutoff_epoch=event_epoch)),
                 self._snapshot.option_observation,
                 self._snapshot.option_surface,
             )
@@ -380,6 +405,8 @@ class LiveMarketState:
                     with self._lock:
                         self._v9_output = output
                         self._v9_error = None
+        self.metrics.observe("coin_market_state_update_latency_ms",
+                             (self._monotonic() - update_started) * 1000)
         return True
 
     def snapshot(self) -> LiveSnapshot:
