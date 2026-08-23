@@ -142,6 +142,10 @@ class LiveMarketState:
         self._evidence_store = evidence_store
         self._evidence_outbox = evidence_outbox
         self._coin_sequence = 0
+        # Preserve accepted COIN order through V4 calculation and the one
+        # non-blocking outbox handoff.  The state lock remains narrowly scoped
+        # and no database work is permitted inside this ingress boundary.
+        self._coin_ingress_lock = threading.Lock()
         self._v9_cycle_handler = v9_cycle_handler
         self.metrics = metrics or OperationalMetrics()
         self._monotonic = monotonic_clock
@@ -280,6 +284,18 @@ class LiveMarketState:
             return self._g2_state
 
     def accept_quote(
+        self, *, bid: float, ask: float, event_epoch: float,
+        bid_size: float | None = None, ask_size: float | None = None,
+    ) -> bool:
+        """Serialize one COIN ingress event through its outbox handoff."""
+
+        with self._coin_ingress_lock:
+            return self._accept_quote_serialized(
+                bid=bid, ask=ask, event_epoch=event_epoch,
+                bid_size=bid_size, ask_size=ask_size,
+            )
+
+    def _accept_quote_serialized(
         self, *, bid: float, ask: float, event_epoch: float,
         bid_size: float | None = None, ask_size: float | None = None,
     ) -> bool:
