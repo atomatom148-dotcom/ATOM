@@ -118,17 +118,23 @@ def test_state_time_and_hash_fail_closed_on_insert_and_select():
     state=build_v4c_state(symbol="X",cohort_id="c",state_as_of=NOW,
         evidence_first_cutoff=NOW,evidence_last_cutoff=NOW,horizons=_six_states())
     class Cursor:
-        def __init__(self):self.results=[];self.inserted=None
+        def __init__(self):self.results=[];self.inserted=None;self.closed=False
         def execute(self,sql,args):
             if sql.startswith("SELECT state_hash FROM"):self.results=[]
             elif sql.startswith("INSERT INTO"):self.inserted=args
         def fetchall(self):return self.results
+        def close(self):self.closed=True
     class Connection:
-        def __init__(self):self.value=Cursor()
+        def __init__(self):
+            self.value=Cursor();self.autocommit=False
+            self.commits=0;self.rollbacks=0
         def cursor(self):return self.value
+        def commit(self):self.commits+=1
+        def rollback(self):self.rollbacks+=1
     connection=Connection(); store=V4CStateStore(connection)
     assert store.insert(replace(state,state_hash="0"*64),NOW)=="STATE_HASH_MISMATCH"
     assert store.insert(state,NOW)=="INSERT"
+    assert (connection.commits,connection.rollbacks,connection.value.closed)==(1,0,True)
     canonical=connection.value.inserted[9]
     connection.value.execute=lambda sql,args:setattr(connection.value,"results",[(state.state_hash,canonical,NOW,NOW,NOW)])
     assert store.latest_json(symbol="X",cohort_id="c",requested_cutoff=NOW)[1]=="AVAILABLE"
@@ -165,11 +171,14 @@ def test_q3_quartile_lower_tail_probability_reasons_and_digest():
 
 def test_latest_json_query_is_bounded_to_two_rows():
     class Cursor:
+        def __init__(self):self.closed=False
         def execute(self,sql,args):self.sql=sql
         def fetchall(self):return []
+        def close(self):self.closed=True
     class Connection:
-        def __init__(self):self.value=Cursor()
+        def __init__(self):self.value=Cursor();self.autocommit=False;self.commits=0
         def cursor(self):return self.value
+        def commit(self):self.commits+=1
     connection=Connection()
     assert V4CStateStore(connection).latest_json(symbol="X",cohort_id="c",requested_cutoff=NOW)==(None,"UNAVAILABLE")
     assert "ORDER BY state_as_of DESC, state_id DESC LIMIT 2" in connection.value.sql

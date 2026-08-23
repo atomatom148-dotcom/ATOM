@@ -184,12 +184,17 @@ def test_zero_forecast_loss_propagates_through_mature_state():
 
 
 class Cursor:
-    def __init__(self, rows): self.rows=rows; self.sql=[]
+    def __init__(self, rows): self.rows=rows; self.sql=[]; self.closed=False
     def execute(self,sql,args): self.sql.append((sql,args))
     def fetchall(self): return self.rows.pop(0)
+    def close(self): self.closed=True
 class Connection:
-    def __init__(self,rows): self.cursor_value=Cursor(rows)
+    def __init__(self,rows):
+        self.cursor_value=Cursor(rows); self.autocommit=False
+        self.commits=0; self.rollbacks=0
     def cursor(self): return self.cursor_value
+    def commit(self): self.commits+=1
+    def rollback(self): self.rollbacks+=1
 
 
 def test_store_idempotence_insert_and_same_time_conflict():
@@ -197,6 +202,7 @@ def test_store_idempotence_insert_and_same_time_conflict():
     con=Connection([[],[]]); store=AccuracyStateStore(con)
     assert store.insert(empty,NOW)=="INSERT"
     assert "INSERT INTO atom_v9_v4_states" in con.cursor_value.sql[-1][0]
+    assert (con.commits,con.rollbacks,con.cursor_value.closed)==(1,0,True)
     con=Connection([[(empty.state_hash,)]]); assert AccuracyStateStore(con).insert(empty,NOW)=="IDEMPOTENT"
     con=Connection([[('a',{},NOW),('b',{},NOW)]])
     assert AccuracyStateStore(con).latest_json(symbol="COIN",cohort_id="x",requested_cutoff=NOW)[1]=="STATE_CONFLICT"

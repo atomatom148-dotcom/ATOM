@@ -5,11 +5,14 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
-from quant.v9_v3_synthesis import MODEL_VERSION, V3HorizonResult
+from quant.v9_v3_synthesis import (
+    CONTRACT_VERSION as V3_CONTRACT_VERSION, MODEL_VERSION, V3HorizonResult,
+)
 from quant.v9_v4a_evidence import (
     CONTRACT_VERSION, EVIDENCE_VERSION, REPLAY_METHOD_VERSION,
     DuplicateConflict, build_cohort, build_forecast, build_outcome,
-    V4AWriter, canonical_sha256, classify_duplicate, select_non_overlapping,
+    V4AWriter, canonical_sha256, canonical_target_identity,
+    classify_duplicate, select_non_overlapping,
 )
 
 
@@ -21,6 +24,7 @@ def upstream():
     slots = tuple(SimpleNamespace(quant_id=q, formula_version=f, horizon="1M")
                   for q, f in (("q2_mean_reversion", "f2"), ("q1_momentum", "f1")))
     v1 = SimpleNamespace(symbol="COIN", cutoff_at=T0, cycle_id="cycle",
+                         contract_version="V9-V1",
                          target_spec_id="target-1", data_schema_version="data-1",
                          source_spec_version="source-1", slots=slots)
     v2 = SimpleNamespace(v2a_method_version="a", v2b_method_version="b",
@@ -29,7 +33,7 @@ def upstream():
         numerical_canonicalization_version="hex", state_id="v2-state:one",
         state_version="V9-V2D-2", state_hash="1" * 64,
         state_as_of=T0.timestamp())
-    result = V3HorizonResult("1M", 60, 1.25, 4.0, "AVAILABLE",
+    result = V3HorizonResult("1M", 60, 1.25, 4.0, "MATURE",
                              ("q1_momentum",), (1.0,), 1, "FULL",
                              q3_diagnostic_magnitude_bps=None)
     return v1, v2, result
@@ -40,6 +44,7 @@ class FakeCursor:
         self.rows = rows
         self.insert_count = 0
         self.last_insert_parameters = None
+        self.closed = False
 
     def execute(self, sql, _parameters):
         if sql.startswith("INSERT"):
@@ -49,13 +54,25 @@ class FakeCursor:
     def fetchall(self):
         return self.rows
 
+    def close(self):
+        self.closed = True
+
 
 class FakeConnection:
     def __init__(self, cursor):
         self._cursor = cursor
+        self.autocommit = False
+        self.commits = 0
+        self.rollbacks = 0
 
     def cursor(self):
         return self._cursor
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
 
 
 class V4AContractTests(unittest.TestCase):
@@ -63,11 +80,11 @@ class V4AContractTests(unittest.TestCase):
         return build_forecast(v1=upstream()[0], v2=upstream()[1],
                               result=upstream()[2], evidence_origin=origin)
 
-    def test_frozen_versions_and_nullable_v3_contract(self):
+    def test_frozen_versions_and_complete_v3_contract_identity(self):
         f = self.forecast()
         self.assertEqual((f.contract_version, f.evidence_version),
                          (CONTRACT_VERSION, EVIDENCE_VERSION))
-        self.assertIsNone(f.v3_contract_version)
+        self.assertEqual(f.v3_contract_version, V3_CONTRACT_VERSION)
         self.assertEqual(f.v3_model_version, "ATOM-TRUE-V9-V3")
 
     def test_forecast_is_immutable_and_bps_can_remain_null(self):
@@ -85,12 +102,33 @@ class V4AContractTests(unittest.TestCase):
 
         cursor = FakeCursor([])
         V4AWriter(FakeConnection(cursor)).persist_forecast(f, T0)
-        record_json = json.loads(cursor.last_insert_parameters[7])
+        record_json = json.loads(cursor.last_insert_parameters[8])
         self.assertEqual(record_json["v2_state_id"], f.v2_state_id)
         self.assertEqual(record_json["v2_state_version"], f.v2_state_version)
         self.assertEqual(record_json["v2_state_hash"], f.v2_state_hash)
         self.assertEqual(record_json["v2_state_as_of"],
                          {"$float64": f.v2_state_as_of.hex()})
+
+    def test_forecast_ledger_contains_complete_causal_identity(self):
+        v1, v2, result = upstream()
+        forecast = build_forecast(
+            v1=v1, v2=v2, result=result, evidence_origin="PRODUCTION",
+            cutoff_midpoint=101.25,
+        )
+        self.assertEqual(forecast.v1_contract_version, "V9-V1")
+        self.assertRegex(forecast.v1_input_hash, r"^[0-9a-f]{64}$")
+        self.assertEqual(forecast.v3_contract_version, V3_CONTRACT_VERSION)
+        self.assertEqual(forecast.v3_model_version, MODEL_VERSION)
+        self.assertEqual(forecast.target_spec_id, "target-1")
+        self.assertEqual(forecast.data_schema_version, "data-1")
+        self.assertEqual(forecast.source_spec_version, "source-1")
+        self.assertEqual(forecast.cutoff_midpoint, 101.25)
+        self.assertEqual(forecast.used_quant_ids, ("q1_momentum",))
+        self.assertEqual(forecast.family_weights, (1.0,))
+        self.assertEqual(forecast.directional_input_count, 1)
+        self.assertEqual(forecast.covariance_mode, "FULL")
+        self.assertFalse(forecast.q3_used)
+        self.assertEqual((forecast.gamma, forecast.phi), (0.0, 1.0))
 
     def test_v2_state_provenance_changes_record_but_not_cohort_identity(self):
         v1, v2, result = upstream()
@@ -178,6 +216,31 @@ class V4AContractTests(unittest.TestCase):
         self.assertEqual(o.outcome_record_hash, dataclasses.replace(o, created_at=T0).outcome_record_hash)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             o.proof_eligible = True
+
+    def test_first_observation_at_or_after_endpoint_is_verified(self):
+        v1, v2, result = upstream()
+        forecast = build_forecast(
+            v1=v1, v2=v2, result=result, evidence_origin="PRODUCTION",
+            cutoff_midpoint=100.0,
+        )
+        forecast = dataclasses.replace(
+            forecast, persisted_at=T0,
+            persistence_proof_eligible=True,
+        )
+        previous = forecast.target_endpoint - timedelta(microseconds=1)
+        observed = forecast.target_endpoint + timedelta(microseconds=1)
+        outcome = build_outcome(
+            forecast=forecast,
+            target_identity=canonical_target_identity(forecast),
+            previous_observation_at=previous,
+            endpoint_observation_at=observed,
+            target_resolved_at=observed,
+            actual_return_bps=2.5,
+        )
+        self.assertEqual(outcome.target_timing_status, "VERIFIED")
+        self.assertTrue(outcome.proof_eligible)
+        self.assertEqual(outcome.reason_codes, ())
+        self.assertEqual(outcome.previous_observation_at, previous)
 
     def test_forecast_persistence_deadline_boundary(self):
         f = self.forecast()
@@ -280,10 +343,13 @@ class V4AContractTests(unittest.TestCase):
     def test_writer_preserves_forecast_conflicts_and_idempotency(self):
         f = self.forecast()
         cursor = FakeCursor([(f.forecast_record_hash,)])
-        writer = V4AWriter(FakeConnection(cursor))
+        connection = FakeConnection(cursor)
+        writer = V4AWriter(connection)
         writer.persist_forecast(f, T0)
         self.assertEqual(writer.last_write_status, "IDEMPOTENT")
         self.assertEqual(cursor.insert_count, 0)
+        self.assertEqual((connection.commits, connection.rollbacks), (1, 0))
+        self.assertTrue(cursor.closed)
 
         conflicting = dataclasses.replace(f, forecast_record_hash="f" * 64,
                                            forecast_record_id="v9v4f:" + "f" * 64)
@@ -325,8 +391,10 @@ class V4AMigrationTests(unittest.TestCase):
         self.assertEqual(self.upper.count("CREATE TABLE"), 2)
         self.assertIn("CREATE TABLE PUBLIC.ATOM_V9_V4_FORECASTS", self.upper)
         self.assertIn("CREATE TABLE PUBLIC.ATOM_V9_V4_OUTCOMES", self.upper)
-        self.assertNotIn("ALTER TABLE PUBLIC.FORECASTS", self.upper)
-        self.assertNotIn("ALTER TABLE PUBLIC.FORECAST_OUTCOMES", self.upper)
+        self.assertNotIn("UPDATE PUBLIC.FORECASTS", self.upper)
+        self.assertNotIn("DELETE FROM PUBLIC.FORECASTS", self.upper)
+        self.assertNotIn("TRUNCATE TABLE PUBLIC.FORECASTS", self.upper)
+        self.assertNotIn("INSERT INTO PUBLIC.FORECASTS", self.upper)
         self.assertNotIn("UNIQUE (SYMBOL, CUTOFF_AT, HORIZON, CYCLE_ID, V3_MODEL_VERSION)", self.upper)
         self.assertNotIn("UNIQUE (FORECAST_RECORD_ID, TARGET_IDENTITY)", self.upper)
         self.assertIn("FORECAST_RECORD_ID TEXT PRIMARY KEY", self.upper)
@@ -335,7 +403,10 @@ class V4AMigrationTests(unittest.TestCase):
         self.assertIn("OUTCOME_RECORD_HASH TEXT NOT NULL UNIQUE", self.upper)
 
     def test_database_mutation_rejection_and_least_privilege(self):
-        self.assertEqual(self.upper.count("BEFORE UPDATE OR DELETE OR TRUNCATE"), 2)
+        self.assertEqual(self.upper.count("BEFORE UPDATE OR DELETE ON"), 2)
+        self.assertEqual(self.upper.count("BEFORE TRUNCATE ON"), 2)
+        self.assertEqual(self.upper.count("FOR EACH ROW"), 2)
+        self.assertEqual(self.upper.count("FOR EACH STATEMENT"), 2)
         self.assertIn("GRANT SELECT, INSERT ON TABLE", self.upper)
         self.assertNotIn("GRANT UPDATE", self.upper)
         self.assertNotIn("GRANT DELETE", self.upper)

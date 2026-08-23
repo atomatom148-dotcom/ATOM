@@ -13,7 +13,8 @@ from quant.v9_v1_contract import HORIZONS, HORIZON_SECONDS
 from quant.v9_v3_synthesis import V3HorizonResult
 from quant.v9_v4a_evidence import (CONTRACT_VERSION, EVIDENCE_VERSION,
     ForecastRecord, OutcomeRecord, OVERLAP_METHOD_VERSION, canonical_sha256,
-    select_non_overlapping, _canonical)
+    select_non_overlapping, _canonical, _decanonical, _close_if_supported,
+    _commit_if_supported, _rollback_if_supported)
 
 STATE_VERSION = "ATOM_TRUE_V9_V4B_ACCURACY_1"
 MODEL_VERSION = "ATOM_TRUE_V9_V4"
@@ -225,24 +226,60 @@ class AccuracyStateStore:
 
     def insert(self, state: AccuracyState, created_at: datetime) -> str:
         cursor=self.connection.cursor()
-        cursor.execute("SELECT state_hash FROM atom_v9_v4_states WHERE state_id=%s",(state.state_id,))
-        rows=cursor.fetchall()
-        if rows: return "IDEMPOTENT" if rows[0][0] == state.state_hash else "STATE_CONFLICT"
-        cutoffs=[x for h in state.horizon_states for x in (h.first_cutoff,h.last_cutoff) if x]
-        cursor.execute("INSERT INTO atom_v9_v4_states (state_id,state_hash,state_version,model_version,symbol,cohort_id,state_as_of,evidence_first_cutoff,evidence_last_cutoff,state_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (state.state_id,state.state_hash,state.state_version,state.model_version,state.symbol,
-             state.cohort_id,state.state_as_of,min(cutoffs) if cutoffs else None,
-             max(cutoffs) if cutoffs else None,json.dumps(_canonical(asdict(state)),sort_keys=True),created_at))
-        return "INSERT"
+        try:
+            cursor.execute("SELECT state_hash FROM atom_v9_v4_states WHERE state_id=%s",(state.state_id,))
+            rows=cursor.fetchall()
+            if rows:
+                status="IDEMPOTENT" if rows[0][0] == state.state_hash else "STATE_CONFLICT"
+                _commit_if_supported(self.connection)
+                return status
+            cutoffs=[x for h in state.horizon_states for x in (h.first_cutoff,h.last_cutoff) if x]
+            cursor.execute("INSERT INTO atom_v9_v4_states (state_id,state_hash,state_version,model_version,symbol,cohort_id,state_as_of,evidence_first_cutoff,evidence_last_cutoff,state_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (state.state_id,state.state_hash,state.state_version,state.model_version,state.symbol,
+                 state.cohort_id,state.state_as_of,min(cutoffs) if cutoffs else None,
+                 max(cutoffs) if cutoffs else None,json.dumps(_canonical(asdict(state)),sort_keys=True),created_at))
+            _commit_if_supported(self.connection)
+            return "INSERT"
+        except Exception:
+            _rollback_if_supported(self.connection)
+            raise
+        finally:
+            _close_if_supported(cursor)
 
     def latest_json(self, *, symbol: str, cohort_id: str, requested_cutoff: datetime):
         cursor=self.connection.cursor()
-        cursor.execute("SELECT state_hash,state_json,state_as_of FROM atom_v9_v4_states WHERE state_version=%s AND model_version=%s AND symbol=%s AND cohort_id=%s AND state_as_of<=%s ORDER BY state_as_of DESC",
-            (STATE_VERSION,MODEL_VERSION,symbol,cohort_id,requested_cutoff))
-        rows=cursor.fetchall()
+        try:
+            cursor.execute("SELECT state_hash,state_json,state_as_of FROM atom_v9_v4_states WHERE state_version=%s AND model_version=%s AND symbol=%s AND cohort_id=%s AND state_as_of<=%s ORDER BY state_as_of DESC, state_id DESC LIMIT 2",
+                (STATE_VERSION,MODEL_VERSION,symbol,cohort_id,requested_cutoff))
+            rows=cursor.fetchall()
+            _commit_if_supported(self.connection)
+        except Exception:
+            _rollback_if_supported(self.connection)
+            raise
+        finally:
+            _close_if_supported(cursor)
         if not rows: return None, "UNAVAILABLE"
-        # Query is ordered; all rows at the greatest instant are adjacent. JSON retains state_as_of.
         greatest = rows[0][2]
         tied=[row for row in rows if row[2] == greatest]
         if len({row[0] for row in tied}) != 1: return None,"STATE_CONFLICT"
-        return tied[0][1],"AVAILABLE"
+        state_hash, raw, _ = tied[0]
+        try:
+            canonical = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(canonical, dict) or canonical.get("state_hash") != state_hash:
+                return None, "STATE_HASH_MISMATCH"
+            value = _decanonical(canonical)
+            payload = {key: item for key, item in value.items()
+                       if key not in ("state_id", "state_hash")}
+            if canonical_sha256(payload) != state_hash:
+                return None, "STATE_HASH_MISMATCH"
+            horizons = tuple(HorizonAccuracyState(
+                **{**item, "reason_codes": tuple(item["reason_codes"])}
+            ) for item in value["horizon_states"])
+            state = AccuracyState(
+                value["state_id"], value["state_hash"], value["state_version"],
+                value["model_version"], value["symbol"], value["cohort_id"],
+                value["state_as_of"], horizons,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None, "STATE_DESERIALIZATION_INVALID"
+        return state,"AVAILABLE"

@@ -1,0 +1,37 @@
+name: V9 market-open acceptance
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 14:35 UTC is after the US cash open in both EST and EDT.
+    - cron: "35 14 * * 1-5"
+
+concurrency:
+  group: v9-market-open-production-acceptance
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      ATOM_MARKET_OPEN_ACCEPTANCE: "1"
+      DATABASE_URL: ${{ secrets.ATOM_V9_RUNTIME_DATABASE_URL }}
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt pytest
+      - name: Verify required secrets
+        run: |
+          test -n "$DATABASE_URL"
+          test -n "$ALPACA_API_KEY"
+          test -n "$ALPACA_SECRET_KEY"
+      - name: Run production-market database acceptance
+        run: PYTHONPATH=. python -m pytest -q tests/test_v9_market_open_acceptance.py

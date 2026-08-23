@@ -190,7 +190,7 @@ def test_metrics_have_percentiles_and_do_not_change_forecast():
             distribution.p95, distribution.p99, distribution.maximum) == (5, 1, 3, 5, 5, 5)
 
 
-@pytest.mark.parametrize("status", ("AVAILABLE", "PROVISIONAL", "UNAVAILABLE"))
+@pytest.mark.parametrize("status", ("MATURE", "PROVISIONAL", "UNAVAILABLE"))
 def test_v3_horizon_status_is_recorded_exactly(monkeypatch, status):
     import quant.v9_v4d_integration as integration
     from quant.v9_v3_synthesis import synthesize_v3
@@ -208,7 +208,7 @@ def test_v3_horizon_status_is_recorded_exactly(monkeypatch, status):
     ).run_cycle()
     counters = dict(metrics.snapshot().counters)
     assert counters[f"horizon.30S.{status}"] == 1
-    assert not any(key.startswith("horizon.") and key.endswith(".MATURE")
+    assert not any(key.startswith("horizon.") and key.endswith(".AVAILABLE")
                    for key in counters)
 
 
@@ -219,7 +219,7 @@ def test_unexpected_v3_horizon_status_is_rejected(monkeypatch):
     v1, v2 = _inputs(1)
     original = synthesize_v3(v1, v2)
     unexpected = replace(original, horizon_results=(
-        replace(original.horizon_results[0], status="MATURE"),
+        replace(original.horizon_results[0], status="AVAILABLE"),
         *original.horizon_results[1:],
     ))
     monkeypatch.setattr(integration, "synthesize_v3", lambda one, two: unexpected)

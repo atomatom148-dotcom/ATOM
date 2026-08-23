@@ -21,6 +21,7 @@ from quant.v9_v2d_evidence_state import (
 )
 
 
+CONTRACT_VERSION = "V9-V3"
 MODEL_VERSION = "ATOM-TRUE-V9-V3"
 CANONICAL_FAMILIES = (
     "q1_momentum", "q2_mean_reversion", "q4_stat_arb", "q5_microstructure",

@@ -130,9 +130,12 @@ class LiveMarketState:
     """Thread-safe causal live state with separate COIN and QQQ histories."""
 
     def __init__(self, *, clock: Callable[[], float] = time.time,
-                 evidence_store: EvidenceStore | None = None) -> None:
+                 evidence_store: EvidenceStore | None = None,
+                 v9_cycle_handler: Callable[["LiveSnapshot", MidpointObservation | None,
+                                             MidpointObservation], object | None] | None = None) -> None:
         self._clock = clock
         self._evidence_store = evidence_store
+        self._v9_cycle_handler = v9_cycle_handler
         self._lock = threading.Lock()
         self._btc_history = MidpointHistory()
         self._ndx_history = MidpointHistory()
@@ -146,6 +149,8 @@ class LiveMarketState:
             None, None, None, None, None,
         )
         self._market_display = LatestMarketDisplay()
+        self._v9_output: object | None = None
+        self._v9_error: str | None = None
 
     def update_market_display(
         self, *, coin_midpoint: float | None = None,
@@ -281,10 +286,12 @@ class LiveMarketState:
             return False
 
         observation = MidpointObservation(event_epoch, (bid + ask) / 2.0)
+        previous_observation: MidpointObservation | None = None
         with self._lock:
             old = self._snapshot.history.observations
             if old and event_epoch <= old[-1].event_epoch:
                 return False
+            previous_observation = old[-1] if old else None
             observations = old + (observation,)
             boundary = event_epoch - HISTORY_SECONDS
             first_in_window = next(
@@ -360,11 +367,34 @@ class LiveMarketState:
                 )
             self._snapshot = next_snapshot
             self._refresh_g2(event_epoch)
+        if self._v9_cycle_handler is not None:
+            try:
+                output = self._v9_cycle_handler(
+                    next_snapshot, previous_observation, observation,
+                )
+            except Exception as error:
+                with self._lock:
+                    self._v9_error = type(error).__name__
+            else:
+                if output is not None:
+                    with self._lock:
+                        self._v9_output = output
+                        self._v9_error = None
         return True
 
     def snapshot(self) -> LiveSnapshot:
         with self._lock:
             return self._snapshot
+
+    def v9_output(self) -> object | None:
+        """Return the latest complete immutable V1→V4D cycle, if available."""
+
+        with self._lock:
+            return self._v9_output
+
+    def v9_error(self) -> str | None:
+        with self._lock:
+            return self._v9_error
 
     def accept_option_observation(self, observation: OptionObservation) -> None:
         """Atomically publish a validated option observation without running Q10."""
