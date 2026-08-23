@@ -233,8 +233,11 @@ def dashboard_data(
     return {
         "title": "ATOM QUANT",
         "market": {
-            "symbol": (market_display.coin_midpoint if market_display else
-                       history.latest.midpoint if history.latest else None),
+            "symbol": (
+                market_display.coin_midpoint
+                if market_display and market_display.coin_event_epoch is not None
+                else history.latest.midpoint if history.latest else None
+            ),
             "benchmarks": ["BTC", "QQQ", "NDX"],
             "btc": cross_asset_state.btc_price if cross_asset_state else None,
             "qqq": (market_display.qqq_midpoint if market_display else
