@@ -76,6 +76,7 @@ class Distribution:
 class OperationalSnapshot:
     counters: tuple[tuple[str, int], ...]
     distributions: tuple[tuple[str, Distribution], ...]
+    statuses: tuple[tuple[str, str], ...] = ()
 
 
 class OperationalMetrics:
@@ -87,6 +88,7 @@ class OperationalMetrics:
         self._limit = retained_samples
         self._counters: Counter[str] = Counter()
         self._samples: dict[str, deque[float]] = {}
+        self._statuses: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def increment(self, name: str, amount: int = 1) -> None:
@@ -99,13 +101,20 @@ class OperationalMetrics:
         with self._lock:
             self._samples.setdefault(name, deque(maxlen=self._limit)).append(milliseconds)
 
+    def set_status(self, name: str, status: str) -> None:
+        """Publish a current bounded categorical status."""
+
+        with self._lock:
+            self._statuses[name] = status
+
     def snapshot(self) -> OperationalSnapshot:
         with self._lock:
             counters = tuple(sorted(self._counters.items()))
             copied = {key: tuple(value) for key, value in self._samples.items()}
+            statuses = tuple(sorted(self._statuses.items()))
         return OperationalSnapshot(counters, tuple(
             (name, _distribution(values)) for name, values in sorted(copied.items())
-        ))
+        ), statuses)
 
 
 class ImmutableStateCache:
