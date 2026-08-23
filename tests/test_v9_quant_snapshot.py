@@ -105,10 +105,10 @@ class V9QuantSnapshotTests(unittest.TestCase):
     def test_v9_failure_is_fail_open_and_evidence_continues(self, evaluate) -> None:
         evidence = Mock()
         with patch.dict(os.environ, {"V9_MATH_CORE_ENABLED": "true"}, clear=True):
-            state = LiveMarketState(clock=lambda: 10.0, evidence_store=evidence)
+            state = LiveMarketState(clock=lambda: 10.0, evidence_outbox=evidence)
             self.assertTrue(state.accept_quote(bid=99.0, ask=101.0, event_epoch=1.0))
         evaluate.assert_called_once()
-        evidence.record_cycle_and_resolve.assert_called_once()
+        evidence.put_nowait.assert_called_once()
         self.assertEqual(state.snapshot().momentum.quant_id, "q1_momentum")
 
     @patch("quant.live_market.build_v9_quant_snapshot",
@@ -116,10 +116,10 @@ class V9QuantSnapshotTests(unittest.TestCase):
     def test_snapshot_failure_is_fail_open_and_evidence_continues(self, build) -> None:
         evidence = Mock()
         with patch.dict(os.environ, {"V9_MATH_CORE_ENABLED": "true"}, clear=True):
-            state = LiveMarketState(clock=lambda: 10.0, evidence_store=evidence)
+            state = LiveMarketState(clock=lambda: 10.0, evidence_outbox=evidence)
             self.assertTrue(state.accept_quote(bid=99.0, ask=101.0, event_epoch=1.0))
         build.assert_called_once()
-        evidence.record_cycle_and_resolve.assert_called_once()
+        evidence.put_nowait.assert_called_once()
         self.assertEqual(state.snapshot().momentum.quant_id, "q1_momentum")
 
 

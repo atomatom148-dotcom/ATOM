@@ -1,18 +1,25 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+import json
 
 import pytest
 
 from quant.v9_v1_contract import HORIZONS, HORIZON_SECONDS
 from quant.v9_v2d_evidence_state import DirectionalCalibrationState
 from quant.v9_v3_synthesis import CANONICAL_FAMILIES
-from quant.v9_v4a_evidence import build_forecast
+from quant.v9_v4a_evidence import _canonical, build_forecast
 from quant.v9_v4c_predictive import CompactHorizonState, build_v4c_state
 from quant.v9_v4d_integration import (
-    OfflineStateBuildScheduler, OperationalMetrics, V4DCoordinator,
+    ImmutableStateCache, OfflineStateBuildScheduler, OperationalMetrics, V4DCoordinator,
     resolve_outcome,
 )
+from quant.evidence_outbox import (
+    EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork, TerminalDeliveryError,
+    V4StateCacheRefresher,
+)
+from quant.history import MidpointObservation
+from quant.live_market import LiveMarketState
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -98,6 +105,168 @@ def _empty_state():
     ) for horizon in HORIZONS)
     return build_v4c_state(symbol="COIN", cohort_id="cohort", state_as_of=NOW,
         evidence_first_cutoff=None, evidence_last_cutoff=None, horizons=horizons)
+
+
+def test_unattempted_persistence_and_failed_delivery_are_reported_truthfully():
+    v1, v2 = _inputs()
+    output = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda _one, _two: "cohort",
+    ).run_cycle()
+    assert {item.status for item in output.persistence} == {"PERSISTENCE_NOT_ATTEMPTED"}
+
+    outbox = EvidenceOutbox()
+    outbox.unavailable()
+    state = LiveMarketState(clock=lambda: NOW.timestamp(), evidence_outbox=outbox,
+                            v9_cycle_handler=lambda *_args: output)
+    assert state.accept_quote(bid=99.0, ask=101.0, event_epoch=NOW.timestamp())
+    published = state.v9_output()
+    assert published.evidence_delivery_status == "DROPPED"
+    assert "QUEUED" not in {item.status for item in published.persistence}
+    assert any(item.final_bps is not None for item in published.final_numbers)
+
+
+def test_background_cache_refresh_publishes_exact_compatible_state():
+    compact = _empty_state()
+    compact_cache, accuracy_cache = ImmutableStateCache(), ImmutableStateCache()
+
+    class Store:
+        def __init__(self, value): self.value = value; self.calls = 0
+        def latest_json(self, **_kwargs):
+            self.calls += 1
+            return (self.value, "AVAILABLE") if self.value is not None else (None, "UNAVAILABLE")
+
+    compact_store, accuracy_store = Store(compact), Store(None)
+    V4StateCacheRefresher(
+        compact_store=compact_store, accuracy_store=accuracy_store,
+        compact_cache=compact_cache, accuracy_cache=accuracy_cache,
+    ).refresh(symbol="COIN", cohort_id="cohort", cutoff=NOW)
+    assert compact_store.calls == accuracy_store.calls == 1
+    assert compact_cache.latest(symbol="COIN", cohort_id="cohort",
+                                requested_cutoff=NOW) == (compact, "AVAILABLE")
+    assert compact_cache.latest(symbol="COIN", cohort_id="other",
+                                requested_cutoff=NOW) == (None, "UNAVAILABLE")
+
+
+class _WorkerConnection:
+    def cursor(self):
+        return SimpleNamespace(execute=lambda *_args: None, fetchall=lambda: (),
+                               close=lambda: None)
+    def commit(self): pass
+    def rollback(self): pass
+
+
+def test_worker_recovers_only_persisted_proof_eligible_unresolved_forecasts():
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecast = replace(calculated.persistence[0].forecast, persisted_at=NOW,
+                       persistence_proof_eligible=True)
+    payload = json.dumps(_canonical(asdict(forecast)), sort_keys=True)
+
+    class Cursor:
+        def execute(self, sql, _params):
+            assert "NOT EXISTS" in sql and "interval '1 hour'" in sql
+        def fetchall(self): return ((forecast.forecast_record_hash, payload),)
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def cursor(self): return Cursor()
+
+    worker = EvidenceLedgerWorker(EvidenceOutbox(), evidence_store=_RawStore(),
+                                  connection=Connection())
+    assert worker._pending == [forecast]
+
+
+class _RawStore:
+    def __init__(self): self.calls = []
+    def record_cycle_and_resolve(self, *_args, **kwargs): self.calls.append(kwargs)
+
+
+def _work(sequence, previous, current, received_at):
+    return QuoteEvidenceWork(sequence, f"COIN:{current.event_epoch:.9f}",
+        previous, current, received_at, (), (), ())
+
+
+def test_worker_uses_captured_resolution_time_and_gap_disables_resolution(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    raw = _RawStore()
+    worker = EvidenceLedgerWorker(EvidenceOutbox(), evidence_store=raw,
+                                  connection=_WorkerConnection())
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecast = replace(calculated.persistence[1].forecast, persisted_at=NOW,
+                       persistence_proof_eligible=True)
+    worker._pending = [forecast]
+
+    class OutcomeWriter:
+        last_write_status = "INSERT"
+        outcomes = []
+        def persist_outcome(self, record, created_at):
+            self.outcomes.append(record)
+            return record
+        def persist_forecast(self, record, persisted_at): return record
+
+    writer = OutcomeWriter()
+    worker._writer = writer
+    previous = MidpointObservation(forecast.target_endpoint.timestamp() - 1, 100.0)
+    current = MidpointObservation(forecast.target_endpoint.timestamp() + 1, 101.0)
+    received = datetime.fromtimestamp(current.event_epoch + 7, timezone.utc)
+    worker.process(_work(1, previous, current, received))
+    assert writer.outcomes[0].target_resolved_at == received
+
+    # Losing sequence 2 makes the sequence-3 bracket resolution-disabled.
+    worker._pending = [forecast]
+    later = MidpointObservation(current.event_epoch + 10, 102.0)
+    worker.process(_work(3, current, later, received + timedelta(seconds=10)))
+    assert len(writer.outcomes) == 1
+    assert raw.calls[-1]["resolution_enabled"] is False
+    counters = dict(worker.metrics.snapshot().counters)
+    assert counters["EVIDENCE_SEQUENCE_GAP"] == 1
+
+
+def test_terminal_failure_advances_fifo_while_transient_retries_same_head(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    previous = MidpointObservation(NOW.timestamp(), 100.0)
+    current = MidpointObservation(NOW.timestamp() + 1, 101.0)
+
+    terminal_outbox = EvidenceOutbox()
+    terminal = EvidenceLedgerWorker(terminal_outbox, evidence_store=_RawStore(),
+                                    connection=_WorkerConnection())
+    first, second = (_work(n, previous, current, NOW + timedelta(seconds=n))
+                     for n in (1, 2))
+    terminal_outbox.put_nowait(first); terminal_outbox.put_nowait(second)
+    terminal_calls = []
+    def terminal_process(item):
+        terminal_calls.append(item.sequence)
+        if item.sequence == 1:
+            raise TerminalDeliveryError("FORECAST_DUPLICATE_CONFLICT")
+        terminal._stop.set()
+    terminal.process = terminal_process
+    thread = terminal.start(); thread.join(timeout=1)
+    assert terminal_calls == [1, 2]
+
+    class OperationalError(Exception): pass
+    transient_outbox = EvidenceOutbox()
+    transient = EvidenceLedgerWorker(transient_outbox, evidence_store=_RawStore(),
+                                     connection=_WorkerConnection())
+    transient_outbox.put_nowait(first)
+    transient_calls = []
+    def transient_process(item):
+        transient_calls.append(item.sequence)
+        if len(transient_calls) == 1:
+            raise OperationalError("database unavailable")
+        transient._stop.set()
+    transient.process = transient_process
+    thread = transient.start(); thread.join(timeout=1)
+    assert transient_calls == [1, 1]
 
 
 @pytest.mark.parametrize("family_count", (11, 10, 7, 3, 1, 0))

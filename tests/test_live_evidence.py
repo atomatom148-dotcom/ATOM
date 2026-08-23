@@ -72,12 +72,21 @@ class MemoryEvidence:
         return (len(self.forecasts) + len(self.volatility_forecasts),
                 len(self.outcomes) + len(self.volatility_outcomes))
 
+    def put_nowait(self, work):
+        self.record_cycle_and_resolve(
+            work.directional,
+            observation_epoch=work.current_observation.event_epoch,
+            observation_midpoint=work.current_observation.midpoint,
+            volatility_forecasts=work.q3,
+        )
+        return True
+
 
 class LiveEvidenceTests(unittest.TestCase):
     def populated_state(self):
         store = MemoryEvidence()
         now = [0.0]
-        state = LiveMarketState(clock=lambda: now[0], evidence_store=store)
+        state = LiveMarketState(clock=lambda: now[0], evidence_outbox=store)
         for second in range(0, 3601, 30):
             now[0] = float(second) + 1
             state.accept_quote(bid=99 + second / 100,
@@ -119,7 +128,7 @@ class LiveEvidenceTests(unittest.TestCase):
 
     def test_unavailable_forecasts_are_not_persisted(self):
         store = MemoryEvidence()
-        state = LiveMarketState(clock=lambda: 1.0, evidence_store=store)
+        state = LiveMarketState(clock=lambda: 1.0, evidence_outbox=store)
         state.accept_quote(bid=99, ask=101, event_epoch=0.0)
         self.assertEqual(store.forecasts, [])
         self.assertEqual(store.volatility_forecasts, [])

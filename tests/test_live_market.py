@@ -2,6 +2,7 @@ import json
 from dataclasses import FrozenInstanceError
 from io import BytesIO
 import os
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
@@ -26,6 +27,54 @@ def request_json(app):
 
 
 class LiveMarketTests(unittest.TestCase):
+    def test_concurrent_coin_quotes_enqueue_in_assigned_sequence_order(self):
+        first_in_v4 = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        evidence_store = MagicMock()
+
+        class CapturingOutbox:
+            def __init__(self):
+                self.items = []
+            def put_nowait(self, item):
+                self.items.append(item)
+                return True
+
+        outbox = CapturingOutbox()
+        def handler(_snapshot, _previous, current):
+            if current.event_epoch == 1.0:
+                first_in_v4.set()  # sequence 1 has already been assigned
+                self.assertTrue(release_first.wait(timeout=2))
+            return None
+
+        state = LiveMarketState(
+            clock=lambda: 10.0, evidence_store=evidence_store,
+            evidence_outbox=outbox, v9_cycle_handler=handler,
+        )
+        results = []
+        first = threading.Thread(target=lambda: results.append(
+            state.accept_quote(bid=99.0, ask=101.0, event_epoch=1.0)))
+        def accept_second():
+            second_started.set()
+            results.append(state.accept_quote(
+                bid=100.0, ask=102.0, event_epoch=2.0))
+        second = threading.Thread(target=accept_second)
+
+        first.start()
+        self.assertTrue(first_in_v4.wait(timeout=2))
+        second.start()
+        self.assertTrue(second_started.wait(timeout=2))
+        # The second caller is attempting ingress, but cannot overtake sequence 1.
+        self.assertEqual(outbox.items, [])
+        release_first.set()
+        first.join(timeout=2); second.join(timeout=2)
+
+        self.assertEqual(results.count(True), 2)
+        self.assertEqual([item.sequence for item in outbox.items], [1, 2])
+        self.assertEqual(dict(state.metrics.snapshot().counters).get(
+            "EVIDENCE_SEQUENCE_GAP", 0), 0)
+        evidence_store.record_cycle_and_resolve.assert_not_called()
+
     def test_market_display_accepts_only_newer_provider_values_and_is_frozen(self):
         state = LiveMarketState()
         self.assertEqual(MARKET_DISPLAY_FETCH_SECONDS, 0.25)

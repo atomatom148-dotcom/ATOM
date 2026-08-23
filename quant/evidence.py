@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import math
 from typing import Protocol, Sequence
 
@@ -73,6 +74,8 @@ class EvidenceStore(Protocol):
         self, forecasts: Sequence[ForecastRecord], *, observation_epoch: float,
         observation_midpoint: float,
         volatility_forecasts: Sequence[VolatilityForecastRecord] | None = None,
+        previous_observation_epoch: float | None = None,
+        resolution_enabled: bool = True,
     ) -> None: ...
 
     def counts(self) -> tuple[int, int]: ...
@@ -89,34 +92,38 @@ class EvidenceStore(Protocol):
 class PostgresEvidenceStore:
     """psycopg v3 implementation; each observed cycle commits atomically."""
 
-    def __init__(self, database_url: str) -> None:
+    def __init__(self, database_url: str, *, connection=None) -> None:
         if not database_url:
             raise ValueError("DATABASE_URL is required")
         import psycopg
 
         self._database_url = database_url
         self._connect = psycopg.connect
+        self._connection = connection
 
     def record_cycle_and_resolve(
         self, forecasts: Sequence[ForecastRecord], *, observation_epoch: float,
         observation_midpoint: float,
         volatility_forecasts: Sequence[VolatilityForecastRecord] | None = None,
+        previous_observation_epoch: float | None = None,
+        resolution_enabled: bool = True,
     ) -> None:
-        with self._connect(self._database_url) as connection:
+        shared_connection = getattr(self, "_connection", None)
+        owner = (self._connect(self._database_url) if shared_connection is None
+                 else nullcontext(shared_connection))
+        with owner as connection:
             with connection.cursor() as cursor:
                 # Quotes arrive strictly in event-time order, so this is the first
                 # eligible observation seen by this single-process resolver.
-                cursor.execute(
-                    """
-                    SELECT COALESCE(
-                        max(resolved_epoch), '-Infinity'::double precision
-                    )
-                    FROM forecast_outcomes
-                    """,
-                    (),
-                )
-                resolution_watermark = cursor.fetchone()[0]
-                cursor.execute(
+                if resolution_enabled:
+                    if previous_observation_epoch is None:
+                        cursor.execute(
+                            """SELECT COALESCE(max(resolved_epoch), '-Infinity'::double precision)
+                               FROM forecast_outcomes""", ())
+                        resolution_watermark = cursor.fetchone()[0]
+                    else:
+                        resolution_watermark = previous_observation_epoch
+                    cursor.execute(
                     """
                     INSERT INTO forecast_outcomes
                         (forecast_id, maturity_midpoint, outcome_bps, resolved_epoch)
@@ -129,10 +136,10 @@ class PostgresEvidenceStore:
                       AND f.maturity_epoch <= %s
                     ON CONFLICT (forecast_id) DO NOTHING
                     """,
-                    (observation_midpoint, observation_midpoint,
-                     observation_epoch, resolution_watermark,
-                     observation_epoch),
-                )
+                        (observation_midpoint, observation_midpoint,
+                         observation_epoch, resolution_watermark,
+                         observation_epoch),
+                    )
                 cursor.executemany(
                     """
                     INSERT INTO forecasts
@@ -154,17 +161,15 @@ class PostgresEvidenceStore:
                     ) for row in forecasts],
                 )
                 if volatility_forecasts is not None:
-                    cursor.execute(
-                        """
-                        SELECT COALESCE(
-                            max(resolved_epoch), '-Infinity'::double precision
-                        )
-                        FROM volatility_forecast_outcomes
-                        """,
-                        (),
-                    )
-                    volatility_resolution_watermark = cursor.fetchone()[0]
-                    cursor.execute(
+                    if resolution_enabled:
+                        if previous_observation_epoch is None:
+                            cursor.execute(
+                                """SELECT COALESCE(max(resolved_epoch), '-Infinity'::double precision)
+                                   FROM volatility_forecast_outcomes""", ())
+                            volatility_resolution_watermark = cursor.fetchone()[0]
+                        else:
+                            volatility_resolution_watermark = previous_observation_epoch
+                        cursor.execute(
                         """
                         INSERT INTO volatility_forecast_outcomes
                             (forecast_id, maturity_midpoint, realized_move_bps,
@@ -179,10 +184,10 @@ class PostgresEvidenceStore:
                           AND f.maturity_epoch <= %s
                         ON CONFLICT (forecast_id) DO NOTHING
                         """,
-                        (observation_midpoint, observation_midpoint,
-                         observation_epoch, volatility_resolution_watermark,
-                         observation_epoch),
-                    )
+                            (observation_midpoint, observation_midpoint,
+                             observation_epoch, volatility_resolution_watermark,
+                             observation_epoch),
+                        )
                     cursor.executemany(
                         """
                         INSERT INTO volatility_forecasts
@@ -203,6 +208,8 @@ class PostgresEvidenceStore:
                             row.data_schema_version, row.source_spec_version,
                         ) for row in volatility_forecasts],
                     )
+            if shared_connection is not None:
+                connection.commit()
 
     def counts(self) -> tuple[int, int]:
         with self._connect(self._database_url) as connection:

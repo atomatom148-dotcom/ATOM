@@ -94,7 +94,7 @@ class V9TelemetryTests(unittest.TestCase):
     def test_enabled_cycle_records_observation_without_changing_evidence(self):
         evidence = Mock()
         with patch.dict(os.environ, {"V9_MATH_CORE_ENABLED": "true"}, clear=True):
-            state = LiveMarketState(clock=lambda: 10.0, evidence_store=evidence)
+            state = LiveMarketState(clock=lambda: 10.0, evidence_outbox=evidence)
             self.assertTrue(state.accept_quote(bid=99.0, ask=101.0, event_epoch=1.0))
 
         latest = latest_v9_observation()
@@ -102,7 +102,7 @@ class V9TelemetryTests(unittest.TestCase):
         self.assertEqual(latest.family_count, 3)
         self.assertLess(latest.non_null_variable_count, 72)
         self.assertEqual(latest.as_of_epoch, 1.0)
-        evidence.record_cycle_and_resolve.assert_called_once()
+        evidence.put_nowait.assert_called_once()
 
     def test_endpoint_only_reads_telemetry(self):
         observation = telemetry_module.V9ObservationTelemetry(
