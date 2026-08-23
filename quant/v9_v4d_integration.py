@@ -205,6 +205,9 @@ class V4DCoordinator:
     def _record_availability(self, v1: V1Input, v2: V2EvidenceState, v3: V3Output,
                              compact: Mapping[str, CompactHorizonState],
                              accuracy: Mapping[str, HorizonAccuracyState]) -> None:
+        if any(result.status not in ("AVAILABLE", "PROVISIONAL", "UNAVAILABLE")
+               for result in v3.horizon_results):
+            raise RuntimeError("UNEXPECTED_V3_HORIZON_STATUS")
         slots = {(slot.quant_id, slot.horizon): slot for slot in v1.slots}
         positive = {result.horizon: {family for family, weight in
                     zip(result.used_quant_ids, result.weights) if weight > 0}
@@ -233,8 +236,7 @@ class V4DCoordinator:
                     self.metrics.increment(prefix + "used_positive_weight")
         for result in v3.horizon_results:
             prefix = f"horizon.{result.horizon}."
-            operational_status = "AVAILABLE" if result.status == "MATURE" else result.status
-            self.metrics.increment(prefix + operational_status)
+            self.metrics.increment(prefix + result.status)
             self.metrics.increment(prefix + "directional_input_count",
                                    result.directional_input_count)
             if 0 < result.directional_input_count < len(CANONICAL_FAMILIES):

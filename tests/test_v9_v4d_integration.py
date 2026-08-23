@@ -46,7 +46,7 @@ def _inputs(family_count=1, unavailable_horizon=None):
         active = horizon != unavailable_horizon
         calibrations = tuple(DirectionalCalibrationState(
             quant_id, "f1", 0.0, 1.0, ((0.0, 0.0), (0.0, 0.0)),
-            100.0, 1.0, 1.0, "MATURE", ()) for quant_id in ids) if active else ()
+            100.0, 1.0, 1.0, "PROVISIONAL", ()) for quant_id in ids) if active else ()
         n = len(calibrations)
         states.append(SimpleNamespace(
             horizon=horizon, directional_calibrations=calibrations,
@@ -189,3 +189,46 @@ def test_metrics_have_percentiles_and_do_not_change_forecast():
     assert (distribution.count, distribution.minimum, distribution.p50,
             distribution.p95, distribution.p99, distribution.maximum) == (5, 1, 3, 5, 5, 5)
 
+
+@pytest.mark.parametrize("status", ("AVAILABLE", "PROVISIONAL", "UNAVAILABLE"))
+def test_v3_horizon_status_is_recorded_exactly(monkeypatch, status):
+    import quant.v9_v4d_integration as integration
+    from quant.v9_v3_synthesis import synthesize_v3
+
+    v1, v2 = _inputs(1)
+    original = synthesize_v3(v1, v2)
+    replaced = replace(original, horizon_results=tuple(
+        replace(result, status=status) for result in original.horizon_results))
+    monkeypatch.setattr(integration, "synthesize_v3", lambda one, two: replaced)
+    metrics = OperationalMetrics()
+    V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda captured: v2,
+        forecast_writer=Writer(), compact_state_lookup=lambda **kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda one, two: "cohort", metrics=metrics,
+    ).run_cycle()
+    counters = dict(metrics.snapshot().counters)
+    assert counters[f"horizon.30S.{status}"] == 1
+    assert not any(key.startswith("horizon.") and key.endswith(".MATURE")
+                   for key in counters)
+
+
+def test_unexpected_v3_horizon_status_is_rejected(monkeypatch):
+    import quant.v9_v4d_integration as integration
+    from quant.v9_v3_synthesis import synthesize_v3
+
+    v1, v2 = _inputs(1)
+    original = synthesize_v3(v1, v2)
+    unexpected = replace(original, horizon_results=(
+        replace(original.horizon_results[0], status="MATURE"),
+        *original.horizon_results[1:],
+    ))
+    monkeypatch.setattr(integration, "synthesize_v3", lambda one, two: unexpected)
+    metrics = OperationalMetrics()
+    coordinator = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda captured: v2,
+        forecast_writer=Writer(), compact_state_lookup=lambda **kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda one, two: "cohort", metrics=metrics,
+    )
+    with pytest.raises(RuntimeError, match="UNEXPECTED_V3_HORIZON_STATUS"):
+        coordinator.run_cycle()
+    assert not any(key.startswith("horizon.") for key, _ in metrics.snapshot().counters)
