@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import math
@@ -396,18 +396,25 @@ class LiveMarketState:
             else:
                 if output is not None:
                     with self._lock:
-                        self._v9_output = output
                         self._v9_error = None
+        delivery_status = "NOT_CONFIGURED"
         if self._evidence_outbox is not None:
             v4 = tuple(result.forecast for result in output.persistence) if output else ()
-            self._evidence_outbox.put_nowait(QuoteEvidenceWork(
+            delivered = self._evidence_outbox.put_nowait(QuoteEvidenceWork(
                 sequence=sequence,
                 cycle_id=f"COIN:{event_epoch:.9f}",
                 previous_observation=previous_observation,
                 current_observation=observation,
                 received_at=datetime.fromtimestamp(cycle, timezone.utc),
                 directional=tuple(forecasts), q3=tuple(volatility_forecasts), v4=v4,
+                state_cohort_id=getattr(output, "state_cohort_id", None),
             ))
+            delivery_status = "ENQUEUED" if delivered else "DROPPED"
+        if output is not None:
+            if hasattr(output, "evidence_delivery_status"):
+                output = replace(output, evidence_delivery_status=delivery_status)
+            with self._lock:
+                self._v9_output = output
         self.metrics.observe("coin_market_state_update_latency_ms",
                              (self._monotonic() - update_started) * 1000)
         return True

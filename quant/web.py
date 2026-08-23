@@ -612,11 +612,25 @@ def main() -> None:
     )
     v2_provider.start()
     v9_runtime = ProductionV9Runtime(database_url, v2_provider, metrics=metrics)
-    from .evidence_outbox import EvidenceLedgerWorker, EvidenceOutbox
+    from .evidence_outbox import (
+        EvidenceLedgerWorker, EvidenceOutbox, V4StateCacheRefresher,
+    )
+    from .v9_v4b_accuracy import AccuracyStateStore
+    from .v9_v4c_predictive import V4CStateStore
+    import psycopg
     outbox = EvidenceOutbox(metrics=metrics)
+    ledger_connection = psycopg.connect(database_url)
+    cache_refresher = V4StateCacheRefresher(
+        compact_store=V4CStateStore(ledger_connection),
+        accuracy_store=AccuracyStateStore(ledger_connection),
+        compact_cache=v9_runtime.compact_cache,
+        accuracy_cache=v9_runtime.accuracy_cache,
+    )
     ledger_worker = EvidenceLedgerWorker(
-        outbox, evidence_store=evidence_store, database_url=database_url,
-        metrics=metrics,
+        outbox, evidence_store=PostgresEvidenceStore(
+            database_url, connection=ledger_connection),
+        connection=ledger_connection,
+        metrics=metrics, cache_refresher=cache_refresher,
     )
     ledger_worker.start()
     state = LiveMarketState(evidence_outbox=outbox,

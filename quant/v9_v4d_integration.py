@@ -58,6 +58,8 @@ class V4DCycleOutput:
     accuracy: tuple[HorizonAccuracyState | None, ...]
     persistence: tuple[PersistenceResult, ...]
     v4_state_status: str
+    evidence_delivery_status: str = "NOT_ATTEMPTED"
+    state_cohort_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,16 +116,16 @@ class ImmutableStateCache:
     """
 
     def __init__(self):
-        self._value = None
+        self._values = {}
         self._lock = threading.Lock()
 
     def publish(self, value) -> None:
         with self._lock:
-            self._value = value
+            self._values[(value.symbol, value.cohort_id)] = value
 
     def latest(self, *, symbol: str, cohort_id: str, requested_cutoff: datetime):
         with self._lock:
-            value = self._value
+            value = self._values.get((symbol, cohort_id))
         if value is None:
             return None, "UNAVAILABLE"
         if (value.symbol != symbol or value.cohort_id != cohort_id or
@@ -195,7 +197,7 @@ class V4DCoordinator:
                                       cutoff_midpoint=self._cutoff_midpoint(v1))
             started = self._monotonic()
             if self._writer is None:
-                stored, status, error_type = forecast, "QUEUED", None
+                stored, status, error_type = forecast, "PERSISTENCE_NOT_ATTEMPTED", None
             else:
                 try:
                     stored = self._writer.persist_forecast(forecast, self._wall_clock())
@@ -210,8 +212,9 @@ class V4DCoordinator:
             persistence.append(PersistenceResult(result.horizon, status, stored,
                                                  latency, error_type))
 
+        cohort_id = self._state_cohort_id(v1, v2)
         state, state_status = self._lookup(
-            symbol=v1.symbol, cohort_id=self._state_cohort_id(v1, v2),
+            symbol=v1.symbol, cohort_id=cohort_id,
             requested_cutoff=v1.cutoff_at,
         )
         if state_status != "AVAILABLE":
@@ -221,7 +224,7 @@ class V4DCoordinator:
         self.metrics.increment("v4_state." + state_status)
         compact = {item.horizon: item for item in state.horizons} if state else {}
         accuracy_state, accuracy_status = (self._accuracy_lookup(
-            symbol=v1.symbol, cohort_id=self._state_cohort_id(v1, v2),
+            symbol=v1.symbol, cohort_id=cohort_id,
             requested_cutoff=v1.cutoff_at) if self._accuracy_lookup else
             (None, "UNAVAILABLE"))
         if accuracy_status != "AVAILABLE" or accuracy_state is None:
@@ -240,7 +243,8 @@ class V4DCoordinator:
                              (self._monotonic() - cycle_started) * 1000)
         return V4DCycleOutput(v1.cycle_id, v1.symbol, v1.cutoff_at, v1, v2, v3,
                              finals, tuple(accuracy.get(h) for h in HORIZONS),
-                             tuple(persistence), state_status)
+                             tuple(persistence), state_status,
+                             state_cohort_id=cohort_id)
 
     def _record_availability(self, v1: V1Input, v2: V2EvidenceState, v3: V3Output,
                              compact: Mapping[str, CompactHorizonState],
