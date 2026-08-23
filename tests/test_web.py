@@ -184,6 +184,42 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertEqual(payload["v9"]["forecast_cutoff"], 100.0)
         self.assertEqual(payload["v9"]["forecast_age"], 5.0)
 
+    def test_live_endpoint_falls_back_to_history_event_epoch(self):
+        state = LiveMarketState()
+        self.assertTrue(state.accept_quote(
+            bid=100.0, ask=100.02, event_epoch=106.0,
+        ))
+        payload = json.loads(request(
+            create_app(state=state, clock=lambda: 107.0), "/api/live"
+        )["body"])
+
+        self.assertEqual(payload["market"]["event_epoch"], 106.0)
+        self.assertEqual(payload["market"]["data_age"], 1.0)
+
+    def test_live_endpoint_samples_clock_after_capturing_live_state(self):
+        state = LiveMarketState()
+        order = []
+
+        def traced(name, function):
+            def wrapper(*args, **kwargs):
+                order.append(name)
+                return function(*args, **kwargs)
+            return wrapper
+
+        for name in ("snapshot", "cross_asset_state", "market_display", "v9_output"):
+            setattr(state, name, traced(name, getattr(state, name)))
+
+        def clock():
+            order.append("clock")
+            return 107.0
+
+        request(create_app(state=state, clock=clock), "/api/live")
+
+        self.assertGreater(order.index("clock"), order.index("snapshot"))
+        self.assertGreater(order.index("clock"), order.index("cross_asset_state"))
+        self.assertGreater(order.index("clock"), order.index("market_display"))
+        self.assertGreater(order.index("clock"), order.index("v9_output"))
+
     def test_live_renderer_updates_every_market_field(self):
         page = request(create_app(), "/")["body"].decode()
 
