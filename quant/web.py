@@ -226,6 +226,10 @@ def dashboard_data(
              else f"{item.range_lower_bps:.2f} to {item.range_upper_bps:.2f}")
             for item in results
         ]
+    v1_output = getattr(v9_output, "v1", None)
+    forecast_cutoff = (v1_output.cutoff_at.timestamp()
+                       if v1_output is not None else None)
+    current_epoch = time.time() if now_epoch is None else now_epoch
     return {
         "title": "ATOM QUANT",
         "market": {
@@ -238,13 +242,20 @@ def dashboard_data(
                     if snapshot and snapshot.qqq_history.latest else None),
             "ndx": cross_asset_state.ndx_price if cross_asset_state else None,
             "data_age": (
-                max(0.0, (time.time() if now_epoch is None else now_epoch) -
-                    market_display.coin_event_epoch)
+                current_epoch - market_display.coin_event_epoch
                 if market_display and market_display.coin_event_epoch is not None
-                else max(0.0, (time.time() if now_epoch is None else now_epoch) -
-                         history.latest.event_epoch) if history.latest else None
+                else current_epoch - history.latest.event_epoch if history.latest else None
+            ),
+            "event_epoch": (
+                market_display.coin_event_epoch if market_display else
+                history.latest.event_epoch if history.latest else None
             ),
             "last_cycle": snapshot.last_cycle if snapshot else (cutoff_epoch if supplied else None),
+        },
+        "v9": {
+            "forecast_cutoff": forecast_cutoff,
+            "forecast_age": (current_epoch - forecast_cutoff
+                             if forecast_cutoff is not None else None),
         },
         "horizons": list(HORIZON_LABELS),
         "final_numbers": final_values,
@@ -516,7 +527,7 @@ def create_app(
                 calculate_missing=False,
             )
             live = {key: data[key] for key in (
-                "market", "final_numbers", "quant_families", "options_data",
+                "market", "v9", "final_numbers", "quant_families", "options_data",
             )}
             body = json.dumps(
                 live, separators=(",", ":"), allow_nan=False,
