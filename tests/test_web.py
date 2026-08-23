@@ -1,6 +1,8 @@
 import json
 import subprocess
 import unittest
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from quant.history import MidpointHistory, MidpointObservation
@@ -60,6 +62,8 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertTrue(all(value is None for value in payload["evidence"].values()))
         self.assertTrue(all(value is None for family in payload["quant_families"] for value in family["values"]))
         self.assertIsNone(payload["market"]["data_age"])
+        self.assertIsNone(payload["market"]["event_epoch"])
+        self.assertEqual(payload["v9"], {"forecast_cutoff": None, "forecast_age": None})
         self.assertIsNone(payload["market"]["last_cycle"])
 
     def test_page_formats_live_values_without_rounding_api_values(self):
@@ -153,12 +157,32 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertEqual(first["status"], "200 OK")
         payload = json.loads(first["body"])
         self.assertEqual(set(payload), {
-            "market", "final_numbers", "quant_families", "options_data",
+            "market", "v9", "final_numbers", "quant_families", "options_data",
         })
         self.assertEqual(payload["market"]["symbol"], 100.01)
         self.assertEqual(payload["market"]["qqq"], 500.01)
         self.assertEqual(payload["market"]["data_age"], 5.0)
         self.assertEqual(json.loads(second["body"])["market"]["data_age"], 5.0)
+
+    def test_live_endpoint_exposes_signed_market_and_v9_ages(self):
+        state = LiveMarketState()
+        state.update_market_display(
+            coin_midpoint=100.01, coin_event_epoch=106.0,
+            qqq_midpoint=500.01, qqq_event_epoch=106.0,
+        )
+        v9_output = SimpleNamespace(
+            v1=SimpleNamespace(cutoff_at=datetime.fromtimestamp(100.0, timezone.utc)),
+            final_numbers=(),
+        )
+        with patch.object(state, "v9_output", return_value=v9_output):
+            payload = json.loads(request(
+                create_app(state=state, clock=lambda: 105.0), "/api/live"
+            )["body"])
+
+        self.assertEqual(payload["market"]["event_epoch"], 106.0)
+        self.assertEqual(payload["market"]["data_age"], -1.0)
+        self.assertEqual(payload["v9"]["forecast_cutoff"], 100.0)
+        self.assertEqual(payload["v9"]["forecast_age"], 5.0)
 
     def test_live_renderer_updates_every_market_field(self):
         page = request(create_app(), "/")["body"].decode()

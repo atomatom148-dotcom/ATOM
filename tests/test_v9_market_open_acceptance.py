@@ -53,11 +53,14 @@ def _validate_deployed_health(payload: dict) -> None:
 def _validate_deployed_live(payload: dict) -> None:
     bps = payload.get("final_numbers", {}).get("BPS")
     assert isinstance(bps, list) and len(bps) == 6
-    assert any(value is not None and not isinstance(value, bool) and
-               isinstance(value, (int, float)) and math.isfinite(value) for value in bps)
+    assert (isinstance(bps[0], (int, float)) and not isinstance(bps[0], bool)
+            and math.isfinite(bps[0]))
     age = payload.get("market", {}).get("data_age")
     assert isinstance(age, (int, float)) and not isinstance(age, bool)
     assert math.isfinite(age) and 0.0 <= age <= MAX_ACTIVE_AGE_SECONDS
+    forecast_age = payload.get("v9", {}).get("forecast_age")
+    assert isinstance(forecast_age, (int, float)) and not isinstance(forecast_age, bool)
+    assert math.isfinite(forecast_age) and 0.0 <= forecast_age <= MAX_ACTIVE_AGE_SECONDS
 
 
 def _deployed_json(base_url: str, path: str) -> dict:
@@ -99,15 +102,31 @@ def test_30s_scoreability_rejects_finite_mismatched_final_bps():
         _scoreable_30s(output)
 
 
-def test_deployed_response_validation_requires_health_and_six_finite_slots():
+def _deployed_payload(*, bps=None, market_age=1.0, forecast_age=1.0):
+    return {"final_numbers":{"BPS":bps or [1.0,None,None,None,None,None]},
+            "market":{"data_age":market_age}, "v9":{"forecast_age":forecast_age}}
+
+
+def test_deployed_response_validation_requires_health_and_finite_30s():
     _validate_deployed_health({"status":"running"})
-    _validate_deployed_live({"final_numbers":{"BPS":[None,1.0,None,None,None,None]},
-                             "market":{"data_age":1.0}})
+    _validate_deployed_live(_deployed_payload())
     with pytest.raises(AssertionError):_validate_deployed_health({"status":"stopped"})
     with pytest.raises(AssertionError):
-        _validate_deployed_live({"final_numbers":{"BPS":[1.0]},"market":{"data_age":1.0}})
+        _validate_deployed_live(_deployed_payload(bps=[1.0]))
     with pytest.raises(AssertionError):
-        _validate_deployed_live({"final_numbers":{"BPS":[None]*6},"market":{"data_age":1.0}})
+        _validate_deployed_live(_deployed_payload(
+            bps=[None, 1.0, None, None, None, None]))
+
+
+def test_deployed_response_validation_rejects_stale_v9_with_fresh_market():
+    with pytest.raises(AssertionError):
+        _validate_deployed_live(_deployed_payload(
+            market_age=1.0, forecast_age=MAX_ACTIVE_AGE_SECONDS + 0.001))
+
+
+def test_deployed_response_validation_rejects_future_market_timestamp():
+    with pytest.raises(AssertionError):
+        _validate_deployed_live(_deployed_payload(market_age=-0.001))
 
 
 def _quote() -> tuple[tuple[float, float, float, float, float],
