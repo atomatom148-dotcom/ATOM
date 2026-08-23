@@ -78,7 +78,7 @@ class OperationalSnapshot:
 class OperationalMetrics:
     """Small bounded in-process telemetry; observations never enter math values."""
 
-    def __init__(self, *, retained_samples: int = 100_000):
+    def __init__(self, *, retained_samples: int = 1024):
         if retained_samples < 1:
             raise ValueError("retained_samples must be positive")
         self._limit = retained_samples
@@ -200,6 +200,8 @@ class V4DCoordinator:
                              (self._monotonic() - v4_started) * 1000)
         self._record_availability(v1, v2, v3, compact, accuracy)
         self.metrics.observe("complete_v9_cycle_latency_ms",
+                             (self._monotonic() - cycle_started) * 1000)
+        self.metrics.observe("v4d_cycle_latency_ms",
                              (self._monotonic() - cycle_started) * 1000)
         return V4DCycleOutput(v1.cycle_id, v1.symbol, v1.cutoff_at, v1, v2, v3,
                              finals, tuple(accuracy.get(h) for h in HORIZONS),

@@ -46,6 +46,7 @@ from .v9_v4a_evidence import (
 from .v9_v4b_accuracy import AccuracyStateStore
 from .v9_v4c_predictive import V4CStateStore
 from .v9_v4d_integration import V4DCycleOutput, V4DCoordinator, resolve_outcome
+from .v9_v4d_integration import OperationalMetrics
 
 
 TARGET_SPEC_ID = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
@@ -74,6 +75,8 @@ class V2RefreshSnapshot:
     state_id: str | None
     state_as_of: float | None
     error_type: str | None
+    duration_ms: float | None = None
+    rows_materialized: int = 0
 
 
 class PostgresV2StateBuilder:
@@ -87,8 +90,10 @@ class PostgresV2StateBuilder:
             connect = psycopg.connect
         self._database_url = database_url
         self._connect = connect
+        self.last_rows_materialized = 0
 
     def build(self) -> V2EvidenceState:
+        self.last_rows_materialized = 0
         connection = self._connect(self._database_url)
         try:
             cursor = connection.cursor()
@@ -140,6 +145,7 @@ class PostgresV2StateBuilder:
                     (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, state_as_of),
                 )
                 magnitude_rows = tuple(cursor.fetchall())
+                self.last_rows_materialized = len(directional_rows) + len(magnitude_rows)
             finally:
                 close = getattr(cursor, "close", None)
                 if callable(close):
@@ -218,23 +224,36 @@ class PostgresV2StateBuilder:
 class ImmutableV2StateProvider:
     """Atomically publish complete frozen V2 states built outside request paths."""
 
-    def __init__(self, builder: PostgresV2StateBuilder):
+    def __init__(self, builder: PostgresV2StateBuilder, *,
+                 metrics: OperationalMetrics | None = None):
         self._builder = builder
         self._lock = threading.Lock()
         self._state: V2EvidenceState | None = None
         self._status = V2RefreshSnapshot("UNAVAILABLE", None, None, None)
+        self.metrics = metrics or OperationalMetrics()
 
     def refresh(self) -> V2RefreshSnapshot:
+        started = time.perf_counter()
         try:
             candidate = self._builder.build()
         except Exception as error:
+            duration = (time.perf_counter() - started) * 1000
             snapshot = V2RefreshSnapshot("UNAVAILABLE", None, None,
-                                         type(error).__name__)
+                                         type(error).__name__, duration,
+                                         self._builder.last_rows_materialized)
+            self.metrics.observe("v2_background_build_duration_ms", duration)
+            self.metrics.observe("v2_background_rows_materialized",
+                                 float(self._builder.last_rows_materialized))
             with self._lock:
                 self._status = snapshot
             return snapshot
+        duration = (time.perf_counter() - started) * 1000
         snapshot = V2RefreshSnapshot("AVAILABLE", candidate.state_id,
-                                     candidate.state_as_of, None)
+                                     candidate.state_as_of, None, duration,
+                                     self._builder.last_rows_materialized)
+        self.metrics.observe("v2_background_build_duration_ms", duration)
+        self.metrics.observe("v2_background_rows_materialized",
+                             float(self._builder.last_rows_materialized))
         with self._lock:
             self._state = candidate
             self._status = snapshot
@@ -330,12 +349,16 @@ class ProductionV9Runtime:
     """One database-backed production coordinator used by the quote path."""
 
     def __init__(self, database_url: str, v2_provider: ImmutableV2StateProvider,
-                 *, connect: Callable | None = None):
+                 *, connect: Callable | None = None,
+                 metrics: OperationalMetrics | None = None,
+                 monotonic_clock: Callable[[], float] = time.perf_counter):
         if connect is None:
             import psycopg
             connect = psycopg.connect
         self._connection = connect(database_url)
         self._provider = v2_provider
+        self.metrics = metrics or OperationalMetrics()
+        self._monotonic = monotonic_clock
         self._writer = V4AWriter(self._connection)
         self._v4c = V4CStateStore(self._connection)
         self._accuracy = AccuracyStateStore(self._connection)
@@ -413,7 +436,10 @@ class ProductionV9Runtime:
             v2 = self._provider.capture(cutoff_at)
         except RuntimeError:
             return None
+        v1_started = self._monotonic()
         v1 = build_live_v1(snapshot, v2)
+        self.metrics.observe("v1_capture_latency_ms",
+                             (self._monotonic() - v1_started) * 1000)
         coordinator = V4DCoordinator(
             capture_v1=lambda: v1,
             capture_v2=lambda _captured: v2,
@@ -422,6 +448,8 @@ class ProductionV9Runtime:
             accuracy_state_lookup=self._accuracy.latest_json,
             state_cohort_id=v4_state_cohort_id,
             cutoff_midpoint=lambda _captured: current.midpoint,
+            metrics=self.metrics,
+            monotonic_clock=self._monotonic,
         )
         output = coordinator.run_cycle()
         pending_ids = {item.forecast_record_id for item in self._pending}
