@@ -1,11 +1,13 @@
 from datetime import datetime, timezone, timedelta
-from dataclasses import replace
+from dataclasses import asdict, replace
+import json
 import math
 import random
 
 import pytest
 
 from quant.v9_v4c_predictive import *
+from quant.v9_v4a_evidence import _canonical
 
 NOW=datetime(2026,1,1,tzinfo=timezone.utc)
 
@@ -136,11 +138,38 @@ def test_state_time_and_hash_fail_closed_on_insert_and_select():
     assert store.insert(state,NOW)=="INSERT"
     assert (connection.commits,connection.rollbacks,connection.value.closed)==(1,0,True)
     canonical=connection.value.inserted[9]
-    connection.value.execute=lambda sql,args:setattr(connection.value,"results",[(state.state_hash,canonical,NOW,NOW,NOW)])
+    row=(state.state_id,state.state_hash,state.state_version,state.model_version,
+         state.symbol,state.cohort_id,NOW,NOW,NOW,canonical)
+    connection.value.execute=lambda sql,args:setattr(connection.value,"results",[row])
     assert store.latest_json(symbol="X",cohort_id="c",requested_cutoff=NOW)[1]=="AVAILABLE"
     tampered=canonical.replace('"symbol": "X"','"symbol": "Y"')
-    connection.value.execute=lambda sql,args:setattr(connection.value,"results",[(state.state_hash,tampered,NOW,NOW,NOW)])
+    connection.value.execute=lambda sql,args:setattr(connection.value,"results",[(*row[:-1],tampered)])
     assert store.latest_json(symbol="X",cohort_id="c",requested_cutoff=NOW)[1]=="STATE_HASH_MISMATCH"
+
+
+@pytest.mark.parametrize("index,replacement", [
+    (0, "wrong-id"), (2, "wrong-state-version"), (3, "wrong-model-version"),
+    (4, "Y"), (5, "wrong-cohort"), (6, NOW-timedelta(seconds=1)),
+    (7, None), (8, None),
+])
+def test_v4c_latest_json_rejects_hash_valid_relational_metadata_mismatch(index,replacement):
+    state=build_v4c_state(symbol="X",cohort_id="c",state_as_of=NOW,
+        evidence_first_cutoff=NOW,evidence_last_cutoff=NOW,horizons=_six_states())
+    raw=json.dumps(_canonical(asdict(state)),sort_keys=True)
+    row=[state.state_id,state.state_hash,state.state_version,state.model_version,
+         state.symbol,state.cohort_id,state.state_as_of,NOW,NOW,raw]
+    row[index]=replacement
+    class Cursor:
+        def execute(self,sql,args):pass
+        def fetchall(self):return [tuple(row)]
+        def close(self):pass
+    class Connection:
+        autocommit=False
+        def cursor(self):return Cursor()
+        def commit(self):pass
+    assert V4CStateStore(Connection()).latest_json(
+        symbol="X",cohort_id="c",requested_cutoff=NOW)==(
+            None,"STATE_DESERIALIZATION_INVALID")
 
 def test_mature_statuses_fail_closed_when_live_numerics_missing():
     from quant.v9_v3_synthesis import V3HorizonResult

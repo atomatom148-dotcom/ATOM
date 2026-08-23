@@ -1,15 +1,17 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import math
+import json
 import random
 
 import pytest
 
 from quant.v9_v1_contract import HORIZONS, HORIZON_SECONDS
 from quant.v9_v3_synthesis import V3HorizonResult
-from quant.v9_v4a_evidence import ForecastRecord, OutcomeRecord, canonical_sha256
+from quant.v9_v4a_evidence import ForecastRecord, OutcomeRecord, canonical_sha256, _canonical
 from quant.v9_v4b_accuracy import (
-    BETA_X_TOLERANCE, JEFFREYS_METHOD, AccuracyStateStore, build_accuracy_state,
+    BETA_X_TOLERANCE, JEFFREYS_METHOD, MODEL_VERSION, STATE_VERSION,
+    AccuracyStateStore, build_accuracy_state,
     effective_n, final_numbers, inverse_regularized_incomplete_beta,
     regularized_incomplete_beta,
 )
@@ -204,5 +206,33 @@ def test_store_idempotence_insert_and_same_time_conflict():
     assert "INSERT INTO atom_v9_v4_states" in con.cursor_value.sql[-1][0]
     assert (con.commits,con.rollbacks,con.cursor_value.closed)==(1,0,True)
     con=Connection([[(empty.state_hash,)]]); assert AccuracyStateStore(con).insert(empty,NOW)=="IDEMPOTENT"
-    con=Connection([[('a',{},NOW),('b',{},NOW)]])
+    con=Connection([[('id-a','a',STATE_VERSION,MODEL_VERSION,'COIN','x',NOW,None,None,{}),
+                     ('id-b','b',STATE_VERSION,MODEL_VERSION,'COIN','x',NOW,None,None,{})]])
     assert AccuracyStateStore(con).latest_json(symbol="COIN",cohort_id="x",requested_cutoff=NOW)[1]=="STATE_CONFLICT"
+
+
+@pytest.mark.parametrize("index,replacement", [
+    (0, "wrong-id"), (2, "wrong-state-version"), (3, "wrong-model-version"),
+    (4, "QQQ"), (5, "wrong-cohort"), (6, NOW-timedelta(seconds=1)),
+    (7, NOW), (8, NOW),
+])
+def test_latest_json_rejects_hash_valid_relational_metadata_mismatch(index, replacement):
+    state=build_accuracy_state(symbol="COIN",state_as_of=NOW,cohorts=cohorts(),evidence=[])
+    raw=json.dumps(_canonical(asdict(state)),sort_keys=True)
+    row=[state.state_id,state.state_hash,state.state_version,state.model_version,
+         state.symbol,state.cohort_id,state.state_as_of,None,None,raw]
+    row[index]=replacement
+    result=AccuracyStateStore(Connection([[tuple(row)]])).latest_json(
+        symbol="COIN",cohort_id=state.cohort_id,requested_cutoff=NOW)
+    assert result==(None,"STATE_DESERIALIZATION_INVALID")
+
+
+def test_latest_json_rejects_hash_valid_future_payload_under_older_sql_time():
+    state=build_accuracy_state(symbol="COIN",state_as_of=NOW+timedelta(seconds=1),
+                               cohorts=cohorts(),evidence=[])
+    raw=json.dumps(_canonical(asdict(state)),sort_keys=True)
+    row=(state.state_id,state.state_hash,state.state_version,state.model_version,
+         state.symbol,state.cohort_id,NOW,None,None,raw)
+    assert AccuracyStateStore(Connection([[row]])).latest_json(
+        symbol="COIN",cohort_id=state.cohort_id,requested_cutoff=NOW)==(
+            None,"STATE_DESERIALIZATION_INVALID")
