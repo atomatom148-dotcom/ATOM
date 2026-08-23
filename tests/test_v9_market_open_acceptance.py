@@ -40,6 +40,7 @@ def _scoreable_30s(output):
     assert v3.status != "UNAVAILABLE"
     assert v3.expected_return_bps is not None and math.isfinite(v3.expected_return_bps)
     assert final.final_bps is not None and math.isfinite(final.final_bps)
+    assert final.final_bps == v3.expected_return_bps
     assert persisted.status != "FAILED"
     assert persisted.forecast.persistence_proof_eligible is True
     return persisted.forecast
@@ -89,6 +90,13 @@ def test_30s_scoreability_accepts_complete_and_rejects_unavailable():
     assert _scoreable_30s(_acceptance_output(scoreable=True)).persistence_proof_eligible
     with pytest.raises(AssertionError):
         _scoreable_30s(_acceptance_output(scoreable=False))
+
+
+def test_30s_scoreability_rejects_finite_mismatched_final_bps():
+    output = _acceptance_output(scoreable=True)
+    output.final_numbers[0].final_bps = 2.0
+    with pytest.raises(AssertionError):
+        _scoreable_30s(output)
 
 
 def test_deployed_response_validation_requires_health_and_six_finite_slots():
