@@ -1,6 +1,8 @@
 from datetime import datetime, timezone, timedelta
+from dataclasses import replace
 import math
 import random
+import time
 
 import pytest
 
@@ -87,3 +89,56 @@ def test_live_final_mean_immutable_and_unavailable_components_null():
     assert final.final_bps==10 and final.move_percent==100*math.expm1(.001)
     assert final.predictive_scale_bps is None and final.range_lower_bps is None
     assert final.probability_positive is None and (final.gamma,final.phi,final.gamma_status)==(0,1,"INACTIVE")
+
+def test_offline_blocks_enforce_proof_timing_cohort_conflicts_and_overlap():
+    rows=[]
+    for i in range(9):
+        rows.append(CalibrationObservation(NOW+timedelta(seconds=10*i),str(i),1,0,1,"s",
+            i!=8,"VERIFIED","c","h",NOW+timedelta(seconds=10*i),20))
+    # Duplicate identical records are canonical; an incompatible duplicate contaminates its key.
+    rows.extend((rows[1],replace(rows[2],actual_bps=2)))
+    blocks=construct_evidence_blocks(rows,cohort_id="c",cohort_hash="h",
+        threshold_end=NOW+timedelta(seconds=30),calibration_end=NOW+timedelta(seconds=60),
+        validation_end=NOW+timedelta(seconds=90))
+    assert [x.forecast_record_id for x in blocks.threshold]==["0"]
+    assert all(a.cutoff+timedelta(seconds=a.horizon_seconds)<=b.cutoff
+               for group in (blocks.threshold,blocks.calibration,blocks.validation)
+               for a,b in zip(group,group[1:]))
+    assert "8" not in [x.forecast_record_id for x in blocks.validation]
+
+def test_probability_calibration_is_six_separate_events_and_preserves_zero_mass():
+    cal=[ProbabilityHoldoutObservation(NOW+timedelta(minutes=i),str(i),float((i%11)-5),0,2) for i in range(500)]
+    hold=[ProbabilityHoldoutObservation(NOW+timedelta(days=1,minutes=i),f"h{i}",float((i%13)-6),0,2) for i in range(500)]
+    residuals,events=calibrate_probability_events(cal,hold,medium_bps=3,large_bps=5)
+    assert len(residuals)==500 and tuple(x.event for x in events)==EVENTS
+    assert all(x.calibration_n==500 and x.holm_rank in range(1,7) for x in events)
+    probabilities=event_probabilities(residuals,0,2,3,5)
+    assert len(probabilities)==6 and all(0<p<1 for p in probabilities)
+
+def test_q3_partition_ties_and_degradation_orientation():
+    tied=[GammaInput(i+1,1,1,NOW+timedelta(minutes=i),str(i)) for i in range(8)]
+    assert q3_quartile_diagnostics(tied,.2,1).reason_codes==("Q3_QUARTILE_TIE_COLLAPSE",)
+    rows=[GammaInput((i%5)+1,2,float(i+1),NOW+timedelta(minutes=i),str(i)) for i in range(240)]
+    result=q3_quartile_diagnostics(rows,.2,sum(x.magnitude**2 for x in rows)/len(rows))
+    assert result.initial_sizes==(60,60,60,60) and len(result.quartiles)==4
+    assert all(x.minimum_magnitude<=x.maximum_magnitude for x in result.quartiles)
+
+def test_state_hash_includes_diagnostics_and_rejects_active_gamma():
+    horizons=tuple(CompactHorizonState(h,"UNAVAILABLE",None,None,"UNAVAILABLE",None,None,
+        "UNAVAILABLE",None,(),("UNAVAILABLE",)*6) for h in HORIZONS)
+    state=build_v4c_state(symbol="COIN",cohort_id="c",state_as_of=NOW,horizons=horizons)
+    assert state.state_id=="v9v4state:"+state.state_hash and len(state.state_hash)==64
+    with pytest.raises(ValueError,match="production gamma"):
+        replace(state,gamma=1)
+
+def test_live_100000_six_horizon_p99_benchmark():
+    from quant.v9_v3_synthesis import V3HorizonResult
+    compact=CompactHorizonState("30S","MATURE",3,5,"MATURE",1,1,"MATURE",2,
+        (-2.,-1.,0.,1.,2.),("MATURE",)*6)
+    result=V3HorizonResult("30S",30,1.,1.,"AVAILABLE",(),(),0,None)
+    durations=[]
+    for _ in range(100_000):
+        start=time.perf_counter()
+        for __ in range(6): final_numbers(result,compact)
+        durations.append(time.perf_counter()-start)
+    assert sorted(durations)[98_999] <= .010
