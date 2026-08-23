@@ -542,6 +542,7 @@ def create_app(
             history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
             now_epoch=as_of_epoch, evidence_counts=counts, phase_e_cohorts=cohorts,
             cross_asset_state=cross_asset_state, v9_output=v9_output,
+            calculate_missing=False,
         )
         if path == "/":
             status, content_type, body = "200 OK", "text/html; charset=utf-8", dashboard_page(data)

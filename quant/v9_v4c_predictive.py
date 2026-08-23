@@ -660,7 +660,7 @@ class V4CStateStore:
     def latest_json(self,*,symbol:str,cohort_id:str,requested_cutoff:datetime):
         cursor=self.connection.cursor()
         try:
-            cursor.execute("SELECT state_hash,state_json,state_as_of,evidence_first_cutoff,evidence_last_cutoff FROM atom_v9_v4_states WHERE state_version=%s AND model_version=%s AND symbol=%s AND cohort_id=%s AND state_as_of<=%s ORDER BY state_as_of DESC, state_id DESC LIMIT 2",
+            cursor.execute("SELECT state_id,state_hash,state_version,model_version,symbol,cohort_id,state_as_of,evidence_first_cutoff,evidence_last_cutoff,state_json FROM atom_v9_v4_states WHERE state_version=%s AND model_version=%s AND symbol=%s AND cohort_id=%s AND state_as_of<=%s ORDER BY state_as_of DESC, state_id DESC LIMIT 2",
                 (PROBABILITY_STATE_VERSION,MODEL_VERSION,symbol,cohort_id,requested_cutoff))
             rows=cursor.fetchall()
             _commit_if_supported(self.connection)
@@ -670,12 +670,13 @@ class V4CStateStore:
         finally:
             _close_if_supported(cursor)
         if not rows:return None,"UNAVAILABLE"
-        greatest=rows[0][2]
-        if len(rows)>1 and rows[1][2]==greatest and rows[1][0]!=rows[0][0]:
+        greatest=rows[0][6]
+        if len(rows)>1 and rows[1][6]==greatest and rows[1][1]!=rows[0][1]:
             return None,"STATE_CONFLICT"
-        state_hash,state_json,state_as_of,first,last=rows[0]
+        (state_id,state_hash,state_version,model_version,row_symbol,row_cohort_id,
+         state_as_of,first,last,state_json)=rows[0]
         if ((first is None)!=(last is None) or first is not None and not first<=last<=state_as_of):
-            return None,"STATE_TIME_INVALID"
+            return None,"STATE_DESERIALIZATION_INVALID"
         canonical=json.loads(state_json) if isinstance(state_json,str) else state_json
         if not isinstance(canonical,dict) or canonical.get("state_hash")!=state_hash:
             return None,"STATE_HASH_MISMATCH"
@@ -696,6 +697,12 @@ class V4CStateStore:
                 value["state_as_of"],value["evidence_first_cutoff"],
                 value["evidence_last_cutoff"],horizons,value["gamma"],
                 value["phi"],value["gamma_status"])
+            if not (state.state_id==state_id and state.state_hash==state_hash and
+                    state.state_version==state_version and state.model_version==model_version and
+                    state.symbol==row_symbol and state.cohort_id==row_cohort_id and
+                    state.state_as_of==state_as_of and state.state_as_of<=requested_cutoff and
+                    state.evidence_first_cutoff==first and state.evidence_last_cutoff==last):
+                return None,"STATE_DESERIALIZATION_INVALID"
         except (KeyError,TypeError,ValueError):
             return None,"STATE_DESERIALIZATION_INVALID"
         return state,"AVAILABLE"

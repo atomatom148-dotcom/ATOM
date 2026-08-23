@@ -249,7 +249,7 @@ class AccuracyStateStore:
     def latest_json(self, *, symbol: str, cohort_id: str, requested_cutoff: datetime):
         cursor=self.connection.cursor()
         try:
-            cursor.execute("SELECT state_hash,state_json,state_as_of FROM atom_v9_v4_states WHERE state_version=%s AND model_version=%s AND symbol=%s AND cohort_id=%s AND state_as_of<=%s ORDER BY state_as_of DESC, state_id DESC LIMIT 2",
+            cursor.execute("SELECT state_id,state_hash,state_version,model_version,symbol,cohort_id,state_as_of,evidence_first_cutoff,evidence_last_cutoff,state_json FROM atom_v9_v4_states WHERE state_version=%s AND model_version=%s AND symbol=%s AND cohort_id=%s AND state_as_of<=%s ORDER BY state_as_of DESC, state_id DESC LIMIT 2",
                 (STATE_VERSION,MODEL_VERSION,symbol,cohort_id,requested_cutoff))
             rows=cursor.fetchall()
             _commit_if_supported(self.connection)
@@ -259,10 +259,11 @@ class AccuracyStateStore:
         finally:
             _close_if_supported(cursor)
         if not rows: return None, "UNAVAILABLE"
-        greatest = rows[0][2]
-        tied=[row for row in rows if row[2] == greatest]
-        if len({row[0] for row in tied}) != 1: return None,"STATE_CONFLICT"
-        state_hash, raw, _ = tied[0]
+        greatest = rows[0][6]
+        tied=[row for row in rows if row[6] == greatest]
+        if len({row[1] for row in tied}) != 1: return None,"STATE_CONFLICT"
+        (state_id, state_hash, state_version, model_version, row_symbol,
+         row_cohort_id, state_as_of, evidence_first, evidence_last, raw) = tied[0]
         try:
             canonical = json.loads(raw) if isinstance(raw, str) else raw
             if not isinstance(canonical, dict) or canonical.get("state_hash") != state_hash:
@@ -280,6 +281,19 @@ class AccuracyStateStore:
                 value["model_version"], value["symbol"], value["cohort_id"],
                 value["state_as_of"], horizons,
             )
+            cutoffs = [cutoff for horizon in horizons
+                       for cutoff in (horizon.first_cutoff, horizon.last_cutoff)
+                       if cutoff is not None]
+            if not (
+                state.state_id == state_id and state.state_hash == state_hash and
+                state.state_version == state_version and
+                state.model_version == model_version and state.symbol == row_symbol and
+                state.cohort_id == row_cohort_id and state.state_as_of == state_as_of and
+                state.state_as_of <= requested_cutoff and
+                (min(cutoffs) if cutoffs else None) == evidence_first and
+                (max(cutoffs) if cutoffs else None) == evidence_last
+            ):
+                return None, "STATE_DESERIALIZATION_INVALID"
         except (KeyError, TypeError, ValueError):
             return None, "STATE_DESERIALIZATION_INVALID"
         return state,"AVAILABLE"

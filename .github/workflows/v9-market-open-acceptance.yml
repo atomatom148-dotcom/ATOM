@@ -18,6 +18,7 @@ jobs:
       contents: read
     env:
       ATOM_MARKET_OPEN_ACCEPTANCE: "1"
+      ATOM_PRODUCTION_BASE_URL: https://atom-v9-thin.onrender.com
       DATABASE_URL: ${{ secrets.ATOM_V9_RUNTIME_DATABASE_URL }}
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}

@@ -39,7 +39,7 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertIn("12 QUANT FAMILIES", page)
         self.assertNotIn(">None<", page)
 
-    def test_json_route_has_frozen_order_and_only_q1_q3_outputs(self):
+    def test_json_route_has_frozen_order_without_request_time_calculation(self):
         history = MidpointHistory(
             MidpointObservation(float(second), 100.0 + second / 100.0)
             for second in range(0, 3601, 30)
@@ -49,10 +49,8 @@ class WebSurfaceTests(unittest.TestCase):
         payload = json.loads(response["body"])
         self.assertEqual(payload["horizons"], list(HORIZON_LABELS))
         self.assertEqual([item["name"] for item in payload["quant_families"]], list(FAMILY_NAMES))
-        for family in payload["quant_families"][:3]:
+        for family in payload["quant_families"]:
             self.assertEqual(len(family["values"]), 6)
-            self.assertTrue(all(isinstance(value, (float, int)) for value in family["values"]))
-        for family in payload["quant_families"][3:]:
             self.assertEqual(family["values"], [None] * 6)
 
     def test_unavailable_fields_are_null_and_not_fabricated(self):
@@ -78,7 +76,7 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertAlmostEqual(payload["market"]["data_age"], 1.234)
         self.assertEqual(payload["market"]["last_cycle"], 1_700_000_000.0)
 
-    def test_page_formats_q1_q3_to_two_decimal_places(self):
+    def test_page_does_not_calculate_q1_q3_from_request_history(self):
         history = MidpointHistory(
             MidpointObservation(float(second), 100.0 + second / 100.0)
             for second in range(0, 3601, 30)
@@ -87,9 +85,17 @@ class WebSurfaceTests(unittest.TestCase):
         payload = json.loads(request(app, "/api/dashboard")["body"])
         page = request(app, "/")["body"].decode()
 
-        for family in payload["quant_families"][:3]:
-            for value in family["values"]:
-                self.assertIn(f">{value:.2f}</td>", page)
+        self.assertTrue(all(value is None for family in payload["quant_families"]
+                            for value in family["values"]))
+        self.assertNotIn(">None<", page)
+
+    def test_request_routes_never_invoke_history_calculators(self):
+        app = create_app()
+        with patch("quant.web.calculate_momentum", side_effect=AssertionError), \
+             patch("quant.web.calculate_mean_reversion", side_effect=AssertionError), \
+             patch("quant.web.calculate_volatility", side_effect=AssertionError):
+            for path in ("/", "/api/dashboard", "/api/live"):
+                self.assertEqual(request(app, path)["status"], "200 OK")
 
     def test_mobile_market_grid_uses_two_non_overlapping_columns(self):
         page = request(create_app(), "/")["body"].decode()
