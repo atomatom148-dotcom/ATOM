@@ -78,7 +78,7 @@ class OperationalSnapshot:
 class OperationalMetrics:
     """Small bounded in-process telemetry; observations never enter math values."""
 
-    def __init__(self, *, retained_samples: int = 100_000):
+    def __init__(self, *, retained_samples: int = 1024):
         if retained_samples < 1:
             raise ValueError("retained_samples must be positive")
         self._limit = retained_samples

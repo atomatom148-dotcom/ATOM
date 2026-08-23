@@ -47,7 +47,6 @@ MAX_NDX_AGE_SECONDS = 10.0
 HISTORY_SECONDS = 3600.0
 MARKET_DISPLAY_FETCH_SECONDS = 0.25
 QUANT_CYCLE_SECONDS = 1.0
-FAMILY_RUNTIME_LIMIT_MS = 100.0
 
 
 def v9_math_core_enabled() -> bool:
@@ -292,11 +291,7 @@ class LiveMarketState:
             return False
 
         update_started = self._monotonic()
-        # Provider quotes use decimal prices; suppress binary representation noise
-        # without changing the mathematical midpoint.
-        observation = MidpointObservation(
-            event_epoch, round(bid + (ask - bid) / 2.0, 12),
-        )
+        observation = MidpointObservation(event_epoch, (bid + ask) / 2.0)
         previous_observation: MidpointObservation | None = None
         with self._lock:
             old = self._snapshot.history.observations
@@ -334,9 +329,6 @@ class LiveMarketState:
                     self.metrics.increment(f"family.{name}.failure")
                 elapsed = (self._monotonic() - started) * 1000
                 self.metrics.observe(f"family.{name}.runtime_ms", elapsed)
-                if elapsed > FAMILY_RUNTIME_LIMIT_MS:
-                    self.metrics.increment(f"family.{name}.slow_excluded")
-                    return None
                 return result
 
             next_snapshot = LiveSnapshot(

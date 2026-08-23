@@ -76,7 +76,7 @@ class V2RefreshSnapshot:
     state_as_of: float | None
     error_type: str | None
     duration_ms: float | None = None
-    rows_scanned: int = 0
+    rows_materialized: int = 0
 
 
 class PostgresV2StateBuilder:
@@ -90,10 +90,10 @@ class PostgresV2StateBuilder:
             connect = psycopg.connect
         self._database_url = database_url
         self._connect = connect
-        self.last_rows_scanned = 0
+        self.last_rows_materialized = 0
 
     def build(self) -> V2EvidenceState:
-        self.last_rows_scanned = 0
+        self.last_rows_materialized = 0
         connection = self._connect(self._database_url)
         try:
             cursor = connection.cursor()
@@ -145,7 +145,7 @@ class PostgresV2StateBuilder:
                     (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, state_as_of),
                 )
                 magnitude_rows = tuple(cursor.fetchall())
-                self.last_rows_scanned = len(directional_rows) + len(magnitude_rows)
+                self.last_rows_materialized = len(directional_rows) + len(magnitude_rows)
             finally:
                 close = getattr(cursor, "close", None)
                 if callable(close):
@@ -240,20 +240,20 @@ class ImmutableV2StateProvider:
             duration = (time.perf_counter() - started) * 1000
             snapshot = V2RefreshSnapshot("UNAVAILABLE", None, None,
                                          type(error).__name__, duration,
-                                         self._builder.last_rows_scanned)
+                                         self._builder.last_rows_materialized)
             self.metrics.observe("v2_background_build_duration_ms", duration)
-            self.metrics.observe("v2_background_rows_scanned",
-                                 float(self._builder.last_rows_scanned))
+            self.metrics.observe("v2_background_rows_materialized",
+                                 float(self._builder.last_rows_materialized))
             with self._lock:
                 self._status = snapshot
             return snapshot
         duration = (time.perf_counter() - started) * 1000
         snapshot = V2RefreshSnapshot("AVAILABLE", candidate.state_id,
                                      candidate.state_as_of, None, duration,
-                                     self._builder.last_rows_scanned)
+                                     self._builder.last_rows_materialized)
         self.metrics.observe("v2_background_build_duration_ms", duration)
-        self.metrics.observe("v2_background_rows_scanned",
-                             float(self._builder.last_rows_scanned))
+        self.metrics.observe("v2_background_rows_materialized",
+                             float(self._builder.last_rows_materialized))
         with self._lock:
             self._state = candidate
             self._status = snapshot
