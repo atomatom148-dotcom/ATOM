@@ -4,7 +4,7 @@ import re
 import unittest
 
 from quant.evidence import MIN_EFFECTIVE_N, PhaseECohortMetrics, PostgresEvidenceStore
-from quant.web import create_app, dashboard_data
+from quant.web import DashboardEvidenceCache, create_app, dashboard_data
 from tests.test_web import request
 
 
@@ -360,11 +360,11 @@ class PhaseEApiTests(unittest.TestCase):
         )
 
         class Store:
-            def __init__(self): self.calls = []
+            def __init__(self): self.calls = []; self.count_calls = 0
             def phase_e_cohorts(self, as_of):
                 self.calls.append(as_of)
                 return (cohort,)
-            def counts(self): raise AssertionError("dashboard count read is forbidden")
+            def counts(self): self.count_calls += 1; return (4, 2)
             def record_cycle_and_resolve(self, *args, **kwargs):
                 raise AssertionError("evidence write is forbidden")
 
@@ -372,10 +372,13 @@ class PhaseEApiTests(unittest.TestCase):
             def snapshot(self): raise AssertionError("market state is forbidden")
 
         store = Store()
-        response = request(create_app(state=State(), evidence_store=store,
-                                      clock=lambda: 777.25), "/api/phase-e")
+        cache = DashboardEvidenceCache(store, clock=lambda: 777.25)
+        cache.refresh()
+        response = request(create_app(state=State(), evidence_cache=cache,
+                                      clock=lambda: 999.0), "/api/phase-e")
         self.assertEqual(response["status"], "200 OK")
         self.assertEqual(store.calls, [777.25])
+        self.assertEqual(store.count_calls, 1)
         self.assertEqual(json.loads(response["body"]), {
             "as_of_epoch": 777.25,
             "cohorts": [{

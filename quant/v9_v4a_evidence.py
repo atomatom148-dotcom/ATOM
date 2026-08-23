@@ -14,18 +14,20 @@ import json
 import math
 from typing import Iterable, Mapping
 
-from quant.v9_v1_contract import HORIZON_SECONDS, V1Input
+from quant.v9_v1_contract import HORIZON_SECONDS, V1Input, v1_input_hash
 from quant.v9_v2d_evidence_state import V2EvidenceState
-from quant.v9_v3_synthesis import CANONICAL_FAMILIES, MODEL_VERSION, V3HorizonResult
+from quant.v9_v3_synthesis import (
+    CANONICAL_FAMILIES, CONTRACT_VERSION as V3_CONTRACT_VERSION,
+    MODEL_VERSION, V3HorizonResult,
+)
 
 
 CONTRACT_VERSION = "ATOM_TRUE_V9_V4_1"
 EVIDENCE_VERSION = "ATOM_TRUE_V9_V4A_1"
 REPLAY_METHOD_VERSION = "ATOM_TRUE_V9_V4_REPLAY_1"
-V3_CONTRACT_VERSION = None
 EVIDENCE_ORIGINS = frozenset(("PRODUCTION", "CAUSAL_REPLAY"))
-TARGET_TIMING_STATUS = "UNVERIFIED"
 TARGET_TIMING_REASON = "TARGET_TIMING_UNVERIFIED"
+TARGET_TIMING_METHOD_VERSION = "ATOM_TRUE_V9_V4_TARGET_FIRST_AT_OR_AFTER_1"
 OVERLAP_METHOD_VERSION = "ATOM_TRUE_V9_V4_OVERLAP_1"
 
 
@@ -48,6 +50,33 @@ def _canonical(value: object) -> object:
         return {str(key): _canonical(value[key]) for key in sorted(value, key=str)}
     if hasattr(value, "__dataclass_fields__"):
         return _canonical(asdict(value))
+    if hasattr(value, "__dict__"):
+        return _canonical(vars(value))
+    return value
+
+
+def _decanonical(value: object) -> object:
+    """Reverse the frozen JSON wrappers used by every compact V4 record."""
+    if isinstance(value, list):
+        return tuple(_decanonical(item) for item in value)
+    if isinstance(value, dict):
+        if set(value) == {"$timestamp_utc"}:
+            token = value["$timestamp_utc"]
+            if not isinstance(token, str):
+                raise ValueError("invalid canonical timestamp")
+            parsed = datetime.fromisoformat(token.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("canonical timestamp is not timezone-aware")
+            return parsed.astimezone(timezone.utc)
+        if set(value) == {"$float64"}:
+            token = value["$float64"]
+            if not isinstance(token, str):
+                raise ValueError("invalid canonical float")
+            parsed = float.fromhex(token)
+            if not math.isfinite(parsed):
+                raise ValueError("canonical float is not finite")
+            return 0.0 if parsed == 0.0 else parsed
+        return {str(key): _decanonical(item) for key, item in value.items()}
     return value
 
 
@@ -104,7 +133,7 @@ class ForecastRecord:
     horizon: str
     horizon_seconds: int
     cycle_id: str
-    v3_contract_version: None
+    v3_contract_version: str
     v3_model_version: str
     v2_state_id: str
     v2_state_version: str
@@ -118,6 +147,19 @@ class ForecastRecord:
     persisted_at: datetime | None = None
     persistence_proof_eligible: bool | None = None
     persistence_reason: str | None = None
+    v1_contract_version: str | None = None
+    v1_input_hash: str | None = None
+    target_spec_id: str | None = None
+    data_schema_version: str | None = None
+    source_spec_version: str | None = None
+    cutoff_midpoint: float | None = None
+    used_quant_ids: tuple[str, ...] = ()
+    family_weights: tuple[float, ...] = ()
+    directional_input_count: int = 0
+    covariance_mode: str | None = None
+    q3_used: bool = False
+    gamma: float = 0.0
+    phi: float = 1.0
 
     @property
     def logical_key(self) -> tuple[object, ...]:
@@ -131,7 +173,7 @@ def _forecast_math(record: ForecastRecord) -> dict[str, object]:
 
 
 def build_forecast(*, v1: V1Input, v2: V2EvidenceState, result: V3HorizonResult,
-                   evidence_origin: str) -> ForecastRecord:
+                   evidence_origin: str, cutoff_midpoint: float | None = None) -> ForecastRecord:
     if evidence_origin not in EVIDENCE_ORIGINS:
         raise ValueError("unsupported durable evidence_origin")
     if result.horizon not in HORIZON_SECONDS:
@@ -140,16 +182,60 @@ def build_forecast(*, v1: V1Input, v2: V2EvidenceState, result: V3HorizonResult,
                    if slot.horizon == result.horizon}
     cohort = build_cohort(v1=v1, v2=v2, horizon=result.horizon,
                           family_formula_map=formula_map)
+    if cutoff_midpoint is not None and (
+            isinstance(cutoff_midpoint, bool) or
+            not isinstance(cutoff_midpoint, (int, float)) or
+            not math.isfinite(cutoff_midpoint) or cutoff_midpoint <= 0):
+        raise ValueError("cutoff_midpoint must be positive and finite")
+    input_hash = (v1_input_hash(v1) if isinstance(v1, V1Input)
+                  else canonical_sha256(v1))
     record = ForecastRecord("", "", CONTRACT_VERSION, EVIDENCE_VERSION,
         evidence_origin, cohort.cohort_id, cohort.cohort_hash, v1.symbol,
         v1.cutoff_at, v1.cutoff_at + timedelta(seconds=result.horizon_seconds),
-        result.horizon, result.horizon_seconds, v1.cycle_id, None, MODEL_VERSION,
+        result.horizon, result.horizon_seconds, v1.cycle_id,
+        V3_CONTRACT_VERSION, MODEL_VERSION,
         v2.state_id, v2.state_version, v2.state_hash, v2.state_as_of,
         result.expected_return_bps, result.predictive_variance_bps2,
-        result.q3_diagnostic_magnitude_bps, result.status, result.reason_codes)
+        result.q3_diagnostic_magnitude_bps, result.status, result.reason_codes,
+        v1_contract_version=v1.contract_version, v1_input_hash=input_hash,
+        target_spec_id=v1.target_spec_id,
+        data_schema_version=v1.data_schema_version,
+        source_spec_version=v1.source_spec_version,
+        cutoff_midpoint=None if cutoff_midpoint is None else float(cutoff_midpoint),
+        used_quant_ids=tuple(result.used_quant_ids),
+        family_weights=tuple(result.weights),
+        directional_input_count=result.directional_input_count,
+        covariance_mode=result.covariance_mode, q3_used=result.q3_used,
+        gamma=result.gamma, phi=result.phi)
     digest = canonical_sha256(_forecast_math(record))
     return replace(record, forecast_record_id="v9v4f:" + digest,
                    forecast_record_hash=digest)
+
+
+def deserialize_forecast_record(payload: str | Mapping[str, object], *,
+                                expected_hash: str | None = None) -> ForecastRecord:
+    """Reconstruct and verify one immutable forecast-ledger payload."""
+
+    canonical = json.loads(payload) if isinstance(payload, str) else payload
+    if not isinstance(canonical, Mapping):
+        raise ValueError("forecast record JSON must be an object")
+    value = _decanonical(dict(canonical))
+    if not isinstance(value, dict):
+        raise ValueError("forecast record JSON is invalid")
+    for field in ("reason_codes", "used_quant_ids", "family_weights"):
+        if field in value:
+            value[field] = tuple(value[field])
+    try:
+        record = ForecastRecord(**value)
+    except TypeError as error:
+        raise ValueError("forecast record JSON does not match the contract") from error
+    if expected_hash is not None and record.forecast_record_hash != expected_hash:
+        raise ValueError("forecast record stored hash mismatch")
+    digest = canonical_sha256(_forecast_math(record))
+    if (record.forecast_record_hash != digest or
+            record.forecast_record_id != "v9v4f:" + digest):
+        raise ValueError("forecast record mathematical hash mismatch")
+    return record
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +255,8 @@ class OutcomeRecord:
     reason_codes: tuple[str, ...]
     proof_eligible: bool
     created_at: datetime | None = None
+    previous_observation_at: datetime | None = None
+    target_timing_method_version: str = TARGET_TIMING_METHOD_VERSION
 
     @property
     def logical_key(self) -> tuple[str, str]:
@@ -180,17 +268,58 @@ def _outcome_math(record: OutcomeRecord) -> dict[str, object]:
     return {key: value for key, value in asdict(record).items() if key not in excluded}
 
 
+def canonical_target_identity(forecast: ForecastRecord) -> str:
+    payload = {
+        "symbol": forecast.symbol,
+        "cycle_id": forecast.cycle_id,
+        "cutoff_at": forecast.cutoff_at,
+        "target_endpoint": forecast.target_endpoint,
+        "horizon": forecast.horizon,
+        "target_spec_id": forecast.target_spec_id,
+        "data_schema_version": forecast.data_schema_version,
+        "source_spec_version": forecast.source_spec_version,
+    }
+    return "v9target:" + canonical_sha256(payload)
+
+
 def build_outcome(*, forecast: ForecastRecord, target_identity: str,
                   endpoint_observation_at: datetime, target_resolved_at: datetime,
-                  actual_return_bps: float | None) -> OutcomeRecord:
+                  actual_return_bps: float | None,
+                  previous_observation_at: datetime | None = None) -> OutcomeRecord:
+    for name, value in (("endpoint_observation_at", endpoint_observation_at),
+                        ("target_resolved_at", target_resolved_at)):
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise ValueError(f"{name} must be timezone-aware")
+    if previous_observation_at is not None and (
+            not isinstance(previous_observation_at, datetime) or
+            previous_observation_at.tzinfo is None):
+        raise ValueError("previous_observation_at must be timezone-aware")
     delay = (endpoint_observation_at - forecast.target_endpoint).total_seconds()
-    reasons = [TARGET_TIMING_REASON]
+    canonical_identity = canonical_target_identity(forecast)
+    timing_verified = (
+        target_identity == canonical_identity and
+        previous_observation_at is not None and
+        previous_observation_at < forecast.target_endpoint <= endpoint_observation_at and
+        target_resolved_at >= endpoint_observation_at
+    )
+    reasons = [] if timing_verified else [TARGET_TIMING_REASON]
     if forecast.persisted_at is None or forecast.persisted_at > forecast.target_endpoint:
         reasons.append("FORECAST_PERSISTED_AFTER_TARGET_ENDPOINT")
+    if actual_return_bps is not None and (
+            isinstance(actual_return_bps, bool) or
+            not isinstance(actual_return_bps, (int, float)) or
+            not math.isfinite(actual_return_bps)):
+        reasons.append("TARGET_VALUE_INVALID")
+    proof_eligible = (timing_verified and not reasons and
+                      actual_return_bps is not None and
+                      forecast.persistence_proof_eligible is True)
     record = OutcomeRecord("", "", CONTRACT_VERSION, EVIDENCE_VERSION,
         forecast.forecast_record_id, target_identity, forecast.target_endpoint,
         endpoint_observation_at, delay, target_resolved_at, actual_return_bps,
-        TARGET_TIMING_STATUS, tuple(sorted(reasons)), False)
+        "VERIFIED" if timing_verified else "UNVERIFIED",
+        tuple(sorted(reasons)), proof_eligible,
+        previous_observation_at=previous_observation_at,
+        target_timing_method_version=TARGET_TIMING_METHOD_VERSION)
     digest = canonical_sha256(_outcome_math(record))
     return replace(record, outcome_record_id="v9v4o:" + digest,
                    outcome_record_hash=digest)
@@ -268,35 +397,71 @@ class V4AWriter:
                          persistence_proof_eligible=eligible,
                          persistence_reason=None if eligible else "FORECAST_PERSISTED_AFTER_TARGET_ENDPOINT")
         cursor = self.connection.cursor()
-        cursor.execute("SELECT forecast_record_hash FROM atom_v9_v4_forecasts WHERE symbol=%s AND cutoff_at=%s AND horizon=%s AND cycle_id=%s AND v3_model_version=%s", record.logical_key)
-        hashes = tuple(row[0] for row in cursor.fetchall())
-        if record.forecast_record_hash in hashes:
-            self.last_write_status = "IDEMPOTENT"
+        try:
+            cursor.execute("SELECT forecast_record_hash FROM atom_v9_v4_forecasts WHERE symbol=%s AND cutoff_at=%s AND horizon=%s AND cycle_id=%s AND v3_model_version=%s", record.logical_key)
+            hashes = tuple(row[0] for row in cursor.fetchall())
+            if record.forecast_record_hash in hashes:
+                self.last_write_status = "IDEMPOTENT"
+                _commit_if_supported(self.connection)
+                return stored
+            if hashes:
+                self.last_write_status = "FORECAST_DUPLICATE_CONFLICT"
+                stored = replace(stored, persistence_proof_eligible=False,
+                                 persistence_reason="FORECAST_DUPLICATE_CONFLICT")
+            else:
+                self.last_write_status = "INSERT"
+            cursor.execute("INSERT INTO atom_v9_v4_forecasts (forecast_record_id, forecast_record_hash, symbol, cutoff_at, target_endpoint, horizon, cycle_id, v3_model_version, record_json, persisted_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                           (record.forecast_record_id, record.forecast_record_hash,
+                            record.symbol, record.cutoff_at, record.target_endpoint, record.horizon,
+                            record.cycle_id, record.v3_model_version,
+                            json.dumps(_canonical(asdict(stored)), sort_keys=True), persisted_at))
+            _commit_if_supported(self.connection)
             return stored
-        if hashes:
-            self.last_write_status = "FORECAST_DUPLICATE_CONFLICT"
-            stored = replace(stored, persistence_proof_eligible=False,
-                             persistence_reason="FORECAST_DUPLICATE_CONFLICT")
-        else:
-            self.last_write_status = "INSERT"
-        cursor.execute("INSERT INTO atom_v9_v4_forecasts (forecast_record_id, forecast_record_hash, symbol, cutoff_at, horizon, cycle_id, v3_model_version, record_json, persisted_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                       (record.forecast_record_id, record.forecast_record_hash,
-                        record.symbol, record.cutoff_at, record.horizon,
-                        record.cycle_id, record.v3_model_version,
-                        json.dumps(_canonical(asdict(stored)), sort_keys=True), persisted_at))
-        return stored
+        except Exception:
+            _rollback_if_supported(self.connection)
+            raise
+        finally:
+            _close_if_supported(cursor)
 
     def persist_outcome(self, record: OutcomeRecord, created_at: datetime) -> OutcomeRecord:
         stored = replace(record, created_at=created_at)
         cursor = self.connection.cursor()
-        cursor.execute("SELECT outcome_record_hash FROM atom_v9_v4_outcomes WHERE forecast_record_id=%s AND target_identity=%s", record.logical_key)
-        hashes = tuple(row[0] for row in cursor.fetchall())
-        if record.outcome_record_hash in hashes:
-            self.last_write_status = "IDEMPOTENT"
+        try:
+            cursor.execute("SELECT outcome_record_hash FROM atom_v9_v4_outcomes WHERE forecast_record_id=%s AND target_identity=%s", record.logical_key)
+            hashes = tuple(row[0] for row in cursor.fetchall())
+            if record.outcome_record_hash in hashes:
+                self.last_write_status = "IDEMPOTENT"
+                _commit_if_supported(self.connection)
+                return stored
+            self.last_write_status = "OUTCOME_CONFLICT" if hashes else "INSERT"
+            cursor.execute("INSERT INTO atom_v9_v4_outcomes (outcome_record_id, outcome_record_hash, forecast_record_id, target_identity, record_json, created_at) VALUES (%s,%s,%s,%s,%s,%s)",
+                           (record.outcome_record_id, record.outcome_record_hash,
+                            record.forecast_record_id, record.target_identity,
+                            json.dumps(_canonical(asdict(stored)), sort_keys=True), created_at))
+            _commit_if_supported(self.connection)
             return stored
-        self.last_write_status = "OUTCOME_CONFLICT" if hashes else "INSERT"
-        cursor.execute("INSERT INTO atom_v9_v4_outcomes (outcome_record_id, outcome_record_hash, forecast_record_id, target_identity, record_json, created_at) VALUES (%s,%s,%s,%s,%s,%s)",
-                       (record.outcome_record_id, record.outcome_record_hash,
-                        record.forecast_record_id, record.target_identity,
-                        json.dumps(_canonical(asdict(stored)), sort_keys=True), created_at))
-        return stored
+        except Exception:
+            _rollback_if_supported(self.connection)
+            raise
+        finally:
+            _close_if_supported(cursor)
+
+
+def _close_if_supported(value: object) -> None:
+    close = getattr(value, "close", None)
+    if callable(close):
+        close()
+
+
+def _commit_if_supported(connection: object) -> None:
+    if not getattr(connection, "autocommit", False):
+        commit = getattr(connection, "commit", None)
+        if callable(commit):
+            commit()
+
+
+def _rollback_if_supported(connection: object) -> None:
+    if not getattr(connection, "autocommit", False):
+        rollback = getattr(connection, "rollback", None)
+        if callable(rollback):
+            rollback()

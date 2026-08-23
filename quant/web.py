@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import json
 import os
 from html import escape
@@ -62,6 +62,58 @@ PHASE_E_HORIZONS = ("30S", "1M", "5M", "15M", "30M", "1H")
 DASHBOARD_PHASE_E_TTL_SECONDS = 300.0
 
 
+@dataclass(frozen=True, slots=True)
+class DashboardEvidenceSnapshot:
+    counts: tuple[int, int] | None = None
+    phase_e_cohorts: tuple[object, ...] = ()
+    as_of_epoch: float | None = None
+    status: str = "UNAVAILABLE"
+
+
+class DashboardEvidenceCache:
+    """Background-only cache; WSGI requests never scan evidence history."""
+
+    def __init__(self, store: EvidenceStore, *, clock: Callable[[], float] = time.time):
+        self._store = store
+        self._clock = clock
+        self._lock = Lock()
+        self._snapshot = DashboardEvidenceSnapshot()
+
+    def refresh(self) -> DashboardEvidenceSnapshot:
+        as_of_epoch = self._clock()
+        try:
+            cohorts = tuple(self._store.phase_e_cohorts(as_of_epoch))
+            volatility_reader = getattr(self._store, "volatility_phase_e_cohorts", None)
+            if callable(volatility_reader):
+                cohorts += tuple(volatility_reader(as_of_epoch))
+            candidate = DashboardEvidenceSnapshot(
+                self._store.counts(), cohorts, as_of_epoch, "AVAILABLE",
+            )
+        except Exception:
+            with self._lock:
+                current = self._snapshot
+            return current
+        with self._lock:
+            self._snapshot = candidate
+        return candidate
+
+    def snapshot(self) -> DashboardEvidenceSnapshot:
+        with self._lock:
+            return self._snapshot
+
+    def start(self, *, interval_seconds: float = DASHBOARD_PHASE_E_TTL_SECONDS) -> Thread:
+        interval = max(30.0, float(interval_seconds))
+
+        def worker() -> None:
+            while True:
+                self.refresh()
+                time.sleep(interval)
+
+        thread = Thread(target=worker, name="atom-dashboard-evidence-cache", daemon=True)
+        thread.start()
+        return thread
+
+
 def dashboard_data(
     history: MidpointHistory | None = None, *, cutoff_epoch: float | None = None,
     snapshot: LiveSnapshot | None = None, now_epoch: float | None = None,
@@ -69,6 +121,7 @@ def dashboard_data(
     phase_e_cohorts: Iterable[object] = (),
     cross_asset_state: CrossAssetState | None = None,
     market_display: LatestMarketDisplay | None = None,
+    v9_output: object | None = None,
     calculate_missing: bool = True,
 ) -> dict[str, object]:
     """Build the frozen dashboard structure, optionally using live quant results."""
@@ -163,6 +216,16 @@ def dashboard_data(
             horizon_order.get(cohort.horizon, len(horizon_order)), cohort.horizon,
         ),
     )
+    final_values = {metric: [None] * 6 for metric in ("BPS", "MOVE%", "RANGE")}
+    results = getattr(v9_output, "final_numbers", ()) if v9_output is not None else ()
+    if len(results) == 6:
+        final_values["BPS"] = [item.final_bps for item in results]
+        final_values["MOVE%"] = [item.move_percent for item in results]
+        final_values["RANGE"] = [
+            (None if item.range_lower_bps is None or item.range_upper_bps is None
+             else f"{item.range_lower_bps:.2f} to {item.range_upper_bps:.2f}")
+            for item in results
+        ]
     return {
         "title": "ATOM QUANT",
         "market": {
@@ -184,9 +247,7 @@ def dashboard_data(
             "last_cycle": snapshot.last_cycle if snapshot else (cutoff_epoch if supplied else None),
         },
         "horizons": list(HORIZON_LABELS),
-        "final_numbers": {
-            metric: [None] * 6 for metric in ("BPS", "MOVE%", "RANGE")
-        },
+        "final_numbers": final_values,
         "quant_families": families,
         "options_data": options_data,
         "evidence": {
@@ -226,7 +287,7 @@ def _table(
         "<tr><th>" + escape(label) + "</th>" +
         "".join(
             f'<td data-dashboard-field="{section}.{escape(label)}.{index}">'
-            f'{_decimal_cell(value) if decimal else _cell(value)}</td>'
+            f'{_decimal_cell(value) if decimal and label != "RANGE" else _cell(value)}</td>'
             for index, value in enumerate(values)
         ) + "</tr>"
         for label, values in rows
@@ -314,7 +375,8 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     set("market.data_age", data.market.data_age, value => decimal(value, "s"));
     set("market.last_cycle", data.market.last_cycle, cycle);
     Object.entries(data.final_numbers).forEach(([name, values]) =>
-      values.forEach((value, index) => set(`final_numbers.${{name}}.${{index}}`, value, decimal)));
+      values.forEach((value, index) => set(`final_numbers.${{name}}.${{index}}`, value,
+        name === "RANGE" ? text : decimal)));
     data.quant_families.forEach(family => family.values.forEach((value, index) =>
       set(`quant_families.${{family.name}}.${{index}}`, value, decimal)));
     set("options_data.expiration", data.options_data.expiration);
@@ -386,54 +448,11 @@ def create_app(
     history: MidpointHistory | None = None, *, cutoff_epoch: float | None = None,
     state: LiveMarketState | None = None, clock: Callable[[], float] = time.time,
     evidence_store: EvidenceStore | None = None,
+    evidence_cache: DashboardEvidenceCache | None = None,
 ) -> Callable:
     """Create the WSGI application, rendering current state on every request."""
 
-    phase_e_cache: tuple[object, ...] = ()
-    phase_e_cache_time: float | None = None
-    phase_e_refreshing = False
-    phase_e_cache_lock = Lock()
-
-    def all_phase_e_cohorts(as_of_epoch: float) -> tuple[object, ...]:
-        cohorts = tuple(evidence_store.phase_e_cohorts(as_of_epoch))
-        volatility_reader = getattr(
-            evidence_store, "volatility_phase_e_cohorts", None,
-        )
-        if callable(volatility_reader):
-            cohorts += tuple(volatility_reader(as_of_epoch))
-        return cohorts
-
-    def refresh_phase_e(as_of_epoch: float, cache_time: float) -> None:
-        nonlocal phase_e_cache, phase_e_cache_time, phase_e_refreshing
-        try:
-            refreshed = all_phase_e_cohorts(as_of_epoch)
-        except Exception:
-            refreshed = None
-        with phase_e_cache_lock:
-            if refreshed is not None:
-                phase_e_cache = refreshed
-                phase_e_cache_time = cache_time
-            phase_e_refreshing = False
-
-    def dashboard_phase_e_cohorts(as_of_epoch: float) -> tuple[object, ...]:
-        nonlocal phase_e_refreshing
-        if evidence_store is None:
-            return ()
-        cache_time = time.monotonic()
-        start_refresh = False
-        with phase_e_cache_lock:
-            if (phase_e_cache_time is not None and
-                    cache_time - phase_e_cache_time < DASHBOARD_PHASE_E_TTL_SECONDS):
-                return phase_e_cache
-            if not phase_e_refreshing:
-                phase_e_refreshing = True
-                start_refresh = True
-            cached = phase_e_cache
-        if start_refresh:
-            Thread(
-                target=refresh_phase_e, args=(as_of_epoch, cache_time), daemon=True,
-            ).start()
-        return cached
+    del evidence_store  # retained only for backward-compatible construction
 
     def application(environ: dict[str, object], start_response: Callable) -> list[bytes]:
         path = environ.get("PATH_INFO", "")
@@ -469,17 +488,16 @@ def create_app(
                                       ("Content-Length", str(len(body)))])
             return [body]
         if path == "/api/phase-e":
-            if evidence_store is None:
+            cached = evidence_cache.snapshot() if evidence_cache is not None else DashboardEvidenceSnapshot()
+            if cached.status != "AVAILABLE":
                 status, content_type, body = (
                     "503 Service Unavailable", "application/json",
                     b'{"error":"evidence store unavailable"}',
                 )
             else:
-                as_of_epoch = clock()
-                cohorts = all_phase_e_cohorts(as_of_epoch)
                 body = json.dumps({
-                    "as_of_epoch": as_of_epoch,
-                    "cohorts": [asdict(cohort) for cohort in cohorts],
+                    "as_of_epoch": cached.as_of_epoch,
+                    "cohorts": [asdict(cohort) for cohort in cached.phase_e_cohorts],
                 }, separators=(",", ":"), allow_nan=False).encode()
                 status, content_type = "200 OK", "application/json"
             start_response(status, [("Content-Type", content_type),
@@ -490,10 +508,12 @@ def create_app(
             snapshot = state.snapshot() if state is not None else None
             cross_asset_state = state.cross_asset_state() if state is not None else None
             market_display = state.market_display() if state is not None else None
+            v9_output = state.v9_output() if state is not None else None
             data = dashboard_data(
                 history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
                 now_epoch=as_of_epoch, cross_asset_state=cross_asset_state,
-                market_display=market_display, calculate_missing=False,
+                market_display=market_display, v9_output=v9_output,
+                calculate_missing=False,
             )
             live = {key: data[key] for key in (
                 "market", "final_numbers", "quant_families", "options_data",
@@ -514,16 +534,14 @@ def create_app(
         as_of_epoch = clock()
         snapshot = state.snapshot() if state is not None else None
         cross_asset_state = state.cross_asset_state() if state is not None else None
-        counts = evidence_store.counts() if evidence_store is not None else None
-        cohorts = (
-            dashboard_phase_e_cohorts(as_of_epoch)
-            if path in ("/", "/api/dashboard")
-            else evidence_store.phase_e_cohorts(as_of_epoch) if evidence_store is not None else ()
-        )
+        v9_output = state.v9_output() if state is not None else None
+        cached = evidence_cache.snapshot() if evidence_cache is not None else DashboardEvidenceSnapshot()
+        counts = cached.counts
+        cohorts = cached.phase_e_cohorts
         data = dashboard_data(
             history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
             now_epoch=as_of_epoch, evidence_counts=counts, phase_e_cohorts=cohorts,
-            cross_asset_state=cross_asset_state,
+            cross_asset_state=cross_asset_state, v9_output=v9_output,
         )
         if path == "/":
             status, content_type, body = "200 OK", "text/html; charset=utf-8", dashboard_page(data)
@@ -540,13 +558,23 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
     args = parser.parse_args()
-    evidence_store = PostgresEvidenceStore(os.environ["DATABASE_URL"])
-    state = LiveMarketState(evidence_store=evidence_store)
+    database_url = os.environ["DATABASE_URL"]
+    evidence_store = PostgresEvidenceStore(database_url)
+    evidence_cache = DashboardEvidenceCache(evidence_store)
+    evidence_cache.start()
+    from .v9_production import (
+        ImmutableV2StateProvider, PostgresV2StateBuilder, ProductionV9Runtime,
+    )
+    v2_provider = ImmutableV2StateProvider(PostgresV2StateBuilder(database_url))
+    v2_provider.start()
+    v9_runtime = ProductionV9Runtime(database_url, v2_provider)
+    state = LiveMarketState(evidence_store=evidence_store,
+                            v9_cycle_handler=v9_runtime.on_quote)
     start_alpaca_poller(state)
     start_alpaca_g2_poller(state)
     start_massive_ndx_poller(state)
     start_alpaca_options_poller(state)
-    app = create_app(state=state, evidence_store=evidence_store)
+    app = create_app(state=state, evidence_cache=evidence_cache)
     with make_server(args.host, args.port, app) as server:
         server.serve_forever()
 

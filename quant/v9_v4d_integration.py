@@ -127,6 +127,7 @@ class V4DCoordinator:
                  forecast_writer: V4AWriter,
                  compact_state_lookup: CompactStateLookup,
                  state_cohort_id: Callable[[V1Input, V2EvidenceState], str],
+                 cutoff_midpoint: Callable[[V1Input], float | None] | None = None,
                  accuracy_state_lookup: Callable[..., tuple[AccuracyState | None, str]] | None = None,
                  metrics: OperationalMetrics | None = None,
                  wall_clock: Callable[[], datetime] = _utc_now,
@@ -136,6 +137,7 @@ class V4DCoordinator:
         self._writer = forecast_writer
         self._lookup = compact_state_lookup
         self._state_cohort_id = state_cohort_id
+        self._cutoff_midpoint = cutoff_midpoint or (lambda _value: None)
         self._accuracy_lookup = accuracy_state_lookup
         self.metrics = metrics or OperationalMetrics()
         self._wall_clock = wall_clock
@@ -157,7 +159,8 @@ class V4DCoordinator:
         persistence = []
         for result in v3.horizon_results:
             forecast = build_forecast(v1=v1, v2=v2, result=result,
-                                      evidence_origin="PRODUCTION")
+                                      evidence_origin="PRODUCTION",
+                                      cutoff_midpoint=self._cutoff_midpoint(v1))
             started = self._monotonic()
             try:
                 stored = self._writer.persist_forecast(forecast, self._wall_clock())
@@ -205,7 +208,7 @@ class V4DCoordinator:
     def _record_availability(self, v1: V1Input, v2: V2EvidenceState, v3: V3Output,
                              compact: Mapping[str, CompactHorizonState],
                              accuracy: Mapping[str, HorizonAccuracyState]) -> None:
-        if any(result.status not in ("AVAILABLE", "PROVISIONAL", "UNAVAILABLE")
+        if any(result.status not in ("MATURE", "PROVISIONAL", "UNAVAILABLE")
                for result in v3.horizon_results):
             raise RuntimeError("UNEXPECTED_V3_HORIZON_STATUS")
         slots = {(slot.quant_id, slot.horizon): slot for slot in v1.slots}
@@ -259,13 +262,15 @@ class V4DCoordinator:
 def resolve_outcome(*, writer: V4AWriter, forecast: ForecastRecord,
                     target_identity: str, endpoint_observation_at: datetime,
                     target_resolved_at: datetime, actual_return_bps: float | None,
+                    previous_observation_at: datetime | None = None,
                     created_at: datetime | None = None,
                     metrics: OperationalMetrics | None = None) -> OutcomeRecord:
     """Append a canonical outcome without modifying its immutable forecast."""
     started = time.perf_counter()
     outcome = build_outcome(forecast=forecast, target_identity=target_identity,
         endpoint_observation_at=endpoint_observation_at,
-        target_resolved_at=target_resolved_at, actual_return_bps=actual_return_bps)
+        target_resolved_at=target_resolved_at, actual_return_bps=actual_return_bps,
+        previous_observation_at=previous_observation_at)
     stored = writer.persist_outcome(outcome, created_at or _utc_now())
     if metrics:
         metrics.increment("outcome_resolution." + (writer.last_write_status or "UNKNOWN"))

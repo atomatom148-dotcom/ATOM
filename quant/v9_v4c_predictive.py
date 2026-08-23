@@ -17,7 +17,8 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 from quant.v9_v1_contract import HORIZONS, HORIZON_SECONDS
 from quant.v9_v3_synthesis import V3HorizonResult
-from quant.v9_v4a_evidence import _canonical, canonical_sha256
+from quant.v9_v4a_evidence import (_canonical, _decanonical, canonical_sha256,
+    _close_if_supported, _commit_if_supported, _rollback_if_supported)
 from quant.v9_v4b_accuracy import effective_n, inverse_regularized_incomplete_beta
 
 MODEL_VERSION = "ATOM_TRUE_V9_V4"
@@ -638,17 +639,36 @@ class V4CStateStore:
                 state.evidence_first_cutoff is not None and
                 not state.evidence_first_cutoff<=state.evidence_last_cutoff<=state.state_as_of):
             return "STATE_TIME_INVALID"
-        cursor=self.connection.cursor(); cursor.execute("SELECT state_hash FROM atom_v9_v4_states WHERE state_id=%s",(state.state_id,)); rows=cursor.fetchall()
-        if rows:return "IDEMPOTENT" if rows[0][0]==state.state_hash else "STATE_CONFLICT"
-        cursor.execute("INSERT INTO atom_v9_v4_states (state_id,state_hash,state_version,model_version,symbol,cohort_id,state_as_of,evidence_first_cutoff,evidence_last_cutoff,state_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (state.state_id,state.state_hash,state.state_version,state.model_version,state.symbol,state.cohort_id,state.state_as_of,state.evidence_first_cutoff,state.evidence_last_cutoff,json.dumps(_canonical(asdict(state)),sort_keys=True),created_at))
-        return "INSERT"
+        cursor=self.connection.cursor()
+        try:
+            cursor.execute("SELECT state_hash FROM atom_v9_v4_states WHERE state_id=%s",(state.state_id,))
+            rows=cursor.fetchall()
+            if rows:
+                status="IDEMPOTENT" if rows[0][0]==state.state_hash else "STATE_CONFLICT"
+                _commit_if_supported(self.connection)
+                return status
+            cursor.execute("INSERT INTO atom_v9_v4_states (state_id,state_hash,state_version,model_version,symbol,cohort_id,state_as_of,evidence_first_cutoff,evidence_last_cutoff,state_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (state.state_id,state.state_hash,state.state_version,state.model_version,state.symbol,state.cohort_id,state.state_as_of,state.evidence_first_cutoff,state.evidence_last_cutoff,json.dumps(_canonical(asdict(state)),sort_keys=True),created_at))
+            _commit_if_supported(self.connection)
+            return "INSERT"
+        except Exception:
+            _rollback_if_supported(self.connection)
+            raise
+        finally:
+            _close_if_supported(cursor)
 
     def latest_json(self,*,symbol:str,cohort_id:str,requested_cutoff:datetime):
         cursor=self.connection.cursor()
-        cursor.execute("SELECT state_hash,state_json,state_as_of,evidence_first_cutoff,evidence_last_cutoff FROM atom_v9_v4_states WHERE state_version=%s AND model_version=%s AND symbol=%s AND cohort_id=%s AND state_as_of<=%s ORDER BY state_as_of DESC, state_id DESC LIMIT 2",
-            (PROBABILITY_STATE_VERSION,MODEL_VERSION,symbol,cohort_id,requested_cutoff))
-        rows=cursor.fetchall()
+        try:
+            cursor.execute("SELECT state_hash,state_json,state_as_of,evidence_first_cutoff,evidence_last_cutoff FROM atom_v9_v4_states WHERE state_version=%s AND model_version=%s AND symbol=%s AND cohort_id=%s AND state_as_of<=%s ORDER BY state_as_of DESC, state_id DESC LIMIT 2",
+                (PROBABILITY_STATE_VERSION,MODEL_VERSION,symbol,cohort_id,requested_cutoff))
+            rows=cursor.fetchall()
+            _commit_if_supported(self.connection)
+        except Exception:
+            _rollback_if_supported(self.connection)
+            raise
+        finally:
+            _close_if_supported(cursor)
         if not rows:return None,"UNAVAILABLE"
         greatest=rows[0][2]
         if len(rows)>1 and rows[1][2]==greatest and rows[1][0]!=rows[0][0]:
@@ -656,9 +676,26 @@ class V4CStateStore:
         state_hash,state_json,state_as_of,first,last=rows[0]
         if ((first is None)!=(last is None) or first is not None and not first<=last<=state_as_of):
             return None,"STATE_TIME_INVALID"
-        value=json.loads(state_json) if isinstance(state_json,str) else state_json
-        if not isinstance(value,dict) or value.get("state_hash")!=state_hash:return None,"STATE_HASH_MISMATCH"
-        payload={k:v for k,v in value.items() if k not in ("state_id","state_hash")}
+        canonical=json.loads(state_json) if isinstance(state_json,str) else state_json
+        if not isinstance(canonical,dict) or canonical.get("state_hash")!=state_hash:
+            return None,"STATE_HASH_MISMATCH"
+        payload={k:v for k,v in canonical.items() if k not in ("state_id","state_hash")}
         encoded=json.dumps(payload,sort_keys=True,separators=(",",":"),ensure_ascii=True).encode("ascii")
         if hashlib.sha256(encoded).hexdigest()!=state_hash:return None,"STATE_HASH_MISMATCH"
-        return value,"AVAILABLE"
+        try:
+            value=_decanonical(canonical)
+            horizons=tuple(CompactHorizonState(
+                **{**item,
+                   "sorted_residuals":tuple(item["sorted_residuals"]),
+                   "event_statuses":tuple(item["event_statuses"]),
+                   "reason_codes":tuple(item.get("reason_codes",()))}
+            ) for item in value["horizons"])
+            state=V4CState(
+                value["state_id"],value["state_hash"],value["state_version"],
+                value["model_version"],value["symbol"],value["cohort_id"],
+                value["state_as_of"],value["evidence_first_cutoff"],
+                value["evidence_last_cutoff"],horizons,value["gamma"],
+                value["phi"],value["gamma_status"])
+        except (KeyError,TypeError,ValueError):
+            return None,"STATE_DESERIALIZATION_INVALID"
+        return state,"AVAILABLE"
