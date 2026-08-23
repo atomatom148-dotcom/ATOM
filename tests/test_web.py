@@ -193,6 +193,7 @@ class WebSurfaceTests(unittest.TestCase):
             create_app(state=state, clock=lambda: 107.0), "/api/live"
         )["body"])
 
+        self.assertEqual(payload["market"]["symbol"], 100.01)
         self.assertEqual(payload["market"]["event_epoch"], 106.0)
         self.assertEqual(payload["market"]["data_age"], 1.0)
 
