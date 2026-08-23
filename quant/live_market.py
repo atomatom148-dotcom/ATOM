@@ -48,6 +48,9 @@ MAX_NDX_AGE_SECONDS = 10.0
 HISTORY_SECONDS = 3600.0
 MARKET_DISPLAY_FETCH_SECONDS = 0.25
 QUANT_CYCLE_SECONDS = 1.0
+BTC_FETCH_SECONDS = 0.25
+BTC_SOURCE_TIMEOUT_SECONDS = 1.0
+MAX_BTC_AGE_SECONDS = 5.0
 
 
 def v9_math_core_enabled() -> bool:
@@ -148,6 +151,7 @@ class LiveMarketState:
         self._coin_ingress_lock = threading.Lock()
         self._v9_cycle_handler = v9_cycle_handler
         self.metrics = metrics or OperationalMetrics()
+        self.metrics.set_status("btc_source_status", "NOT_STARTED")
         self._monotonic = monotonic_clock
         self._lock = threading.Lock()
         self._btc_history = MidpointHistory()
@@ -602,7 +606,12 @@ def poll_alpaca(
         time.sleep(interval)
 
 
-def poll_alpaca_g2(state: LiveMarketState, *, interval: float = 1.0) -> None:
+def poll_alpaca_g2(
+    state: LiveMarketState, *, interval: float = BTC_FETCH_SECONDS,
+    timeout: float = BTC_SOURCE_TIMEOUT_SECONDS,
+    clock: Callable[[], float] = time.time,
+    monotonic: Callable[[], float] = time.perf_counter,
+) -> None:
     """Maintain the independent BTC input without blocking the ATOM cycle."""
 
     headers = {
@@ -612,15 +621,25 @@ def poll_alpaca_g2(state: LiveMarketState, *, interval: float = 1.0) -> None:
     while True:
         try:
             with urlopen(Request(ALPACA_BTC_LATEST_QUOTE_URL, headers=headers),
-                         timeout=10) as response:
+                         timeout=timeout) as response:
                 payload = json.load(response)
+            received_at = monotonic()
             item = payload["quotes"]["BTC/USD"]
             price = (float(item["bp"]) + float(item["ap"])) / 2.0
             event_epoch = parse_alpaca_timestamp(item["t"])
-            state.accept_g2_price(
-                asset="BTC", price=price, event_epoch=event_epoch,
+            quote_age_ms = (clock() - event_epoch) * 1000.0
+            if quote_age_ms < 0 or quote_age_ms >= MAX_BTC_AGE_SECONDS * 1000.0:
+                raise ValueError("Alpaca BTC quote is stale or future-dated")
+            if not state.accept_g2_price(
+                    asset="BTC", price=price, event_epoch=event_epoch):
+                raise ValueError("Alpaca BTC quote was rejected")
+            state.metrics.observe("btc_quote_age_ms", quote_age_ms)
+            state.metrics.observe(
+                "btc_ingest_latency_ms", (monotonic() - received_at) * 1000.0,
             )
+            state.metrics.set_status("btc_source_status", "LIVE")
         except Exception as error:
+            state.metrics.set_status("btc_source_status", "UNAVAILABLE")
             print(f"Alpaca BTC quote poll failed: {error}", flush=True)
         time.sleep(interval)
 
@@ -680,6 +699,7 @@ def start_alpaca_options_poller(state: LiveMarketState) -> threading.Thread:
 
 
 __all__ = ["LatestMarketDisplay", "LiveMarketState", "LiveSnapshot",
+           "BTC_FETCH_SECONDS", "BTC_SOURCE_TIMEOUT_SECONDS", "MAX_BTC_AGE_SECONDS",
            "MARKET_DISPLAY_FETCH_SECONDS", "QUANT_CYCLE_SECONDS", "parse_alpaca_ndx_value",
            "parse_alpaca_timestamp", "parse_massive_ndx_snapshot", "poll_alpaca",
            "poll_alpaca_g2", "poll_massive_ndx", "start_alpaca_g2_poller",

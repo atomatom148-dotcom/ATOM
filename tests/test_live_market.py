@@ -8,7 +8,8 @@ from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 
 from quant.live_market import (
-    ALPACA_BTC_LATEST_QUOTE_URL, ALPACA_LATEST_QUOTES_URL,
+    ALPACA_BTC_LATEST_QUOTE_URL, ALPACA_LATEST_QUOTES_URL, BTC_FETCH_SECONDS,
+    BTC_SOURCE_TIMEOUT_SECONDS, MAX_BTC_AGE_SECONDS,
     ALPACA_NDX_LATEST_VALUE_URL, MARKET_DISPLAY_FETCH_SECONDS, LiveMarketState,
     MASSIVE_NDX_SNAPSHOT_URL, parse_alpaca_ndx_value, parse_alpaca_timestamp,
     parse_massive_ndx_snapshot, poll_alpaca, poll_alpaca_g2, poll_massive_ndx,
@@ -289,17 +290,108 @@ class LiveMarketTests(unittest.TestCase):
             "quant.live_market.time.sleep", side_effect=RuntimeError("stop"),
         ):
             with self.assertRaisesRegex(RuntimeError, "stop"):
-                poll_alpaca_g2(state)
+                poll_alpaca_g2(state, clock=lambda: 2.0,
+                               monotonic=iter((10.0, 10.002)).__next__)
 
         self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"],
+                         BTC_SOURCE_TIMEOUT_SECONDS)
         self.assertEqual(
             urlopen.call_args.args[0].full_url, ALPACA_BTC_LATEST_QUOTE_URL,
         )
         value = state.cross_asset_state()
         self.assertEqual(value.btc_price, 101.0)
+        telemetry = state.metrics.snapshot()
+        distributions = dict(telemetry.distributions)
+        self.assertEqual(distributions["btc_quote_age_ms"].p50, 1000.0)
+        self.assertAlmostEqual(distributions["btc_ingest_latency_ms"].p50, 2.0)
+        self.assertEqual(dict(telemetry.statuses)["btc_source_status"], "LIVE")
         self.assertIsNone(value.ndx_price)
         self.assertIsNone(value.ndx_age_seconds)
         self.assertEqual(value.ndx_return_bps, (None,) * 6)
+
+    def test_btc_failure_is_single_attempt_and_cannot_enter_coin_path(self):
+        state = MagicMock(spec=LiveMarketState)
+        state.metrics = LiveMarketState().metrics
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }), patch(
+            "quant.live_market.urlopen", side_effect=TimeoutError("slow source"),
+        ) as source, patch(
+            "quant.live_market.time.sleep", side_effect=RuntimeError("stop"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                poll_alpaca_g2(state)
+
+        source.assert_called_once()
+        self.assertEqual(source.call_args.kwargs["timeout"],
+                         BTC_SOURCE_TIMEOUT_SECONDS)
+        state.accept_quote.assert_not_called()
+        state.accept_qqq_quote.assert_not_called()
+        state.accept_g2_price.assert_not_called()
+        self.assertEqual(
+            dict(state.metrics.snapshot().statuses)["btc_source_status"],
+            "UNAVAILABLE",
+        )
+
+    def test_blocked_btc_source_does_not_block_coin_or_live_response(self):
+        state = LiveMarketState(clock=lambda: 101.0)
+        source_entered = threading.Event()
+        release_source = threading.Event()
+
+        def blocked_source(*_args, **_kwargs):
+            source_entered.set()
+            self.assertTrue(release_source.wait(timeout=2))
+            raise TimeoutError("bounded BTC timeout")
+
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }), patch(
+            "quant.live_market.urlopen", side_effect=blocked_source,
+        ), patch("quant.live_market.time.sleep", side_effect=RuntimeError("stop")):
+            def run_poller():
+                try:
+                    poll_alpaca_g2(state)
+                except RuntimeError as error:
+                    self.assertEqual(str(error), "stop")
+
+            worker = threading.Thread(target=run_poller)
+            worker.start()
+            self.assertTrue(source_entered.wait(timeout=1))
+            self.assertTrue(state.accept_quote(
+                bid=99.0, ask=101.0, event_epoch=100.0))
+            response = request_json(create_app(state=state, clock=lambda: 101.0))
+            self.assertEqual(response["market"]["symbol"], 100.0)
+            release_source.set()
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+
+    def test_stale_btc_is_excluded_without_replacing_last_valid_timestamp(self):
+        state = LiveMarketState(clock=lambda: 100.0)
+        self.assertTrue(state.accept_g2_price(
+            asset="BTC", price=99.0, event_epoch=99.0))
+        response = BytesIO(json.dumps({"quotes": {"BTC/USD": {
+            "bp": 100.0, "ap": 102.0, "t": "1970-01-01T00:01:30Z",
+        }}}).encode())
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }), patch(
+            "quant.live_market.urlopen", return_value=response,
+        ), patch(
+            "quant.live_market.time.sleep", side_effect=RuntimeError("stop"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                poll_alpaca_g2(state, clock=lambda: 100.0)
+
+        value = state.cross_asset_state()
+        self.assertEqual(value.btc_price, 99.0)
+        self.assertEqual(state._btc_history.latest.event_epoch, 99.0)
+        self.assertEqual(MAX_BTC_AGE_SECONDS, 5.0)
+        self.assertEqual(BTC_FETCH_SECONDS, 0.25)
+        self.assertEqual(
+            dict(state.metrics.snapshot().statuses)["btc_source_status"],
+            "UNAVAILABLE",
+        )
 
     def test_massive_ndx_poller_stops_after_one_forbidden_response(self):
         state = LiveMarketState(clock=lambda: 101.0)
