@@ -13,7 +13,7 @@ import hashlib
 import json
 import math
 import sys
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 from quant.v9_v1_contract import HORIZONS, HORIZON_SECONDS
 from quant.v9_v3_synthesis import V3HorizonResult
@@ -141,6 +141,48 @@ def calibrate_probability_event(predictions: Sequence[float], outcomes: Sequence
 
 
 @dataclass(frozen=True, slots=True)
+class ProbabilityEventInput:
+    event: str; predictions: tuple[float,...]; outcomes: tuple[int,...]
+    p_climatology: float; calibration_n: int; calibration_effective_n: float
+    holdout_effective_n: float; effective_events: float; effective_non_events: float
+    reliability_result: ReliabilityResult | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProbabilityEventState:
+    event: str; status: str; calibration: ProbabilityCalibration
+    holm_rank: int; holm_threshold: float; holm_passed: bool
+    holm_gate_lower_bound: float | None; reason_codes: tuple[str,...]
+
+
+def calibrate_six_events(inputs: Mapping[str, ProbabilityEventInput]) -> tuple[ProbabilityEventState,...]:
+    """Apply the frozen, horizon-local six-event probability family."""
+    if tuple(inputs) != EVENTS or any(inputs[event].event != event for event in EVENTS):
+        raise ValueError("exact canonical six-event family required")
+    calibrations=tuple(calibrate_probability_event(x.predictions,x.outcomes,x.p_climatology)
+                       for x in (inputs[event] for event in EVENTS))
+    adjusted=holm(tuple(x.p if x.hac_result.status=="AVAILABLE" else 1.0 for x in calibrations))
+    states=[]
+    for event,item,cal,correction in zip(EVENTS,(inputs[x] for x in EVENTS),calibrations,adjusted):
+        reasons=list(cal.reason_codes)
+        evidence=(item.calibration_n>=500 and item.calibration_effective_n>=400 and
+                  item.holdout_effective_n>=400 and item.effective_events>=30 and
+                  item.effective_non_events>=30)
+        if not evidence:reasons.append("PROBABILITY_EVIDENCE_INSUFFICIENT")
+        reliable=item.reliability_result is not None and item.reliability_result.status=="PASS"
+        if not reliable:reasons.append("RELIABILITY_GATE_FAILED")
+        lower=None
+        if correction.passed and cal.hac_result.status=="AVAILABLE":
+            lower=cal.mean_brier_improvement-normal_ppf(1-correction.threshold)*cal.hac_result.se
+        mature=(evidence and reliable and cal.hac_result.status=="AVAILABLE" and cal.brier_gate_passed and
+                correction.passed and lower is not None and math.isfinite(lower) and lower>0)
+        status="MATURE" if mature else ("UNAVAILABLE" if cal.hac_result.status=="UNAVAILABLE" else "PROVISIONAL")
+        states.append(ProbabilityEventState(event,status,cal,correction.rank,correction.threshold,
+                                            correction.passed,lower,tuple(sorted(set(reasons)))))
+    return tuple(states)
+
+
+@dataclass(frozen=True, slots=True)
 class Q3QuartileObservation:
     forecast_record_id: str; cutoff: datetime; magnitude: float; d_gamma: float
 
@@ -168,6 +210,46 @@ def build_q3_quartile_state(observations: Sequence[Q3QuartileObservation]) -> Q3
                               result.reason_codes)
     return Q3QuartileState("AVAILABLE",len(ordered),neff,result.mean,result,
                           normal_cdf(result.z),digest,())
+
+
+@dataclass(frozen=True, slots=True)
+class Q3QuartileGate:
+    status: str; q: int; r: int; initial_sizes: tuple[int,...]
+    removed_boundaries: tuple[int,...]; quartiles: tuple[Q3QuartileState,...]
+    significant_degradation: tuple[bool,...]; evidence_digest: str
+    reason_codes: tuple[str,...]
+
+
+def build_q3_quartile_gate(observations: Sequence[Q3QuartileObservation]) -> Q3QuartileGate:
+    canonical=tuple(sorted(observations,key=lambda x:(x.magnitude,x.cutoff,x.forecast_record_id)))
+    digest=canonical_sha256(tuple((x.forecast_record_id,x.cutoff,x.magnitude,x.d_gamma)
+                                  for x in canonical))
+    n=len(canonical); q,r=divmod(n,4)
+    if n<4:
+        return Q3QuartileGate("UNAVAILABLE",q,r,(),(),(),(),digest,("Q3_QUARTILE_COUNT_INSUFFICIENT",))
+    if any(x.cutoff.tzinfo is None or not math.isfinite(x.magnitude) or x.magnitude<0 or
+           not math.isfinite(x.d_gamma) for x in canonical):
+        return Q3QuartileGate("UNAVAILABLE",q,r,(),(),(),(),digest,("Q3_QUARTILE_INPUT_UNAVAILABLE",))
+    sizes=tuple(q+(index<r) for index in range(4)); boundaries=[]; total=0
+    for size in sizes[:-1]:total+=size;boundaries.append(total)
+    removed=tuple(index for index,boundary in enumerate(boundaries,1)
+                  if canonical[boundary-1].magnitude==canonical[boundary].magnitude)
+    surviving=[boundary for index,boundary in enumerate(boundaries,1) if index not in removed]
+    if len(surviving)!=3:
+        return Q3QuartileGate("UNAVAILABLE",q,r,sizes,removed,(),(),digest,("Q3_QUARTILE_TIE_COLLAPSE",))
+    groups=[];start=0
+    for end in surviving+[n]:groups.append(canonical[start:end]);start=end
+    quartiles=tuple(build_q3_quartile_state(group) for group in groups)
+    reasons=tuple(reason for quartile in quartiles for reason in quartile.reason_codes)
+    if any(quartile.status!="AVAILABLE" or quartile.effective_n<50 for quartile in quartiles):
+        extra=("Q3_QUARTILE_EFFECTIVE_N_INSUFFICIENT",) if any(x.effective_n<50 for x in quartiles) else ()
+        return Q3QuartileGate("UNAVAILABLE",q,r,sizes,removed,quartiles,(),digest,
+                             tuple(sorted(set(reasons+extra))))
+    corrections=holm(tuple(x.p_degradation for x in quartiles))
+    degraded=tuple(x.passed for x in corrections)
+    status="FAIL" if any(degraded) else "PASS"
+    final_reasons=("Q3_QUARTILE_SIGNIFICANT_DEGRADATION",) if status=="FAIL" else ()
+    return Q3QuartileGate(status,q,r,sizes,removed,quartiles,degraded,digest,final_reasons)
 
 
 def empirical_cdfs(sorted_z: Sequence[float], z: float) -> tuple[float,float]:
@@ -236,12 +318,18 @@ def _resolved_by(x: CalibrationObservation, boundary: datetime) -> bool:
 def calibrate_scale(observations: Sequence[CalibrationObservation], *, calibration_end: datetime) -> ScaleResult:
     valid=tuple(x for x in observations if _resolved_by(x,calibration_end) and all(math.isfinite(v) for v in
         (x.actual_bps,x.mean_bps,x.q0_bps2)) and x.q0_bps2>0)
-    scores=tuple((x.actual_bps-x.mean_bps)**2/x.q0_bps2 for x in valid)
+    scores_list=[]
+    for x in valid:
+        error=x.actual_bps-x.mean_bps
+        try:score=error*error/x.q0_bps2
+        except OverflowError:continue
+        if math.isfinite(error) and math.isfinite(score):scores_list.append(score)
+    scores=tuple(scores_list)
     neff,reasons=effective_n(scores)
     k2=math.fsum(scores)/len(scores) if scores else None
     k=math.sqrt(k2) if k2 is not None and math.isfinite(k2) and k2>0 else None
-    status="MATURE" if len(valid)>=250 and neff>=200 and k is not None else ("PROVISIONAL" if k is not None else "UNAVAILABLE")
-    return ScaleResult(status,len(valid),neff,k2 if k is not None else None,k,tuple(reasons))
+    status="MATURE" if len(scores)>=250 and neff>=200 and k is not None else ("PROVISIONAL" if k is not None else "UNAVAILABLE")
+    return ScaleResult(status,len(scores),neff,k2 if k is not None else None,k,tuple(reasons))
 
 @dataclass(frozen=True, slots=True)
 class ThresholdResult:
@@ -266,24 +354,34 @@ class RangeResult:
     rolling_interval: tuple[float,float] | None; mean_width: float | None
     reason_codes: tuple[str,...]
 
+@dataclass(frozen=True, slots=True)
+class RangeValidationObservation:
+    cutoff: datetime; target_resolved_at: datetime; actual_bps: float
+    lower_bps: float; upper_bps: float; session_id: str
+
 def _jeffreys(binary: Sequence[int]) -> tuple[float,tuple[float,float]] | None:
     if not binary:return None
     neff,_=effective_n(binary); wins=sum(binary); ew=neff*wins/len(binary); el=neff-ew
     return neff,(inverse_regularized_incomplete_beta(ew+.5,el+.5,.025),
                  inverse_regularized_incomplete_beta(ew+.5,el+.5,.975))
 
-def calibrate_range(calibration_scores: Sequence[float], validation: Sequence[tuple[float,float,float,str]],
-                    rolling_session_ids: Sequence[str]) -> RangeResult:
+def calibrate_range(calibration_scores: Sequence[float], validation: Sequence[RangeValidationObservation],
+                    rolling_session_ids: Sequence[str], *, validation_end: datetime) -> RangeResult:
     scores=tuple(float(x) for x in calibration_scores if math.isfinite(x) and x>=0)
     score_neff,score_reasons=effective_n(scores); j=math.ceil((len(scores)+1)*.9)
     quantile=sorted(scores)[j-1] if scores and j<=len(scores) else None
-    valid=tuple(x for x in validation if all(math.isfinite(v) for v in x[:3]) and x[1]<=x[2])
-    covered=[int(lo<=y<=hi) for y,lo,hi,_ in valid]; cov=_jeffreys(covered)
-    lower_miss=[int(y<lo) for y,lo,hi,_ in valid if not lo<=y<=hi]; miss=_jeffreys(lower_miss)
-    rolling_set=set(rolling_session_ids[-20:]); rolling=[flag for flag,x in zip(covered,valid) if x[3] in rolling_set]
+    valid=tuple(x for x in validation if validation_end.tzinfo is not None and x.cutoff.tzinfo is not None and
+        x.target_resolved_at.tzinfo is not None and x.cutoff<=validation_end and
+        x.target_resolved_at<=validation_end and all(math.isfinite(v) for v in
+        (x.actual_bps,x.lower_bps,x.upper_bps)) and x.lower_bps<=x.upper_bps and
+        math.isfinite(x.upper_bps-x.lower_bps))
+    covered=[int(x.lower_bps<=x.actual_bps<=x.upper_bps) for x in valid]; cov=_jeffreys(covered)
+    lower_miss=[int(x.actual_bps<x.lower_bps) for x in valid
+                if not x.lower_bps<=x.actual_bps<=x.upper_bps]; miss=_jeffreys(lower_miss)
+    rolling_set=set(rolling_session_ids[-20:]); rolling=[flag for flag,x in zip(covered,valid) if x.session_id in rolling_set]
     roll=_jeffreys(rolling); coverage=math.fsum(covered)/len(covered) if covered else None
     effmiss=(cov[0]*(1-coverage)) if cov and coverage is not None else 0.0
-    width=math.fsum(hi-lo for _,lo,hi,_ in valid)/len(valid) if valid else None
+    width=math.fsum(x.upper_bps-x.lower_bps for x in valid)/len(valid) if valid else None
     mature=(quantile is not None and len(scores)>=250 and score_neff>=200 and len(valid)>=250 and
             cov is not None and cov[0]>=200 and cov[1][0]<=.9<=cov[1][1] and
             (cov[1][1]-cov[1][0])/2<=.05 and effmiss>=20 and miss is not None and
@@ -304,6 +402,8 @@ class GammaOptimizerResult:
     status: str; eta: float | None; gamma: float | None; objective: float | None
     m2: float | None; iterations: int; interval: tuple[float,float] | None
     evaluations: tuple[tuple[float,float],...]; reason_codes: tuple[str,...]
+    baseline_objective: float | None=None; challenger_objective: float | None=None
+    objective_improvement: float | None=None; convergence_status: str="UNAVAILABLE"
 
 
 def gamma_objective(inputs: Sequence[GammaInput], eta: float, m2: float) -> float:
@@ -352,7 +452,7 @@ def optimize_gamma(inputs: Sequence[GammaInput], *, maximum_iterations: int=256)
         else:
             oldd,oldld=d,ld; a=c; c,lc=oldd,oldld; d=a+g*(b-a); ld=ev(d)
     if b-a>1e-12:
-        return GammaOptimizerResult("UNAVAILABLE",None,None,None,m2,iterations,(a,b),tuple(sorted(cache.items())),("GAMMA_OPTIMIZER_DID_NOT_CONVERGE",))
+        return GammaOptimizerResult("UNAVAILABLE",None,None,None,m2,iterations,(a,b),tuple(sorted(cache.items())),("GAMMA_OPTIMIZER_DID_NOT_CONVERGE",),ev(0.0),None,None,"DID_NOT_CONVERGE")
     candidates=(0.0,a,b,(a+b)/2,c,d)
     canonical=tuple(sorted(set(eta for eta in candidates if 0<=eta<1)))
     evaluated=[(eta,ev(eta)) for eta in canonical if math.isfinite(ev(eta))]
@@ -368,7 +468,9 @@ def optimize_gamma(inputs: Sequence[GammaInput], *, maximum_iterations: int=256)
     eta,obj=best; denominator=m2*(1-eta); gamma=0.0 if eta==0 else eta/denominator
     if not math.isfinite(denominator) or denominator<=0 or not math.isfinite(gamma) or gamma<0:
         return GammaOptimizerResult("UNAVAILABLE",None,None,None,m2,iterations,(a,b),tuple(sorted(cache.items())),("GAMMA_FINITE_OPTIMUM_UNAVAILABLE",))
-    return GammaOptimizerResult("INACTIVE",eta,gamma,obj,m2,iterations,(a,b),tuple(sorted(cache.items())),())
+    baseline=ev(0.0)
+    return GammaOptimizerResult("INACTIVE",eta,gamma,obj,m2,iterations,(a,b),tuple(sorted(cache.items())),(),
+                                baseline,obj,baseline-obj,"CONVERGED")
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,11 +489,16 @@ class CompactHorizonState:
             raise ValueError("canonical horizon and six event statuses required")
         if tuple(sorted(self.sorted_residuals)) != self.sorted_residuals or any(not math.isfinite(x) for x in self.sorted_residuals):
             raise ValueError("signed residuals must be a finite sorted tuple")
+        numerical=(self.medium_threshold_bps,self.large_threshold_bps,self.kappa_squared,
+                   self.kappa,self.range_quantile)
+        if any(value is not None and not math.isfinite(value) for value in numerical):
+            raise ValueError("compact state numerical fields must be finite or null")
 
 @dataclass(frozen=True, slots=True)
 class V4CState:
-    state_id: str; state_hash: str; model_version: str; symbol: str; cohort_id: str
-    state_as_of: datetime; evidence_last_cutoff: datetime | None
+    state_id: str; state_hash: str; state_version: str; model_version: str; symbol: str; cohort_id: str
+    state_as_of: datetime; evidence_first_cutoff: datetime | None
+    evidence_last_cutoff: datetime | None
     horizons: tuple[CompactHorizonState,...]
     gamma: float=0.0; phi: float=1.0; gamma_status: str="INACTIVE"
 
@@ -399,16 +506,21 @@ class V4CState:
         object.__setattr__(self,"horizons",tuple(self.horizons))
         if self.gamma != 0 or self.phi != 1 or self.gamma_status != "INACTIVE":
             raise ValueError("V4C production gamma is frozen inactive")
-        if self.evidence_last_cutoff is not None and self.evidence_last_cutoff > self.state_as_of:
-            raise ValueError("evidence_last_cutoff must not exceed state_as_of")
+        boundaries=(self.evidence_first_cutoff,self.evidence_last_cutoff)
+        if (boundaries[0] is None)!=(boundaries[1] is None):
+            raise ValueError("evidence boundaries must both be null or non-null")
+        if boundaries[0] is not None and not boundaries[0]<=boundaries[1]<=self.state_as_of:
+            raise ValueError("evidence boundaries must satisfy first <= last <= state_as_of")
 
 def build_v4c_state(*,symbol:str,cohort_id:str,state_as_of:datetime,
+                    evidence_first_cutoff:datetime|None,
                     evidence_last_cutoff:datetime|None,
                     horizons:Sequence[CompactHorizonState])->V4CState:
     values=tuple(horizons)
     if tuple(x.horizon for x in values)!=HORIZONS:
         raise ValueError("six canonical horizon states required")
-    shell=V4CState("","",MODEL_VERSION,symbol,cohort_id,state_as_of,evidence_last_cutoff,values)
+    shell=V4CState("","",PROBABILITY_STATE_VERSION,MODEL_VERSION,symbol,cohort_id,state_as_of,
+                   evidence_first_cutoff,evidence_last_cutoff,values)
     payload={k:v for k,v in asdict(shell).items() if k not in ("state_id","state_hash")}
     digest=canonical_sha256(payload)
     return replace(shell,state_id="v9v4state:"+digest,state_hash=digest)
@@ -429,17 +541,21 @@ class FinalNumbers:
 
 def final_numbers(result: V3HorizonResult, state: CompactHorizonState | None) -> FinalNumbers:
     reasons=list(result.reason_codes)
-    if result.status=="UNAVAILABLE":
+    if (result.status=="UNAVAILABLE" or result.expected_return_bps is None or
+            not math.isfinite(result.expected_return_bps)):
         reasons.extend(("V3_UNAVAILABLE","FINAL_BPS_UNAVAILABLE")); mu=None
     else: mu=result.expected_return_bps
     move=None
     if mu is not None:
         try: move=100*math.expm1(mu/10000)
         except OverflowError: reasons.append("MOVE_PERCENT_NUMERICAL_FAILURE")
+        if move is not None and not math.isfinite(move):
+            move=None; reasons.append("MOVE_PERCENT_NUMERICAL_FAILURE")
     direction="UNAVAILABLE" if mu is None else "EXPECTED_UP" if mu>0 else "EXPECTED_DOWN" if mu<0 else "EXPECTED_FLAT"
     scale=None
     if state and state.scale_status=="MATURE" and state.kappa and result.predictive_variance_bps2 and result.predictive_variance_bps2>0:
         scale=state.kappa*math.sqrt(result.predictive_variance_bps2)
+        if not math.isfinite(scale) or scale<=0:scale=None
     lower=upper=lowerp=upperp=None; range_status=state.range_status if state else "UNAVAILABLE"
     if state and state.range_status=="MATURE" and mu is not None and scale and state.range_quantile is not None:
         lower=mu-state.range_quantile*scale; upper=mu+state.range_quantile*scale
@@ -479,25 +595,28 @@ class V4CStateStore:
         digest=canonical_sha256(payload)
         if state.state_hash!=digest or state.state_id!="v9v4state:"+digest:
             return "STATE_HASH_MISMATCH"
-        if state.evidence_last_cutoff is not None and state.evidence_last_cutoff>state.state_as_of:
+        if ((state.evidence_first_cutoff is None)!=(state.evidence_last_cutoff is None) or
+                state.evidence_first_cutoff is not None and
+                not state.evidence_first_cutoff<=state.evidence_last_cutoff<=state.state_as_of):
             return "STATE_TIME_INVALID"
         cursor=self.connection.cursor(); cursor.execute("SELECT state_hash FROM atom_v9_v4_states WHERE state_id=%s",(state.state_id,)); rows=cursor.fetchall()
         if rows:return "IDEMPOTENT" if rows[0][0]==state.state_hash else "STATE_CONFLICT"
         cursor.execute("INSERT INTO atom_v9_v4_states (state_id,state_hash,state_version,model_version,symbol,cohort_id,state_as_of,evidence_first_cutoff,evidence_last_cutoff,state_json,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (state.state_id,state.state_hash,PROBABILITY_STATE_VERSION,state.model_version,state.symbol,state.cohort_id,state.state_as_of,None,state.evidence_last_cutoff,json.dumps(_canonical(asdict(state)),sort_keys=True),created_at))
+            (state.state_id,state.state_hash,state.state_version,state.model_version,state.symbol,state.cohort_id,state.state_as_of,state.evidence_first_cutoff,state.evidence_last_cutoff,json.dumps(_canonical(asdict(state)),sort_keys=True),created_at))
         return "INSERT"
 
     def latest_json(self,*,symbol:str,cohort_id:str,requested_cutoff:datetime):
         cursor=self.connection.cursor()
-        cursor.execute("SELECT state_hash,state_json,state_as_of,evidence_last_cutoff FROM atom_v9_v4_states WHERE state_version=%s AND model_version=%s AND symbol=%s AND cohort_id=%s AND state_as_of<=%s ORDER BY state_as_of DESC, state_id DESC LIMIT 2",
+        cursor.execute("SELECT state_hash,state_json,state_as_of,evidence_first_cutoff,evidence_last_cutoff FROM atom_v9_v4_states WHERE state_version=%s AND model_version=%s AND symbol=%s AND cohort_id=%s AND state_as_of<=%s ORDER BY state_as_of DESC, state_id DESC LIMIT 2",
             (PROBABILITY_STATE_VERSION,MODEL_VERSION,symbol,cohort_id,requested_cutoff))
         rows=cursor.fetchall()
         if not rows:return None,"UNAVAILABLE"
         greatest=rows[0][2]
         if len(rows)>1 and rows[1][2]==greatest and rows[1][0]!=rows[0][0]:
             return None,"STATE_CONFLICT"
-        state_hash,state_json,state_as_of,last=rows[0]
-        if last is not None and last>state_as_of:return None,"STATE_TIME_INVALID"
+        state_hash,state_json,state_as_of,first,last=rows[0]
+        if ((first is None)!=(last is None) or first is not None and not first<=last<=state_as_of):
+            return None,"STATE_TIME_INVALID"
         value=json.loads(state_json) if isinstance(state_json,str) else state_json
         if not isinstance(value,dict) or value.get("state_hash")!=state_hash:return None,"STATE_HASH_MISMATCH"
         payload={k:v for k,v in value.items() if k not in ("state_id","state_hash")}

@@ -91,8 +91,8 @@ def test_gamma_final_candidate_tolerance_tie_selects_smallest(monkeypatch):
 
 def test_range_order_statistic_and_provisional_not_published():
     scores=[float(i) for i in range(250)]
-    validation=[(0.,-1.,1.,str(i%20)) for i in range(250)]
-    state=calibrate_range(scores,validation,[str(i) for i in range(20)])
+    validation=[RangeValidationObservation(NOW,NOW,0.,-1.,1.,str(i%20)) for i in range(250)]
+    state=calibrate_range(scores,validation,[str(i) for i in range(20)],validation_end=NOW)
     assert state.quantile==sorted(scores)[math.ceil(251*.9)-1]
     assert state.status!="MATURE"
 
@@ -112,11 +112,11 @@ def _six_states(**changes):
         "UNAVAILABLE",None,(),("UNAVAILABLE",)*6,**changes) for h in HORIZONS)
 
 def test_state_time_and_hash_fail_closed_on_insert_and_select():
-    with pytest.raises(ValueError,match="evidence_last_cutoff"):
+    with pytest.raises(ValueError,match="evidence boundaries"):
         build_v4c_state(symbol="X",cohort_id="c",state_as_of=NOW,
-                        evidence_last_cutoff=NOW+timedelta(seconds=1),horizons=_six_states())
+                        evidence_first_cutoff=NOW,evidence_last_cutoff=NOW+timedelta(seconds=1),horizons=_six_states())
     state=build_v4c_state(symbol="X",cohort_id="c",state_as_of=NOW,
-        evidence_last_cutoff=NOW,horizons=_six_states())
+        evidence_first_cutoff=NOW,evidence_last_cutoff=NOW,horizons=_six_states())
     class Cursor:
         def __init__(self):self.results=[];self.inserted=None
         def execute(self,sql,args):
@@ -130,10 +130,10 @@ def test_state_time_and_hash_fail_closed_on_insert_and_select():
     assert store.insert(replace(state,state_hash="0"*64),NOW)=="STATE_HASH_MISMATCH"
     assert store.insert(state,NOW)=="INSERT"
     canonical=connection.value.inserted[9]
-    connection.value.execute=lambda sql,args:setattr(connection.value,"results",[(state.state_hash,canonical,NOW,NOW)])
+    connection.value.execute=lambda sql,args:setattr(connection.value,"results",[(state.state_hash,canonical,NOW,NOW,NOW)])
     assert store.latest_json(symbol="X",cohort_id="c",requested_cutoff=NOW)[1]=="AVAILABLE"
     tampered=canonical.replace('"symbol": "X"','"symbol": "Y"')
-    connection.value.execute=lambda sql,args:setattr(connection.value,"results",[(state.state_hash,tampered,NOW,NOW)])
+    connection.value.execute=lambda sql,args:setattr(connection.value,"results",[(state.state_hash,tampered,NOW,NOW,NOW)])
     assert store.latest_json(symbol="X",cohort_id="c",requested_cutoff=NOW)[1]=="STATE_HASH_MISMATCH"
 
 def test_mature_statuses_fail_closed_when_live_numerics_missing():
@@ -181,3 +181,59 @@ def test_v3_unavailable_nulls_final_even_if_value_is_present():
     assert (result.final_bps,result.move_percent,result.direction)==(None,None,"UNAVAILABLE")
     assert "V3_UNAVAILABLE" in result.reason_codes
     assert "FINAL_BPS_UNAVAILABLE" in result.reason_codes
+
+def test_six_event_wrapper_requires_family_and_unavailable_hac_fails_holm():
+    reliable=reliability([ReliabilityObservation(.5,i%2,NOW+timedelta(minutes=i),str(i))
+                          for i in range(150)])
+    inputs={event:ProbabilityEventInput(event,(.5,)*500,(0,1)*250,.5,500,500,500,250,250,reliable)
+            for event in EVENTS}
+    states=calibrate_six_events(inputs)
+    assert tuple(x.event for x in states)==EVENTS and len(states)==6
+    assert all(x.status=="UNAVAILABLE" and x.calibration.p==1 and
+               x.calibration.reason_codes==("HAC_VARIANCE_ZERO",) and not x.holm_passed
+               for x in states)
+    with pytest.raises(ValueError,match="canonical"):
+        calibrate_six_events(dict(reversed(tuple(inputs.items()))))
+
+@pytest.mark.parametrize("n,sizes",[(8,(2,2,2,2)),(9,(3,2,2,2)),(10,(3,3,2,2)),
+                                     (11,(3,3,3,2)),(12,(3,3,3,3))])
+def test_q3_four_group_early_remainder(n,sizes):
+    rows=[Q3QuartileObservation(str(i),NOW+timedelta(minutes=i),float(i),(-1.)**i*i)
+          for i in range(n)]
+    assert build_q3_quartile_gate(rows).initial_sizes==sizes
+
+def test_q3_complete_gate_ties_effective_n_and_digest():
+    tied=[Q3QuartileObservation(str(i),NOW+timedelta(minutes=i),1.,float(i%3-1)) for i in range(200)]
+    collapsed=build_q3_quartile_gate(tied)
+    assert collapsed.status=="UNAVAILABLE" and collapsed.removed_boundaries==(1,2,3)
+    rows=[Q3QuartileObservation(str(i),NOW+timedelta(minutes=i),float(i),float(i%7-3))
+          for i in range(240)]
+    result=build_q3_quartile_gate(rows)
+    assert len(result.quartiles)==4 and all(x.effective_n>=50 for x in result.quartiles)
+    assert all(x.p_degradation==normal_cdf(x.hac_result.z) for x in result.quartiles)
+    assert result.evidence_digest==build_q3_quartile_gate(tuple(reversed(rows))).evidence_digest
+
+def test_range_validation_excludes_outcomes_resolved_after_boundary():
+    scores=[float(i) for i in range(250)]
+    late=[RangeValidationObservation(NOW,NOW+timedelta(days=2),0.,-1.,1.,"s") for _ in range(250)]
+    result=calibrate_range(scores,late,["s"],validation_end=NOW+timedelta(days=1))
+    assert result.validation_n==0
+
+def test_state_boundaries_version_and_nonfinite_publication_guards():
+    with pytest.raises(ValueError,match="both be null"):
+        build_v4c_state(symbol="X",cohort_id="c",state_as_of=NOW,
+            evidence_first_cutoff=NOW,evidence_last_cutoff=None,horizons=_six_states())
+    state=build_v4c_state(symbol="X",cohort_id="c",state_as_of=NOW,
+        evidence_first_cutoff=None,evidence_last_cutoff=None,horizons=_six_states())
+    assert state.state_version==PROBABILITY_STATE_VERSION and len(state.state_hash)==64
+    with pytest.raises(ValueError,match="finite"):
+        CompactHorizonState("30S","MATURE",math.nan,2.,"MATURE",1.,1.,"MATURE",1.,(),("MATURE",)*6)
+    from quant.v9_v3_synthesis import V3HorizonResult
+    result=final_numbers(V3HorizonResult("30S",30,math.inf,1.,"AVAILABLE",(),(),0,None),None)
+    assert result.final_bps is None and result.move_percent is None
+
+def test_gamma_optimizer_diagnostics_are_explicit():
+    result=optimize_gamma([GammaInput(.2,1,.1),GammaInput(3,1,3)]*30)
+    assert result.convergence_status=="CONVERGED"
+    assert result.baseline_objective is not None and result.challenger_objective==result.objective
+    assert result.objective_improvement==pytest.approx(result.baseline_objective-result.challenger_objective)
