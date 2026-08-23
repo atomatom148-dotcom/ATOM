@@ -233,8 +233,11 @@ def dashboard_data(
     return {
         "title": "ATOM QUANT",
         "market": {
-            "symbol": (market_display.coin_midpoint if market_display else
-                       history.latest.midpoint if history.latest else None),
+            "symbol": (
+                market_display.coin_midpoint
+                if market_display and market_display.coin_event_epoch is not None
+                else history.latest.midpoint if history.latest else None
+            ),
             "benchmarks": ["BTC", "QQQ", "NDX"],
             "btc": cross_asset_state.btc_price if cross_asset_state else None,
             "qqq": (market_display.qqq_midpoint if market_display else
@@ -247,8 +250,9 @@ def dashboard_data(
                 else current_epoch - history.latest.event_epoch if history.latest else None
             ),
             "event_epoch": (
-                market_display.coin_event_epoch if market_display else
-                history.latest.event_epoch if history.latest else None
+                market_display.coin_event_epoch
+                if market_display and market_display.coin_event_epoch is not None
+                else history.latest.event_epoch if history.latest else None
             ),
             "last_cycle": snapshot.last_cycle if snapshot else (cutoff_epoch if supplied else None),
         },
@@ -515,11 +519,11 @@ def create_app(
                                     ("Content-Length", str(len(body)))])
             return [body]
         if path == "/api/live":
-            as_of_epoch = clock()
             snapshot = state.snapshot() if state is not None else None
             cross_asset_state = state.cross_asset_state() if state is not None else None
             market_display = state.market_display() if state is not None else None
             v9_output = state.v9_output() if state is not None else None
+            as_of_epoch = clock()
             data = dashboard_data(
                 history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
                 now_epoch=as_of_epoch, cross_asset_state=cross_asset_state,
@@ -542,10 +546,10 @@ def create_app(
                 ("Content-Length", str(len(body))),
             ])
             return [body]
-        as_of_epoch = clock()
         snapshot = state.snapshot() if state is not None else None
         cross_asset_state = state.cross_asset_state() if state is not None else None
         v9_output = state.v9_output() if state is not None else None
+        as_of_epoch = clock()
         cached = evidence_cache.snapshot() if evidence_cache is not None else DashboardEvidenceSnapshot()
         counts = cached.counts
         cohorts = cached.phase_e_cohorts
