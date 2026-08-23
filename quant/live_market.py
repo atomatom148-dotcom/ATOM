@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import math
 import os
@@ -33,6 +33,7 @@ from .q12_event_session import EventSessionResult, calculate_event_session
 from .v9_math_core import V9MathCore, V9MathInput, V9QuantFamily
 from .v9_telemetry import record_v9_observation
 from .v9_v4d_integration import OperationalMetrics
+from .evidence_outbox import EvidenceOutbox, QuoteEvidenceWork
 
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
@@ -132,12 +133,15 @@ class LiveMarketState:
 
     def __init__(self, *, clock: Callable[[], float] = time.time,
                  evidence_store: EvidenceStore | None = None,
+                 evidence_outbox: EvidenceOutbox | None = None,
                  v9_cycle_handler: Callable[["LiveSnapshot", MidpointObservation | None,
                                              MidpointObservation], object | None] | None = None,
                  metrics: OperationalMetrics | None = None,
                  monotonic_clock: Callable[[], float] = time.perf_counter) -> None:
         self._clock = clock
         self._evidence_store = evidence_store
+        self._evidence_outbox = evidence_outbox
+        self._coin_sequence = 0
         self._v9_cycle_handler = v9_cycle_handler
         self.metrics = metrics or OperationalMetrics()
         self._monotonic = monotonic_clock
@@ -352,8 +356,7 @@ class LiveMarketState:
                 self._snapshot.option_surface,
             )
             _observe_v9(next_snapshot, symbol="COIN", as_of_epoch=event_epoch)
-            if self._evidence_store is not None:
-                forecasts = records_for_results(
+            forecasts = records_for_results(
                     results=(
                         next_snapshot.momentum,
                         next_snapshot.mean_reversion,
@@ -371,19 +374,17 @@ class LiveMarketState:
                     cutoff_epoch=event_epoch, cutoff_midpoint=observation.midpoint,
                     created_epoch=cycle,
                 )
-                volatility_forecasts = records_for_volatility(
+            volatility_forecasts = records_for_volatility(
                     result=next_snapshot.volatility,
                     cycle_id=f"COIN:{event_epoch:.9f}", symbol="COIN",
                     cutoff_epoch=event_epoch, cutoff_midpoint=observation.midpoint,
                     created_epoch=cycle,
                 )
-                self._evidence_store.record_cycle_and_resolve(
-                    forecasts, observation_epoch=event_epoch,
-                    observation_midpoint=observation.midpoint,
-                    volatility_forecasts=volatility_forecasts,
-                )
             self._snapshot = next_snapshot
             self._refresh_g2(event_epoch)
+            self._coin_sequence += 1
+            sequence = self._coin_sequence
+        output = None
         if self._v9_cycle_handler is not None:
             try:
                 output = self._v9_cycle_handler(
@@ -397,6 +398,16 @@ class LiveMarketState:
                     with self._lock:
                         self._v9_output = output
                         self._v9_error = None
+        if self._evidence_outbox is not None:
+            v4 = tuple(result.forecast for result in output.persistence) if output else ()
+            self._evidence_outbox.put_nowait(QuoteEvidenceWork(
+                sequence=sequence,
+                cycle_id=f"COIN:{event_epoch:.9f}",
+                previous_observation=previous_observation,
+                current_observation=observation,
+                received_at=datetime.fromtimestamp(cycle, timezone.utc),
+                directional=tuple(forecasts), q3=tuple(volatility_forecasts), v4=v4,
+            ))
         self.metrics.observe("coin_market_state_update_latency_ms",
                              (self._monotonic() - update_started) * 1000)
         return True

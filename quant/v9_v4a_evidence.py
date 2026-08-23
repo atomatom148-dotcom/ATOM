@@ -263,6 +263,29 @@ class OutcomeRecord:
         return self.forecast_record_id, self.target_identity
 
 
+def deserialize_outcome_record(payload: str | Mapping[str, object], *,
+                               expected_hash: str | None = None) -> OutcomeRecord:
+    """Reconstruct and validate the originally stored outcome metadata."""
+    canonical = json.loads(payload) if isinstance(payload, str) else payload
+    if not isinstance(canonical, Mapping):
+        raise ValueError("outcome record JSON must be an object")
+    value = _decanonical(dict(canonical))
+    if not isinstance(value, dict):
+        raise ValueError("outcome record JSON is invalid")
+    if "reason_codes" in value:
+        value["reason_codes"] = tuple(value["reason_codes"])
+    try:
+        record = OutcomeRecord(**value)
+    except TypeError as error:
+        raise ValueError("outcome record JSON does not match the contract") from error
+    digest = canonical_sha256(_outcome_math(record))
+    if (expected_hash is not None and record.outcome_record_hash != expected_hash) or (
+            record.outcome_record_hash != digest or
+            record.outcome_record_id != "v9v4o:" + digest):
+        raise ValueError("outcome record hash mismatch")
+    return record
+
+
 def _outcome_math(record: OutcomeRecord) -> dict[str, object]:
     excluded = {"outcome_record_id", "outcome_record_hash", "created_at"}
     return {key: value for key, value in asdict(record).items() if key not in excluded}
@@ -398,11 +421,16 @@ class V4AWriter:
                          persistence_reason=None if eligible else "FORECAST_PERSISTED_AFTER_TARGET_ENDPOINT")
         cursor = self.connection.cursor()
         try:
-            cursor.execute("SELECT forecast_record_hash FROM atom_v9_v4_forecasts WHERE symbol=%s AND cutoff_at=%s AND horizon=%s AND cycle_id=%s AND v3_model_version=%s", record.logical_key)
-            hashes = tuple(row[0] for row in cursor.fetchall())
+            cursor.execute("SELECT forecast_record_hash, record_json FROM atom_v9_v4_forecasts WHERE symbol=%s AND cutoff_at=%s AND horizon=%s AND cycle_id=%s AND v3_model_version=%s", record.logical_key)
+            rows = tuple(cursor.fetchall())
+            hashes = tuple(row[0] for row in rows)
             if record.forecast_record_hash in hashes:
                 self.last_write_status = "IDEMPOTENT"
                 _commit_if_supported(self.connection)
+                original = next(row for row in rows if row[0] == record.forecast_record_hash)
+                if len(original) > 1 and original[1] is not None:
+                    return deserialize_forecast_record(
+                        original[1], expected_hash=record.forecast_record_hash)
                 return stored
             if hashes:
                 self.last_write_status = "FORECAST_DUPLICATE_CONFLICT"
@@ -427,11 +455,16 @@ class V4AWriter:
         stored = replace(record, created_at=created_at)
         cursor = self.connection.cursor()
         try:
-            cursor.execute("SELECT outcome_record_hash FROM atom_v9_v4_outcomes WHERE forecast_record_id=%s AND target_identity=%s", record.logical_key)
-            hashes = tuple(row[0] for row in cursor.fetchall())
+            cursor.execute("SELECT outcome_record_hash, record_json FROM atom_v9_v4_outcomes WHERE forecast_record_id=%s AND target_identity=%s", record.logical_key)
+            rows = tuple(cursor.fetchall())
+            hashes = tuple(row[0] for row in rows)
             if record.outcome_record_hash in hashes:
                 self.last_write_status = "IDEMPOTENT"
                 _commit_if_supported(self.connection)
+                original = next(row for row in rows if row[0] == record.outcome_record_hash)
+                if len(original) > 1 and original[1] is not None:
+                    return deserialize_outcome_record(
+                        original[1], expected_hash=record.outcome_record_hash)
                 return stored
             self.last_write_status = "OUTCOME_CONFLICT" if hashes else "INSERT"
             cursor.execute("INSERT INTO atom_v9_v4_outcomes (outcome_record_id, outcome_record_hash, forecast_record_id, target_identity, record_json, created_at) VALUES (%s,%s,%s,%s,%s,%s)",

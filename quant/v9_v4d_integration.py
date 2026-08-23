@@ -10,7 +10,7 @@ separate entry points so neither can accidentally enter a request path.
 from __future__ import annotations
 
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import math
 import threading
@@ -24,6 +24,7 @@ from quant.v9_v3_synthesis import (
 )
 from quant.v9_v4a_evidence import (
     ForecastRecord, OutcomeRecord, V4AWriter, build_forecast, build_outcome,
+    canonical_sha256,
 )
 from quant.v9_v4b_accuracy import AccuracyState, HorizonAccuracyState
 from quant.v9_v4c_predictive import (
@@ -105,6 +106,37 @@ class OperationalMetrics:
         ))
 
 
+class ImmutableStateCache:
+    """Atomic publication of one validated immutable V4 state.
+
+    Reads do not perform I/O.  Relational stores are intentionally consumed only
+    by background refresh code which calls :meth:`publish`.
+    """
+
+    def __init__(self):
+        self._value = None
+        self._lock = threading.Lock()
+
+    def publish(self, value) -> None:
+        with self._lock:
+            self._value = value
+
+    def latest(self, *, symbol: str, cohort_id: str, requested_cutoff: datetime):
+        with self._lock:
+            value = self._value
+        if value is None:
+            return None, "UNAVAILABLE"
+        if (value.symbol != symbol or value.cohort_id != cohort_id or
+                value.state_as_of > requested_cutoff):
+            return None, "UNAVAILABLE"
+        payload = {key: item for key, item in asdict(value).items()
+                   if key not in ("state_id", "state_hash")}
+        if (value.state_hash != canonical_sha256(payload) or
+                value.state_id != "v9v4state:" + value.state_hash):
+            return None, "STATE_HASH_MISMATCH"
+        return value, "AVAILABLE"
+
+
 def _distribution(values: tuple[float, ...]) -> Distribution:
     if not values:
         return Distribution(0, None, None, None, None, None)
@@ -124,7 +156,7 @@ class V4DCoordinator:
 
     def __init__(self, *, capture_v1: Callable[[], V1Input],
                  capture_v2: Callable[[V1Input], V2EvidenceState],
-                 forecast_writer: V4AWriter,
+                 forecast_writer: V4AWriter | None,
                  compact_state_lookup: CompactStateLookup,
                  state_cohort_id: Callable[[V1Input, V2EvidenceState], str],
                  cutoff_midpoint: Callable[[V1Input], float | None] | None = None,
@@ -162,14 +194,17 @@ class V4DCoordinator:
                                       evidence_origin="PRODUCTION",
                                       cutoff_midpoint=self._cutoff_midpoint(v1))
             started = self._monotonic()
-            try:
-                stored = self._writer.persist_forecast(forecast, self._wall_clock())
-                status = self._writer.last_write_status or "UNKNOWN"
-                error_type = None
-                self.metrics.increment("forecast_persistence.success")
-            except Exception as error:  # persistence is an explicitly isolated boundary
-                stored, status, error_type = forecast, "FAILED", type(error).__name__
-                self.metrics.increment("forecast_persistence.failure")
+            if self._writer is None:
+                stored, status, error_type = forecast, "QUEUED", None
+            else:
+                try:
+                    stored = self._writer.persist_forecast(forecast, self._wall_clock())
+                    status = self._writer.last_write_status or "UNKNOWN"
+                    error_type = None
+                    self.metrics.increment("forecast_persistence.success")
+                except Exception as error:  # persistence is an explicitly isolated boundary
+                    stored, status, error_type = forecast, "FAILED", type(error).__name__
+                    self.metrics.increment("forecast_persistence.failure")
             latency = (self._monotonic() - started) * 1000
             self.metrics.observe("forecast_persistence_latency_ms", latency)
             persistence.append(PersistenceResult(result.horizon, status, stored,

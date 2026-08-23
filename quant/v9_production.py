@@ -45,8 +45,8 @@ from .v9_v4a_evidence import (
 )
 from .v9_v4b_accuracy import AccuracyStateStore
 from .v9_v4c_predictive import V4CStateStore
-from .v9_v4d_integration import V4DCycleOutput, V4DCoordinator, resolve_outcome
-from .v9_v4d_integration import OperationalMetrics
+from .v9_v4d_integration import V4DCycleOutput, V4DCoordinator
+from .v9_v4d_integration import ImmutableStateCache, OperationalMetrics
 
 
 TARGET_SPEC_ID = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
@@ -346,91 +346,21 @@ def v4_state_cohort_id(v1: V1Input, v2: V2EvidenceState) -> str:
 
 
 class ProductionV9Runtime:
-    """One database-backed production coordinator used by the quote path."""
+    """I/O-free production coordinator used by the quote path."""
 
     def __init__(self, database_url: str, v2_provider: ImmutableV2StateProvider,
                  *, connect: Callable | None = None,
                  metrics: OperationalMetrics | None = None,
                  monotonic_clock: Callable[[], float] = time.perf_counter):
-        if connect is None:
-            import psycopg
-            connect = psycopg.connect
-        self._connection = connect(database_url)
         self._provider = v2_provider
         self.metrics = metrics or OperationalMetrics()
         self._monotonic = monotonic_clock
-        self._writer = V4AWriter(self._connection)
-        self._v4c = V4CStateStore(self._connection)
-        self._accuracy = AccuracyStateStore(self._connection)
-        self._pending = self._load_pending()
-
-    def _load_pending(self) -> list:
-        cursor = self._connection.cursor()
-        try:
-            cursor.execute(
-                """
-                SELECT f.forecast_record_hash, f.record_json
-                FROM public.atom_v9_v4_forecasts AS f
-                WHERE f.target_endpoint >= now() - interval '1 hour'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM public.atom_v9_v4_outcomes AS o
-                      WHERE o.forecast_record_id=f.forecast_record_id
-                  )
-                ORDER BY f.target_endpoint, f.forecast_record_id
-                """,
-                (),
-            )
-            rows = tuple(cursor.fetchall())
-            commit = getattr(self._connection, "commit", None)
-            if callable(commit):
-                commit()
-        except Exception:
-            rollback = getattr(self._connection, "rollback", None)
-            if callable(rollback):
-                rollback()
-            raise
-        finally:
-            close = getattr(cursor, "close", None)
-            if callable(close):
-                close()
-        records = []
-        for expected_hash, payload in rows:
-            try:
-                records.append(deserialize_forecast_record(
-                    payload, expected_hash=str(expected_hash)))
-            except ValueError:
-                continue
-        return records
-
-    def _resolve_crossed(self, previous: MidpointObservation | None,
-                         current: MidpointObservation) -> None:
-        if previous is None:
-            return
-        remaining = []
-        for forecast in self._pending:
-            endpoint_epoch = forecast.target_endpoint.timestamp()
-            if endpoint_epoch > current.event_epoch:
-                remaining.append(forecast)
-                continue
-            if endpoint_epoch <= previous.event_epoch or forecast.cutoff_midpoint is None:
-                continue
-            actual = 10_000.0 * math.log(current.midpoint / forecast.cutoff_midpoint)
-            resolve_outcome(
-                writer=self._writer, forecast=forecast,
-                target_identity=canonical_target_identity(forecast),
-                previous_observation_at=datetime.fromtimestamp(
-                    previous.event_epoch, timezone.utc),
-                endpoint_observation_at=datetime.fromtimestamp(
-                    current.event_epoch, timezone.utc),
-                target_resolved_at=datetime.now(timezone.utc),
-                actual_return_bps=actual,
-            )
-        self._pending = remaining
+        self.compact_cache = ImmutableStateCache()
+        self.accuracy_cache = ImmutableStateCache()
 
     def on_quote(self, snapshot: LiveSnapshot,
                  previous: MidpointObservation | None,
                  current: MidpointObservation) -> V4DCycleOutput | None:
-        self._resolve_crossed(previous, current)
         cutoff_at = datetime.fromtimestamp(current.event_epoch, timezone.utc)
         try:
             v2 = self._provider.capture(cutoff_at)
@@ -443,31 +373,18 @@ class ProductionV9Runtime:
         coordinator = V4DCoordinator(
             capture_v1=lambda: v1,
             capture_v2=lambda _captured: v2,
-            forecast_writer=self._writer,
-            compact_state_lookup=self._v4c.latest_json,
-            accuracy_state_lookup=self._accuracy.latest_json,
+            forecast_writer=None,
+            compact_state_lookup=self.compact_cache.latest,
+            accuracy_state_lookup=self.accuracy_cache.latest,
             state_cohort_id=v4_state_cohort_id,
             cutoff_midpoint=lambda _captured: current.midpoint,
             metrics=self.metrics,
             monotonic_clock=self._monotonic,
         )
-        output = coordinator.run_cycle()
-        pending_ids = {item.forecast_record_id for item in self._pending}
-        for result in output.persistence:
-            forecast = result.forecast
-            if (result.status != "FAILED" and
-                    forecast.persistence_proof_eligible is True and
-                    forecast.forecast_record_id not in pending_ids):
-                self._pending.append(forecast)
-                pending_ids.add(forecast.forecast_record_id)
-        self._pending.sort(key=lambda item: (item.target_endpoint,
-                                             item.forecast_record_id))
-        return output
+        return coordinator.run_cycle()
 
     def close(self) -> None:
-        close = getattr(self._connection, "close", None)
-        if callable(close):
-            close()
+        return None
 
 
 __all__ = [

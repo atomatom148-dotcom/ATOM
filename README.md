@@ -2,6 +2,16 @@
 
 Quant research pipeline only.
 
+## Speed Gate 2 evidence causality
+
+Live COIN evidence is captured into immutable, bounded envelopes and delivered
+asynchronously to the evidence ledger. Raw forecast `created_epoch` remains the
+quote capture time; it is **not** a database-availability timestamp. Therefore
+this release does not claim exact historical V2 replay causality for delayed raw
+forecast/outcome delivery. Such a claim requires a separate evidence-contract
+compatibility change adding immutable availability timestamps. Missing live
+envelopes are never backfilled from later quotes.
+
 ```
 COIN snapshot → Unified Quant → exact-six ledger → truthful status
 ```

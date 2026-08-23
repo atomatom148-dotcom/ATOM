@@ -49,9 +49,9 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
     def test_live_cycle_wires_all_eleven_directional_families(self):
         class CapturingStore:
             forecasts = ()
-
-            def record_cycle_and_resolve(self, forecasts, **_observation):
-                self.forecasts = tuple(forecasts)
+            def put_nowait(self, work):
+                self.forecasts = work.directional
+                return True
 
         store = CapturingStore()
         directional_results = {
@@ -79,7 +79,7 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
                 (1, 2, 3, 4, 5, 6),
             ),
         ):
-            state = LiveMarketState(clock=lambda: 2.0, evidence_store=store)
+            state = LiveMarketState(clock=lambda: 2.0, evidence_outbox=store)
             self.assertTrue(state.accept_quote(bid=100, ask=102, event_epoch=1))
 
         self.assertEqual(len(store.forecasts), 66)
@@ -129,9 +129,9 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
     def test_live_cycle_writes_zero_q10_records_when_result_is_none(self):
         class CapturingStore:
             forecasts = ()
-
-            def record_cycle_and_resolve(self, forecasts, **_observation):
-                self.forecasts = tuple(forecasts)
+            def put_nowait(self, work):
+                self.forecasts = work.directional
+                return True
 
         store = CapturingStore()
         directional_results = {
@@ -153,7 +153,7 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
             **{name: Mock(return_value=value)
                for name, value in directional_results.items()},
         ), patch("quant.live_market.calculate_options_vol", return_value=None):
-            state = LiveMarketState(clock=lambda: 2.0, evidence_store=store)
+            state = LiveMarketState(clock=lambda: 2.0, evidence_outbox=store)
             self.assertTrue(state.accept_quote(bid=100, ask=102, event_epoch=1))
 
         self.assertEqual(len(store.forecasts), 60)

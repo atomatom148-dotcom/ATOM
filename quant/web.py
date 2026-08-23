@@ -612,7 +612,14 @@ def main() -> None:
     )
     v2_provider.start()
     v9_runtime = ProductionV9Runtime(database_url, v2_provider, metrics=metrics)
-    state = LiveMarketState(evidence_store=evidence_store,
+    from .evidence_outbox import EvidenceLedgerWorker, EvidenceOutbox
+    outbox = EvidenceOutbox(metrics=metrics)
+    ledger_worker = EvidenceLedgerWorker(
+        outbox, evidence_store=evidence_store, database_url=database_url,
+        metrics=metrics,
+    )
+    ledger_worker.start()
+    state = LiveMarketState(evidence_outbox=outbox,
                             v9_cycle_handler=v9_runtime.on_quote,
                             metrics=metrics)
     start_alpaca_poller(state)
