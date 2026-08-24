@@ -726,14 +726,29 @@ Capture must never be placed inside V1, V2, V3, V4C, V4D mathematics, or `V4DCoo
 
 ### Authorized SIM-3 implementation files
 
-After this freeze is merged, SIM-3 may change exactly these four files and no others:
+After this freeze is merged, SIM-3 may change exactly these five files and no others:
 
 - minimally modify existing `quant/live_market.py` only to pass the exact completed handler-returned `V4DCycleOutput` reference into the final `QuoteEvidenceWork.v4d_output` field at the existing Stage-A construction;
 - minimally modify existing `quant/evidence_outbox.py` only for the immutable outbox field, finalized-result capture, and Stage-B nonblocking submit hook;
+- minimally modify existing `quant/web.py` solely as the SIM-3 composition root for the construction, dependency injection, startup, and shutdown wiring frozen below;
 - create `quant/v9_sim3_capture.py`; and
 - create `tests/test_v9_sim3_capture.py`.
 
 No other production, quant, test, migration, schema, Render, web, or configuration file is authorized.
+
+### Exact composition root and lifecycle wiring
+
+`quant/web.py` is the sole authorized SIM-3 composition root. Its SIM-3 authority is limited to construction, dependency injection, startup, and shutdown wiring; it has no simulator mathematical, persistence, submission, retry, inspection, or request-path authority.
+
+At application startup, `quant/web.py` receives an explicit simulator database connection factory from existing application configuration, constructs `SimulationIntentStore` with that explicit factory, constructs the SIM-3 capture adapter and worker with that store and the frozen injected UTC clock, starts the single SIM-3 daemon worker, and injects the SIM-3 nonblocking submission adapter into `EvidenceLedgerWorker`. `EvidenceLedgerWorker` receives the adapter only after startup succeeds. Startup and shutdown are each application-lifecycle operations and never request operations.
+
+The explicit connection factory must connect only as `atom_v9_sim_runtime`. No simulator component reads environment variables directly. There is no fallback to the V4 runtime role or to any privileged, service-role, owner, or production connection. `SimulationIntentStore` continues to enforce its frozen `current_user = atom_v9_sim_runtime` verification. No hidden or inferred credential path is authorized.
+
+If the explicit simulator connection factory is absent, SIM-3 remains disabled: production starts and operates normally, `EvidenceLedgerWorker` receives no simulator adapter, no simulator database connection is attempted, and no request may initialize or retry SIM-3. If store construction, adapter construction, or worker startup raises an ordinary `Exception`, `quant/web.py` contains it, marks SIM-3 unavailable through the frozen bounded telemetry, continues production without SIM-3, and performs no retry. Startup is attempted exactly once.
+
+The application shutdown owner calls the frozen SIM-3 `stop()` method exactly once if and only if startup succeeded. `stop()` retains the frozen one-second maximum total join bound. Ordinary shutdown exceptions are contained and simulator shutdown cannot prevent production shutdown.
+
+No web route or request handler may construct, start, stop, retry, inspect the database for, or invoke SIM-3. No historical scan or simulator calculation occurs during a request. Authorization of `quant/web.py` is composition and lifecycle only; SIM-3 adds no simulator endpoint or page.
 
 ### Exact immutable Stage-A and post-persistence representations
 
@@ -873,7 +888,16 @@ The single authorized SIM-3 test module must freeze and prove:
 - every SIM-3 failure leaves all production persistence results unchanged;
 - existing `EvidenceLedgerWorker` persistence, retry, ordering, and failure behavior remains unchanged;
 - the existing V4D output value, mathematics, and identity remain unchanged;
-- implementation requires only the exact four authorized files;
+- implementation requires only the exact five authorized files;
+- explicit `SimulationIntentStore` and capture-adapter construction, successful-startup dependency injection, and exact `atom_v9_sim_runtime` connection ownership;
+- no direct environment read or fallback to V4, privileged, service-role, owner, or production credentials;
+- missing simulator configuration disables SIM-3 without a database connection attempt or production impact;
+- store-construction, adapter-construction, and worker-startup failure containment without retry;
+- exactly-once startup and exactly-once successful-startup shutdown ownership;
+- bounded one-second shutdown and shutdown-exception containment;
+- `EvidenceLedgerWorker` receives the adapter only after successful startup;
+- request handlers never initialize, start, stop, retry, inspect, or invoke SIM-3; and
+- production continues normally when SIM-3 is absent or startup fails;
 - exact field mappings and exact V3 status translation;
 - exact six-horizon order;
 - one clock read per completed cycle and the shared `eligible_at`;
@@ -896,7 +920,7 @@ The single authorized SIM-3 test module must freeze and prove:
 - no request-path work;
 - exact bounded telemetry surface and 256-sample limits;
 - deterministic benchmark p99 submit no greater than 1 ms;
-- no migration, schema, Render, web, broker, options, or later-phase change; and
+- no migration, schema, Render, web endpoint or request-path, broker, options, or later-phase change; and
 - full-suite regression proving Q1–Q12 and V1–V4 mathematics unchanged.
 
 ### Phase boundary
