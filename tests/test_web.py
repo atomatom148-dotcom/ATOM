@@ -9,7 +9,8 @@ from quant.history import MidpointHistory, MidpointObservation
 from quant.evidence import PhaseECohortMetrics
 from quant.live_market import LiveMarketState
 from quant.web import (DashboardEvidenceCache, FAMILY_NAMES, HORIZON_LABELS,
-                       PHASE_E_FAMILY_NAMES, create_app, dashboard_data)
+                       PHASE_E_FAMILY_NAMES, create_app, dashboard_data,
+                       dashboard_page)
 
 
 def request(app, path):
@@ -157,7 +158,8 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertEqual(first["status"], "200 OK")
         payload = json.loads(first["body"])
         self.assertEqual(set(payload), {
-            "market", "v9", "final_numbers", "quant_families", "options_data",
+            "market", "v9", "final_numbers", "v9_accuracy", "quant_families",
+            "options_data",
         })
         self.assertEqual(payload["market"]["symbol"], 100.01)
         self.assertEqual(payload["market"]["qqq"], 500.01)
@@ -237,11 +239,69 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertIn('data-dashboard-field="options_data.expiration"', page)
         self.assertIn('data-dashboard-field="evidence.Forecasts.0"', page)
         self.assertIn("Object.entries(data.final_numbers)", page)
+        self.assertIn("Object.entries(accuracyRows)", page)
         self.assertIn("data.quant_families.forEach", page)
         self.assertIn('["calls", "puts"].forEach', page)
         self.assertIn("<h3>CALLS</h3>", page)
         self.assertIn("<h3>PUTS</h3>", page)
         self.assertIn("Object.entries(data.evidence)", page)
+
+    def test_v9_accuracy_displays_existing_state_for_six_canonical_horizons(self):
+        final_numbers = tuple(SimpleNamespace(
+            final_bps=float(index + 1), move_percent=float(index + 11),
+            range_lower_bps=float(index + 21), range_upper_bps=float(index + 31),
+        ) for index in range(6))
+        accuracy = (
+            SimpleNamespace(horizon="30S", directional_wins=400,
+                            directional_losses=20, directional_accuracy=400 / 420,
+                            directional_effective_n=399.25, status="MATURE"),
+            SimpleNamespace(horizon="1M", directional_wins=7,
+                            directional_losses=3, directional_accuracy=0.7,
+                            directional_effective_n=8.5, status="PROVISIONAL"),
+        )
+        output = SimpleNamespace(final_numbers=final_numbers, accuracy=accuracy)
+
+        data = dashboard_data(v9_output=output)
+        rendered = dashboard_page(data).decode()
+
+        self.assertEqual([row["horizon"] for row in data["v9_accuracy"]],
+                         ["30S", "1M", "5M", "15M", "30M", "1H"])
+        self.assertEqual(data["v9_accuracy"][0], {
+            "horizon": "30S", "directional_wins": 400,
+            "directional_losses": 20, "directional_accuracy": 400 / 420,
+            "directional_effective_n": 399.25, "status": "MATURE",
+        })
+        self.assertEqual(data["v9_accuracy"][1]["status"], "PROVISIONAL")
+        self.assertEqual(data["v9_accuracy"][2]["status"], "UNAVAILABLE")
+        self.assertEqual(data["v9_accuracy"][2]["directional_accuracy"], None)
+        self.assertIn(">95.2%<", rendered)
+        self.assertIn(">399.25<", rendered)
+        self.assertIn(">MATURE<", rendered)
+        self.assertIn(">PROVISIONAL<", rendered)
+        self.assertIn(">—<", rendered)
+        self.assertNotIn(">0%<", rendered)
+        self.assertEqual(data["final_numbers"], {
+            "BPS": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "MOVE%": [11.0, 12.0, 13.0, 14.0, 15.0, 16.0],
+            "RANGE": [f"{index + 21:.2f} to {index + 31:.2f}"
+                      for index in range(6)],
+        })
+        self.assertIn("V9 DIRECTIONAL ACCURACY", rendered)
+
+    def test_v9_accuracy_request_path_only_reads_published_live_output(self):
+        class Store:
+            def counts(self): raise AssertionError("must not scan historical evidence")
+            def phase_e_cohorts(self, _as_of):
+                raise AssertionError("must not scan historical evidence")
+
+        state = LiveMarketState()
+        output = SimpleNamespace(final_numbers=(), accuracy=())
+        with patch.object(state, "v9_output", return_value=output):
+            response = request(create_app(state=state, evidence_store=Store()), "/api/live")
+
+        self.assertEqual(response["status"], "200 OK")
+        self.assertTrue(all(row["status"] == "UNAVAILABLE"
+                            for row in json.loads(response["body"])["v9_accuracy"]))
 
     def test_live_renderer_blanks_null_values_without_fake_zeroes(self):
         page = request(create_app(), "/")["body"].decode()
