@@ -718,7 +718,7 @@ SIM-3 only converts one completed immutable `V4DCycleOutput` into SIM-1 intents 
 
 SIM-3 uses exactly two production stages because the current production repository completes V4D before its evidence outbox worker finalizes V4 forecast persistence.
 
-**Stage A — completed V4D capture.** `quant.v9_production.ProductionV9Runtime.on_quote` is the existing owner that receives the completed immutable `V4DCycleOutput` immediately after its local `V4DCoordinator.run_cycle()` call returns. Stage A passes that exact immutable output by reference into the existing evidence outbox work item as specified below. It performs no simulator submission, intent construction, serialization, database work, retry, wait, or historical scan. It must not extend work under the COIN ingress lock beyond the bounded immutable reference/copy required by the existing nonblocking evidence-outbox enqueue. Production output and evidence delivery remain unchanged when the simulator is absent.
+**Stage A — completed V4D capture.** The existing post-handler `QuoteEvidenceWork(...)` construction inside `quant.live_market.LiveMarketState._accept_quote_serialized()` is the exact Stage-A owner. After the production handler returns its completed immutable `V4DCycleOutput`, Stage A passes that exact object reference into the existing evidence outbox work item as specified below. Its only authorized production change is adding and populating that one immutable field. Stage A performs no simulator intent construction, SIM-3 queue submission, simulator-evidence serialization, database access, wait, retry, or historical scan; does not modify `V4DCycleOutput`; and does not change quote publication or production evidence semantics. It must not extend work under the COIN ingress lock beyond the bounded immutable reference/copy required by the existing nonblocking evidence-outbox enqueue. Production output and evidence delivery remain unchanged when the simulator is absent.
 
 **Stage B — post-persistence simulator submission.** `quant.evidence_outbox.EvidenceLedgerWorker.process` is the exact existing post-persistence owner and the only location of the SIM-3 submit hook. The hook runs only after that method has finalized all six V4 forecast-persistence outcomes. It combines the exact immutable completed `V4DCycleOutput` carried from Stage A with the exact six finalized persisted forecast outcomes produced by that invocation, constructs one frozen whole-cycle SIM-3 work item, and calls the nonblocking SIM-3 adapter. Stage B runs outside both COIN and BTC ingestion locks. Simulator absence, submission failure, queue overflow, worker absence, or any ordinary exception is contained and cannot change, roll back, retry, reorder, or replace production evidence persistence or production output.
 
@@ -728,7 +728,7 @@ Capture must never be placed inside V1, V2, V3, V4C, V4D mathematics, or `V4DCoo
 
 After this freeze is merged, SIM-3 may change exactly these four files and no others:
 
-- minimally modify existing `quant/v9_production.py` only for the Stage-A immutable completed-output handoff;
+- minimally modify existing `quant/live_market.py` only to pass the exact completed handler-returned `V4DCycleOutput` reference into the final `QuoteEvidenceWork.v4d_output` field at the existing Stage-A construction;
 - minimally modify existing `quant/evidence_outbox.py` only for the immutable outbox field, finalized-result capture, and Stage-B nonblocking submit hook;
 - create `quant/v9_sim3_capture.py`; and
 - create `tests/test_v9_sim3_capture.py`.
@@ -737,7 +737,7 @@ No other production, quant, test, migration, schema, Render, web, or configurati
 
 ### Exact immutable Stage-A and post-persistence representations
 
-Stage A adds exactly one field, in the final position, to the existing frozen and slotted `quant.evidence_outbox.QuoteEvidenceWork`:
+Stage A adds exactly one field, in the final position, to the existing frozen and slotted `quant.evidence_outbox.QuoteEvidenceWork`, and `LiveMarketState._accept_quote_serialized()` passes the exact completed object returned by its production handler into that field when it constructs the outbox item:
 
 ```python
 v4d_output: V4DCycleOutput
@@ -851,7 +851,7 @@ Stage A performs only the bounded immutable reference/copy into the existing evi
 
 ### Isolation prohibitions
 
-SIM-3 is explicitly prohibited from running the adapter directly inside `V4DCoordinator.run_cycle()`; simulator database work inside `quant/v9_production.py`; simulator work while the COIN or BTC ingestion lock is held; changing `EvidenceLedgerWorker` persistence, retry, ordering, commit, rollback, or failure semantics; changing V4D output mathematics or identity; changing production forecast records; moving production persistence into V4D; synchronously waiting for SIM-3; and implementing SIM-4 or later behavior.
+SIM-3 is explicitly prohibited from running the adapter directly inside `V4DCoordinator.run_cycle()`; simulator database work inside `quant/live_market.py`; simulator work while the COIN or BTC ingestion lock is held; changing `EvidenceLedgerWorker` persistence, retry, ordering, commit, rollback, or failure semantics; changing V4D output mathematics or identity; changing production forecast records; moving production persistence into V4D; synchronously waiting for SIM-3; and implementing SIM-4 or later behavior.
 
 SIM-3 is also prohibited from production evidence writes; production ledger reads; calibration, `RANGE`, probability, or truth-credit access; broker clients or credentials; orders; options; entries, exits, positions, resolutions, or P&L; web/API endpoints; migrations or schema changes; Render changes; historical scans; environment-variable credential fallback; and modification of Q1–Q12 or V1–V4 mathematics. It may not add request-path work or run capture from a web request.
 
@@ -859,9 +859,10 @@ SIM-3 is also prohibited from production evidence writes; production ledger read
 
 The single authorized SIM-3 test module must freeze and prove:
 
-- the exact completed `V4DCycleOutput` object is carried immutably from Stage A;
+- `QuoteEvidenceWork` contains the exact immutable `V4DCycleOutput` reference;
+- `LiveMarketState._accept_quote_serialized()` passes the exact production-handler return object into `QuoteEvidenceWork.v4d_output`;
 - Stage A performs no simulator submission, intent construction, serialization, or database work;
-- Stage B runs only after all six production persistence outcomes are final;
+- Stage B uses that exact carried object only after all six production persistence outcomes are final;
 - exact successful persisted records supply the SIM-1 forecast IDs and hashes;
 - no simulator work runs under the COIN or BTC ingestion lock;
 - every SIM-3 failure leaves all production persistence results unchanged;
