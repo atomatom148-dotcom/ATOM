@@ -32,6 +32,10 @@ COIN snapshot
 
 The existing Unified Quant implementation and all historical evidence remain preserved. This amendment changes current authority only; it deletes nothing.
 
+## Paper simulator amendment
+
+The production pipeline and Q1–Q12/V1–V4 ownership remain unchanged. The paper simulator is authorized only as a downstream consumer of completed, immutable V4D output. It has no production, forecasting, broker, or truth-credit authority. `SIMULATION_FREEZE.md` is controlling law for all simulator work. Simulator failure, delay, overload, missing data, or complete unavailability cannot affect production.
+
 ## Forbidden until explicit freeze amendment
 
 - Direction Brain or any forecast writer outside the approved 12-family ATOM Quant runtime
