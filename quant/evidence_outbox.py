@@ -303,14 +303,19 @@ class EvidenceLedgerWorker:
         )
         if (self._state_builder is not None and
                 self._state_build_scheduler is not None and len(item.v4) == 6):
-            self._state_builder.prepare(
-                symbol=item.v4[0].symbol, state_as_of=refresh_cutoff,
-                cohorts={forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
-                         for forecast in item.v4},
-            )
-            if new_outcome:
-                self._state_build_scheduler.note_new_outcome()
-            self._state_build_scheduler.run_if_due()
+            try:
+                self._state_builder.prepare(
+                    symbol=item.v4[0].symbol, state_as_of=refresh_cutoff,
+                    cohorts={forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
+                             for forecast in item.v4},
+                )
+                if new_outcome:
+                    self._state_build_scheduler.note_new_outcome()
+                self._state_build_scheduler.run_if_due()
+            except Exception:
+                # Statistical publication is isolated from the evidence ledger.
+                # The pending scheduler generation remains retryable.
+                self.metrics.increment("v4b_state_builder.failure")
         if (self._simulation_submit is not None and item.v4d_output is not None
                 and len(finalized) == 6):
             try:

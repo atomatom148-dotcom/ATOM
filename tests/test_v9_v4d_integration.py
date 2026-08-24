@@ -448,6 +448,98 @@ def test_new_worker_outcome_triggers_cadenced_v4b_build(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("outcome_status,previous_present,expected_notes,raises", (
+    ("IDEMPOTENT", True, 0, False),
+    ("OUTCOME_CONFLICT", True, 0, True),
+    ("INSERT", False, 0, False),
+))
+def test_non_new_outcomes_do_not_create_v4b_generation(
+        monkeypatch, outcome_status, previous_present, expected_notes, raises):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecasts = tuple(replace(item.forecast, persisted_at=NOW,
+                              persistence_proof_eligible=True)
+                      for item in calculated.persistence)
+    due = forecasts[0]
+    previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
+    current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
+
+    class StatusWriter(Writer):
+        def persist_outcome(self, record, created_at):
+            self.last_write_status = outcome_status
+            return record
+    class Builder:
+        def prepare(self, **_kwargs): pass
+    class Scheduler:
+        def __init__(self): self.notes = 0; self.runs = 0
+        def note_new_outcome(self): self.notes += 1
+        def run_if_due(self): self.runs += 1
+    scheduler = Scheduler()
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
+        state_builder=Builder(), state_build_scheduler=scheduler,
+    )
+    worker._pending = [due]
+    worker._writer = StatusWriter()
+    item = QuoteEvidenceWork(
+        1, "cycle", previous if previous_present else None, current,
+        due.target_endpoint, (), (), forecasts, "cohort", calculated,
+    )
+
+    if raises:
+        with pytest.raises(TerminalDeliveryError, match="OUTCOME_CONFLICT"):
+            worker.process(item)
+        assert scheduler.runs == 0
+    else:
+        worker.process(item)
+        assert scheduler.runs == 1
+    assert scheduler.notes == expected_notes
+
+
+def test_v4b_builder_failure_isolated_from_forecast_delivery(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecasts = tuple(replace(item.forecast, persisted_at=NOW,
+                              persistence_proof_eligible=True)
+                      for item in calculated.persistence)
+    due = forecasts[0]
+    previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
+    current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
+
+    class Builder:
+        def prepare(self, **_kwargs): pass
+    class FailingScheduler:
+        def note_new_outcome(self): pass
+        def run_if_due(self): raise RuntimeError("offline builder failed")
+    writer = Writer()
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
+        state_builder=Builder(), state_build_scheduler=FailingScheduler(),
+    )
+    worker._pending = [due]
+    worker._writer = writer
+    item = QuoteEvidenceWork(
+        1, "cycle", previous, current, due.target_endpoint,
+        (), (), forecasts, "cohort", calculated,
+    )
+
+    worker.process(item)
+    assert len(writer.outcomes) == 1
+    assert len(writer.forecasts) == 6
+    assert any(number.final_bps is not None for number in calculated.final_numbers)
+    assert dict(worker.metrics.snapshot().counters)["v4b_state_builder.failure"] == 1
+
+
 def test_metrics_have_percentiles_and_do_not_change_forecast():
     metrics = OperationalMetrics(retained_samples=10)
     for value in (5, 1, 3, 2, 4):
