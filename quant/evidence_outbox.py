@@ -18,7 +18,10 @@ from .evidence import ForecastRecord as RawForecastRecord, VolatilityForecastRec
 from .history import MidpointObservation
 from .v9_v4a_evidence import ForecastRecord as V4ForecastRecord, V4AWriter, canonical_target_identity
 from .v9_v4a_evidence import deserialize_forecast_record
-from .v9_v4d_integration import ImmutableStateCache, OperationalMetrics, resolve_outcome
+from .v9_v4d_integration import (
+    ImmutableStateCache, OperationalMetrics, V4DCycleOutput, resolve_outcome,
+)
+from .v9_sim3_capture import FinalizedV4PersistenceResult
 
 
 EVIDENCE_OUTBOX_CAPACITY = 256
@@ -68,6 +71,7 @@ class QuoteEvidenceWork:
     q3: tuple[VolatilityForecastRecord, ...]
     v4: tuple[V4ForecastRecord, ...]
     state_cohort_id: str | None = None
+    v4d_output: V4DCycleOutput | None = None
 
 
 class EvidenceOutbox:
@@ -111,6 +115,7 @@ class EvidenceLedgerWorker:
                  database_url: str | None = None,
                  metrics: OperationalMetrics | None = None,
                  cache_refresher: V4StateCacheRefresher | None = None,
+                 simulation_submit: Callable | None = None,
                  wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
         if connection is None:
             if connect is None:
@@ -122,6 +127,7 @@ class EvidenceLedgerWorker:
         self.metrics = metrics or outbox.metrics
         self._clock = wall_clock
         self._cache_refresher = cache_refresher
+        self._simulation_submit = simulation_submit
         self._pending: list[V4ForecastRecord] = self._load_pending()
         self._last_sequence: int | None = None
         self._resolution_contiguous = True
@@ -209,11 +215,16 @@ class EvidenceLedgerWorker:
             resolution_enabled=not gap and previous is not None,
         )
         pending_ids = {record.forecast_record_id for record in remaining}
+        finalized = []
         for forecast in item.v4:
             stored = self._writer.persist_forecast(forecast, self._clock())
             if self._writer.last_write_status in {
                     "FORECAST_DUPLICATE_CONFLICT", "OUTCOME_CONFLICT"}:
                 raise TerminalDeliveryError(self._writer.last_write_status)
+            status = ("INSERTED" if self._writer.last_write_status == "INSERT"
+                      else self._writer.last_write_status)
+            finalized.append(FinalizedV4PersistenceResult(
+                forecast.horizon, status, stored))
             if (stored.persistence_proof_eligible is True and
                     stored.forecast_record_id not in pending_ids):
                 remaining.append(stored)
@@ -222,6 +233,12 @@ class EvidenceLedgerWorker:
         self._pending = remaining
         self._last_sequence = item.sequence
         self._resolution_contiguous = True
+        if (self._simulation_submit is not None and item.v4d_output is not None
+                and len(finalized) == 6):
+            try:
+                self._simulation_submit(item.v4d_output, tuple(finalized))
+            except Exception:
+                pass
         if self._cache_refresher is not None and item.state_cohort_id is not None:
             try:
                 self._cache_refresher.refresh(
