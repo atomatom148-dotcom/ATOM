@@ -11,14 +11,17 @@ from quant.v9_v3_synthesis import CANONICAL_FAMILIES
 from quant.v9_v4a_evidence import (
     _canonical, build_forecast, build_outcome, canonical_target_identity,
 )
-from quant.v9_v4c_predictive import CompactHorizonState, build_v4c_state
+from quant.v9_v4c_predictive import (
+    PROBABILITY_STATE_VERSION, CompactHorizonState, build_v4c_state,
+)
 from quant.v9_v4d_integration import (
     ImmutableStateCache, OfflineStateBuildScheduler, OperationalMetrics, V4DCoordinator,
     resolve_outcome,
 )
 from quant.evidence_outbox import (
     EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork, TerminalDeliveryError,
-    PostgresV4BStateBuilder, V4StateCacheRefresher,
+    PostgresV4BStateBuilder, PostgresV4CStateBuilder, PostgresV4StateBuilder,
+    V4StateCacheRefresher,
 )
 from quant.history import MidpointObservation
 from quant.live_market import LiveMarketState
@@ -404,6 +407,93 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
     assert captured == {"symbol": "COIN", "state_as_of": as_of,
                         "cohorts": cohorts, "evidence": ((forecast, outcome),)}
     assert store.calls == [(state, NOW + timedelta(minutes=2))]
+
+
+def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state(monkeypatch):
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "unused", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecast = replace(calculated.persistence[0].forecast, persisted_at=NOW,
+                       persistence_proof_eligible=True)
+    outcome = build_outcome(
+        forecast=forecast, target_identity=canonical_target_identity(forecast),
+        previous_observation_at=forecast.target_endpoint - timedelta(seconds=1),
+        endpoint_observation_at=forecast.target_endpoint,
+        target_resolved_at=forecast.target_endpoint, actual_return_bps=2.0)
+
+    class Cursor:
+        def execute(self, sql, params):
+            assert "atom_v9_v4_forecasts" in sql and "atom_v9_v4_outcomes" in sql
+            assert "o.created_at<=%s" in sql
+        def fetchall(self):
+            return ((forecast.forecast_record_hash, json.dumps(_canonical(asdict(forecast))),
+                     outcome.outcome_record_hash, json.dumps(_canonical(asdict(outcome)))),)
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def cursor(self): return Cursor()
+
+    import quant.evidence_outbox as module
+    calls = {"threshold": 0, "scale": 0, "range": 0, "state": 0}
+    for name in ("build_thresholds", "calibrate_scale", "calibrate_range", "build_v4c_state"):
+        original = getattr(module, name)
+        key = {"build_thresholds": "threshold", "calibrate_scale": "scale",
+               "calibrate_range": "range", "build_v4c_state": "state"}[name]
+        def spy(*args, _original=original, _key=key, **kwargs):
+            calls[_key] += 1
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(module, name, spy)
+
+    store = SimpleNamespace(calls=[])
+    store.insert = lambda state, created: store.calls.append((state, created)) or "INSERT"
+    builder = PostgresV4CStateBuilder(Connection(), state_store=store,
+                                      wall_clock=lambda: NOW + timedelta(minutes=2))
+    cohorts = {item.forecast.horizon:
+               (item.forecast.cohort_id, item.forecast.cohort_hash)
+               for item in calculated.persistence}
+    as_of = NOW + timedelta(hours=2)
+    builder.prepare(symbol="COIN", state_as_of=as_of, cohorts=cohorts)
+
+    assert builder.build_and_publish() == "INSERT"
+    state = store.calls[0][0]
+    assert calls == {"threshold": 6, "scale": 6, "range": 12, "state": 1}
+    assert state.state_version == PROBABILITY_STATE_VERSION
+    assert state.cohort_id == "v9v4statecohort:" + module.canonical_sha256(
+        tuple(cohorts[horizon] for horizon in HORIZONS))
+    assert state.horizons[0].range_status == "UNAVAILABLE"
+    assert all(item.range_status == "UNAVAILABLE" for item in state.horizons)
+    assert store.calls[0][1] == NOW + timedelta(minutes=2)
+
+
+def test_combined_builder_keeps_accuracy_and_compact_in_one_generation():
+    class Builder:
+        def __init__(self, result): self.result = result; self.prepared = []; self.calls = 0
+        def prepare(self, **candidate): self.prepared.append(candidate)
+        def build_and_publish(self): self.calls += 1; return self.result
+    accuracy, compact = Builder("IDEMPOTENT"), Builder("INSERT")
+    builder = PostgresV4StateBuilder(accuracy, compact)
+    candidate = {"symbol": "COIN", "state_as_of": NOW,
+                 "cohorts": {h: ("c", "h") for h in HORIZONS}}
+    builder.prepare(**candidate)
+    assert builder.build_and_publish() == "INSERT"
+    assert accuracy.prepared == compact.prepared == [candidate]
+    assert accuracy.calls == compact.calls == 1
+
+
+def test_compact_failure_does_not_suppress_accuracy_publication():
+    class Accuracy:
+        calls = 0
+        def build_and_publish(self):
+            self.calls += 1
+            return "INSERT"
+    class Compact:
+        def build_and_publish(self): raise RuntimeError("compact build failed")
+    accuracy = Accuracy()
+    with pytest.raises(RuntimeError, match="compact build failed"):
+        PostgresV4StateBuilder(accuracy, Compact()).build_and_publish()
+    assert accuracy.calls == 1
 
 
 def test_new_worker_outcome_triggers_cadenced_v4b_build(monkeypatch):
