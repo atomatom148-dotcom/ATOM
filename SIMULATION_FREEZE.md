@@ -714,54 +714,80 @@ SIM-2A freezes the smallest SIM-3 implementation described below. It is document
 
 SIM-3 only converts one completed immutable `V4DCycleOutput` into SIM-1 intents and asynchronously persists those intents through `SimulationIntentStore`. It performs no entry, exit, position, resolution, P&L, compact-state, web, broker, options, or order behavior.
 
-### Production boundary and owner
+### Production boundary and exact two-stage handoff
 
-The exact production owner is `quant.v9_production.ProductionV9Runtime.on_quote`. It receives the completed `V4DCycleOutput` immediately after its local `V4DCoordinator.run_cycle()` call returns. The one authorized production hook is in that method, after `run_cycle()` returns and therefore after every V4 forecast-persistence result in `V4DCycleOutput.persistence` is final. The method submits the completed output to the injected SIM-3 capture adapter and then publishes and returns the production output normally, regardless of simulator state or submit result.
+SIM-3 uses exactly two production stages because the current production repository completes V4D before its evidence outbox worker finalizes V4 forecast persistence.
 
-Capture must never be placed inside V1, V2, V3, V4C, V4D mathematics, or `V4DCoordinator.run_cycle()`. It must never execute while the COIN or BTC ingestion lock is held. The production quote owner and its caller must preserve the existing outside-lock execution boundary. Production publishes normally if capture is absent, not started, stopped, failed, full, malformed, or throws an ordinary exception.
+**Stage A — completed V4D capture.** `quant.v9_production.ProductionV9Runtime.on_quote` is the existing owner that receives the completed immutable `V4DCycleOutput` immediately after its local `V4DCoordinator.run_cycle()` call returns. Stage A passes that exact immutable output by reference into the existing evidence outbox work item as specified below. It performs no simulator submission, intent construction, serialization, database work, retry, wait, or historical scan. It must not extend work under the COIN ingress lock beyond the bounded immutable reference/copy required by the existing nonblocking evidence-outbox enqueue. Production output and evidence delivery remain unchanged when the simulator is absent.
+
+**Stage B — post-persistence simulator submission.** `quant.evidence_outbox.EvidenceLedgerWorker.process` is the exact existing post-persistence owner and the only location of the SIM-3 submit hook. The hook runs only after that method has finalized all six V4 forecast-persistence outcomes. It combines the exact immutable completed `V4DCycleOutput` carried from Stage A with the exact six finalized persisted forecast outcomes produced by that invocation, constructs one frozen whole-cycle SIM-3 work item, and calls the nonblocking SIM-3 adapter. Stage B runs outside both COIN and BTC ingestion locks. Simulator absence, submission failure, queue overflow, worker absence, or any ordinary exception is contained and cannot change, roll back, retry, reorder, or replace production evidence persistence or production output.
+
+Capture must never be placed inside V1, V2, V3, V4C, V4D mathematics, or `V4DCoordinator.run_cycle()`. Production publishes normally if either stage is absent, stopped, failed, full, malformed, or throws an ordinary exception.
 
 ### Authorized SIM-3 implementation files
 
-After this freeze is merged, SIM-3 may change exactly these three files and no others:
+After this freeze is merged, SIM-3 may change exactly these four files and no others:
 
-- create `quant/v9_sim3_capture.py`;
-- create `tests/test_v9_sim3_capture.py`; and
-- minimally modify the production-owner file `quant/v9_production.py` only to inject the capture adapter and invoke its post-V4D nonblocking submit hook.
+- minimally modify existing `quant/v9_production.py` only for the Stage-A immutable completed-output handoff;
+- minimally modify existing `quant/evidence_outbox.py` only for the immutable outbox field, finalized-result capture, and Stage-B nonblocking submit hook;
+- create `quant/v9_sim3_capture.py`; and
+- create `tests/test_v9_sim3_capture.py`.
 
 No other production, quant, test, migration, schema, Render, web, or configuration file is authorized.
 
-### Immutable cycle handoff
+### Exact immutable Stage-A and post-persistence representations
 
-`quant/v9_sim3_capture.py` shall define exactly one cycle work-item value type named `SimulationCaptureWorkItem`:
+Stage A adds exactly one field, in the final position, to the existing frozen and slotted `quant.evidence_outbox.QuoteEvidenceWork`:
+
+```python
+v4d_output: V4DCycleOutput
+```
+
+That field holds the exact object returned by `V4DCoordinator.run_cycle()`; it is not rebuilt, replaced, serialized, or copied into mutable state. `QuoteEvidenceWork` remains `@dataclass(frozen=True, slots=True)`, and all of its collection fields remain tuples.
+
+`quant/v9_sim3_capture.py` defines the exact frozen representation of one finalized V4 persistence outcome:
+
+```python
+@dataclass(frozen=True, slots=True)
+class FinalizedV4PersistenceResult:
+    horizon: str
+    status: str
+    forecast: ForecastRecord
+```
+
+For each of the six outbox V4 forecasts, `EvidenceLedgerWorker.process()` creates one result from that exact call to `V4AWriter.persist_forecast()`: `horizon` is the input forecast's `horizon`; `status` is the final `V4AWriter.last_write_status`, normalized only from the repository's successful `INSERT` spelling to SIM-3 `INSERTED`, with `IDEMPOTENT` unchanged; and `forecast` is the exact validated `ForecastRecord` returned by that call. The complete representation is one tuple in exact order `30S`, `1M`, `5M`, `15M`, `30M`, `1H`. It is created locally for the current outbox item and is never reconstructed by query. If the existing production persistence path raises or otherwise does not finalize all six results, Stage B does not submit that cycle and emits only bounded simulator telemetry; the existing worker handles the production failure exactly as before. `FAILED` is reserved for an already-finalized unsuccessful result exposed by the unchanged production persistence boundary and carries the exact attempted record. A malformed, duplicate, missing, or out-of-order result tuple fails simulator capture closed without changing production persistence.
+
+`quant/v9_sim3_capture.py` also defines exactly one cycle work-item value type named `SimulationCaptureWorkItem`:
 
 ```python
 @dataclass(frozen=True, slots=True)
 class SimulationCaptureWorkItem:
     cycle_output: V4DCycleOutput
+    persistence_results: tuple[FinalizedV4PersistenceResult, ...]
     eligible_at: datetime
 ```
 
-`cycle_output` is the completed immutable `V4DCycleOutput`; `eligible_at` is one validated UTC timestamp. The work item contains no mutable collection, and SIM-3 must not copy either field into a mutable container as part of the handoff.
+`cycle_output` is the exact completed immutable Stage-A object, `persistence_results` is the exact complete six-result Stage-B tuple, and `eligible_at` is one validated UTC timestamp. The work item contains no mutable collection, and SIM-3 must not copy any field into a mutable container as part of the handoff.
 
 ### Clock
 
-The capture adapter constructor receives exactly one callable UTC clock. Submit reads it exactly once for each completed V4D cycle, after V4D completion and immediately before constructing and enqueueing the work item. That single `eligible_at` applies to all six horizons. The value must be a valid timezone-aware `datetime` at UTC offset zero whose timestamp is finite; naive, non-UTC, nonfinite, unrepresentable, or otherwise invalid values are rejected. Clock access is forbidden everywhere else in SIM-3. Clock failure is contained, emits only bounded telemetry, and returns `CAPTURE_UNAVAILABLE`.
+The capture adapter constructor receives exactly one callable UTC clock. Stage B submit reads it exactly once for each completed V4D cycle, after all six persistence outcomes are final and immediately before constructing and enqueueing the work item. That single `eligible_at` applies to all six horizons. The value must be a valid timezone-aware `datetime` at UTC offset zero whose timestamp is finite; naive, non-UTC, nonfinite, unrepresentable, or otherwise invalid values are rejected. Clock access is forbidden everywhere else in SIM-3. Clock failure is contained, emits only bounded telemetry, and returns `CAPTURE_UNAVAILABLE`.
 
 ### Source eligibility and exact mapping
 
-A horizon creates an intent only when its matching `PersistenceResult.status` is exactly `INSERTED` or `IDEMPOTENT`. `FAILED`, `PERSISTENCE_NOT_ATTEMPTED`, and every other status create no simulator intent and only increment bounded failure telemetry. SIM-3 uses `PersistenceResult.forecast`, the exact successfully persisted V4 forecast record returned for that horizon; it performs no lookup or reconstruction.
+A horizon creates an intent only when its matching `FinalizedV4PersistenceResult.status` is exactly `INSERTED` or `IDEMPOTENT` and its `forecast` is the exact validated persisted V4A `ForecastRecord` returned by `V4AWriter.persist_forecast()` for that horizon. `FAILED`, `PERSISTENCE_NOT_ATTEMPTED`, and every other status create no simulator intent and only increment bounded failure telemetry. SIM-3 performs no lookup or reconstruction.
 
 For each eligible horizon, SIM-3 calls the frozen SIM-1 `build_simulation_trade_intent` constructor exactly once with this field-to-field mapping, using values from the same immutable `V4DCycleOutput` and its matching horizon members:
 
 | SIM-1 constructor argument | Exact SIM-3 source |
 | --- | --- |
 | `source_cycle_id` | `cycle_output.cycle_id` |
-| `source_forecast_record_id` | `persistence_result.forecast.forecast_record_id` |
-| `source_forecast_record_hash` | `persistence_result.forecast.forecast_record_hash` |
+| `source_forecast_record_id` | `finalized_result.forecast.forecast_record_id` from the exact successful Stage-B return value |
+| `source_forecast_record_hash` | `finalized_result.forecast.forecast_record_hash` from the same exact successful Stage-B return value |
 | `source_v2_state_id` | `cycle_output.v2.state_id` |
 | `source_v2_state_hash` | `cycle_output.v2.state_hash` |
-| `source_v3_contract_version` | `persistence_result.forecast.v3_contract_version` |
-| `source_v3_model_version` | `cycle_output.v3.model_version`, which must equal `persistence_result.forecast.v3_model_version` |
+| `source_v3_contract_version` | `finalized_result.forecast.v3_contract_version` |
+| `source_v3_model_version` | `cycle_output.v3.model_version`, which must equal `finalized_result.forecast.v3_model_version` |
 | `cutoff_at` | `cycle_output.cutoff_at` |
 | `eligible_at` | `work_item.eligible_at` |
 | `horizon` | matching `cycle_output.v3.horizon_results[*].horizon` |
@@ -769,7 +795,7 @@ For each eligible horizon, SIM-3 calls the frozen SIM-1 `build_simulation_trade_
 | `final_bps` | matching `cycle_output.final_numbers[*].final_bps` |
 | `source_v3_status` | translation of matching `cycle_output.v3.horizon_results[*].status` below |
 
-The exact V3-to-SIM-1 status translation is `MATURE` → `AVAILABLE`, `PROVISIONAL` → `PROVISIONAL`, and `UNAVAILABLE` → `UNAVAILABLE`. No other V3 status is accepted. The matching `PersistenceResult.horizon`, `PersistenceResult.forecast.horizon`, V3 horizon, and final-numbers horizon must all equal the frozen horizon being processed; the forecast `cycle_id`, `cutoff_at`, `v2_state_id`, and `v2_state_hash` must equal their mapped cycle values. SIM-3 delegates decision, intent status, and quantity mapping exclusively to `build_simulation_trade_intent`; it must not recreate SIM-1 mathematics.
+The exact V3-to-SIM-1 status translation is `MATURE` → `AVAILABLE`, `PROVISIONAL` → `PROVISIONAL`, and `UNAVAILABLE` → `UNAVAILABLE`. No other V3 status is accepted. The matching `FinalizedV4PersistenceResult.horizon`, `FinalizedV4PersistenceResult.forecast.horizon`, V3 horizon, and final-numbers horizon must all equal the frozen horizon being processed; the forecast `cycle_id`, `cutoff_at`, `v2_state_id`, and `v2_state_hash` must equal their mapped cycle values. SIM-3 delegates decision, intent status, and quantity mapping exclusively to `build_simulation_trade_intent`; it must not recreate SIM-1 mathematics.
 
 ### Horizon behavior
 
@@ -821,21 +847,32 @@ Counters are bounded in label cardinality, queue depth is a current gauge, and b
 
 ### Performance boundary
 
-The synchronous post-V4D path performs only one clock read, immutable work-item construction, one nonblocking queue operation, and a bounded telemetry update. It performs no intent construction, six-horizon loop, serialization, database access, retry, wait, sleep, or scan. The frozen capture-submit target is p99 no greater than 1 ms under the deterministic benchmark. Worker processing is measured separately and cannot affect production latency.
+Stage A performs only the bounded immutable reference/copy into the existing evidence outbox work item and performs no simulator call. The synchronous Stage-B capture-submit path performs only one clock read, immutable work-item construction, one nonblocking queue operation, and a bounded telemetry update. It performs no intent construction, serialization, database access, retry, wait, sleep, or scan; validation and any six-horizon processing occur only in the SIM-3 worker. The frozen capture-submit target is p99 no greater than 1 ms under the deterministic benchmark. SIM-3 worker processing is measured separately and cannot affect production latency.
 
 ### Isolation prohibitions
 
-SIM-3 is explicitly prohibited from production evidence writes; production ledger reads; calibration, `RANGE`, probability, or truth-credit access; broker clients or credentials; orders; options; entries, exits, positions, resolutions, or P&L; web/API endpoints; migrations or schema changes; Render changes; historical scans; environment-variable credential fallback; and modification of Q1–Q12 or V1–V4 mathematics. It may not add request-path work or run capture from a web request.
+SIM-3 is explicitly prohibited from running the adapter directly inside `V4DCoordinator.run_cycle()`; simulator database work inside `quant/v9_production.py`; simulator work while the COIN or BTC ingestion lock is held; changing `EvidenceLedgerWorker` persistence, retry, ordering, commit, rollback, or failure semantics; changing V4D output mathematics or identity; changing production forecast records; moving production persistence into V4D; synchronously waiting for SIM-3; and implementing SIM-4 or later behavior.
+
+SIM-3 is also prohibited from production evidence writes; production ledger reads; calibration, `RANGE`, probability, or truth-credit access; broker clients or credentials; orders; options; entries, exits, positions, resolutions, or P&L; web/API endpoints; migrations or schema changes; Render changes; historical scans; environment-variable credential fallback; and modification of Q1–Q12 or V1–V4 mathematics. It may not add request-path work or run capture from a web request.
 
 ### Required focused tests
 
 The single authorized SIM-3 test module must freeze and prove:
 
+- the exact completed `V4DCycleOutput` object is carried immutably from Stage A;
+- Stage A performs no simulator submission, intent construction, serialization, or database work;
+- Stage B runs only after all six production persistence outcomes are final;
+- exact successful persisted records supply the SIM-1 forecast IDs and hashes;
+- no simulator work runs under the COIN or BTC ingestion lock;
+- every SIM-3 failure leaves all production persistence results unchanged;
+- existing `EvidenceLedgerWorker` persistence, retry, ordering, and failure behavior remains unchanged;
+- the existing V4D output value, mathematics, and identity remain unchanged;
+- implementation requires only the exact four authorized files;
 - exact field mappings and exact V3 status translation;
 - exact six-horizon order;
 - one clock read per completed cycle and the shared `eligible_at`;
 - immutable, frozen, slotted whole-cycle handoff with no mutable collections;
-- post-`run_cycle`, post-forecast-persistence hook placement;
+- exact Stage-A post-`run_cycle` handoff and Stage-B post-forecast-persistence hook placement;
 - nonblocking submit and no synchronous horizon, construction, serialization, or store work;
 - queue capacity 64 and atomic whole-cycle admission;
 - incoming-cycle drop without older-cycle eviction on overflow;
