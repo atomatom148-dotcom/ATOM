@@ -718,7 +718,7 @@ SIM-3 only converts one completed immutable `V4DCycleOutput` into SIM-1 intents 
 
 SIM-3 uses exactly two production stages because the current production repository completes V4D before its evidence outbox worker finalizes V4 forecast persistence.
 
-**Stage A — completed V4D capture.** The existing post-handler `QuoteEvidenceWork(...)` construction inside `quant.live_market.LiveMarketState._accept_quote_serialized()` is the exact Stage-A owner. After the production handler returns its completed immutable `V4DCycleOutput`, Stage A passes that exact object reference into the existing evidence outbox work item as specified below. Its only authorized production change is adding and populating that one immutable field. Stage A performs no simulator intent construction, SIM-3 queue submission, simulator-evidence serialization, database access, wait, retry, or historical scan; does not modify `V4DCycleOutput`; and does not change quote publication or production evidence semantics. It must not extend work under the COIN ingress lock beyond the bounded immutable reference/copy required by the existing nonblocking evidence-outbox enqueue. Production output and evidence delivery remain unchanged when the simulator is absent.
+**Stage A — completed V4D capture.** The existing post-handler `QuoteEvidenceWork(...)` construction inside `quant.live_market.LiveMarketState._accept_quote_serialized()` is the exact Stage-A owner. After the production handler returns a valid completed immutable `V4DCycleOutput`, Stage A passes that exact object reference into the existing evidence outbox work item as specified below. Its only authorized production change is adding and conditionally populating that one immutable field. Stage A performs no simulator intent construction, SIM-3 queue submission, simulator-evidence serialization, database access, wait, retry, or historical scan; does not modify `V4DCycleOutput`; and does not change quote publication or production evidence semantics. It must not extend work under the COIN ingress lock beyond the bounded immutable reference/copy required by the existing nonblocking evidence-outbox enqueue. Production output and evidence delivery remain unchanged when the simulator is absent.
 
 **Stage B — post-persistence simulator submission.** `quant.evidence_outbox.EvidenceLedgerWorker.process` is the exact existing post-persistence owner and the only location of the SIM-3 submit hook. The hook runs only after that method has finalized all six V4 forecast-persistence outcomes. It combines the exact immutable completed `V4DCycleOutput` carried from Stage A with the exact six finalized persisted forecast outcomes produced by that invocation, constructs one frozen whole-cycle SIM-3 work item, and calls the nonblocking SIM-3 adapter. Stage B runs outside both COIN and BTC ingestion locks. Simulator absence, submission failure, queue overflow, worker absence, or any ordinary exception is contained and cannot change, roll back, retry, reorder, or replace production evidence persistence or production output.
 
@@ -737,13 +737,15 @@ No other production, quant, test, migration, schema, Render, web, or configurati
 
 ### Exact immutable Stage-A and post-persistence representations
 
-Stage A adds exactly one field, in the final position, to the existing frozen and slotted `quant.evidence_outbox.QuoteEvidenceWork`, and `LiveMarketState._accept_quote_serialized()` passes the exact completed object returned by its production handler into that field when it constructs the outbox item:
+Stage A adds exactly one field, in the final position, to the existing frozen and slotted `quant.evidence_outbox.QuoteEvidenceWork`:
 
 ```python
-v4d_output: V4DCycleOutput
+v4d_output: V4DCycleOutput | None = None
 ```
 
-That field holds the exact object returned by `V4DCoordinator.run_cycle()`; it is not rebuilt, replaced, serialized, or copied into mutable state. `QuoteEvidenceWork` remains `@dataclass(frozen=True, slots=True)`, and all of its collection fields remain tuples.
+The default preserves every existing `QuoteEvidenceWork` constructor unchanged and makes `v4d_output` exactly `None` for those constructors. When the production V4D handler returns a valid `V4DCycleOutput`, `LiveMarketState._accept_quote_serialized()` passes that exact object reference into `v4d_output`; it is not rebuilt, replaced, serialized, or copied into mutable state. When the handler is absent, disabled, raises, or returns `None`, `v4d_output` remains `None`, existing production evidence enqueue and persistence continue unchanged, and no synthetic V4D output or simulator intent is created. `QuoteEvidenceWork` remains `@dataclass(frozen=True, slots=True)`, and all of its collection fields remain tuples.
+
+`None` is not a production error and cannot block, fail, or alter production evidence delivery. Stage B may submit to SIM-3 only when `v4d_output` is a valid `V4DCycleOutput` and all required V4 persistence outcomes have finalized. A `None` value skips simulator submission, records only bounded SIM-3 telemetry, and has no other effect.
 
 `quant/v9_sim3_capture.py` defines the exact frozen representation of one finalized V4 persistence outcome:
 
@@ -861,6 +863,9 @@ The single authorized SIM-3 test module must freeze and prove:
 
 - `QuoteEvidenceWork` contains the exact immutable `V4DCycleOutput` reference;
 - `LiveMarketState._accept_quote_serialized()` passes the exact production-handler return object into `QuoteEvidenceWork.v4d_output`;
+- existing `QuoteEvidenceWork` constructors remain compatible and default `v4d_output` to `None`;
+- an absent, disabled, failed, or `None` V4D handler skips only SIM-3, emits bounded telemetry, and creates no synthetic output or intent;
+- production evidence enqueue and persistence remain unchanged with both valid and `None` `v4d_output` values;
 - Stage A performs no simulator submission, intent construction, serialization, or database work;
 - Stage B uses that exact carried object only after all six production persistence outcomes are final;
 - exact successful persisted records supply the SIM-1 forecast IDs and hashes;
