@@ -17,9 +17,11 @@ from typing import Callable
 from .evidence import ForecastRecord as RawForecastRecord, VolatilityForecastRecord
 from .history import MidpointObservation
 from .v9_v4a_evidence import ForecastRecord as V4ForecastRecord, V4AWriter, canonical_target_identity
-from .v9_v4a_evidence import deserialize_forecast_record
+from .v9_v4a_evidence import deserialize_forecast_record, deserialize_outcome_record
+from .v9_v4b_accuracy import AccuracyStateStore, build_accuracy_state
 from .v9_v4d_integration import (
-    ImmutableStateCache, OperationalMetrics, V4DCycleOutput, resolve_outcome,
+    ImmutableStateCache, OfflineStateBuildScheduler, OperationalMetrics,
+    V4DCycleOutput, resolve_outcome,
 )
 from .v9_sim3_capture import FinalizedV4PersistenceResult
 
@@ -56,6 +58,62 @@ class V4StateCacheRefresher:
             symbol=symbol, cohort_id=cohort_id, requested_cutoff=cutoff)
         if accuracy_status == "AVAILABLE" and accuracy is not None:
             self._accuracy_cache.publish(accuracy)
+
+
+class PostgresV4BStateBuilder:
+    """Build one frozen accuracy state from durable governed V4A evidence."""
+
+    def __init__(self, connection, *, state_store=None,
+                 wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+        self._connection = connection
+        self._store = state_store or AccuracyStateStore(connection)
+        self._clock = wall_clock
+        self._candidate = None
+
+    def prepare(self, *, symbol: str, state_as_of: datetime,
+                cohorts: dict[str, tuple[str, str]]) -> None:
+        self._candidate = (symbol, state_as_of, dict(cohorts))
+
+    def build_and_publish(self) -> str:
+        if self._candidate is None:
+            return "SKIPPED_NO_CANDIDATE"
+        symbol, state_as_of, cohorts = self._candidate
+        cursor = self._connection.cursor()
+        try:
+            cursor.execute(
+                """SELECT f.forecast_record_hash, f.record_json,
+                          o.outcome_record_hash, o.record_json
+                   FROM public.atom_v9_v4_forecasts AS f
+                   JOIN public.atom_v9_v4_outcomes AS o
+                     USING (forecast_record_id)
+                   WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
+                   ORDER BY f.cutoff_at, f.forecast_record_id,
+                            o.created_at, o.outcome_record_id""",
+                (symbol, state_as_of, state_as_of),
+            )
+            rows = tuple(cursor.fetchall())
+            commit = getattr(self._connection, "commit", None)
+            if callable(commit):
+                commit()
+        except Exception:
+            rollback = getattr(self._connection, "rollback", None)
+            if callable(rollback):
+                rollback()
+            raise
+        finally:
+            close = getattr(cursor, "close", None)
+            if callable(close):
+                close()
+        evidence = tuple(
+            (deserialize_forecast_record(forecast_json, expected_hash=str(forecast_hash)),
+             deserialize_outcome_record(outcome_json, expected_hash=str(outcome_hash)))
+            for forecast_hash, forecast_json, outcome_hash, outcome_json in rows
+        )
+        state = build_accuracy_state(
+            symbol=symbol, state_as_of=state_as_of,
+            cohorts=cohorts, evidence=evidence,
+        )
+        return self._store.insert(state, self._clock())
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +173,8 @@ class EvidenceLedgerWorker:
                  database_url: str | None = None,
                  metrics: OperationalMetrics | None = None,
                  cache_refresher: V4StateCacheRefresher | None = None,
+                 state_builder: PostgresV4BStateBuilder | None = None,
+                 state_build_scheduler: OfflineStateBuildScheduler | None = None,
                  simulation_submit: Callable | None = None,
                  wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
         if connection is None:
@@ -127,6 +187,8 @@ class EvidenceLedgerWorker:
         self.metrics = metrics or outbox.metrics
         self._clock = wall_clock
         self._cache_refresher = cache_refresher
+        self._state_builder = state_builder
+        self._state_build_scheduler = state_build_scheduler
         self._simulation_submit = simulation_submit
         self._pending: list[V4ForecastRecord] = self._load_pending()
         self._last_sequence: int | None = None
@@ -183,6 +245,7 @@ class EvidenceLedgerWorker:
             self.metrics.increment("EVIDENCE_SEQUENCE_GAP")
         previous, current = item.previous_observation, item.current_observation
         remaining = []
+        new_outcome = False
         if previous is not None:
             for forecast in self._pending:
                 endpoint = forecast.target_endpoint.timestamp()
@@ -202,6 +265,7 @@ class EvidenceLedgerWorker:
                             current.midpoint / forecast.cutoff_midpoint),
                         metrics=self.metrics,
                     )
+                    new_outcome = new_outcome or self._writer.last_write_status == "INSERT"
                     if self._writer.last_write_status == "OUTCOME_CONFLICT":
                         raise TerminalDeliveryError("OUTCOME_CONFLICT")
         else:
@@ -233,6 +297,25 @@ class EvidenceLedgerWorker:
         self._pending = remaining
         self._last_sequence = item.sequence
         self._resolution_contiguous = True
+        refresh_cutoff = max(
+            item.received_at,
+            datetime.fromtimestamp(current.event_epoch, timezone.utc),
+        )
+        if (self._state_builder is not None and
+                self._state_build_scheduler is not None and len(item.v4) == 6):
+            try:
+                self._state_builder.prepare(
+                    symbol=item.v4[0].symbol, state_as_of=refresh_cutoff,
+                    cohorts={forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
+                             for forecast in item.v4},
+                )
+                if new_outcome:
+                    self._state_build_scheduler.note_new_outcome()
+                self._state_build_scheduler.run_if_due()
+            except Exception:
+                # Statistical publication is isolated from the evidence ledger.
+                # The pending scheduler generation remains retryable.
+                self.metrics.increment("v4b_state_builder.failure")
         if (self._simulation_submit is not None and item.v4d_output is not None
                 and len(finalized) == 6):
             try:
@@ -243,7 +326,7 @@ class EvidenceLedgerWorker:
             try:
                 self._cache_refresher.refresh(
                     symbol="COIN", cohort_id=item.state_cohort_id,
-                    cutoff=datetime.fromtimestamp(current.event_epoch, timezone.utc))
+                    cutoff=refresh_cutoff)
             except Exception:
                 self.metrics.increment("v4_state_cache.refresh_failure")
         self.metrics.observe("evidence_ledger_worker_latency_ms",

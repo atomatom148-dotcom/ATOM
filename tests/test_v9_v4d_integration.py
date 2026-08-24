@@ -8,7 +8,9 @@ import pytest
 from quant.v9_v1_contract import HORIZONS, HORIZON_SECONDS
 from quant.v9_v2d_evidence_state import DirectionalCalibrationState
 from quant.v9_v3_synthesis import CANONICAL_FAMILIES
-from quant.v9_v4a_evidence import _canonical, build_forecast
+from quant.v9_v4a_evidence import (
+    _canonical, build_forecast, build_outcome, canonical_target_identity,
+)
 from quant.v9_v4c_predictive import CompactHorizonState, build_v4c_state
 from quant.v9_v4d_integration import (
     ImmutableStateCache, OfflineStateBuildScheduler, OperationalMetrics, V4DCoordinator,
@@ -16,7 +18,7 @@ from quant.v9_v4d_integration import (
 )
 from quant.evidence_outbox import (
     EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork, TerminalDeliveryError,
-    V4StateCacheRefresher,
+    PostgresV4BStateBuilder, V4StateCacheRefresher,
 )
 from quant.history import MidpointObservation
 from quant.live_market import LiveMarketState
@@ -348,6 +350,194 @@ def test_offline_builder_requires_new_outcome_and_sixty_seconds():
     assert scheduler.run_if_due() == "SKIPPED_RATE_LIMIT"
     clock[0] = 60
     assert scheduler.run_if_due() == "INSERT" and len(calls) == 2
+
+
+def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkeypatch):
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecast = replace(calculated.persistence[0].forecast, persisted_at=NOW,
+                       persistence_proof_eligible=True)
+    previous = forecast.target_endpoint - timedelta(seconds=1)
+    outcome = build_outcome(
+        forecast=forecast, target_identity=canonical_target_identity(forecast),
+        previous_observation_at=previous,
+        endpoint_observation_at=forecast.target_endpoint,
+        target_resolved_at=forecast.target_endpoint,
+        actual_return_bps=2.0,
+    )
+
+    class Cursor:
+        def execute(self, sql, params):
+            assert "atom_v9_v4_forecasts" in sql and "atom_v9_v4_outcomes" in sql
+            assert "o.created_at<=%s" in sql
+            self.params = params
+        def fetchall(self):
+            return ((forecast.forecast_record_hash,
+                     json.dumps(_canonical(asdict(forecast))),
+                     outcome.outcome_record_hash,
+                     json.dumps(_canonical(asdict(outcome)))),)
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def __init__(self): self.cursor_value = Cursor()
+        def cursor(self): return self.cursor_value
+
+    captured = {}
+    state = SimpleNamespace(state_id="state")
+    def frozen_build(**kwargs):
+        captured.update(kwargs)
+        return state
+    monkeypatch.setattr("quant.evidence_outbox.build_accuracy_state", frozen_build)
+    store = SimpleNamespace(
+        calls=[], insert=lambda candidate, created: store.calls.append((candidate, created)) or "INSERT")
+    connection = Connection()
+    builder = PostgresV4BStateBuilder(connection, state_store=store,
+                                      wall_clock=lambda: NOW + timedelta(minutes=2))
+    cohorts = {h: ("cohort", "b" * 64) for h in HORIZONS}
+    as_of = NOW + timedelta(minutes=1)
+    builder.prepare(symbol="COIN", state_as_of=as_of, cohorts=cohorts)
+
+    assert builder.build_and_publish() == "INSERT"
+    assert captured == {"symbol": "COIN", "state_as_of": as_of,
+                        "cohorts": cohorts, "evidence": ((forecast, outcome),)}
+    assert store.calls == [(state, NOW + timedelta(minutes=2))]
+
+
+def test_new_worker_outcome_triggers_cadenced_v4b_build(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecasts = tuple(replace(item.forecast, persisted_at=NOW,
+                              persistence_proof_eligible=True)
+                      for item in calculated.persistence)
+    due = forecasts[0]
+    previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
+    current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
+
+    class Builder:
+        def __init__(self): self.prepared = []
+        def prepare(self, **kwargs): self.prepared.append(kwargs)
+    class Scheduler:
+        def __init__(self): self.notes = 0; self.runs = 0
+        def note_new_outcome(self): self.notes += 1
+        def run_if_due(self): self.runs += 1
+    builder, scheduler = Builder(), Scheduler()
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
+        state_builder=builder, state_build_scheduler=scheduler,
+    )
+    worker._pending = [due]
+    worker._writer = Writer()
+    item = QuoteEvidenceWork(
+        1, "cycle", previous, current, due.target_endpoint,
+        (), (), forecasts, "cohort", calculated,
+    )
+
+    worker.process(item)
+    assert scheduler.notes == scheduler.runs == 1
+    assert builder.prepared[0]["cohorts"] == {
+        forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
+        for forecast in forecasts
+    }
+
+
+@pytest.mark.parametrize("outcome_status,previous_present,expected_notes,raises", (
+    ("IDEMPOTENT", True, 0, False),
+    ("OUTCOME_CONFLICT", True, 0, True),
+    ("INSERT", False, 0, False),
+))
+def test_non_new_outcomes_do_not_create_v4b_generation(
+        monkeypatch, outcome_status, previous_present, expected_notes, raises):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecasts = tuple(replace(item.forecast, persisted_at=NOW,
+                              persistence_proof_eligible=True)
+                      for item in calculated.persistence)
+    due = forecasts[0]
+    previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
+    current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
+
+    class StatusWriter(Writer):
+        def persist_outcome(self, record, created_at):
+            self.last_write_status = outcome_status
+            return record
+    class Builder:
+        def prepare(self, **_kwargs): pass
+    class Scheduler:
+        def __init__(self): self.notes = 0; self.runs = 0
+        def note_new_outcome(self): self.notes += 1
+        def run_if_due(self): self.runs += 1
+    scheduler = Scheduler()
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
+        state_builder=Builder(), state_build_scheduler=scheduler,
+    )
+    worker._pending = [due]
+    worker._writer = StatusWriter()
+    item = QuoteEvidenceWork(
+        1, "cycle", previous if previous_present else None, current,
+        due.target_endpoint, (), (), forecasts, "cohort", calculated,
+    )
+
+    if raises:
+        with pytest.raises(TerminalDeliveryError, match="OUTCOME_CONFLICT"):
+            worker.process(item)
+        assert scheduler.runs == 0
+    else:
+        worker.process(item)
+        assert scheduler.runs == 1
+    assert scheduler.notes == expected_notes
+
+
+def test_v4b_builder_failure_isolated_from_forecast_delivery(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecasts = tuple(replace(item.forecast, persisted_at=NOW,
+                              persistence_proof_eligible=True)
+                      for item in calculated.persistence)
+    due = forecasts[0]
+    previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
+    current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
+
+    class Builder:
+        def prepare(self, **_kwargs): pass
+    class FailingScheduler:
+        def note_new_outcome(self): pass
+        def run_if_due(self): raise RuntimeError("offline builder failed")
+    writer = Writer()
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
+        state_builder=Builder(), state_build_scheduler=FailingScheduler(),
+    )
+    worker._pending = [due]
+    worker._writer = writer
+    item = QuoteEvidenceWork(
+        1, "cycle", previous, current, due.target_endpoint,
+        (), (), forecasts, "cohort", calculated,
+    )
+
+    worker.process(item)
+    assert len(writer.outcomes) == 1
+    assert len(writer.forecasts) == 6
+    assert any(number.final_bps is not None for number in calculated.final_numbers)
+    assert dict(worker.metrics.snapshot().counters)["v4b_state_builder.failure"] == 1
 
 
 def test_metrics_have_percentiles_and_do_not_change_forecast():
