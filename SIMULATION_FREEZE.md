@@ -391,3 +391,317 @@ SIM-1 must test:
 ### SIM-0B and SIM-1 hard boundaries
 
 SIM-0B adds no Python implementation, tests, migration, database change, Render change, web change, broker integration, Q1–Q12 change, V1–V4 change, entry selection, resolution, P&L, compact state, or unrelated documentation rewrite.
+
+## SIM-1A — Exact SIM-2 Intent Persistence Freeze
+
+SIM-1A freezes the following SIM-2 persistence decisions exactly. It is documentation-only and does not implement SIM-2.
+
+### Identities
+
+```
+SIM_INTENT_STORE_VERSION = ATOM_TRUE_V9_SIM2_STORE_1
+SIM_INTENT_SCHEMA_VERSION = ATOM_TRUE_V9_SIM2_SCHEMA_1
+SIM_INTENT_TABLE = public.atom_v9_sim_intents
+SIM_RUNTIME_ROLE = atom_v9_sim_runtime
+MIGRATION_FILE = migrations/010_create_v9_sim_intents.sql
+```
+
+If migration number `010` is already occupied, stop without editing and report the conflict.
+
+### Database placement
+
+Use the existing PostgreSQL database and `public` schema, but use an isolated simulator table and isolated simulator role.
+
+No simulator foreign key may reference a production table.
+
+### Table — exact column order
+
+1. `intent_id text PRIMARY KEY`
+2. `intent_hash text UNIQUE NOT NULL`
+3. `contract_version text NOT NULL`
+4. `canonicalization_version text NOT NULL`
+5. `simulator_version text NOT NULL`
+6. `symbol text NOT NULL`
+7. `horizon text NOT NULL`
+8. `horizon_seconds integer NOT NULL`
+9. `cutoff_at timestamptz NOT NULL`
+10. `eligible_at timestamptz NOT NULL`
+11. `source_v3_status text NOT NULL`
+12. `decision text NOT NULL`
+13. `status text NOT NULL`
+14. `record_json jsonb NOT NULL`
+15. `created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP`
+
+`created_at` is operational metadata and is excluded from the mathematical intent hash.
+
+### Constraints
+
+- `intent_id` must match `^v9simintent:[0-9a-f]{64}$`.
+- `intent_hash` must match `^[0-9a-f]{64}$`.
+- `contract_version` must equal `ATOM_TRUE_V9_SIM1_INTENT_1`.
+- `canonicalization_version` must equal `ATOM_TRUE_V9_SIM_CANONICAL_V4A_1`.
+- `simulator_version` must equal `ATOM_TRUE_V9_SIM_1`.
+- `symbol` must equal `COIN`.
+- `horizon`/`horizon_seconds` pairs must be exactly:
+  - `30S`/`30`
+  - `1M`/`60`
+  - `5M`/`300`
+  - `15M`/`900`
+  - `30M`/`1800`
+  - `1H`/`3600`
+- `eligible_at >= cutoff_at`.
+- `source_v3_status` must be `AVAILABLE`, `PROVISIONAL`, or `UNAVAILABLE`.
+- `decision` must be `LONG`, `SHORT`, or `NO_TRADE`.
+- `status` must be `ACTIONABLE`, `NO_TRADE`, or `UNAVAILABLE`.
+- `record_json` must be a JSON object.
+- No foreign keys.
+- No uniqueness constraint on horizon, cutoff, session, date, or source cycle.
+
+### Index
+
+Create exactly one non-unique lookup index:
+
+```
+atom_v9_sim_intents_lookup_idx
+```
+
+on:
+
+```
+(symbol, horizon, eligible_at, intent_id)
+```
+
+### Unlimited history
+
+- Unlimited sequential intent and trade history.
+- No daily, session, or lifetime cap.
+- No deletion, rotation, overwrite, replacement, or truncation.
+- No uniqueness rule may limit repeated horizon activity over time.
+- `NO_TRADE` and `UNAVAILABLE` intents remain persistable evidence.
+- `NO_TRADE` and `UNAVAILABLE` never occupy a simulated position.
+- The one-open-trade-per-horizon rule belongs to later lifecycle phases, not SIM-2 persistence.
+
+### Role
+
+Create `atom_v9_sim_runtime` with exactly:
+
+```
+LOGIN
+NOINHERIT
+NOSUPERUSER
+NOCREATEDB
+NOCREATEROLE
+NOREPLICATION
+NOBYPASSRLS
+```
+
+The migration contains no password.
+
+If the role already exists, fail with `duplicate_object`. Do not adopt or alter an existing role.
+
+Grant the role:
+
+- `USAGE` on schema `public`.
+- `SELECT` and `INSERT` only on `public.atom_v9_sim_intents`.
+
+Grant no sequence privileges.
+
+The simulator role receives no privileges on production V1–V4, forecast, outcome, state, truth, calibration, `RANGE`, probability, or legacy evidence tables.
+
+Explicitly preserve isolation from:
+
+- `atom_v9_v4_forecasts`
+- `atom_v9_v4_outcomes`
+- `atom_v9_v4_states`
+- `forecasts`
+- `forecast_outcomes`
+- `volatility_forecasts`
+- `volatility_forecast_outcomes`
+
+Revoke simulator-table access from:
+
+- `PUBLIC`
+- `anon`
+- `authenticated`
+- `service_role`
+- `atom_v9_v4_runtime`
+
+### RLS and append-only enforcement
+
+Enable and FORCE row-level security.
+
+Create exactly two role-specific policies:
+
+- `atom_v9_sim_intents_runtime_select`
+- `atom_v9_sim_intents_runtime_insert`
+
+Only `atom_v9_sim_runtime` receives these policies.
+
+Create function:
+
+```
+public.atom_v9_sim_reject_mutation()
+```
+
+Properties:
+
+- `RETURNS trigger`
+- `LANGUAGE plpgsql`
+- `SECURITY INVOKER`
+- `SET search_path = pg_catalog`
+- Raises: `SIM evidence is append-only`
+
+Revoke function execution from:
+
+- `PUBLIC`
+- `anon`
+- `authenticated`
+- `service_role`
+- `atom_v9_v4_runtime`
+- `atom_v9_sim_runtime`
+
+Create:
+
+- Row-level `BEFORE UPDATE OR DELETE` trigger: `atom_v9_sim_intents_reject_update_delete`.
+- Statement-level `BEFORE TRUNCATE` trigger: `atom_v9_sim_intents_reject_truncate`.
+
+The runtime role must not own the table and must not bypass RLS.
+
+### Serialization
+
+SIM-2 must use the existing SIM-1:
+
+- `serialize_intent`
+- `deserialize_intent`
+
+`record_json` stores the JSON object obtained from the canonical serialized intent.
+
+PostgreSQL JSONB key normalization is allowed.
+
+Raw JSONB bytes are never treated as the mathematical hash input.
+
+Every loaded row must:
+
+1. Deserialize through `deserialize_intent`.
+2. Recalculate and validate `intent_hash` and `intent_id`.
+3. Match every duplicated relational column exactly.
+4. Reject missing, unknown, malformed, or noncanonical content.
+
+### Store API
+
+Future SIM-2 implementation creates:
+
+```python
+class SimulationIntentStore
+```
+
+Exact public methods:
+
+- `insert(intent: SimulationTradeIntent) -> str`
+- `get(intent_id: str) -> SimulationTradeIntent | None`
+
+The constructor receives an explicit no-argument database connection factory.
+
+It must not:
+
+- Read environment variables.
+- Use `DATABASE_URL`.
+- Use V4 credentials.
+- Fall back to privileged credentials.
+- Scan production tables.
+
+Before table access, verify `current_user` equals `atom_v9_sim_runtime`.
+
+### Insert results
+
+Exact successful results:
+
+- `INSERTED`
+- `IDEMPOTENT`
+
+Use an atomic PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` mechanism.
+
+If insertion conflicts:
+
+1. Re-read the row by `intent_id` or `intent_hash`.
+2. Deserialize and fully validate it.
+3. Compare its complete immutable intent content.
+
+Exact identical content returns `IDEMPOTENT`.
+
+Different content reusing either identity raises:
+
+```
+SimulationIntentConflictError
+reason = SIM2_INTENT_CONFLICT
+```
+
+Malformed or mismatched stored content raises:
+
+```
+SimulationIntentRowInvalidError
+reason = SIM2_ROW_INVALID
+```
+
+Wrong database role raises:
+
+```
+SimulationIntentRoleError
+reason = SIM2_ROLE_MISMATCH
+```
+
+Every successful operation commits.
+
+Every conflict or failure rolls back.
+
+Connections and cursors acquired by the store are closed on every path.
+
+### Authorized SIM-2 implementation files
+
+After this freeze is merged, SIM-2 may create exactly:
+
+- `migrations/010_create_v9_sim_intents.sql`
+- `quant/v9_sim2_store.py`
+- `tests/test_v9_sim2_persistence.py`
+
+It may not modify `quant/v9_sim1_contract.py` or any production file.
+
+### Required tests
+
+Freeze tests for:
+
+- Exact table shape and column order.
+- Every constraint.
+- One lookup index.
+- Exact role attributes.
+- Existing-role conflict.
+- Exact grants and revocations.
+- Absence of production-table privileges.
+- ENABLE and FORCE RLS.
+- Exact policies.
+- Row-level UPDATE/DELETE rejection.
+- Statement-level TRUNCATE rejection.
+- Safe trigger function configuration.
+- Serialization round trip.
+- Relational-column/payload equality.
+- Hash and ID tamper rejection.
+- Inserted result.
+- Idempotent identical insert.
+- Conflicting identity.
+- Concurrent identical insertion.
+- Commit, rollback, and connection closure.
+- Current-user enforcement.
+- Missing and malformed rows.
+- Unlimited horizon history.
+- Persistable `NO_TRADE` and `UNAVAILABLE` intents.
+- No mutation SQL.
+- No environment or credential fallback.
+- No production imports or table scans.
+- Full existing suite remains green.
+- Final diff contains only the three authorized SIM-2 files.
+
+### Phase boundary
+
+SIM-2 implements storage only.
+
+It does not implement runtime capture, open-position enforcement, entry, exit, resolution, P&L, compact state, web integration, Render changes, broker access, or order submission.
