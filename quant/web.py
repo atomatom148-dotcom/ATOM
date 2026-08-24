@@ -685,6 +685,7 @@ def main(*, simulator_connection_factory: Callable | None = None,
     v9_runtime = ProductionV9Runtime(database_url, v2_provider, metrics=metrics)
     from .evidence_outbox import (
         EvidenceLedgerWorker, EvidenceOutbox, PostgresV4BStateBuilder,
+        PostgresV4CStateBuilder, PostgresV4StateBuilder,
         V4StateCacheRefresher,
     )
     from .v9_v4d_integration import OfflineStateBuildScheduler
@@ -700,8 +701,10 @@ def main(*, simulator_connection_factory: Callable | None = None,
         accuracy_cache=v9_runtime.accuracy_cache,
     )
     accuracy_builder = PostgresV4BStateBuilder(ledger_connection)
-    accuracy_scheduler = OfflineStateBuildScheduler(
-        accuracy_builder.build_and_publish, metrics=metrics,
+    compact_builder = PostgresV4CStateBuilder(ledger_connection)
+    state_builder = PostgresV4StateBuilder(accuracy_builder, compact_builder)
+    state_scheduler = OfflineStateBuildScheduler(
+        state_builder.build_and_publish, metrics=metrics,
     )
     sim3 = _start_sim3(simulator_connection_factory, simulator_utc_clock)
     try:
@@ -710,8 +713,8 @@ def main(*, simulator_connection_factory: Callable | None = None,
                 database_url, connection=ledger_connection),
             connection=ledger_connection,
             metrics=metrics, cache_refresher=cache_refresher,
-            state_builder=accuracy_builder,
-            state_build_scheduler=accuracy_scheduler,
+            state_builder=state_builder,
+            state_build_scheduler=state_scheduler,
             simulation_submit=sim3.submit if sim3 is not None else None,
         )
         ledger_worker.start()

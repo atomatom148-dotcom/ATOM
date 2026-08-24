@@ -17,8 +17,18 @@ from typing import Callable
 from .evidence import ForecastRecord as RawForecastRecord, VolatilityForecastRecord
 from .history import MidpointObservation
 from .v9_v4a_evidence import ForecastRecord as V4ForecastRecord, V4AWriter, canonical_target_identity
-from .v9_v4a_evidence import deserialize_forecast_record, deserialize_outcome_record
+from .v9_v4a_evidence import (
+    CONTRACT_VERSION as V4_CONTRACT_VERSION, EVIDENCE_VERSION as V4_EVIDENCE_VERSION,
+    canonical_sha256, deserialize_forecast_record, deserialize_outcome_record,
+    select_non_overlapping,
+)
 from .v9_v4b_accuracy import AccuracyStateStore, build_accuracy_state
+from .v9_v1_contract import HORIZONS
+from .v9_v4c_predictive import (
+    CalibrationObservation, CompactHorizonState, RangeValidationObservation,
+    V4CStateStore, build_thresholds, build_v4c_state, calibrate_range,
+    calibrate_scale,
+)
 from .v9_v4d_integration import (
     ImmutableStateCache, OfflineStateBuildScheduler, OperationalMetrics,
     V4DCycleOutput, resolve_outcome,
@@ -114,6 +124,165 @@ class PostgresV4BStateBuilder:
             cohorts=cohorts, evidence=evidence,
         )
         return self._store.insert(state, self._clock())
+
+
+class PostgresV4CStateBuilder:
+    """Build the frozen compact V4C state from governed immutable V4A evidence."""
+
+    def __init__(self, connection, *, state_store=None,
+                 wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+        self._connection = connection
+        self._store = state_store or V4CStateStore(connection)
+        self._clock = wall_clock
+        self._candidate = None
+
+    def prepare(self, *, symbol: str, state_as_of: datetime,
+                cohorts: dict[str, tuple[str, str]]) -> None:
+        self._candidate = (symbol, state_as_of, dict(cohorts))
+
+    def build_and_publish(self) -> str:
+        if self._candidate is None:
+            return "SKIPPED_NO_CANDIDATE"
+        symbol, state_as_of, cohorts = self._candidate
+        cursor = self._connection.cursor()
+        try:
+            cursor.execute(
+                """SELECT f.forecast_record_hash, f.record_json,
+                          o.outcome_record_hash, o.record_json
+                   FROM public.atom_v9_v4_forecasts AS f
+                   JOIN public.atom_v9_v4_outcomes AS o
+                     USING (forecast_record_id)
+                   WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
+                   ORDER BY f.cutoff_at, f.forecast_record_id,
+                            o.created_at, o.outcome_record_id""",
+                (symbol, state_as_of, state_as_of),
+            )
+            rows = tuple(cursor.fetchall())
+            commit = getattr(self._connection, "commit", None)
+            if callable(commit):
+                commit()
+        except Exception:
+            rollback = getattr(self._connection, "rollback", None)
+            if callable(rollback):
+                rollback()
+            raise
+        finally:
+            close = getattr(cursor, "close", None)
+            if callable(close):
+                close()
+        evidence = tuple(
+            (deserialize_forecast_record(forecast_json, expected_hash=str(forecast_hash)),
+             deserialize_outcome_record(outcome_json, expected_hash=str(outcome_hash)))
+            for forecast_hash, forecast_json, outcome_hash, outcome_json in rows
+        )
+        state = self._build_state(symbol, state_as_of, cohorts, evidence)
+        return self._store.insert(state, self._clock())
+
+    @staticmethod
+    def _build_state(symbol, state_as_of, cohorts, evidence):
+        if tuple(cohorts) != HORIZONS:
+            raise ValueError("cohorts must contain exactly six canonical horizons in order")
+        compact = []
+        selected_all = []
+        for horizon in HORIZONS:
+            cohort_id, cohort_hash = cohorts[horizon]
+            governed = tuple((forecast, outcome) for forecast, outcome in evidence if
+                forecast.horizon == horizon and forecast.cohort_id == cohort_id and
+                forecast.cohort_hash == cohort_hash and forecast.symbol == symbol and
+                forecast.contract_version == V4_CONTRACT_VERSION and
+                forecast.evidence_version == V4_EVIDENCE_VERSION and
+                outcome.contract_version == V4_CONTRACT_VERSION and
+                outcome.evidence_version == V4_EVIDENCE_VERSION and
+                forecast.evidence_origin == "PRODUCTION" and
+                forecast.persistence_proof_eligible is True and outcome.proof_eligible and
+                outcome.target_timing_status == "VERIFIED" and
+                outcome.forecast_record_id == forecast.forecast_record_id and
+                forecast.cutoff_at <= state_as_of and outcome.target_resolved_at <= state_as_of and
+                forecast.expected_return_bps is not None and
+                forecast.predictive_variance_bps2 is not None and
+                outcome.actual_return_bps is not None and
+                all(isinstance(value, (int, float)) and not isinstance(value, bool) and
+                    math.isfinite(value) for value in (
+                        forecast.expected_return_bps,
+                        forecast.predictive_variance_bps2,
+                        outcome.actual_return_bps)) and
+                forecast.predictive_variance_bps2 > 0)
+            selection = select_non_overlapping(governed)
+            selected_ids = set(selection.selected_ids)
+            selected = tuple(sorted(
+                (pair for pair in governed if pair[0].forecast_record_id in selected_ids),
+                key=lambda pair: (pair[0].cutoff_at, pair[0].forecast_record_id)))
+            selected_all.extend(selected)
+
+            split = max(0, len(selected) - 250)
+            calibration_pairs, validation_pairs = selected[:split], selected[split:]
+            calibration_end = (calibration_pairs[-1][0].cutoff_at
+                               if calibration_pairs else state_as_of)
+            observations = tuple(CalibrationObservation(
+                forecast.cutoff_at, forecast.forecast_record_id,
+                float(outcome.actual_return_bps), float(forecast.expected_return_bps),
+                float(forecast.predictive_variance_bps2),
+                forecast.cutoff_at.date().isoformat(), outcome.target_resolved_at)
+                for forecast, outcome in calibration_pairs)
+            thresholds = build_thresholds(observations, reference_end=calibration_end)
+            scale = calibrate_scale(observations, calibration_end=calibration_end)
+            scores = tuple(abs(observation.actual_bps - observation.mean_bps) /
+                (scale.kappa * math.sqrt(observation.q0_bps2)) for observation in observations
+                if scale.kappa is not None)
+            provisional = calibrate_range(scores, (), (), validation_end=state_as_of)
+            validation = tuple(RangeValidationObservation(
+                forecast.cutoff_at, outcome.target_resolved_at,
+                float(outcome.actual_return_bps),
+                float(forecast.expected_return_bps) - provisional.quantile *
+                    scale.kappa * math.sqrt(float(forecast.predictive_variance_bps2)),
+                float(forecast.expected_return_bps) + provisional.quantile *
+                    scale.kappa * math.sqrt(float(forecast.predictive_variance_bps2)),
+                forecast.cutoff_at.date().isoformat())
+                for forecast, outcome in validation_pairs
+                if provisional.quantile is not None and scale.kappa is not None)
+            sessions = tuple(dict.fromkeys(item.session_id for item in validation))
+            range_result = calibrate_range(scores, validation, sessions,
+                                           validation_end=state_as_of)
+            residuals = tuple(sorted(
+                (observation.actual_bps - observation.mean_bps) /
+                (scale.kappa * math.sqrt(observation.q0_bps2)) for observation in observations
+                if scale.kappa is not None))
+            reasons = tuple(sorted(set(thresholds.reason_codes + scale.reason_codes +
+                                       range_result.reason_codes)))
+            compact.append(CompactHorizonState(
+                horizon, thresholds.status, thresholds.medium_bps,
+                thresholds.large_bps, scale.status, scale.kappa_squared, scale.kappa,
+                range_result.status, range_result.quantile, residuals,
+                ("UNAVAILABLE",) * 6, reasons))
+        cutoffs = tuple(pair[0].cutoff_at for pair in selected_all)
+        combined_cohort = "v9v4statecohort:" + canonical_sha256(
+            tuple(cohorts[horizon] for horizon in HORIZONS))
+        return build_v4c_state(
+            symbol=symbol, cohort_id=combined_cohort, state_as_of=state_as_of,
+            evidence_first_cutoff=min(cutoffs) if cutoffs else None,
+            evidence_last_cutoff=max(cutoffs) if cutoffs else None,
+            horizons=tuple(compact))
+
+
+class PostgresV4StateBuilder:
+    """Publish V4B and V4C from the same new-outcome scheduler generation."""
+
+    def __init__(self, accuracy_builder, compact_builder):
+        self._accuracy_builder = accuracy_builder
+        self._compact_builder = compact_builder
+
+    def prepare(self, **candidate) -> None:
+        self._accuracy_builder.prepare(**candidate)
+        self._compact_builder.prepare(**candidate)
+
+    def build_and_publish(self) -> str:
+        accuracy = self._accuracy_builder.build_and_publish()
+        compact = self._compact_builder.build_and_publish()
+        if "INSERT" in (accuracy, compact):
+            return "INSERT"
+        if accuracy == compact == "IDEMPOTENT":
+            return "IDEMPOTENT"
+        return compact if compact != "IDEMPOTENT" else accuracy
 
 
 @dataclass(frozen=True, slots=True)
