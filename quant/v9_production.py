@@ -310,13 +310,21 @@ def build_live_v1(snapshot: LiveSnapshot, v2: V2EvidenceState) -> V1Input:
         result = results[quant_id]
         values = (getattr(result, "volatility_bps", None) if quant_id == "q3_volatility"
                   else getattr(result, "forecast_bps", None))
+        source_epoch = latest.event_epoch
+        if quant_id in ("q4_stat_arb", "q10_options_vol") and result is not None:
+            source_epoch = getattr(result, "source_as_of_epoch", None)
+            if (isinstance(source_epoch, bool) or
+                    not isinstance(source_epoch, (int, float)) or
+                    not math.isfinite(source_epoch)):
+                raise RuntimeError(f"{quant_id.upper()}_PROVIDER_TIMESTAMP_UNAVAILABLE")
+        source_at = datetime.fromtimestamp(source_epoch, timezone.utc)
         for index, horizon in enumerate(HORIZONS):
             value = None if values is None else values[index]
             observations.append(V1SlotObservation(
                 quant_id, FORMULA_VERSION_MAP[quant_id], horizon,
                 HORIZON_SECONDS[horizon],
                 MAGNITUDE_BPS if quant_id == "q3_volatility" else DIRECTIONAL_BPS,
-                value, cutoff_at, cutoff_at, cutoff_at,
+                value, cutoff_at, source_at, cutoff_at,
                 DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION,
                 None if value is not None else "MISSING_VALUE",
             ))

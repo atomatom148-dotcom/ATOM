@@ -131,6 +131,16 @@ class LatestMarketDisplay:
     qqq_event_epoch: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class LivePublication:
+    """One immutable market/V9 publication captured under one lock."""
+
+    snapshot: LiveSnapshot
+    v9_output: object | None
+    cross_asset_state: CrossAssetState
+    market_display: LatestMarketDisplay
+
+
 class LiveMarketState:
     """Thread-safe causal live state with separate COIN and QQQ histories."""
 
@@ -168,6 +178,10 @@ class LiveMarketState:
         self._market_display = LatestMarketDisplay()
         self._v9_output: object | None = None
         self._v9_error: str | None = None
+        self._coin_cycle_pending = False
+        self._publication = LivePublication(
+            self._snapshot, self._v9_output, self._g2_state, self._market_display,
+        )
 
     def update_market_display(
         self, *, coin_midpoint: float | None = None,
@@ -203,6 +217,10 @@ class LiveMarketState:
                     float(qqq_midpoint) if qqq_newer else current.qqq_midpoint,
                     float(qqq_event_epoch) if qqq_newer else current.qqq_event_epoch,
                 )
+                if not self._coin_cycle_pending:
+                    self._publication = replace(
+                        self._publication, market_display=self._market_display,
+                    )
                 changed = True
         return changed
 
@@ -210,7 +228,7 @@ class LiveMarketState:
         """Return the current immutable display snapshot."""
 
         with self._lock:
-            return self._market_display
+            return self._publication.market_display
 
     def accept_qqq_quote(self, *, bid: float, ask: float, event_epoch: float) -> bool:
         """Store one validated QQQ midpoint without inventing or resampling data."""
@@ -245,6 +263,11 @@ class LiveMarketState:
                 self._snapshot.option_surface,
             )
             self._refresh_g2(event_epoch)
+            if not self._coin_cycle_pending:
+                self._publication = replace(
+                    self._publication, snapshot=self._snapshot,
+                    cross_asset_state=self._g2_state,
+                )
         return True
 
     def accept_g2_price(self, *, asset: str, price: float, event_epoch: float) -> bool:
@@ -271,6 +294,10 @@ class LiveMarketState:
             else:
                 self._ndx_history = updated
             self._refresh_g2(event_epoch)
+            if not self._coin_cycle_pending:
+                self._publication = replace(
+                    self._publication, cross_asset_state=self._g2_state,
+                )
         return True
 
     def _refresh_g2(self, event_epoch: float) -> None:
@@ -285,7 +312,7 @@ class LiveMarketState:
         """Return the latest already-maintained immutable G2-A state."""
 
         with self._lock:
-            return self._g2_state
+            return self._publication.cross_asset_state
 
     def accept_quote(
         self, *, bid: float, ask: float, event_epoch: float,
@@ -404,43 +431,68 @@ class LiveMarketState:
             self._refresh_g2(event_epoch)
             self._coin_sequence += 1
             sequence = self._coin_sequence
+            self._coin_cycle_pending = True
+            cycle_g2_state = self._g2_state
+            cycle_market_display = self._market_display
         output = None
+        v9_error = None
         if self._v9_cycle_handler is not None:
             try:
                 output = self._v9_cycle_handler(
                     next_snapshot, previous_observation, observation,
                 )
             except Exception as error:
-                with self._lock:
-                    self._v9_error = type(error).__name__
-            else:
-                if output is not None:
-                    with self._lock:
-                        self._v9_error = None
+                v9_error = type(error).__name__
         delivery_status = "NOT_CONFIGURED"
         if self._evidence_outbox is not None:
-            v4 = tuple(result.forecast for result in output.persistence) if output else ()
-            delivered = self._evidence_outbox.put_nowait(QuoteEvidenceWork(
-                sequence=sequence,
-                cycle_id=f"COIN:{event_epoch:.9f}",
-                previous_observation=previous_observation,
-                current_observation=observation,
-                received_at=datetime.fromtimestamp(cycle, timezone.utc),
-                directional=tuple(forecasts), q3=tuple(volatility_forecasts), v4=v4,
-                state_cohort_id=getattr(output, "state_cohort_id", None),
-                v4d_output=output,
-            ))
-            delivery_status = "ENQUEUED" if delivered else "DROPPED"
+            try:
+                v4 = tuple(result.forecast for result in output.persistence) if output else ()
+                delivered = self._evidence_outbox.put_nowait(QuoteEvidenceWork(
+                    sequence=sequence,
+                    cycle_id=f"COIN:{event_epoch:.9f}",
+                    previous_observation=previous_observation,
+                    current_observation=observation,
+                    received_at=datetime.fromtimestamp(cycle, timezone.utc),
+                    directional=tuple(forecasts), q3=tuple(volatility_forecasts), v4=v4,
+                    state_cohort_id=getattr(output, "state_cohort_id", None),
+                    v4d_output=output,
+                ))
+                delivery_status = "ENQUEUED" if delivered else "DROPPED"
+            except Exception as error:
+                delivery_status = "FAILED"
+                v9_error = v9_error or type(error).__name__
+                self.metrics.increment("evidence_outbox.failure")
         if output is not None:
-            if hasattr(output, "evidence_delivery_status"):
-                output = replace(output, evidence_delivery_status=delivery_status)
-            with self._lock:
-                self._v9_output = output
+            try:
+                if hasattr(output, "evidence_delivery_status"):
+                    output = replace(output, evidence_delivery_status=delivery_status)
+            except Exception as error:
+                output = None
+                v9_error = v9_error or type(error).__name__
+        with self._lock:
+            self._v9_output = output
+            self._v9_error = v9_error
+            self._coin_cycle_pending = False
+            self._publication = LivePublication(
+                next_snapshot, output, cycle_g2_state, cycle_market_display,
+            )
         self.metrics.observe("coin_market_state_update_latency_ms",
                              (self._monotonic() - update_started) * 1000)
         return True
 
     def snapshot(self) -> LiveSnapshot:
+        with self._lock:
+            return self._publication.snapshot
+
+    def publication(self) -> LivePublication:
+        """Return market, V9, cross-asset, and display state from one commit."""
+
+        with self._lock:
+            return self._publication
+
+    def input_snapshot(self) -> LiveSnapshot:
+        """Return the latest accepted inputs, including a cycle still in flight."""
+
         with self._lock:
             return self._snapshot
 
@@ -448,7 +500,7 @@ class LiveMarketState:
         """Return the latest complete immutable V1→V4D cycle, if available."""
 
         with self._lock:
-            return self._v9_output
+            return self._publication.v9_output
 
     def v9_error(self) -> str | None:
         with self._lock:
@@ -470,6 +522,10 @@ class LiveMarketState:
                 current.regime, current.event_session, observation,
                 current.option_surface,
             )
+            if not self._coin_cycle_pending:
+                self._publication = replace(
+                    self._publication, snapshot=self._snapshot,
+                )
 
     def accept_option_surface(self, surface: OptionSurface, *, midpoint: float) -> None:
         """Atomically publish a complete surface and its dashboard anchor call."""
@@ -491,6 +547,10 @@ class LiveMarketState:
                 current.cross_asset, current.factor, current.options_vol,
                 current.regime, current.event_session, representative, surface,
             )
+            if not self._coin_cycle_pending:
+                self._publication = replace(
+                    self._publication, snapshot=self._snapshot,
+                )
 
 
 def parse_alpaca_timestamp(value: str) -> float:
@@ -699,7 +759,7 @@ def start_alpaca_options_poller(state: LiveMarketState) -> threading.Thread:
     return thread
 
 
-__all__ = ["LatestMarketDisplay", "LiveMarketState", "LiveSnapshot",
+__all__ = ["LatestMarketDisplay", "LiveMarketState", "LivePublication", "LiveSnapshot",
            "BTC_FETCH_SECONDS", "BTC_SOURCE_TIMEOUT_SECONDS", "MAX_BTC_AGE_SECONDS",
            "MARKET_DISPLAY_FETCH_SECONDS", "QUANT_CYCLE_SECONDS", "parse_alpaca_ndx_value",
            "parse_alpaca_timestamp", "parse_massive_ndx_snapshot", "poll_alpaca",

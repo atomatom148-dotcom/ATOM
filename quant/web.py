@@ -542,7 +542,7 @@ def create_app(
                                       ("Content-Length", str(len(body)))])
             return [body]
         if path == "/api/g2-cross-asset":
-            value = state.cross_asset_state() if state is not None else None
+            value = state.publication().cross_asset_state if state is not None else None
             body = json.dumps(
                 asdict(value) if value is not None else None,
                 separators=(",", ":"), allow_nan=False,
@@ -591,10 +591,13 @@ def create_app(
                                     ("Content-Length", str(len(body)))])
             return [body]
         if path == "/api/live":
-            snapshot = state.snapshot() if state is not None else None
-            cross_asset_state = state.cross_asset_state() if state is not None else None
-            market_display = state.market_display() if state is not None else None
-            v9_output = state.v9_output() if state is not None else None
+            publication = state.publication() if state is not None else None
+            snapshot = publication.snapshot if publication is not None else None
+            cross_asset_state = (
+                publication.cross_asset_state if publication is not None else None
+            )
+            market_display = publication.market_display if publication is not None else None
+            v9_output = publication.v9_output if publication is not None else None
             as_of_epoch = clock()
             data = dashboard_data(
                 history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
@@ -619,9 +622,13 @@ def create_app(
                 ("Content-Length", str(len(body))),
             ])
             return [body]
-        snapshot = state.snapshot() if state is not None else None
-        cross_asset_state = state.cross_asset_state() if state is not None else None
-        v9_output = state.v9_output() if state is not None else None
+        publication = state.publication() if state is not None else None
+        snapshot = publication.snapshot if publication is not None else None
+        cross_asset_state = (
+            publication.cross_asset_state if publication is not None else None
+        )
+        market_display = publication.market_display if publication is not None else None
+        v9_output = publication.v9_output if publication is not None else None
         as_of_epoch = clock()
         cached = evidence_cache.snapshot() if evidence_cache is not None else DashboardEvidenceSnapshot()
         counts = cached.counts
@@ -629,7 +636,8 @@ def create_app(
         data = dashboard_data(
             history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
             now_epoch=as_of_epoch, evidence_counts=counts, phase_e_cohorts=cohorts,
-            cross_asset_state=cross_asset_state, v9_output=v9_output,
+            cross_asset_state=cross_asset_state, market_display=market_display,
+            v9_output=v9_output,
             calculate_missing=False,
         )
         if path == "/":

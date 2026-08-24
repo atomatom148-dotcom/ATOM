@@ -1,6 +1,7 @@
 import json
 import subprocess
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -176,7 +177,8 @@ class WebSurfaceTests(unittest.TestCase):
             v1=SimpleNamespace(cutoff_at=datetime.fromtimestamp(100.0, timezone.utc)),
             final_numbers=(),
         )
-        with patch.object(state, "v9_output", return_value=v9_output):
+        publication = replace(state.publication(), v9_output=v9_output)
+        with patch.object(state, "publication", return_value=publication):
             payload = json.loads(request(
                 create_app(state=state, clock=lambda: 105.0), "/api/live"
             )["body"])
@@ -209,8 +211,7 @@ class WebSurfaceTests(unittest.TestCase):
                 return function(*args, **kwargs)
             return wrapper
 
-        for name in ("snapshot", "cross_asset_state", "market_display", "v9_output"):
-            setattr(state, name, traced(name, getattr(state, name)))
+        state.publication = traced("publication", state.publication)
 
         def clock():
             order.append("clock")
@@ -218,10 +219,7 @@ class WebSurfaceTests(unittest.TestCase):
 
         request(create_app(state=state, clock=clock), "/api/live")
 
-        self.assertGreater(order.index("clock"), order.index("snapshot"))
-        self.assertGreater(order.index("clock"), order.index("cross_asset_state"))
-        self.assertGreater(order.index("clock"), order.index("market_display"))
-        self.assertGreater(order.index("clock"), order.index("v9_output"))
+        self.assertEqual(order, ["publication", "clock"])
 
     def test_live_renderer_updates_every_market_field(self):
         page = request(create_app(), "/")["body"].decode()
@@ -296,7 +294,8 @@ class WebSurfaceTests(unittest.TestCase):
 
         state = LiveMarketState()
         output = SimpleNamespace(final_numbers=(), accuracy=())
-        with patch.object(state, "v9_output", return_value=output):
+        publication = replace(state.publication(), v9_output=output)
+        with patch.object(state, "publication", return_value=publication):
             response = request(create_app(state=state, evidence_store=Store()), "/api/live")
 
         self.assertEqual(response["status"], "200 OK")

@@ -11,7 +11,7 @@ from .models import HORIZONS
 
 
 QUANT_ID = "q4_stat_arb"
-FORMULA_VERSION = "coin-market-residual-ar1-v1"
+FORMULA_VERSION = "coin-market-residual-ar1-v2"
 HORIZON_SECONDS = (30, 60, 300, 900, 1800, 3600)
 LOOKBACK_SECONDS = 3600
 MAX_QQQ_AGE_SECONDS = 5
@@ -23,6 +23,7 @@ class StatArbResult:
     quant_id: str
     formula_version: str
     cutoff_epoch: float
+    source_as_of_epoch: float
     forecast_bps: tuple[float, ...]
     alpha: float
     beta: float
@@ -56,6 +57,8 @@ def calculate_stat_arb(
     qqq = tuple(item for item in qqq_history.observations if item.event_epoch <= cutoff_epoch)
     pairs = _synchronize(coin, qqq)
     if len(pairs) < MIN_SYNCHRONIZED_OBSERVATIONS:
+        return None
+    if cutoff_epoch - pairs[-1][1].event_epoch > MAX_QQQ_AGE_SECONDS:
         return None
 
     c = tuple(math.log(pair[0].midpoint) for pair in pairs)
@@ -96,7 +99,7 @@ def calculate_stat_arb(
     if not all(math.isfinite(value) for value in forecasts):
         return None
     return StatArbResult(
-        QUANT_ID, FORMULA_VERSION, cutoff_epoch, forecasts,
+        QUANT_ID, FORMULA_VERSION, cutoff_epoch, pairs[-1][1].event_epoch, forecasts,
         alpha, beta, phi, current_residual, delta,
     )
 

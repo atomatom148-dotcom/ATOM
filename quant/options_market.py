@@ -130,10 +130,15 @@ def parse_alpaca_option_snapshot(
         bid = bid if bid is not None and bid >= 0 else None
         ask = ask if ask is not None and ask >= 0 else None
     premium = (bid + ask) / 2 if valid_market else None
-    event_epoch = cutoff_epoch
     timestamp = quote.get("t")
-    if isinstance(timestamp, str):
-        event_epoch = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+    if not isinstance(timestamp, str):
+        raise ValueError("latestQuote.t is required")
+    provider_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    if provider_time.tzinfo is None:
+        raise ValueError("latestQuote.t must include a UTC offset")
+    event_epoch = provider_time.timestamp()
+    if not math.isfinite(event_epoch):
+        raise ValueError("latestQuote.t must be finite")
     greeks = snapshot.get("greeks")
     greeks = greeks if isinstance(greeks, dict) else {}
     return OptionObservation(
@@ -224,13 +229,28 @@ def fetch_coin_option_surface(*, midpoint: float, cutoff_epoch: float) -> Option
         snapshot_query["page_token"] = token
 
     def observations(items: tuple[dict[str, object], ...]) -> tuple[OptionObservation, ...]:
-        return tuple(parse_alpaca_option_snapshot(item, snapshots[item["symbol"]], cutoff_epoch=cutoff_epoch)
-                     for item in items if isinstance(snapshots.get(item["symbol"]), dict))
+        parsed = []
+        for item in items:
+            raw = snapshots.get(item["symbol"])
+            if not isinstance(raw, dict):
+                continue
+            try:
+                parsed.append(parse_alpaca_option_snapshot(
+                    item, raw, cutoff_epoch=cutoff_epoch,
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return tuple(parsed)
 
     call_observations, put_observations = observations(calls), observations(puts)
     if not call_observations and not put_observations:
         return None
-    return OptionSurface(cutoff_epoch, expiration.isoformat(), call_observations, put_observations)
+    provider_as_of = min(
+        item.event_epoch for item in call_observations + put_observations
+    )
+    return OptionSurface(
+        provider_as_of, expiration.isoformat(), call_observations, put_observations,
+    )
 
 
 def poll_alpaca_options(state: object, *, interval: float = OPTIONS_POLL_INTERVAL,
@@ -239,7 +259,7 @@ def poll_alpaca_options(state: object, *, interval: float = OPTIONS_POLL_INTERVA
 
     while True:
         try:
-            snapshot = state.snapshot()
+            snapshot = state.input_snapshot()
             if snapshot.history.latest is not None:
                 surface = fetch_coin_option_surface(
                     midpoint=snapshot.history.latest.midpoint, cutoff_epoch=clock(),
