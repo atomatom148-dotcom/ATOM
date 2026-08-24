@@ -14,18 +14,19 @@ import math
 from typing import Iterable
 
 from quant.v9_v2a_dataset import (
-    DIRECTIONAL_FAMILIES, HORIZON_SECONDS, METHOD_VERSION as V2A_METHOD_VERSION,
-    Q3, SYMBOL, V2ADataset,
+    DIRECTIONAL_FAMILIES, FamilyLineage, HORIZON_SECONDS,
+    METHOD_VERSION as V2A_METHOD_VERSION, Q3, SYMBOL, V2ADataset,
+    v2a_dataset_hash,
 )
 from quant.v9_v2b_calibration import (
     FORMULA_VERSION as V2B_METHOD_VERSION, DirectionalCalibration,
-    Q3MagnitudeCalibration, V2BCalibration,
+    Q3MagnitudeCalibration, V2BCalibration, v2b_component_hash,
 )
 from quant.v9_v2c_covariance import METHOD_VERSION as V2C_METHOD_VERSION, V2CCovariance
 
 
-STATE_SCHEMA_VERSION = "V9-V2D-STATE-2"
-STATE_VERSION = "V9-V2D-2"
+STATE_SCHEMA_VERSION = "V9-V2D-STATE-3"
+STATE_VERSION = "V9-V2D-3"
 MODEL_FAMILY = "V9-V2"
 EFFECTIVE_N_METHOD_VERSION = "V9-V2B-PAIRED-IPS-1"
 CALIBRATION_METHOD_VERSION = V2B_METHOD_VERSION
@@ -39,6 +40,9 @@ STATUSES = frozenset(("MATURE", "PROVISIONAL", "UNAVAILABLE"))
 class DirectionalCalibrationState:
     quant_id: str
     formula_version: str
+    data_schema_version: str
+    source_spec_version: str
+    dataset_hash: str
     calibration_intercept: float
     calibration_slope: float
     calibration_parameter_covariance_2x2: tuple[tuple[float, float], tuple[float, float]]
@@ -55,6 +59,9 @@ class Q3MagnitudeState:
     reason_codes: tuple[str, ...]
     quant_id: str | None = None
     formula_version: str | None = None
+    data_schema_version: str | None = None
+    source_spec_version: str | None = None
+    dataset_hash: str | None = None
     calibration_alpha: float | None = None
     calibration_beta: float | None = None
     parameter_covariance_2x2: tuple[tuple[float, float], tuple[float, float]] | None = None
@@ -71,6 +78,7 @@ class HorizonEvidenceState:
     status: str
     reason_codes: tuple[str, ...]
     directional_calibrations: tuple[DirectionalCalibrationState, ...]
+    family_lineage: tuple[FamilyLineage, ...]
     ordered_quant_ids: tuple[str, ...]
     pair_support_boolean_matrix: tuple[tuple[bool, ...], ...]
     stabilized_covariance_matrix: tuple[tuple[float, ...], ...] | None
@@ -171,7 +179,7 @@ def _reasons(*groups: Iterable[str]) -> tuple[str, ...]:
 
 def _missing(horizon: str, reason: str = "HORIZON_EVIDENCE_UNAVAILABLE") -> HorizonEvidenceState:
     return HorizonEvidenceState(
-        horizon, HORIZON_SECONDS[horizon], "UNAVAILABLE", (reason,), (), (), (), None,
+        horizon, HORIZON_SECONDS[horizon], "UNAVAILABLE", (reason,), (), (), (), (), None,
         False, "UNAVAILABLE", (("COVARIANCE_UNAVAILABLE",) if reason != "COVARIANCE_UNAVAILABLE" else (reason,)),
         Q3MagnitudeState("UNAVAILABLE", ("Q3_EVIDENCE_UNAVAILABLE",)),
     )
@@ -179,7 +187,8 @@ def _missing(horizon: str, reason: str = "HORIZON_EVIDENCE_UNAVAILABLE") -> Hori
 
 def _directional(item: DirectionalCalibration) -> DirectionalCalibrationState:
     return DirectionalCalibrationState(
-        item.quant_id, item.formula_version, item.calibration_intercept,
+        item.quant_id, item.formula_version, item.data_schema_version,
+        item.source_spec_version, item.dataset_hash, item.calibration_intercept,
         item.calibration_slope, item.calibration_parameter_covariance_2x2,
         item.effective_n, item.residual_variance, item.residual_standard_deviation,
         item.status, tuple(sorted(item.reason_codes)),
@@ -191,7 +200,9 @@ def _q3(item: Q3MagnitudeCalibration | None) -> Q3MagnitudeState:
         return Q3MagnitudeState("UNAVAILABLE", ("Q3_EVIDENCE_UNAVAILABLE",))
     return Q3MagnitudeState(
         item.status, tuple(sorted(item.reason_codes)), item.quant_id,
-        item.formula_version, item.calibration_alpha, item.calibration_beta,
+        item.formula_version, item.data_schema_version,
+        item.source_spec_version, item.dataset_hash,
+        item.calibration_alpha, item.calibration_beta,
         item.parameter_covariance_2x2, item.effective_n,
         item.magnitude_residual_variance, item.magnitude_mae, item.magnitude_rmse,
     )
@@ -204,19 +215,53 @@ def _assemble_horizon(dataset: V2ADataset, calibration: V2BCalibration,
     subsets = tuple(dataset.directional_subsets)
     expected_ids = tuple(item.quant_id for item in subsets)
     expected_formulas = tuple(item.formula_version for item in subsets)
+    components = (dataset, calibration, covariance)
+    if not _all_finite(components):
+        return _missing(horizon, "NONFINITE_COMPONENT_STATE"), False
+    lineage_map = {item.quant_id: item for item in dataset.family_lineage}
+    expected_lineage = tuple(lineage_map.get(quant_id) for quant_id in expected_ids)
+    q3_lineage = lineage_map.get(Q3)
     b_items = tuple(item for item in calibration.directional if item.horizon == horizon)
-    b_map = {(item.quant_id, item.formula_version): item for item in b_items}
-    ordered_b = tuple(b_map.get(pair) for pair in zip(expected_ids, expected_formulas))
+    b_map = {(item.quant_id, item.formula_version,
+              item.data_schema_version, item.source_spec_version,
+              item.dataset_hash): item for item in b_items}
+    ordered_b = tuple(b_map.get((
+        quant_id, formula, lineage.data_schema_version,
+        lineage.source_spec_version, dataset.dataset_hash,
+    )) if lineage is not None else None
+        for quant_id, formula, lineage in zip(
+            expected_ids, expected_formulas, expected_lineage))
     q3_subset = dataset.q3_subset
     q3_items = tuple(item for item in calibration.q3_magnitude if item.horizon == horizon)
     q3_item = next((item for item in q3_items if q3_subset and
-                    (item.quant_id, item.formula_version) ==
-                    (q3_subset.quant_id, q3_subset.formula_version)), None)
+                    q3_lineage is not None and
+                    (item.quant_id, item.formula_version,
+                     item.data_schema_version, item.source_spec_version,
+                     item.dataset_hash) ==
+                    (q3_subset.quant_id, q3_subset.formula_version,
+                     q3_lineage.data_schema_version,
+                     q3_lineage.source_spec_version,
+                     dataset.dataset_hash)), None)
+    calibration_hash = v2b_component_hash(calibration, horizon)
+    manifest = dict(calibration.input_manifest)
+    canonical_family_lineage = tuple(
+        lineage_map[q] for q in (*DIRECTIONAL_FAMILIES, Q3)
+        if q in lineage_map
+    )
     integrity = (
         dataset.symbol == SYMBOL and dataset.method_version == V2A_METHOD_VERSION and
+        dataset.dataset_hash == v2a_dataset_hash(dataset) and
         calibration.formula_version == V2B_METHOD_VERSION and
+        len(manifest) == len(calibration.input_manifest) and
+        manifest.get(horizon) == dataset.dataset_hash and
         covariance.method_version == V2C_METHOD_VERSION and covariance.horizon == horizon and
+        covariance.dataset_hash == dataset.dataset_hash and
+        covariance.v2b_component_hash == calibration_hash and
         all(item.horizon == horizon for item in b_items + q3_items) and
+        len(b_map) == len(b_items) and
+        dataset.family_lineage == canonical_family_lineage and
+        all(item is not None for item in expected_lineage) and
+        covariance.ordered_family_lineage == expected_lineage and
         expected_ids == tuple(q for q in DIRECTIONAL_FAMILIES if q in expected_ids) and
         len(b_items) == len(expected_ids) and all(ordered_b) and
         covariance.ordered_quant_ids == expected_ids and
@@ -234,9 +279,6 @@ def _assemble_horizon(dataset: V2ADataset, calibration: V2BCalibration,
         ((q3_subset is None and not q3_items) or
          (q3_subset is not None and len(q3_items) == 1 and q3_item is not None))
     )
-    components = (dataset, calibration, covariance)
-    if not _all_finite(components):
-        return _missing(horizon, "NONFINITE_COMPONENT_STATE"), False
     if not integrity:
         return _missing(horizon, "CROSS_LAYER_INTEGRITY_FAILURE"), False
 
@@ -265,6 +307,7 @@ def _assemble_horizon(dataset: V2ADataset, calibration: V2BCalibration,
         status = "PROVISIONAL"
     return HorizonEvidenceState(
         horizon, HORIZON_SECONDS[horizon], status, tuple(sorted(reasons)), directional,
+        dataset.family_lineage,
         covariance.ordered_quant_ids,
         covariance.pair_support_boolean_matrix,
         covariance.stabilized_covariance_matrix if covariance_usable else None,
@@ -286,6 +329,17 @@ def build_v2d_evidence_state(*, state_as_of: float,
     ds_by_h = {item.horizon: item for item in ds_items}
     cov_by_h = {item.horizon: item for item in cov_items}
     duplicate_horizons = (len(ds_by_h) != len(ds_items) or len(cov_by_h) != len(cov_items))
+    invalid_calibration_manifests = set()
+    for calibration in cal_items:
+        entries = tuple(calibration.input_manifest)
+        manifest = dict(entries)
+        expected = tuple(
+            (horizon, ds_by_h[horizon].dataset_hash)
+            for horizon in HORIZONS
+            if horizon in manifest and horizon in ds_by_h
+        )
+        if len(manifest) != len(entries) or entries != expected:
+            invalid_calibration_manifests.add(id(calibration))
     horizon_states = []
     hashes: list[ComponentHash] = []
     accepted_datasets: list[V2ADataset] = []
@@ -300,6 +354,8 @@ def build_v2d_evidence_state(*, state_as_of: float,
             horizon_states.append(_missing(horizon)); continue
         if dataset is None or covariance is None or len(matching_calibrations) != 1:
             horizon_states.append(_missing(horizon, "CROSS_LAYER_INTEGRITY_FAILURE")); continue
+        if id(matching_calibrations[0]) in invalid_calibration_manifests:
+            horizon_states.append(_missing(horizon, "CROSS_LAYER_INTEGRITY_FAILURE")); continue
         if dataset.state_as_of > state_as_of:
             horizon_states.append(_missing(horizon, "CROSS_LAYER_INTEGRITY_FAILURE")); continue
         if duplicate_horizons:
@@ -312,12 +368,8 @@ def build_v2d_evidence_state(*, state_as_of: float,
             accepted_indexes.append(len(horizon_states) - 1)
             hashes.extend((
                 ComponentHash(horizon, "V2A", dataset.dataset_hash),
-                ComponentHash(horizon, "V2B", _digest((
-                    calibration.formula_version,
-                    tuple(item for item in calibration.directional if item.horizon == horizon),
-                    tuple(item for item in calibration.q3_magnitude if item.horizon == horizon),
-                    calibration.gamma, calibration.gamma_state,
-                ))),
+                ComponentHash(horizon, "V2B", v2b_component_hash(
+                    calibration, horizon)),
                 ComponentHash(horizon, "V2C", _digest(covariance)),
             ))
     accepted_identities = {

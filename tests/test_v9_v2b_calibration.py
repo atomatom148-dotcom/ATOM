@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import math
 
 import pytest
@@ -95,3 +95,18 @@ def test_q3_is_separate_nonnegative_and_gamma_is_frozen():
 def test_nonfinite_scores_are_rejected():
     with pytest.raises(ValueError):
         effective_n((1, math.nan))
+
+
+def test_input_manifest_and_family_lineage_are_exact_and_duplicate_horizons_fail():
+    dataset = _dataset("30S", (1, 2, 3), {"q1_momentum": (0, 1, 2)})
+    result = calibrate_v2b((dataset,))
+
+    assert result.input_manifest == (("30S", dataset.dataset_hash),)
+    assert (result.directional[0].data_schema_version,
+            result.directional[0].source_spec_version,
+            result.directional[0].dataset_hash) == (
+                "s1", "src1", dataset.dataset_hash)
+    with pytest.raises(ValueError, match="duplicate V2-A horizon"):
+        calibrate_v2b((dataset, dataset))
+    with pytest.raises(ValueError, match="invalid V2-A dataset hash"):
+        calibrate_v2b((replace(dataset, dataset_hash="0" * 64),))

@@ -7,15 +7,19 @@ used below is already admitted by :mod:`quant.v9_v2a_dataset`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import hashlib
+import json
 import math
 import sys
 from typing import Iterable, Sequence
 
-from quant.v9_v2a_dataset import Q3, V2ADataset
+from quant.v9_v2a_dataset import (
+    HORIZON_SECONDS, Q3, V2ADataset, v2a_dataset_hash,
+)
 
 
-FORMULA_VERSION = "V9-V2B-1"
+FORMULA_VERSION = "V9-V2B-2"
 ALPHA_BIAS = 0.05
 _EPS = sys.float_info.epsilon
 
@@ -45,6 +49,9 @@ class DirectionalCalibration:
     quant_id: str
     formula_version: str
     horizon: str
+    data_schema_version: str
+    source_spec_version: str
+    dataset_hash: str
     raw_resolved_count: int
     canonical_skeleton_count: int
     family_observation_count: int
@@ -78,6 +85,9 @@ class Q3MagnitudeCalibration:
     quant_id: str
     formula_version: str
     horizon: str
+    data_schema_version: str
+    source_spec_version: str
+    dataset_hash: str
     magnitude_target_specification: str
     family_observation_count: int
     kish_n: float
@@ -107,10 +117,41 @@ class Q3MagnitudeCalibration:
 @dataclass(frozen=True, slots=True)
 class V2BCalibration:
     formula_version: str
+    input_manifest: tuple[tuple[str, str], ...]
     directional: tuple[DirectionalCalibration, ...]
     q3_magnitude: tuple[Q3MagnitudeCalibration, ...]
     gamma: float
     gamma_state: str
+
+
+def _canonical(value: object) -> object:
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite V2-B component")
+        return {"$float64": (0.0 if value == 0.0 else value).hex()}
+    if isinstance(value, (tuple, list)):
+        return [_canonical(item) for item in value]
+    if hasattr(value, "__dataclass_fields__"):
+        return _canonical(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _canonical(value[key])
+                for key in sorted(value, key=str)}
+    return value
+
+
+def v2b_component_hash(calibration: V2BCalibration, horizon: str) -> str:
+    """Bind one horizon's V2-B values to their exact V2-A lineage."""
+    payload = (
+        calibration.formula_version,
+        calibration.input_manifest,
+        tuple(item for item in calibration.directional if item.horizon == horizon),
+        tuple(item for item in calibration.q3_magnitude if item.horizon == horizon),
+        calibration.gamma,
+        calibration.gamma_state,
+    )
+    encoded = json.dumps(_canonical(payload), sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _zero(x: float) -> float:
@@ -159,6 +200,9 @@ class _Series:
     dataset: V2ADataset
     quant_id: str
     formula: str
+    data_schema_version: str
+    source_spec_version: str
+    dataset_hash: str
     x: tuple[float, ...]
     y: tuple[float, ...]
     en: EffectiveN
@@ -174,13 +218,20 @@ class _Preliminary:
 
 def _series(dataset: V2ADataset, quant_id: str, formula: str,
             observations: Iterable[object], magnitude: bool = False) -> _Series:
+    lineage = next((item for item in dataset.family_lineage
+                    if (item.quant_id, item.formula_version) ==
+                    (quant_id, formula)), None)
+    if lineage is None:
+        raise ValueError("family lineage is missing from V2-A dataset")
     targets = {row.identity: row.target_bps for row in dataset.skeleton}
     pairs = tuple((float(row.value_bps), abs(targets[row.target_identity]) if magnitude
                    else targets[row.target_identity]) for row in observations)
     x = tuple(pair[0] for pair in pairs)
     y = tuple(pair[1] for pair in pairs)
     score = tuple((abs(b) - a) if magnitude else (b - a) for a, b in pairs)
-    return _Series(dataset, quant_id, formula, x, y, effective_n(score))
+    return _Series(dataset, quant_id, formula, lineage.data_schema_version,
+                   lineage.source_spec_version, dataset.dataset_hash,
+                   x, y, effective_n(score))
 
 
 def _moments(s: _Series) -> tuple[float, float, float, float, float]:
@@ -290,6 +341,7 @@ def _directional_result(s: _Series, prior: tuple[float, float], donors: int,
     tau_a, tau_c = prior
     if not n:
         return DirectionalCalibration(s.quant_id, s.formula, s.dataset.horizon,
+            s.data_schema_version, s.source_spec_version, s.dataset_hash,
             s.dataset.raw_resolved_count, len(s.dataset.skeleton), 0, 0.0, 1.0, 0.0,
             tau_a, tau_c, None, None, 0.0, 1.0, False, False,
             ((0.0,0.0),(0.0,0.0)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
@@ -364,6 +416,7 @@ def _finish_directional(s: _Series, a: float, c: float, cov, d: float,
               "RESIDUAL_SCALE_FALLBACK" not in reasons and not boundary and
               "TINY_EFFECTIVE_N" not in reasons)
     return DirectionalCalibration(s.quant_id,s.formula,s.dataset.horizon,
+        s.data_schema_version,s.source_spec_version,s.dataset_hash,
         s.dataset.raw_resolved_count,len(s.dataset.skeleton),n,s.en.kish_n,
         s.en.serial_dependence_factor,s.en.effective_n,ta,tc,la,lc,_zero(a),_zero(c),
         boundary,identifiable,cov,_zero(d),_zero(raw),_zero(calibrated),
@@ -377,7 +430,9 @@ def _q3_result(s: _Series, prior: tuple[float,float], donors: int, pool: float |
                target_spec: str) -> Q3MagnitudeCalibration:
     reasons=list(s.en.reasons); n=len(s.x); ta,tb=prior
     if not n:
-        return Q3MagnitudeCalibration(Q3,s.formula,s.dataset.horizon,target_spec,0,0,1,0,
+        return Q3MagnitudeCalibration(Q3,s.formula,s.dataset.horizon,
+            s.data_schema_version,s.source_spec_version,s.dataset_hash,
+            target_spec,0,0,1,0,
             0,1,False,False,ta,tb,None,None,((0.,0.),(0.,0.)),0,0,0,0,0,0,0,0,
             "UNAVAILABLE",("NO_EVIDENCE",))
     if donors<2:
@@ -425,7 +480,9 @@ def _finish_q3(s,a,b,cov,d,ta,tb,la,lb,reasons,target_spec):
             "SERIAL_DEPENDENCE_UNIDENTIFIABLE" not in reasons and
             "RESIDUAL_SCALE_UNAVAILABLE" not in reasons and "RESIDUAL_SCALE_FALLBACK" not in reasons and
             "TINY_EFFECTIVE_N" not in reasons and "BETA_BOUNDARY" not in reasons and "ALPHA_BOUNDARY" not in reasons)
-    return Q3MagnitudeCalibration(Q3,s.formula,s.dataset.horizon,target_spec,n,s.en.kish_n,
+    return Q3MagnitudeCalibration(Q3,s.formula,s.dataset.horizon,
+        s.data_schema_version,s.source_spec_version,s.dataset_hash,
+        target_spec,n,s.en.kish_n,
         s.en.serial_dependence_factor,s.en.effective_n,_zero(a),_zero(b),a==0,b==0,ta,tb,la,lb,cov,
         _zero(math.fsum(x-y for x,y in zip(s.x,s.y))/n),_zero(-mean),
         _zero(math.fsum(abs(r) for r in residuals)/n),_zero(math.sqrt(mse)),_zero(var),
@@ -436,8 +493,10 @@ def _finish_q3(s,a,b,cov,d,ta,tb,la,lb,reasons,target_spec):
 def calibrate_v2b(datasets: Iterable[V2ADataset]) -> V2BCalibration:
     """Calibrate compatible families per horizon and Q3 across horizons."""
     data=tuple(datasets)
-    if len({(d.horizon,d.dataset_hash) for d in data}) != len(data):
-        raise ValueError("duplicate V2-A dataset")
+    if len({d.horizon for d in data}) != len(data):
+        raise ValueError("duplicate V2-A horizon")
+    if any(d.dataset_hash != v2a_dataset_hash(d) for d in data):
+        raise ValueError("invalid V2-A dataset hash")
     directional=[]
     for d in data:
         directional.extend(_series(d,s.quant_id,s.formula_version,s.observations)
@@ -446,7 +505,8 @@ def calibrate_v2b(datasets: Iterable[V2ADataset]) -> V2BCalibration:
     def cohort(s):
         d=s.dataset
         return (d.horizon,d.symbol,d.target_spec_id,d.target_data_schema_version,
-                d.target_source_spec_version)
+                d.target_source_spec_version,s.data_schema_version,
+                s.source_spec_version)
     priors={}; pools={}
     for key in {cohort(s) for s in directional}:
         members=[s for s in directional if cohort(s)==key]
@@ -465,7 +525,7 @@ def calibrate_v2b(datasets: Iterable[V2ADataset]) -> V2BCalibration:
     def qcohort(s):
         d=s.dataset
         return (d.symbol,d.target_spec_id,d.target_data_schema_version,d.target_source_spec_version,
-                s.formula)
+                s.formula,s.data_schema_version,s.source_spec_version)
     qhyper={}
     for key in {qcohort(s) for s in qseries}:
         members=[s for s in qseries if qcohort(s)==key]
@@ -483,7 +543,11 @@ def calibrate_v2b(datasets: Iterable[V2ADataset]) -> V2BCalibration:
         tsa,tb,count,pool=qhyper[qcohort(s)]
         qresults.append(_q3_result(s,((math.fsum(y*y for y in s.y)/len(s.y))*tsa if s.y else 0.,tb),count,pool,
                                     "ABSOLUTE_DIRECTIONAL_TARGET_BPS"))
-    return V2BCalibration(FORMULA_VERSION,dresults,tuple(qresults),0.0,
+    manifest = tuple((horizon, next(d.dataset_hash for d in data
+                                    if d.horizon == horizon))
+                     for horizon in HORIZON_SECONDS
+                     if any(d.horizon == horizon for d in data))
+    return V2BCalibration(FORMULA_VERSION,manifest,dresults,tuple(qresults),0.0,
                           "SCALE_CONDITIONING_UNAVAILABLE_PENDING_CAUSAL_V3_REPLAY")
 
 

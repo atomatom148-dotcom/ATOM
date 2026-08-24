@@ -58,7 +58,8 @@ def _inputs(family_count=1, unavailable_horizon=None):
     for horizon in HORIZONS:
         active = horizon != unavailable_horizon
         calibrations = tuple(DirectionalCalibrationState(
-            quant_id, "f1", 0.0, 1.0, ((0.0, 0.0), (0.0, 0.0)),
+            quant_id, "f1", "schema", "source", "dataset",
+            0.0, 1.0, ((0.0, 0.0), (0.0, 0.0)),
             100.0, 1.0, 1.0, "PROVISIONAL", ()) for quant_id in ids) if active else ()
         n = len(calibrations)
         states.append(SimpleNamespace(

@@ -69,6 +69,45 @@ def test_causal_resolution_boundaries_and_family_validity():
     assert reasons(dataset)["NONFINITE_VALUE"] == 1
 
 
+@pytest.mark.parametrize(
+    "bad_target",
+    (
+        RawTarget(10, "early-resolution", "COIN", "log-return-v1", "ts1",
+                  "target-src1", "30S", 10, 40, 39, 1.0),
+        RawTarget(11, "wrong-maturity", "COIN", "log-return-v1", "ts1",
+                  "target-src1", "30S", 10, 41, 41, 1.0),
+    ),
+)
+def test_target_timing_requires_exact_endpoint_and_post_maturity_resolution(bad_target):
+    result = build([bad_target])
+    assert result.skeleton == ()
+    assert reasons(result) == {"TARGET_TIMING_MISMATCH": 1}
+
+
+def test_family_attachment_requires_exact_cutoff_and_causal_time_chain():
+    t = target(1, 10, resolved=40)
+    wrong_cutoff = observation(1, t)
+    wrong_cutoff = RawFamilyObservation(
+        wrong_cutoff.record_id, wrong_cutoff.target_identity, wrong_cutoff.symbol,
+        wrong_cutoff.quant_id, wrong_cutoff.formula_version,
+        wrong_cutoff.data_schema_version, wrong_cutoff.source_spec_version,
+        wrong_cutoff.horizon, wrong_cutoff.numerical_type, wrong_cutoff.value_bps,
+        11, wrong_cutoff.source_as_of_epoch, wrong_cutoff.available_epoch,
+        wrong_cutoff.availability_state,
+    )
+    at_maturity = observation(2, t, available=40)
+    after_maturity = observation(3, t, available=40.001)
+    before_cutoff = observation(4, t, available=9)
+
+    result = build([t], [wrong_cutoff, at_maturity, after_maturity, before_cutoff])
+
+    assert result.directional_subsets[0].observations == ()
+    assert reasons(result) == {
+        "FAMILY_TARGET_MISMATCH": 1,
+        "FORECAST_NOT_CAUSAL": 3,
+    }
+
+
 @pytest.mark.parametrize("quant", ["q1_momentum", Q3])
 def test_only_fresh_family_observations_can_enter_subsets(quant):
     t = target(1, 10)
@@ -97,6 +136,24 @@ def test_exact_versions_are_isolated():
     assert reasons(result) == {"DATA_SCHEMA_VERSION_MISMATCH": 2,
                                "FORMULA_VERSION_MISMATCH": 1,
                                "SOURCE_SPEC_VERSION_MISMATCH": 1}
+
+
+def test_declared_family_lineage_is_canonical_complete_and_hash_bound():
+    t = target(1, 10)
+    base = build([t], versions=tuple(reversed(VERSIONS)))
+    changed = build([t], versions=(
+        ("q1_momentum", "f1", "fs2", "src1"),
+        ("q2_mean_reversion", "f2", "fs1", "src1"),
+        (Q3, "f3", "fs1", "src1"),
+    ))
+
+    assert tuple(item.quant_id for item in base.family_lineage) == (
+        "q1_momentum", "q2_mean_reversion", Q3,
+    )
+    assert base.family_lineage[0].data_schema_version == "fs1"
+    assert base.dataset_hash != changed.dataset_hash
+    with pytest.raises(ValueError, match="invalid lineage"):
+        build([t], versions=(("not-a-family", "f", "s", "src"),))
 
 
 def test_duplicate_collapse_conflict_and_permutation_are_deterministic():

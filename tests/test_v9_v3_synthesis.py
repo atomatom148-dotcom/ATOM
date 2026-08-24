@@ -9,7 +9,8 @@ from quant.v9_v3_synthesis import CANONICAL_FAMILIES, synthesize_v3
 
 
 def _cal(q, *, a=0.0, c=1.0, residual=1.0, status="MATURE"):
-    return DirectionalCalibrationState(q, "f1", a, c, ((0.0, 0.0), (0.0, 0.0)),
+    return DirectionalCalibrationState(q, "f1", "schema", "source", "dataset",
+                                       a, c, ((0.0, 0.0), (0.0, 0.0)),
                                        100.0, residual, residual ** .5, status, ())
 
 

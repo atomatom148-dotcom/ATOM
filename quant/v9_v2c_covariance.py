@@ -10,11 +10,16 @@ from dataclasses import dataclass
 import math
 import sys
 
-from quant.v9_v2a_dataset import DIRECTIONAL_FAMILIES, TargetIdentity, V2ADataset
-from quant.v9_v2b_calibration import V2BCalibration, effective_n
+from quant.v9_v2a_dataset import (
+    DIRECTIONAL_FAMILIES, FamilyLineage, TargetIdentity, V2ADataset,
+    v2a_dataset_hash,
+)
+from quant.v9_v2b_calibration import (
+    V2BCalibration, effective_n, v2b_component_hash,
+)
 
 
-METHOD_VERSION = "V9-V2C-1"
+METHOD_VERSION = "V9-V2C-2"
 OAS_METHOD = "STANDARD_COMPLETE_CASE_OAS"
 EPSILON_RELATIVE = math.sqrt(sys.float_info.epsilon)
 EPSILON_ABSOLUTE = sys.float_info.min
@@ -27,8 +32,11 @@ Matrix = tuple[tuple[float, ...], ...]
 class V2CCovariance:
     method_version: str
     horizon: str
+    dataset_hash: str
+    v2b_component_hash: str
     ordered_quant_ids: tuple[str, ...]
     ordered_formula_versions: tuple[str, ...]
+    ordered_family_lineage: tuple[FamilyLineage, ...]
     pairwise_raw_synchronized_n_matrix: Matrix
     pairwise_effective_n_matrix: Matrix
     pair_support_boolean_matrix: tuple[tuple[bool, ...], ...]
@@ -127,12 +135,30 @@ def _oas(rows: list[list[float]]) -> tuple[list[list[float]], list[list[float]],
 
 def build_v2c_covariance(dataset: V2ADataset, calibration: V2BCalibration) -> V2CCovariance:
     """Build the immutable covariance state for one V2-A horizon cohort."""
+    if dataset.dataset_hash != v2a_dataset_hash(dataset):
+        raise ValueError("invalid V2-A dataset hash")
+    manifest = dict(calibration.input_manifest)
+    if (len(manifest) != len(calibration.input_manifest) or
+            manifest.get(dataset.horizon) != dataset.dataset_hash):
+        raise ValueError("V2-B input manifest does not match V2-A dataset")
+    calibration_hash = v2b_component_hash(calibration, dataset.horizon)
     subsets = {item.quant_id: item for item in dataset.directional_subsets}
     quant_ids = tuple(q for q in DIRECTIONAL_FAMILIES if q in subsets)
-    calibrations = {(item.horizon, item.quant_id, item.formula_version): item
-                    for item in calibration.directional}
-    selected = [calibrations.get((dataset.horizon, q, subsets[q].formula_version))
-                for q in quant_ids]
+    calibrations = {}
+    for item in calibration.directional:
+        key = (item.horizon, item.quant_id, item.formula_version,
+               item.data_schema_version, item.source_spec_version,
+               item.dataset_hash)
+        if key in calibrations:
+            raise ValueError("duplicate V2-B directional calibration lineage")
+        calibrations[key] = item
+    lineage_by_quant = {item.quant_id: item for item in dataset.family_lineage}
+    ordered_lineage = tuple(lineage_by_quant[q] for q in quant_ids)
+    selected = [calibrations.get((
+        dataset.horizon, q, subsets[q].formula_version,
+        lineage_by_quant[q].data_schema_version,
+        lineage_by_quant[q].source_spec_version, dataset.dataset_hash,
+    )) for q in quant_ids]
     formulas = tuple(subsets[q].formula_version for q in quant_ids)
     targets = {row.identity: row.target_bps for row in dataset.skeleton}
     residuals: list[dict[TargetIdentity, float]] = []
@@ -265,7 +291,10 @@ def build_v2c_covariance(dataset: V2ADataset, calibration: V2BCalibration) -> V2
     if status == "UNAVAILABLE":
         reasons.add("SUPPORTED_POSITIVE_SCALE_UNAVAILABLE")
         dependence = False
-    return V2CCovariance(METHOD_VERSION, dataset.horizon, quant_ids, formulas,
+    return V2CCovariance(
+        METHOD_VERSION, dataset.horizon, dataset.dataset_hash,
+        calibration_hash, quant_ids, formulas,
+        ordered_lineage,
         _matrix(counts), _matrix(neffs), tuple(tuple(row) for row in support), _matrix(pair_cov),
         tuple(quant_ids[j] for j in representatives), complete_n, duplicate_groups,
         _matrix(empirical), shrinkage, delta, pooled, _matrix(psd_matrix), _matrix(stable),

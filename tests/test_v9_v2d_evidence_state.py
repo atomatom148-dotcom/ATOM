@@ -5,7 +5,7 @@ import pytest
 
 from quant.v9_v2a_dataset import (
     DIRECTIONAL_BPS, ExclusionCount, HORIZON_SECONDS, RawFamilyObservation, RawTarget,
-    TargetIdentity, build_v2a_dataset,
+    TargetIdentity, build_v2a_dataset, v2a_dataset_hash,
 )
 from quant.v9_v2b_calibration import calibrate_v2b
 from quant.v9_v2c_covariance import build_v2c_covariance
@@ -73,6 +73,10 @@ def test_covariance_pair_support_is_forwarded_verbatim_and_immutable():
     assert slot.ordered_quant_ids is component[2].ordered_quant_ids
     assert slot.pair_support_boolean_matrix is component[2].pair_support_boolean_matrix
     assert slot.ordered_directional_quant_ids == slot.ordered_quant_ids
+    assert slot.family_lineage is component[0].family_lineage
+    assert slot.directional_calibrations[0].data_schema_version == "qs1"
+    assert slot.directional_calibrations[0].source_spec_version == "q-src1"
+    assert slot.directional_calibrations[0].dataset_hash == component[0].dataset_hash
     assert isinstance(slot.pair_support_boolean_matrix, tuple)
     assert all(isinstance(row, tuple) for row in slot.pair_support_boolean_matrix)
     assert all(isinstance(value, bool)
@@ -132,6 +136,23 @@ def test_cross_layer_integrity_rejects_mismatches(mutation):
     slot = state.horizon_state_tuple[0]
     assert slot.status == "UNAVAILABLE"
     assert "CROSS_LAYER_INTEGRITY_FAILURE" in slot.reason_codes
+
+
+def test_cross_layer_lineage_rejects_calibration_and_covariance_from_other_dataset():
+    dataset, calibration, covariance = _components()
+    other_dataset = replace(
+        dataset,
+        exclusions=(ExclusionCount("DIFFERENT_CANONICAL_DATASET", 1),),
+    )
+    other_dataset = replace(
+        other_dataset, dataset_hash=v2a_dataset_hash(other_dataset))
+
+    state = _state(((other_dataset, calibration, covariance),))
+
+    assert state.horizon_state_tuple[0].status == "UNAVAILABLE"
+    assert state.horizon_state_tuple[0].reason_codes == (
+        "CROSS_LAYER_INTEGRITY_FAILURE",)
+    assert state.component_hash_tuple == ()
 
 
 def test_future_cutoff_is_excluded_and_heterogeneous_cutoffs_are_explicit():
@@ -272,7 +293,7 @@ def test_rejected_bundle_does_not_contribute_top_level_metadata(kind, reason):
                 baseline.target_source_spec_version)
 
 
-def test_fixed_rejected_bundle_participates_and_changes_state_identity():
+def test_forged_dataset_hash_cannot_promote_a_rejected_bundle():
     valid, rejected = _rejected_bundle_fixture("nonfinite")
     rejected_state = _state((valid, rejected))
     fixed = _components("1M", state_as_of=10000.0)
@@ -281,14 +302,10 @@ def test_fixed_rejected_bundle_participates_and_changes_state_identity():
         exclusions=(ExclusionCount("FIXED_BUNDLE_EXCLUSION", 3),),
         dataset_hash="f" * 64,
     )
-    fixed_state = _state((valid, (fixed_dataset, fixed[1], fixed[2])))
+    forged_state = _state((valid, (fixed_dataset, fixed[1], fixed[2])))
 
-    assert fixed_state.horizon_state_tuple[1].status == "MATURE"
-    assert fixed_state.training_start == -500.0
-    assert fixed_state.training_end == 9999.0
-    assert ("FIXED_BUNDLE_EXCLUSION", 3) in fixed_state.exclusion_count_tuple
-    assert fixed_state.component_hash_tuple != rejected_state.component_hash_tuple
-    assert fixed_state.evidence_manifest_hash != rejected_state.evidence_manifest_hash
-    assert fixed_state.state_hash != rejected_state.state_hash
-    assert not any("forecast" in field.lower() or "final_bps" in field.lower()
-                   for field in fixed_state.__dataclass_fields__)
+    assert forged_state.horizon_state_tuple[1].status == "UNAVAILABLE"
+    assert forged_state.horizon_state_tuple[1].reason_codes == (
+        "CROSS_LAYER_INTEGRITY_FAILURE",)
+    assert forged_state.component_hash_tuple == rejected_state.component_hash_tuple
+    assert forged_state.evidence_manifest_hash == rejected_state.evidence_manifest_hash

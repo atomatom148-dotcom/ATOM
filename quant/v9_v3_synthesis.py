@@ -219,8 +219,10 @@ def _eligible_v1_slot(slot: object, calibration: DirectionalCalibrationState,
         slot.numerical_type == DIRECTIONAL_BPS and
         slot.availability_state == "FRESH" and
         slot.formula_version == calibration.formula_version and
-        slot.data_schema_version == v1.data_schema_version and
-        slot.source_spec_version == v1.source_spec_version and
+        slot.data_schema_version == calibration.data_schema_version ==
+        v1.data_schema_version and
+        slot.source_spec_version == calibration.source_spec_version ==
+        v1.source_spec_version and
         isinstance(value, (int, float)) and not isinstance(value, bool) and
         math.isfinite(value) and
         isinstance(slot.forecast_cutoff_at, datetime) and
