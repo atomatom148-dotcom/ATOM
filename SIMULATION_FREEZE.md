@@ -705,3 +705,157 @@ Freeze tests for:
 SIM-2 implements storage only.
 
 It does not implement runtime capture, open-position enforcement, entry, exit, resolution, P&L, compact state, web integration, Render changes, broker access, or order submission.
+
+## SIM-2A — Exact SIM-3 Asynchronous V4D Intent Capture Freeze
+
+SIM-2A freezes the smallest SIM-3 implementation described below. It is documentation-only, does not implement SIM-3, and does not authorize any later simulator phase.
+
+### Purpose
+
+SIM-3 only converts one completed immutable `V4DCycleOutput` into SIM-1 intents and asynchronously persists those intents through `SimulationIntentStore`. It performs no entry, exit, position, resolution, P&L, compact-state, web, broker, options, or order behavior.
+
+### Production boundary and owner
+
+The exact production owner is `quant.v9_production.ProductionV9Runtime.on_quote`. It receives the completed `V4DCycleOutput` immediately after its local `V4DCoordinator.run_cycle()` call returns. The one authorized production hook is in that method, after `run_cycle()` returns and therefore after every V4 forecast-persistence result in `V4DCycleOutput.persistence` is final. The method submits the completed output to the injected SIM-3 capture adapter and then publishes and returns the production output normally, regardless of simulator state or submit result.
+
+Capture must never be placed inside V1, V2, V3, V4C, V4D mathematics, or `V4DCoordinator.run_cycle()`. It must never execute while the COIN or BTC ingestion lock is held. The production quote owner and its caller must preserve the existing outside-lock execution boundary. Production publishes normally if capture is absent, not started, stopped, failed, full, malformed, or throws an ordinary exception.
+
+### Authorized SIM-3 implementation files
+
+After this freeze is merged, SIM-3 may change exactly these three files and no others:
+
+- create `quant/v9_sim3_capture.py`;
+- create `tests/test_v9_sim3_capture.py`; and
+- minimally modify the production-owner file `quant/v9_production.py` only to inject the capture adapter and invoke its post-V4D nonblocking submit hook.
+
+No other production, quant, test, migration, schema, Render, web, or configuration file is authorized.
+
+### Immutable cycle handoff
+
+`quant/v9_sim3_capture.py` shall define exactly one cycle work-item value type named `SimulationCaptureWorkItem`:
+
+```python
+@dataclass(frozen=True, slots=True)
+class SimulationCaptureWorkItem:
+    cycle_output: V4DCycleOutput
+    eligible_at: datetime
+```
+
+`cycle_output` is the completed immutable `V4DCycleOutput`; `eligible_at` is one validated UTC timestamp. The work item contains no mutable collection, and SIM-3 must not copy either field into a mutable container as part of the handoff.
+
+### Clock
+
+The capture adapter constructor receives exactly one callable UTC clock. Submit reads it exactly once for each completed V4D cycle, after V4D completion and immediately before constructing and enqueueing the work item. That single `eligible_at` applies to all six horizons. The value must be a valid timezone-aware `datetime` at UTC offset zero whose timestamp is finite; naive, non-UTC, nonfinite, unrepresentable, or otherwise invalid values are rejected. Clock access is forbidden everywhere else in SIM-3. Clock failure is contained, emits only bounded telemetry, and returns `CAPTURE_UNAVAILABLE`.
+
+### Source eligibility and exact mapping
+
+A horizon creates an intent only when its matching `PersistenceResult.status` is exactly `INSERTED` or `IDEMPOTENT`. `FAILED`, `PERSISTENCE_NOT_ATTEMPTED`, and every other status create no simulator intent and only increment bounded failure telemetry. SIM-3 uses `PersistenceResult.forecast`, the exact successfully persisted V4 forecast record returned for that horizon; it performs no lookup or reconstruction.
+
+For each eligible horizon, SIM-3 calls the frozen SIM-1 `build_simulation_trade_intent` constructor exactly once with this field-to-field mapping, using values from the same immutable `V4DCycleOutput` and its matching horizon members:
+
+| SIM-1 constructor argument | Exact SIM-3 source |
+| --- | --- |
+| `source_cycle_id` | `cycle_output.cycle_id` |
+| `source_forecast_record_id` | `persistence_result.forecast.forecast_record_id` |
+| `source_forecast_record_hash` | `persistence_result.forecast.forecast_record_hash` |
+| `source_v2_state_id` | `cycle_output.v2.state_id` |
+| `source_v2_state_hash` | `cycle_output.v2.state_hash` |
+| `source_v3_contract_version` | `persistence_result.forecast.v3_contract_version` |
+| `source_v3_model_version` | `cycle_output.v3.model_version`, which must equal `persistence_result.forecast.v3_model_version` |
+| `cutoff_at` | `cycle_output.cutoff_at` |
+| `eligible_at` | `work_item.eligible_at` |
+| `horizon` | matching `cycle_output.v3.horizon_results[*].horizon` |
+| `horizon_seconds` | matching `cycle_output.v3.horizon_results[*].horizon_seconds` |
+| `final_bps` | matching `cycle_output.final_numbers[*].final_bps` |
+| `source_v3_status` | translation of matching `cycle_output.v3.horizon_results[*].status` below |
+
+The exact V3-to-SIM-1 status translation is `MATURE` → `AVAILABLE`, `PROVISIONAL` → `PROVISIONAL`, and `UNAVAILABLE` → `UNAVAILABLE`. No other V3 status is accepted. The matching `PersistenceResult.horizon`, `PersistenceResult.forecast.horizon`, V3 horizon, and final-numbers horizon must all equal the frozen horizon being processed; the forecast `cycle_id`, `cutoff_at`, `v2_state_id`, and `v2_state_hash` must equal their mapped cycle values. SIM-3 delegates decision, intent status, and quantity mapping exclusively to `build_simulation_trade_intent`; it must not recreate SIM-1 mathematics.
+
+### Horizon behavior
+
+The worker iterates exactly `30S`, `1M`, `5M`, `15M`, `30M`, `1H`, in that order. Each eligible horizon is independently built and persisted. One horizon failure cannot block any later horizon. Malformed, duplicate, missing, or out-of-order V4D horizon structure fails the affected complete cycle closed before any intent is built or persisted, emits bounded telemetry, and never changes production.
+
+`NO_TRADE` and `UNAVAILABLE` intents remain persistable evidence. They never open positions; SIM-3 has no position authority.
+
+### Queue and submit result
+
+SIM-3 uses one in-process bounded FIFO queue with capacity exactly 64, containing complete `SimulationCaptureWorkItem` cycles. Submit uses only `put_nowait`, or the exact nonblocking equivalent. The complete six-horizon cycle is admitted atomically as one item; horizons are never partially enqueued. If full, the incoming complete cycle is dropped, no older queued cycle is evicted, and only bounded telemetry is updated. Overflow must never create synthetic intent evidence.
+
+Submit returns exactly one of:
+
+- `ACCEPTED`;
+- `DROPPED_QUEUE_FULL`; or
+- `CAPTURE_UNAVAILABLE`.
+
+Enqueue exceptions are contained and return `CAPTURE_UNAVAILABLE`.
+
+### Worker lifecycle
+
+Exactly one daemon thread owns queue consumption. The adapter exposes explicit `start()` and `stop()` methods; calling `start()` twice is idempotent and never creates a second worker. Worker absence, crash, or startup failure cannot affect production. Shutdown uses a private sentinel unavailable to callers.
+
+Once stop begins, submit accepts no new work. Stop attempts bounded FIFO draining and joins the worker for at most one second total. Remaining queued items may be abandoned after that bound with bounded telemetry. Shutdown may never delay production beyond the one-second join bound.
+
+### Persistence and failure containment
+
+Worker persistence occurs only through `SimulationIntentStore.insert()`. SIM-3 never opens a database connection directly and never calls `SimulationIntentStore.get()` for deduplication. It performs no retry, backoff, jitter, sleep, wait, historical scan, or second persistence attempt. `INSERTED` and `IDEMPOTENT` are success. Identity conflict, malformed evidence, an unexpected store result, a store exception, or any other per-horizon failure increments bounded telemetry and processing continues with the next horizon.
+
+SIM-3 does not catch `BaseException`. Ordinary `Exception` is contained at both the complete-cycle worker boundary and each per-horizon boundary, without reaching or terminating production. An escaped ordinary worker-cycle exception increments worker failure telemetry and the worker continues to the next queued cycle.
+
+### Bounded operational telemetry
+
+SIM-3 exposes only these bounded operational metrics:
+
+- `sim3_submit_status`: exactly `NOT_STARTED`, `READY`, `STOPPED`, or `FAILED`;
+- `sim3_queue_depth`: integer from 0 through 64 inclusive;
+- `sim3_cycles_accepted_total`;
+- `sim3_cycles_dropped_total`;
+- `sim3_cycles_processed_total`;
+- `sim3_intents_inserted_total`;
+- `sim3_intents_idempotent_total`;
+- `sim3_horizon_failures_total`;
+- `sim3_worker_failures_total`;
+- `sim3_capture_latency_ms`: bounded rolling sample containing only the latest 256 submissions; and
+- `sim3_worker_latency_ms`: bounded rolling sample containing only the latest 256 processed cycles.
+
+Counters are bounded in label cardinality, queue depth is a current gauge, and both latency samples have fixed maximum length. Telemetry contains no IDs, exception text or type, source values, horizons, dynamic keys, or unbounded labels. Telemetry failure is contained and cannot alter submit results, worker progress, persistence evidence, or production.
+
+### Performance boundary
+
+The synchronous post-V4D path performs only one clock read, immutable work-item construction, one nonblocking queue operation, and a bounded telemetry update. It performs no intent construction, six-horizon loop, serialization, database access, retry, wait, sleep, or scan. The frozen capture-submit target is p99 no greater than 1 ms under the deterministic benchmark. Worker processing is measured separately and cannot affect production latency.
+
+### Isolation prohibitions
+
+SIM-3 is explicitly prohibited from production evidence writes; production ledger reads; calibration, `RANGE`, probability, or truth-credit access; broker clients or credentials; orders; options; entries, exits, positions, resolutions, or P&L; web/API endpoints; migrations or schema changes; Render changes; historical scans; environment-variable credential fallback; and modification of Q1–Q12 or V1–V4 mathematics. It may not add request-path work or run capture from a web request.
+
+### Required focused tests
+
+The single authorized SIM-3 test module must freeze and prove:
+
+- exact field mappings and exact V3 status translation;
+- exact six-horizon order;
+- one clock read per completed cycle and the shared `eligible_at`;
+- immutable, frozen, slotted whole-cycle handoff with no mutable collections;
+- post-`run_cycle`, post-forecast-persistence hook placement;
+- nonblocking submit and no synchronous horizon, construction, serialization, or store work;
+- queue capacity 64 and atomic whole-cycle admission;
+- incoming-cycle drop without older-cycle eviction on overflow;
+- no synthetic overflow evidence;
+- worker start, stop, and double-start idempotency;
+- at most one second of total shutdown joining and bounded abandonment;
+- `INSERTED` and `IDEMPOTENT` handling;
+- exactly one persistence attempt and no retry;
+- no direct database access and no store reads;
+- per-horizon failure isolation and continuation;
+- queue, clock, worker startup/crash, store, telemetry, and malformed-input failure containment;
+- malformed, duplicate, missing, and out-of-order cycle structure failing closed before persistence;
+- `NO_TRADE` and `UNAVAILABLE` persistence;
+- no execution under the production COIN or BTC ingestion lock;
+- no request-path work;
+- exact bounded telemetry surface and 256-sample limits;
+- deterministic benchmark p99 submit no greater than 1 ms;
+- no migration, schema, Render, web, broker, options, or later-phase change; and
+- full-suite regression proving Q1–Q12 and V1–V4 mathematics unchanged.
+
+### Phase boundary
+
+SIM-3 implements only this asynchronous intent-capture boundary. It does not authorize SIM-4 entry selection or any later simulator behavior.
