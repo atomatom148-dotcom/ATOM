@@ -428,6 +428,7 @@ class LiveMarketState:
                 received_at=datetime.fromtimestamp(cycle, timezone.utc),
                 directional=tuple(forecasts), q3=tuple(volatility_forecasts), v4=v4,
                 state_cohort_id=getattr(output, "state_cohort_id", None),
+                v4d_output=output,
             ))
             delivery_status = "ENQUEUED" if delivered else "DROPPED"
         if output is not None:

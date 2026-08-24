@@ -8,6 +8,7 @@ import json
 import os
 from html import escape
 import time
+from datetime import datetime, timezone
 from threading import Lock, Thread
 from typing import Callable, Iterable
 from wsgiref.simple_server import make_server
@@ -594,7 +595,30 @@ def create_app(
     return application
 
 
-def main() -> None:
+def _start_sim3(simulator_connection_factory: Callable | None,
+                utc_clock: Callable[[], datetime]):
+    """Construct SIM-3 once from an explicit least-privilege factory."""
+    if simulator_connection_factory is None:
+        return None
+    from .v9_sim2_store import SimulationIntentStore
+    from .v9_sim3_capture import Sim3Telemetry, SimulationCaptureAdapter
+    telemetry = Sim3Telemetry()
+    try:
+        store = SimulationIntentStore(simulator_connection_factory)
+        adapter = SimulationCaptureAdapter(store, utc_clock, telemetry=telemetry)
+        adapter.start()
+        return adapter
+    except Exception:
+        try:
+            telemetry.status("FAILED")
+        except Exception:
+            pass
+        return None
+
+
+def main(*, simulator_connection_factory: Callable | None = None,
+         simulator_utc_clock: Callable[[], datetime] =
+         lambda: datetime.now(timezone.utc)) -> None:
     parser = argparse.ArgumentParser(description="Serve the ATOM numerical dashboard")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
@@ -626,23 +650,33 @@ def main() -> None:
         compact_cache=v9_runtime.compact_cache,
         accuracy_cache=v9_runtime.accuracy_cache,
     )
-    ledger_worker = EvidenceLedgerWorker(
-        outbox, evidence_store=PostgresEvidenceStore(
-            database_url, connection=ledger_connection),
-        connection=ledger_connection,
-        metrics=metrics, cache_refresher=cache_refresher,
-    )
-    ledger_worker.start()
-    state = LiveMarketState(evidence_outbox=outbox,
-                            v9_cycle_handler=v9_runtime.on_quote,
-                            metrics=metrics)
-    start_alpaca_poller(state)
-    start_alpaca_g2_poller(state)
-    start_massive_ndx_poller(state)
-    start_alpaca_options_poller(state)
-    app = create_app(state=state, evidence_cache=evidence_cache, metrics=metrics)
-    with make_server(args.host, args.port, app) as server:
-        server.serve_forever()
+    sim3 = _start_sim3(simulator_connection_factory, simulator_utc_clock)
+    try:
+        ledger_worker = EvidenceLedgerWorker(
+            outbox, evidence_store=PostgresEvidenceStore(
+                database_url, connection=ledger_connection),
+            connection=ledger_connection,
+            metrics=metrics, cache_refresher=cache_refresher,
+            simulation_submit=sim3.submit if sim3 is not None else None,
+        )
+        ledger_worker.start()
+        state = LiveMarketState(evidence_outbox=outbox,
+                                v9_cycle_handler=v9_runtime.on_quote,
+                                metrics=metrics)
+        start_alpaca_poller(state)
+        start_alpaca_g2_poller(state)
+        start_massive_ndx_poller(state)
+        start_alpaca_options_poller(state)
+        app = create_app(state=state, evidence_cache=evidence_cache,
+                         metrics=metrics)
+        with make_server(args.host, args.port, app) as server:
+            server.serve_forever()
+    finally:
+        if sim3 is not None:
+            try:
+                sim3.stop()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
