@@ -684,8 +684,10 @@ def main(*, simulator_connection_factory: Callable | None = None,
     v2_provider.start()
     v9_runtime = ProductionV9Runtime(database_url, v2_provider, metrics=metrics)
     from .evidence_outbox import (
-        EvidenceLedgerWorker, EvidenceOutbox, V4StateCacheRefresher,
+        EvidenceLedgerWorker, EvidenceOutbox, PostgresV4BStateBuilder,
+        V4StateCacheRefresher,
     )
+    from .v9_v4d_integration import OfflineStateBuildScheduler
     from .v9_v4b_accuracy import AccuracyStateStore
     from .v9_v4c_predictive import V4CStateStore
     import psycopg
@@ -697,6 +699,10 @@ def main(*, simulator_connection_factory: Callable | None = None,
         compact_cache=v9_runtime.compact_cache,
         accuracy_cache=v9_runtime.accuracy_cache,
     )
+    accuracy_builder = PostgresV4BStateBuilder(ledger_connection)
+    accuracy_scheduler = OfflineStateBuildScheduler(
+        accuracy_builder.build_and_publish, metrics=metrics,
+    )
     sim3 = _start_sim3(simulator_connection_factory, simulator_utc_clock)
     try:
         ledger_worker = EvidenceLedgerWorker(
@@ -704,6 +710,8 @@ def main(*, simulator_connection_factory: Callable | None = None,
                 database_url, connection=ledger_connection),
             connection=ledger_connection,
             metrics=metrics, cache_refresher=cache_refresher,
+            state_builder=accuracy_builder,
+            state_build_scheduler=accuracy_scheduler,
             simulation_submit=sim3.submit if sim3 is not None else None,
         )
         ledger_worker.start()
