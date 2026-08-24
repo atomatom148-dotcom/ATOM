@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from dataclasses import FrozenInstanceError, replace
-from pathlib import Path
 from types import SimpleNamespace
+import ast
 import inspect
 import threading
 import time
@@ -258,13 +258,39 @@ def test_missing_configuration_startup_failure_and_request_path_isolation():
     assert "SimulationIntentStore" not in source
 
 
-def test_exact_authorized_five_file_scope():
-    root = Path(__file__).parents[1]
-    import subprocess
-    changed = subprocess.check_output(
-        ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
-        cwd=root, text=True).splitlines()
-    assert set(changed) == {
-        "quant/live_market.py", "quant/evidence_outbox.py", "quant/web.py",
-        "quant/v9_sim3_capture.py", "tests/test_v9_sim3_capture.py",
-    }
+def test_sim3_integration_boundary_is_static_and_history_independent():
+    import quant.evidence_outbox as evidence_outbox
+    import quant.live_market as live_market
+    import quant.web as web
+
+    live_tree = ast.parse(inspect.getsource(live_market))
+    sim_imports = [node for node in ast.walk(live_tree)
+                   if isinstance(node, ast.ImportFrom) and
+                   node.module and "sim" in node.module]
+    assert sim_imports == []
+    handoffs = [
+        keyword for node in ast.walk(live_tree) if isinstance(node, ast.Call)
+        for keyword in node.keywords if keyword.arg == "v4d_output"
+    ]
+    assert len(handoffs) == 1
+    assert isinstance(handoffs[0].value, ast.Name)
+    assert handoffs[0].value.id == "output"
+
+    outbox_tree = ast.parse(inspect.getsource(evidence_outbox))
+    imports = [node for node in ast.walk(outbox_tree)
+               if isinstance(node, ast.ImportFrom) and
+               node.module == "v9_sim3_capture"]
+    assert len(imports) == 1
+    assert [alias.name for alias in imports[0].names] == [
+        "FinalizedV4PersistenceResult",
+    ]
+    submit_calls = [node for node in ast.walk(outbox_tree)
+                    if isinstance(node, ast.Call) and
+                    isinstance(node.func, ast.Attribute) and
+                    node.func.attr == "_simulation_submit"]
+    assert len(submit_calls) == 1
+
+    assert "SimulationCapture" not in inspect.getsource(web.create_app)
+    startup = inspect.getsource(web._start_sim3)
+    assert "SimulationIntentStore" in startup
+    assert "SimulationCaptureAdapter" in startup

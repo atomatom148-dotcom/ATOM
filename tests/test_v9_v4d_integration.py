@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import json
 import threading
+import time
 
 import pytest
 
@@ -262,19 +263,192 @@ def test_terminal_failure_advances_fifo_while_transient_retries_same_head(monkey
     assert terminal_calls == [1, 2]
 
     class OperationalError(Exception): pass
+    class AdminShutdown(OperationalError): pass
+    class RecoverableConnection(_WorkerConnection):
+        def __init__(self, name):
+            self.name = name
+            self.close_calls = 0
+            self.rollback_calls = 0
+        def close(self): self.close_calls += 1
+        def rollback(self): self.rollback_calls += 1
+    class RebindStore(_RawStore):
+        def __init__(self): super().__init__(); self.connections = []
+        def rebind_connection(self, connection): self.connections.append(connection)
+    class RebindRefresher:
+        def __init__(self): self.connections = []
+        def rebind_connection(self, connection): self.connections.append(connection)
+
+    dead, recovered = RecoverableConnection("dead"), RecoverableConnection("recovered")
+    attempts = []
+    def connect(_database_url):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise AdminShutdown("database still unavailable")
+        return recovered
+    store, refresher = RebindStore(), RebindRefresher()
     transient_outbox = EvidenceOutbox()
-    transient = EvidenceLedgerWorker(transient_outbox, evidence_store=_RawStore(),
-                                     connection=_WorkerConnection())
+    transient = EvidenceLedgerWorker(
+        transient_outbox, evidence_store=store, connection=dead,
+        connect=connect, database_url="postgresql://runtime",
+        cache_refresher=refresher,
+    )
+    pending = [object()]
+    transient._pending = pending
     transient_outbox.put_nowait(first)
     transient_calls = []
     def transient_process(item):
         transient_calls.append(item.sequence)
         if len(transient_calls) == 1:
-            raise OperationalError("database unavailable")
+            raise AdminShutdown("database unavailable")
+        assert transient._connection is recovered
+        assert transient._writer.connection is recovered
         transient._stop.set()
     transient.process = transient_process
     thread = transient.start(); thread.join(timeout=1)
     assert transient_calls == [1, 1]
+    assert attempts == [1, 1]
+    assert store.connections == refresher.connections == [recovered]
+    assert transient._pending is pending
+    assert (dead.rollback_calls, dead.close_calls) == (1, 1)
+    counters = dict(transient.metrics.snapshot().counters)
+    assert counters["evidence_ledger_worker.reconnect_failure"] == 1
+    assert counters["evidence_ledger_worker.reconnect_success"] == 1
+    transient.close()
+    assert recovered.close_calls == 1
+
+
+def test_state_builder_reconnects_both_builders_and_preserves_generation():
+    class OperationalError(Exception): pass
+    class AdminShutdown(OperationalError): pass
+    class Connection:
+        def __init__(self, name): self.name = name; self.close_calls = 0
+        def close(self): self.close_calls += 1
+    class Builder:
+        def __init__(self):
+            self.prepared = []
+            self.connections = []
+            self.build_calls = 0
+        def prepare(self, **candidate): self.prepared.append(candidate)
+        def rebind_connection(self, connection): self.connections.append(connection)
+        def build_and_publish(self):
+            self.build_calls += 1
+            if self.build_calls == 1:
+                clock[0] = 61.0
+                raise AdminShutdown("state connection lost")
+            return "INSERT"
+
+    clock = [0.0]
+    dead, recovered = Connection("dead"), Connection("recovered")
+    builder = Builder()
+    scheduler = OfflineStateBuildScheduler(
+        builder.build_and_publish, monotonic_clock=lambda: clock[0],
+    )
+    metrics = OperationalMetrics()
+    worker = V4StateBuildWorker(
+        builder, scheduler, connection=dead,
+        connect=lambda _database_url: recovered,
+        database_url="postgresql://runtime", metrics=metrics,
+    )
+    worker.start()
+    worker.submit(
+        symbol="COIN", state_as_of=NOW,
+        cohorts={horizon: ("cohort", "a" * 64) for horizon in HORIZONS},
+        new_outcome=True,
+    )
+    deadline = time.monotonic() + 2.5
+    while builder.build_calls < 2 and time.monotonic() < deadline:
+        time.sleep(.01)
+    worker.close()
+
+    assert builder.build_calls == 2
+    assert len(builder.prepared) == 1
+    assert builder.connections == [recovered]
+    assert scheduler._latest_outcome_generation == scheduler._built_generation == 1
+    assert dead.close_calls == recovered.close_calls == 1
+    assert dict(metrics.snapshot().counters)[
+        "v4_state_build_worker.reconnect_success"] == 1
+
+
+def test_ledger_close_drains_every_accepted_item_before_closing_connection(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    started, release = threading.Event(), threading.Event()
+
+    class Connection(_WorkerConnection):
+        def __init__(self): self.close_calls = 0
+        def close(self): self.close_calls += 1
+
+    connection = Connection()
+    outbox = EvidenceOutbox()
+    worker = EvidenceLedgerWorker(
+        outbox, evidence_store=_RawStore(), connection=connection)
+    previous = MidpointObservation(NOW.timestamp(), 100.0)
+    current = MidpointObservation(NOW.timestamp() + 1, 101.0)
+    items = tuple(_work(n, previous, current, NOW + timedelta(seconds=n))
+                  for n in (1, 2))
+    for item in items:
+        assert outbox.put_nowait(item)
+    processed = []
+
+    def process(item):
+        processed.append(item.sequence)
+        if item.sequence == 1:
+            started.set()
+            assert release.wait(2)
+
+    worker.process = process
+    worker.start()
+    assert started.wait(1)
+    closer = threading.Thread(target=worker.close)
+    closer.start()
+    time.sleep(.02)
+    assert closer.is_alive()
+    assert connection.close_calls == 0
+    assert outbox.put_nowait(items[0]) is False
+    release.set()
+    closer.join(timeout=2)
+
+    assert not closer.is_alive()
+    assert processed == [1, 2]
+    assert connection.close_calls == 1
+
+
+def test_state_builder_close_never_closes_connection_under_active_build():
+    started, release = threading.Event(), threading.Event()
+
+    class Connection:
+        def __init__(self): self.close_calls = 0
+        def close(self): self.close_calls += 1
+
+    class Builder:
+        def prepare(self, **_candidate): pass
+        def build_and_publish(self):
+            started.set()
+            assert release.wait(2)
+            return "INSERT"
+
+    connection = Connection()
+    builder = Builder()
+    worker = V4StateBuildWorker(
+        builder, OfflineStateBuildScheduler(builder.build_and_publish),
+        connection=connection,
+    )
+    worker.start()
+    worker.submit(
+        symbol="COIN", state_as_of=NOW,
+        cohorts={horizon: ("cohort", "a" * 64) for horizon in HORIZONS},
+        new_outcome=True,
+    )
+    assert started.wait(1)
+    closer = threading.Thread(target=worker.close)
+    closer.start()
+    time.sleep(.02)
+    assert closer.is_alive()
+    assert connection.close_calls == 0
+    release.set()
+    closer.join(timeout=2)
+
+    assert not closer.is_alive()
+    assert connection.close_calls == 1
 
 
 @pytest.mark.parametrize("family_count", (11, 10, 7, 3, 1, 0))
@@ -472,17 +646,22 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
 
 def test_combined_builder_keeps_accuracy_and_compact_in_one_generation():
     class Builder:
-        def __init__(self, result): self.result = result; self.prepared = []; self.calls = 0
+        def __init__(self, result):
+            self.result = result; self.prepared = []; self.calls = 0; self.connections = []
         def prepare(self, **candidate): self.prepared.append(candidate)
+        def rebind_connection(self, connection): self.connections.append(connection)
         def build_and_publish(self): self.calls += 1; return self.result
     accuracy, compact = Builder("IDEMPOTENT"), Builder("INSERT")
     builder = PostgresV4StateBuilder(accuracy, compact)
     candidate = {"symbol": "COIN", "state_as_of": NOW,
                  "cohorts": {h: ("c", "h") for h in HORIZONS}}
     builder.prepare(**candidate)
+    replacement = object()
+    builder.rebind_connection(replacement)
     assert builder.build_and_publish() == "INSERT"
     assert accuracy.prepared == compact.prepared == [candidate]
     assert accuracy.calls == compact.calls == 1
+    assert accuracy.connections == compact.connections == [replacement]
 
 
 def test_compact_failure_does_not_suppress_accuracy_publication():

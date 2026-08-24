@@ -630,6 +630,7 @@ def final_numbers(result: V3HorizonResult, state: CompactHorizonState | None) ->
 
 class V4CStateStore:
     def __init__(self,connection):self.connection=connection
+    def rebind_connection(self,connection):self.connection=connection
     def insert(self,state:V4CState,created_at:datetime)->str:
         payload={k:v for k,v in asdict(state).items() if k not in ("state_id","state_hash")}
         digest=canonical_sha256(payload)

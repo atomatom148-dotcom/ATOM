@@ -7,18 +7,19 @@ import json
 import math
 import os
 import time
-from urllib.request import Request, urlopen
+from typing import Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from quant.live_market import ALPACA_LATEST_QUOTES_URL, LiveMarketState, parse_alpaca_timestamp
-from quant.v9_production import (
-    ImmutableV2StateProvider, PostgresV2StateBuilder, ProductionV9Runtime,
+from quant.v9_v1_contract import HORIZONS, MAX_ACTIVE_AGE_SECONDS
+from quant.v9_v4a_evidence import (
+    canonical_target_identity, deserialize_forecast_record,
+    deserialize_outcome_record,
 )
-from quant.v9_v1_contract import MAX_ACTIVE_AGE_SECONDS
-from quant.web import create_app
 
 
 market_open_only = pytest.mark.skipif(
@@ -55,6 +56,9 @@ def _validate_deployed_live(payload: dict) -> None:
     assert isinstance(bps, list) and len(bps) == 6
     assert (isinstance(bps[0], (int, float)) and not isinstance(bps[0], bool)
             and math.isfinite(bps[0]))
+    horizon_statuses = payload.get("v9", {}).get("horizon_statuses")
+    assert isinstance(horizon_statuses, list) and len(horizon_statuses) == 6
+    assert horizon_statuses[0] in {"MATURE", "PROVISIONAL"}
     age = payload.get("market", {}).get("data_age")
     assert isinstance(age, (int, float)) and not isinstance(age, bool)
     assert math.isfinite(age) and 0.0 <= age <= MAX_ACTIVE_AGE_SECONDS
@@ -63,10 +67,120 @@ def _validate_deployed_live(payload: dict) -> None:
     assert math.isfinite(forecast_age) and 0.0 <= forecast_age <= MAX_ACTIVE_AGE_SECONDS
 
 
-def _deployed_json(base_url: str, path: str) -> dict:
-    with urlopen(base_url.rstrip("/") + path, timeout=15) as response:
-        assert response.status == 200
-        return json.load(response)
+def _deployed_json(base_url: str, path: str, *, deadline: float | None = None) -> dict:
+    """Read one deployed endpoint, retrying only transient transport failures."""
+
+    deadline = time.monotonic() + 45 if deadline is None else deadline
+    last_error = None
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        try:
+            with urlopen(
+                base_url.rstrip("/") + path,
+                timeout=max(0.001, min(15.0, remaining)),
+            ) as response:
+                assert response.status == 200
+                payload = json.load(response)
+            assert isinstance(payload, dict)
+            return payload
+        except HTTPError as error:
+            if error.code not in {408, 425, 429, 500, 502, 503, 504}:
+                raise AssertionError(
+                    f"deployed endpoint returned non-retryable HTTP {error.code}: {path}"
+                ) from error
+            last_error = error
+        except (AssertionError, URLError, TimeoutError,
+                json.JSONDecodeError, OSError) as error:
+            last_error = error
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    raise AssertionError(f"deployed endpoint remained unavailable: {path}") from last_error
+
+
+def _database_read(database_url: str, operation: Callable, *, deadline: float):
+    """Run a retryable operation in a fresh, explicitly read-only transaction."""
+
+    import psycopg
+
+    last_error = None
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining < 1.0:
+            break
+        connect_timeout = max(1, min(10, math.ceil(remaining)))
+        statement_timeout_ms = max(1, min(10_000, int(remaining * 1000)))
+        try:
+            with psycopg.connect(
+                database_url,
+                connect_timeout=connect_timeout,
+                options=f"-c statement_timeout={statement_timeout_ms}",
+            ) as connection:
+                connection.read_only = True
+                with connection.cursor() as cursor:
+                    return operation(cursor)
+        except (psycopg.OperationalError, psycopg.InterfaceError,
+                ConnectionError, TimeoutError) as error:
+            last_error = error
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    raise AssertionError("read-only database operation remained unavailable") from last_error
+
+
+def test_database_reads_force_read_only_and_bounded_timeouts(monkeypatch):
+    import psycopg
+
+    cursor = SimpleNamespace()
+
+    class CursorContext:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    class ConnectionContext:
+        read_only = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return CursorContext()
+
+    connection = ConnectionContext()
+    observed = {}
+
+    def connect(database_url, **kwargs):
+        observed.update(database_url=database_url, **kwargs)
+        return connection
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+    assert _database_read(
+        "postgresql://read-only-test",
+        lambda value: value,
+        deadline=time.monotonic() + 2,
+    ) is cursor
+    assert connection.read_only is True
+    assert observed["database_url"] == "postgresql://read-only-test"
+    assert 1 <= observed["connect_timeout"] <= 10
+    assert observed["options"].startswith("-c statement_timeout=")
+
+
+def _skip_if_xnys_closed(now: datetime | None = None) -> None:
+    """Skip scheduled/manual runs outside an authoritative XNYS open minute."""
+
+    import exchange_calendars
+    import pandas
+
+    current = pandas.Timestamp(now or datetime.now(timezone.utc))
+    if current.tzinfo is None:
+        current = current.tz_localize("UTC")
+    else:
+        current = current.tz_convert("UTC")
+    minute = current.floor("min")
+    if not exchange_calendars.get_calendar("XNYS").is_open_on_minute(minute):
+        pytest.skip(f"XNYS session is closed at {minute.isoformat()}")
 
 
 def test_quote_freshness_accepts_fresh_and_rejects_stale_or_future():
@@ -102,9 +216,22 @@ def test_30s_scoreability_rejects_finite_mismatched_final_bps():
         _scoreable_30s(output)
 
 
-def _deployed_payload(*, bps=None, market_age=1.0, forecast_age=1.0):
-    return {"final_numbers":{"BPS":bps or [1.0,None,None,None,None,None]},
-            "market":{"data_age":market_age}, "v9":{"forecast_age":forecast_age}}
+def _deployed_payload(
+    *, bps=None, horizon_statuses=None, market_age=1.0, forecast_age=1.0,
+):
+    return {
+        "final_numbers": {
+            "BPS": bps if bps is not None else [1.0, None, None, None, None, None],
+        },
+        "market": {"data_age": market_age},
+        "v9": {
+            "forecast_age": forecast_age,
+            "horizon_statuses": (
+                horizon_statuses if horizon_statuses is not None
+                else ["MATURE"] + ["UNAVAILABLE"] * 5
+            ),
+        },
+    }
 
 
 def test_deployed_response_validation_requires_health_and_finite_30s():
@@ -113,6 +240,8 @@ def test_deployed_response_validation_requires_health_and_finite_30s():
     with pytest.raises(AssertionError):_validate_deployed_health({"status":"stopped"})
     with pytest.raises(AssertionError):
         _validate_deployed_live(_deployed_payload(bps=[1.0]))
+    with pytest.raises(AssertionError):
+        _validate_deployed_live(_deployed_payload(horizon_statuses=["MATURE"]))
     with pytest.raises(AssertionError):
         _validate_deployed_live(_deployed_payload(
             bps=[None, 1.0, None, None, None, None]))
@@ -129,126 +258,230 @@ def test_deployed_response_validation_rejects_future_market_timestamp():
         _validate_deployed_live(_deployed_payload(market_age=-0.001))
 
 
-def _quote() -> tuple[tuple[float, float, float, float, float],
-                      tuple[float, float, float]]:
-    headers = {
-        "APCA-API-KEY-ID": os.environ["ALPACA_API_KEY"],
-        "APCA-API-SECRET-KEY": os.environ["ALPACA_SECRET_KEY"],
-    }
-    with urlopen(Request(ALPACA_LATEST_QUOTES_URL, headers=headers), timeout=15) as response:
-        quotes = json.load(response)["quotes"]
-    coin, qqq = quotes["COIN"], quotes["QQQ"]
-    return (
-        (float(coin["bp"]), float(coin["ap"]), float(coin["bs"]),
-         float(coin["as"]), parse_alpaca_timestamp(coin["t"])),
-        (float(qqq["bp"]), float(qqq["ap"]), parse_alpaca_timestamp(qqq["t"])),
+def _assert_live_forecast_agreement(payload: dict, forecast) -> None:
+    """Bind the visible 30S number to the exact durable 30S record."""
+
+    live_bps = payload["final_numbers"]["BPS"][0]
+    live_status = payload["v9"]["horizon_statuses"][0]
+    assert isinstance(live_bps, (int, float)) and not isinstance(live_bps, bool)
+    assert math.isfinite(live_bps)
+    assert forecast.status in {"MATURE", "PROVISIONAL"}
+    assert live_status == forecast.status
+    assert isinstance(forecast.expected_return_bps, (int, float))
+    assert not isinstance(forecast.expected_return_bps, bool)
+    assert math.isfinite(forecast.expected_return_bps)
+    assert forecast.expected_return_bps == live_bps
+
+
+def test_live_30s_must_exactly_match_scoreable_persisted_forecast():
+    for status in ("MATURE", "PROVISIONAL"):
+        payload = _deployed_payload(
+            bps=[1.25, None, None, None, None, None],
+            horizon_statuses=[status] + ["UNAVAILABLE"] * 5,
+        )
+        _assert_live_forecast_agreement(
+            payload, SimpleNamespace(status=status, expected_return_bps=1.25))
+    payload = _deployed_payload(bps=[1.25, None, None, None, None, None])
+    for forecast in (
+        SimpleNamespace(status="MATURE", expected_return_bps=1.5),
+        SimpleNamespace(status="UNAVAILABLE", expected_return_bps=1.25),
+        SimpleNamespace(status="PROVISIONAL", expected_return_bps=None),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_live_forecast_agreement(payload, forecast)
+    with pytest.raises(AssertionError):
+        _assert_live_forecast_agreement(
+            _deployed_payload(
+                bps=[1.25, None, None, None, None, None],
+                horizon_statuses=["PROVISIONAL"] + ["UNAVAILABLE"] * 5,
+            ),
+            SimpleNamespace(status="MATURE", expected_return_bps=1.25),
+        )
+
+
+def _poll_new_deployed_cycle(base_url: str, baseline_cutoff: float) -> dict:
+    deadline = time.monotonic() + 90
+    last_error = None
+    while time.monotonic() < deadline:
+        payload = _deployed_json(base_url, "/api/live", deadline=deadline)
+        try:
+            _validate_deployed_live(payload)
+            cutoff = payload["v9"]["forecast_cutoff"]
+            assert isinstance(cutoff, (int, float)) and not isinstance(cutoff, bool)
+            assert math.isfinite(cutoff) and cutoff > baseline_cutoff
+        except (AssertionError, KeyError, TypeError) as error:
+            last_error = error
+            time.sleep(1)
+            continue
+        return payload
+    raise AssertionError("deployed service did not publish a new scoreable cycle") from last_error
+
+
+def _logical_duplicate_surplus(database_url: str, *, deadline: float) -> tuple[int, int]:
+    def read(cursor):
+        cursor.execute(
+            """
+            SELECT
+              COALESCE((SELECT sum(row_count - 1) FROM (
+                 SELECT count(*) AS row_count
+                 FROM public.atom_v9_v4_forecasts
+                 GROUP BY symbol, cutoff_at, horizon, cycle_id, v3_model_version
+                 HAVING count(*) > 1
+               ) AS forecast_conflicts), 0),
+              COALESCE((SELECT sum(row_count - 1) FROM (
+                 SELECT count(*) AS row_count
+                 FROM public.atom_v9_v4_outcomes
+                 GROUP BY forecast_record_id, target_identity
+                 HAVING count(*) > 1
+               ) AS outcome_conflicts), 0)
+            """,
+            (),
+        )
+        return tuple(map(int, cursor.fetchone()))
+
+    return _database_read(database_url, read, deadline=deadline)
+
+
+def _assert_duplicate_surplus_unchanged(
+    baseline: tuple[int, int], current: tuple[int, int],
+) -> None:
+    """Allow immutable historical conflicts, but reject every newly added row."""
+
+    assert current == baseline
+
+
+def test_duplicate_gate_allows_history_but_detects_growth_in_existing_group():
+    _assert_duplicate_surplus_unchanged((3, 2), (3, 2))
+    with pytest.raises(AssertionError):
+        _assert_duplicate_surplus_unchanged((3, 2), (4, 2))
+    with pytest.raises(AssertionError):
+        _assert_duplicate_surplus_unchanged((3, 2), (3, 3))
+
+
+def _poll_forecasts(database_url: str, cutoff_at: datetime):
+    deadline = time.monotonic() + 45
+    rows = ()
+    while time.monotonic() < deadline:
+        def read(cursor):
+            cursor.execute(
+                """SELECT forecast_record_hash, record_json
+                   FROM public.atom_v9_v4_forecasts
+                   WHERE symbol='COIN' AND cutoff_at=%s
+                   ORDER BY cutoff_at, horizon, forecast_record_id""",
+                (cutoff_at,),
+            )
+            return tuple(cursor.fetchall())
+
+        rows = _database_read(database_url, read, deadline=deadline)
+        if len(rows) >= 6:
+            break
+        time.sleep(1)
+    assert len(rows) == 6
+    return tuple(deserialize_forecast_record(
+        payload, expected_hash=str(record_hash),
+    ) for record_hash, payload in rows)
+
+
+def _poll_verified_outcome(database_url: str, forecast):
+    target_identity = canonical_target_identity(forecast)
+    deadline = time.monotonic() + 90
+    rows = ()
+    while time.monotonic() < deadline:
+        def read(cursor):
+            cursor.execute(
+                """SELECT outcome_record_hash, record_json
+                   FROM public.atom_v9_v4_outcomes
+                   WHERE forecast_record_id=%s AND target_identity=%s
+                   ORDER BY created_at, outcome_record_id""",
+                (forecast.forecast_record_id, target_identity),
+            )
+            return tuple(cursor.fetchall())
+
+        rows = _database_read(database_url, read, deadline=deadline)
+        if rows:
+            break
+        time.sleep(1)
+    assert len(rows) == 1
+    return deserialize_outcome_record(
+        rows[0][1], expected_hash=str(rows[0][0]),
     )
-
-
-def _request_json(app, path: str) -> dict:
-    result = {}
-    def start_response(status, headers):
-        result["status"] = status
-    body = b"".join(app({"PATH_INFO": path}, start_response))
-    assert result["status"] == "200 OK"
-    return json.loads(body)
 
 
 @market_open_only
 def test_market_open_database_backed_v1_through_website_and_verified_outcome():
-    import psycopg
-
+    _skip_if_xnys_closed()
     database_url = os.environ["DATABASE_URL"]
-    with psycopg.connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT current_user", ())
-            assert cursor.fetchone()[0] == "atom_v9_v4_runtime"
-            cursor.execute(
-                """
-                SELECT has_table_privilege(current_user,'public.atom_v9_v4_forecasts','SELECT'),
-                       has_table_privilege(current_user,'public.atom_v9_v4_forecasts','INSERT'),
-                       has_table_privilege(current_user,'public.atom_v9_v4_forecasts','UPDATE'),
-                       has_table_privilege(current_user,'public.atom_v9_v4_forecasts','DELETE')
-                """,
-                (),
-            )
-            assert cursor.fetchone() == (True, True, False, False)
+    base_url = os.environ["ATOM_PRODUCTION_BASE_URL"]
+    _validate_deployed_health(_deployed_json(base_url, "/health"))
+    initial = _deployed_json(base_url, "/api/live")
+    baseline_cutoff = initial.get("v9", {}).get("forecast_cutoff")
+    if (not isinstance(baseline_cutoff, (int, float)) or
+            isinstance(baseline_cutoff, bool) or
+            not math.isfinite(baseline_cutoff)):
+        baseline_cutoff = -math.inf
 
-    provider = ImmutableV2StateProvider(PostgresV2StateBuilder(database_url))
-    assert provider.refresh().status == "AVAILABLE"
-    runtime = ProductionV9Runtime(database_url, provider)
-    state = LiveMarketState(v9_cycle_handler=runtime.on_quote)
-    try:
-        coin, qqq = _quote()
-        _require_fresh_quote(coin[4], time.time())
-        market_time = datetime.fromtimestamp(coin[4], ZoneInfo("America/New_York"))
-        assert market_time.weekday() < 5
-        assert (market_time.hour, market_time.minute) >= (9, 30)
-        assert (market_time.hour, market_time.minute) < (16, 0)
-        state.accept_qqq_quote(bid=qqq[0], ask=qqq[1], event_epoch=qqq[2])
-        assert state.accept_quote(bid=coin[0], ask=coin[1], bid_size=coin[2],
-                                  ask_size=coin[3], event_epoch=coin[4])
+    def runtime_permissions(cursor):
+        cursor.execute("SELECT current_user", ())
+        current_user = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT has_table_privilege(current_user,'public.atom_v9_v4_forecasts','SELECT'),
+                   has_table_privilege(current_user,'public.atom_v9_v4_forecasts','INSERT'),
+                   has_table_privilege(current_user,'public.atom_v9_v4_forecasts','UPDATE'),
+                   has_table_privilege(current_user,'public.atom_v9_v4_forecasts','DELETE')
+            """,
+            (),
+        )
+        return current_user, cursor.fetchone()
 
-        deadline = time.monotonic() + 20
-        second = None
-        while time.monotonic() < deadline:
-            candidate, qqq = _quote()
-            if candidate[4] > coin[4]:
-                second = candidate
-                _require_fresh_quote(second[4], time.time())
-                state.accept_qqq_quote(bid=qqq[0], ask=qqq[1], event_epoch=qqq[2])
-                assert state.accept_quote(
-                    bid=second[0], ask=second[1], bid_size=second[2],
-                    ask_size=second[3], event_epoch=second[4],
-                )
-                break
-            time.sleep(1)
-        assert second is not None
-        output = state.v9_output()
-        assert output is not None
-        assert output.v1.evidence_state_id == output.v2.state_id
-        assert output.v3.cycle_id == output.v1.cycle_id
-        forecast = _scoreable_30s(output)
-        payload = _request_json(create_app(state=state), "/api/live")
-        assert payload["final_numbers"]["BPS"] == [
-            item.final_bps for item in output.final_numbers
-        ]
+    current_user, privileges = _database_read(
+        database_url, runtime_permissions, deadline=time.monotonic() + 45)
+    assert current_user == "atom_v9_v4_runtime"
+    assert privileges == (True, True, False, False)
+    baseline_surplus = _logical_duplicate_surplus(
+        database_url, deadline=time.monotonic() + 45)
 
-        wait_seconds = max(0.0, forecast.target_endpoint.timestamp() - time.time() + 2.0)
+    payload = _poll_new_deployed_cycle(base_url, float(baseline_cutoff))
+    cutoff = float(payload["v9"]["forecast_cutoff"])
+    market_time = datetime.fromtimestamp(
+        cutoff, ZoneInfo("America/New_York"))
+    assert market_time.weekday() < 5
+    assert (market_time.hour, market_time.minute) >= (9, 30)
+    assert (market_time.hour, market_time.minute) < (16, 0)
+    cutoff_at = datetime.fromtimestamp(cutoff, timezone.utc)
+    forecasts = _poll_forecasts(database_url, cutoff_at)
+    assert {forecast.horizon for forecast in forecasts} == set(HORIZONS)
+    assert len({forecast.logical_key for forecast in forecasts}) == 6
+    assert len({forecast.cycle_id for forecast in forecasts}) == 1
+    cycle_id = forecasts[0].cycle_id
+    assert all(forecast.cycle_id == cycle_id for forecast in forecasts)
+    assert all(forecast.cutoff_at == cutoff_at for forecast in forecasts)
+    assert all(forecast.persistence_proof_eligible is True
+               for forecast in forecasts)
+    forecast_30s = next(
+        forecast for forecast in forecasts if forecast.horizon == "30S")
+    assert forecast_30s.target_endpoint.timestamp() == cutoff + 30
+    _assert_live_forecast_agreement(payload, forecast_30s)
+
+    wait_seconds = max(
+        0.0, forecast_30s.target_endpoint.timestamp() - time.time())
+    if wait_seconds:
         time.sleep(wait_seconds)
-        deadline = time.monotonic() + 20
-        crossed = None
-        # The accepted one-second quant-cycle observations remain consecutive:
-        # polling quotes are display-only until the first observation at/after target.
-        while time.monotonic() < deadline:
-            candidate, qqq = _quote()
-            if candidate[4] >= forecast.target_endpoint.timestamp():
-                crossed = candidate
-                _require_fresh_quote(crossed[4], time.time())
-                state.accept_qqq_quote(bid=qqq[0], ask=qqq[1], event_epoch=qqq[2])
-                assert state.accept_quote(
-                    bid=crossed[0], ask=crossed[1], bid_size=crossed[2],
-                    ask_size=crossed[3], event_epoch=crossed[4],
-                )
-                break
-            time.sleep(1)
-        assert crossed is not None
+    outcome = _poll_verified_outcome(database_url, forecast_30s)
+    target_identity = canonical_target_identity(forecast_30s)
+    assert outcome.forecast_record_id == forecast_30s.forecast_record_id
+    assert outcome.target_identity == target_identity
+    assert outcome.target_endpoint == forecast_30s.target_endpoint
+    assert outcome.previous_observation_at < outcome.target_endpoint
+    assert outcome.target_endpoint <= outcome.endpoint_observation_at
+    assert outcome.target_resolved_at >= outcome.endpoint_observation_at
+    assert outcome.target_timing_status == "VERIFIED"
+    assert outcome.proof_eligible is True
+    _assert_duplicate_surplus_unchanged(
+        baseline_surplus,
+        _logical_duplicate_surplus(
+            database_url, deadline=time.monotonic() + 45),
+    )
 
-        with psycopg.connect(database_url) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT record_json FROM public.atom_v9_v4_outcomes "
-                    "WHERE forecast_record_id=%s ORDER BY created_at DESC LIMIT 1",
-                    (forecast.forecast_record_id,),
-                )
-                row = cursor.fetchone()
-        assert row is not None
-        outcome = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-        assert outcome["target_timing_status"] == "VERIFIED"
-        assert outcome["proof_eligible"] is True
-
-        base_url = os.environ["ATOM_PRODUCTION_BASE_URL"]
-        _validate_deployed_health(_deployed_json(base_url, "/health"))
-        _validate_deployed_live(_deployed_json(base_url, "/api/live"))
-    finally:
-        runtime.close()
+    _validate_deployed_health(_deployed_json(base_url, "/health"))
+    _validate_deployed_live(_deployed_json(base_url, "/api/live"))

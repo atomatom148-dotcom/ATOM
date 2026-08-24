@@ -6,6 +6,7 @@ from datetime import date, datetime, time as datetime_time, timedelta, timezone
 import json
 import math
 import os
+import threading
 import time
 from typing import Callable, Iterable
 from urllib.parse import urlencode
@@ -254,10 +255,11 @@ def fetch_coin_option_surface(*, midpoint: float, cutoff_epoch: float) -> Option
 
 
 def poll_alpaca_options(state: object, *, interval: float = OPTIONS_POLL_INTERVAL,
-                        clock: Callable[[], float] = time.time) -> None:
+                        clock: Callable[[], float] = time.time,
+                        stop_event: threading.Event | None = None) -> None:
     """Poll independently; failures deliberately retain the last valid snapshot."""
 
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             snapshot = state.input_snapshot()
             if snapshot.history.latest is not None:
@@ -275,7 +277,10 @@ def poll_alpaca_options(state: object, *, interval: float = OPTIONS_POLL_INTERVA
             print(f"Alpaca options poll failed: HTTP {error.code}: {body}", flush=True)
         except Exception as error:
             print(f"Alpaca options poll failed: {error}", flush=True)
-        time.sleep(interval)
+        if stop_event is None:
+            time.sleep(interval)
+        elif stop_event.wait(interval):
+            return
 
 
 __all__ = ["ALPACA_COIN_OPTION_SNAPSHOTS_URL", "ALPACA_OPTIONS_CONTRACTS_URL",

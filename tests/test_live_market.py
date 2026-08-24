@@ -76,6 +76,47 @@ class LiveMarketTests(unittest.TestCase):
             "EVIDENCE_SEQUENCE_GAP", 0), 0)
         evidence_store.record_cycle_and_resolve.assert_not_called()
 
+    def test_stop_accepting_quotes_is_an_outbox_handoff_barrier(self):
+        entered_handler = threading.Event()
+        release_handler = threading.Event()
+
+        class CapturingOutbox:
+            def __init__(self): self.items = []
+            def put_nowait(self, item):
+                self.items.append(item)
+                return True
+
+        outbox = CapturingOutbox()
+        def handler(*_args):
+            entered_handler.set()
+            self.assertTrue(release_handler.wait(timeout=2))
+            return None
+
+        state = LiveMarketState(
+            clock=lambda: 10.0, evidence_outbox=outbox,
+            v9_cycle_handler=handler,
+        )
+        accepted = []
+        ingress = threading.Thread(target=lambda: accepted.append(
+            state.accept_quote(bid=99.0, ask=101.0, event_epoch=1.0)))
+        ingress.start()
+        self.assertTrue(entered_handler.wait(timeout=1))
+
+        stopped = threading.Event()
+        stopper = threading.Thread(target=lambda: (
+            state.stop_accepting_quotes(), stopped.set()))
+        stopper.start()
+        self.assertFalse(stopped.wait(timeout=.02))
+        release_handler.set()
+        ingress.join(timeout=2); stopper.join(timeout=2)
+
+        self.assertEqual(accepted, [True])
+        self.assertEqual(len(outbox.items), 1)
+        self.assertTrue(stopped.is_set())
+        self.assertFalse(state.accept_quote(
+            bid=100.0, ask=102.0, event_epoch=2.0))
+        self.assertEqual(len(outbox.items), 1)
+
     def test_market_display_accepts_only_newer_provider_values_and_is_frozen(self):
         state = LiveMarketState()
         self.assertEqual(MARKET_DISPLAY_FETCH_SECONDS, 0.25)

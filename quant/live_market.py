@@ -159,6 +159,7 @@ class LiveMarketState:
         # non-blocking outbox handoff.  The state lock remains narrowly scoped
         # and no database work is permitted inside this ingress boundary.
         self._coin_ingress_lock = threading.Lock()
+        self._accepting_coin_quotes = True
         self._v9_cycle_handler = v9_cycle_handler
         self.metrics = metrics or OperationalMetrics()
         self.metrics.set_status("btc_source_status", "NOT_STARTED")
@@ -326,11 +327,20 @@ class LiveMarketState:
                 bid_size=bid_size, ask_size=ask_size,
             )
 
+    def stop_accepting_quotes(self) -> None:
+        """Close COIN ingress after any in-flight outbox handoff completes."""
+
+        with self._coin_ingress_lock:
+            self._accepting_coin_quotes = False
+
     def _accept_quote_serialized(
         self, *, bid: float, ask: float, event_epoch: float,
         bid_size: float | None = None, ask_size: float | None = None,
     ) -> bool:
         """Validate a quote, preserve its event time, and run Q1-Q3."""
+
+        if not self._accepting_coin_quotes:
+            return False
 
         values = (bid, ask, event_epoch)
         if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
@@ -615,6 +625,7 @@ def parse_massive_ndx_snapshot(payload: object) -> tuple[float, float]:
 def poll_alpaca(
     state: LiveMarketState, *, interval: float = MARKET_DISPLAY_FETCH_SECONDS,
     monotonic: Callable[[], float] = time.monotonic,
+    stop_event: threading.Event | None = None,
 ) -> None:
     """Continuously fetch latest COIN and QQQ quotes in one Alpaca request."""
 
@@ -625,7 +636,7 @@ def poll_alpaca(
         "APCA-API-SECRET-KEY": secret_key,
     }
     last_quant_cycle: float | None = None
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             request = Request(ALPACA_LATEST_QUOTES_URL, headers=headers)
             with urlopen(request, timeout=10) as response:
@@ -664,7 +675,10 @@ def poll_alpaca(
                 )
         except Exception as error:  # Keep web-process health independent of market data.
             print(f"Alpaca quote poll failed: {error}", flush=True)
-        time.sleep(interval)
+        if stop_event is None:
+            time.sleep(interval)
+        elif stop_event.wait(interval):
+            return
 
 
 def poll_alpaca_g2(
@@ -672,6 +686,7 @@ def poll_alpaca_g2(
     timeout: float = BTC_SOURCE_TIMEOUT_SECONDS,
     clock: Callable[[], float] = time.time,
     monotonic: Callable[[], float] = time.perf_counter,
+    stop_event: threading.Event | None = None,
 ) -> None:
     """Maintain the independent BTC input without blocking the ATOM cycle."""
 
@@ -679,7 +694,7 @@ def poll_alpaca_g2(
         "APCA-API-KEY-ID": os.environ["ALPACA_API_KEY"],
         "APCA-API-SECRET-KEY": os.environ["ALPACA_SECRET_KEY"],
     }
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             with urlopen(Request(ALPACA_BTC_LATEST_QUOTE_URL, headers=headers),
                          timeout=timeout) as response:
@@ -702,14 +717,18 @@ def poll_alpaca_g2(
         except Exception as error:
             state.metrics.set_status("btc_source_status", "UNAVAILABLE")
             print(f"Alpaca BTC quote poll failed: {error}", flush=True)
-        time.sleep(interval)
+        if stop_event is None:
+            time.sleep(interval)
+        elif stop_event.wait(interval):
+            return
 
 
-def poll_massive_ndx(state: LiveMarketState, *, interval: float = 1.0) -> None:
+def poll_massive_ndx(state: LiveMarketState, *, interval: float = 1.0,
+                     stop_event: threading.Event | None = None) -> None:
     """Maintain the independent real-time NDX input without blocking ATOM."""
 
     headers = {"Authorization": f"Bearer {os.environ['MASSIVE_API_KEY']}"}
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             with urlopen(Request(MASSIVE_NDX_SNAPSHOT_URL, headers=headers),
                          timeout=10) as response:
@@ -728,33 +747,45 @@ def poll_massive_ndx(state: LiveMarketState, *, interval: float = 1.0) -> None:
             print(f"Massive NDX snapshot poll failed: {error}", flush=True)
         except Exception as error:
             print(f"Massive NDX snapshot poll failed: {error}", flush=True)
-        time.sleep(interval)
+        if stop_event is None:
+            time.sleep(interval)
+        elif stop_event.wait(interval):
+            return
 
 
-def start_alpaca_poller(state: LiveMarketState) -> threading.Thread:
-    thread = threading.Thread(target=poll_alpaca, args=(state,), daemon=True)
+def start_alpaca_poller(state: LiveMarketState, *,
+                        stop_event: threading.Event | None = None) -> threading.Thread:
+    thread = threading.Thread(
+        target=poll_alpaca, args=(state,), kwargs={"stop_event": stop_event}, daemon=True)
     thread.start()
     return thread
 
 
-def start_alpaca_g2_poller(state: LiveMarketState) -> threading.Thread:
-    thread = threading.Thread(target=poll_alpaca_g2, args=(state,), daemon=True)
+def start_alpaca_g2_poller(state: LiveMarketState, *,
+                           stop_event: threading.Event | None = None) -> threading.Thread:
+    thread = threading.Thread(
+        target=poll_alpaca_g2, args=(state,), kwargs={"stop_event": stop_event}, daemon=True)
     thread.start()
     return thread
 
 
-def start_massive_ndx_poller(state: LiveMarketState) -> threading.Thread:
-    thread = threading.Thread(target=poll_massive_ndx, args=(state,), daemon=True)
+def start_massive_ndx_poller(state: LiveMarketState, *,
+                             stop_event: threading.Event | None = None) -> threading.Thread:
+    thread = threading.Thread(
+        target=poll_massive_ndx, args=(state,), kwargs={"stop_event": stop_event}, daemon=True)
     thread.start()
     return thread
 
 
-def start_alpaca_options_poller(state: LiveMarketState) -> threading.Thread:
+def start_alpaca_options_poller(state: LiveMarketState, *,
+                                stop_event: threading.Event | None = None) -> threading.Thread:
     """Start the independent ten-second backend options ingestion loop."""
 
     from .options_market import poll_alpaca_options
 
-    thread = threading.Thread(target=poll_alpaca_options, args=(state,), daemon=True)
+    thread = threading.Thread(
+        target=poll_alpaca_options, args=(state,),
+        kwargs={"stop_event": stop_event}, daemon=True)
     thread.start()
     return thread
 

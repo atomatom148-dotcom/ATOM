@@ -65,7 +65,10 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertTrue(all(value is None for family in payload["quant_families"] for value in family["values"]))
         self.assertIsNone(payload["market"]["data_age"])
         self.assertIsNone(payload["market"]["event_epoch"])
-        self.assertEqual(payload["v9"], {"forecast_cutoff": None, "forecast_age": None})
+        self.assertEqual(payload["v9"], {
+            "forecast_cutoff": None, "forecast_age": None,
+            "horizon_statuses": ["UNAVAILABLE"] * 6,
+        })
         self.assertIsNone(payload["market"]["last_cycle"])
 
     def test_page_formats_live_values_without_rounding_api_values(self):
@@ -175,6 +178,14 @@ class WebSurfaceTests(unittest.TestCase):
         )
         v9_output = SimpleNamespace(
             v1=SimpleNamespace(cutoff_at=datetime.fromtimestamp(100.0, timezone.utc)),
+            v3=SimpleNamespace(horizon_results=tuple(
+                SimpleNamespace(horizon=horizon, status=status)
+                for horizon, status in zip(
+                    ("30S", "1M", "5M", "15M", "30M", "1H"),
+                    ("MATURE", "PROVISIONAL", "UNAVAILABLE",
+                     "MATURE", "PROVISIONAL", "UNAVAILABLE"),
+                )
+            )),
             final_numbers=(),
         )
         publication = replace(state.publication(), v9_output=v9_output)
@@ -187,6 +198,10 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertEqual(payload["market"]["data_age"], -1.0)
         self.assertEqual(payload["v9"]["forecast_cutoff"], 100.0)
         self.assertEqual(payload["v9"]["forecast_age"], 5.0)
+        self.assertEqual(payload["v9"]["horizon_statuses"], [
+            "MATURE", "PROVISIONAL", "UNAVAILABLE",
+            "MATURE", "PROVISIONAL", "UNAVAILABLE",
+        ])
 
     def test_live_endpoint_falls_back_to_history_event_epoch(self):
         state = LiveMarketState()

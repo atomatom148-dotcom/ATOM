@@ -45,9 +45,10 @@ class TerminalDeliveryError(RuntimeError):
 
 def _transient_database_error(error: Exception) -> bool:
     """Recognize DB-API connection/operational failures without importing on path."""
-    return type(error).__name__ in {
+    transient_names = {
         "OperationalError", "InterfaceError", "ConnectionError", "TimeoutError",
     }
+    return any(base.__name__ in transient_names for base in type(error).__mro__)
 
 
 class V4StateCacheRefresher:
@@ -58,6 +59,21 @@ class V4StateCacheRefresher:
                  accuracy_cache: ImmutableStateCache):
         self._compact_store, self._accuracy_store = compact_store, accuracy_store
         self._compact_cache, self._accuracy_cache = compact_cache, accuracy_cache
+
+    def rebind_connection(self, connection) -> None:
+        """Replace both readers after their shared DB session is recovered."""
+
+        for store, replacement in (
+            (self._compact_store, V4CStateStore),
+            (self._accuracy_store, AccuracyStateStore),
+        ):
+            rebind = getattr(store, "rebind_connection", None)
+            if callable(rebind):
+                rebind(connection)
+            elif store is self._compact_store:
+                self._compact_store = replacement(connection)
+            else:
+                self._accuracy_store = replacement(connection)
 
     def refresh(self, *, symbol: str, cohort_id: str, cutoff: datetime) -> None:
         compact, compact_status = self._compact_store.latest_json(
@@ -79,6 +95,12 @@ class PostgresV4BStateBuilder:
         self._store = state_store or AccuracyStateStore(connection)
         self._clock = wall_clock
         self._candidate = None
+
+    def rebind_connection(self, connection) -> None:
+        self._connection = connection
+        rebind = getattr(self._store, "rebind_connection", None)
+        if callable(rebind):
+            rebind(connection)
 
     def prepare(self, *, symbol: str, state_as_of: datetime,
                 cohorts: dict[str, tuple[str, str]]) -> None:
@@ -135,6 +157,12 @@ class PostgresV4CStateBuilder:
         self._store = state_store or V4CStateStore(connection)
         self._clock = wall_clock
         self._candidate = None
+
+    def rebind_connection(self, connection) -> None:
+        self._connection = connection
+        rebind = getattr(self._store, "rebind_connection", None)
+        if callable(rebind):
+            rebind(connection)
 
     def prepare(self, *, symbol: str, state_as_of: datetime,
                 cohorts: dict[str, tuple[str, str]]) -> None:
@@ -275,6 +303,10 @@ class PostgresV4StateBuilder:
         self._accuracy_builder.prepare(**candidate)
         self._compact_builder.prepare(**candidate)
 
+    def rebind_connection(self, connection) -> None:
+        self._accuracy_builder.rebind_connection(connection)
+        self._compact_builder.rebind_connection(connection)
+
     def build_and_publish(self) -> str:
         accuracy = self._accuracy_builder.build_and_publish()
         compact = self._compact_builder.build_and_publish()
@@ -299,16 +331,55 @@ class V4StateBuildWorker:
     """Run full-history V4 state construction outside the evidence FIFO."""
 
     def __init__(self, state_builder: PostgresV4StateBuilder,
-                 scheduler: OfflineStateBuildScheduler, *,
+                 scheduler: OfflineStateBuildScheduler, *, connection=None,
+                 connect: Callable | None = None, database_url: str | None = None,
                  metrics: OperationalMetrics | None = None):
         self._builder = state_builder
         self._scheduler = scheduler
         self._metrics = metrics or OperationalMetrics()
+        self._connection = connection
+        self._connect = connect
+        self._database_url = database_url
         self._latest: V4StateBuildCandidate | None = None
         self._latest_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._needs_reconnect = False
+
+    def _reconnect(self) -> None:
+        if self._connect is None or not self._database_url:
+            raise RuntimeError("V4 state builder reconnect is not configured")
+        connection = self._connect(self._database_url)
+        try:
+            self._builder.rebind_connection(connection)
+        except Exception:
+            close = getattr(connection, "close", None)
+            if callable(close):
+                close()
+            raise
+        old, self._connection = self._connection, connection
+        rollback = getattr(old, "rollback", None)
+        if callable(rollback):
+            try:
+                rollback()
+            except Exception:
+                pass
+        close = getattr(old, "close", None)
+        if callable(close):
+            close()
+        self._metrics.increment("v4_state_build_worker.reconnect_success")
+
+    def _recover_if_needed(self) -> bool:
+        if not self._needs_reconnect:
+            return True
+        try:
+            self._reconnect()
+        except Exception:
+            self._metrics.increment("v4_state_build_worker.reconnect_failure")
+            return False
+        self._needs_reconnect = False
+        return True
 
     def submit(self, *, symbol: str, state_as_of: datetime,
                cohorts: dict[str, tuple[str, str]], new_outcome: bool) -> None:
@@ -337,6 +408,8 @@ class V4StateBuildWorker:
         while not self._stop.is_set():
             self._wake.wait(1.0)
             self._wake.clear()
+            if not self._recover_if_needed():
+                continue
             candidate = self._take_latest()
             if candidate is not None:
                 try:
@@ -349,15 +422,21 @@ class V4StateBuildWorker:
                     if candidate.new_outcome:
                         self._scheduler.note_new_outcome()
                         pending_generation = True
-                except Exception:
+                except Exception as error:
                     self._metrics.increment("v4_state_build_worker.failure")
+                    if _transient_database_error(error):
+                        self._needs_reconnect = True
+                        self._recover_if_needed()
                     continue
             if not pending_generation:
                 continue
             try:
                 status = self._scheduler.run_if_due()
-            except Exception:
+            except Exception as error:
                 self._metrics.increment("v4_state_build_worker.failure")
+                if _transient_database_error(error):
+                    self._needs_reconnect = True
+                    self._recover_if_needed()
                 continue
             if status in {"INSERT", "IDEMPOTENT", "SKIPPED_NO_NEW_OUTCOME"}:
                 pending_generation = False
@@ -374,7 +453,15 @@ class V4StateBuildWorker:
         self._stop.set()
         self._wake.set()
         if self._thread is not None:
-            self._thread.join(timeout=1.0)
+            # Never close a recovered connection underneath an active build.
+            self._thread.join()
+        close = getattr(self._connection, "close", None)
+        if callable(close):
+            close()
+        self._connection = None
+
+    def close(self) -> None:
+        self.stop()
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,15 +487,20 @@ class EvidenceOutbox:
         self._queue: Queue[QuoteEvidenceWork] = Queue(EVIDENCE_OUTBOX_CAPACITY)
         self.metrics = metrics or OperationalMetrics()
         self._available = True
+        self._availability_lock = threading.Lock()
 
     def put_nowait(self, item: QuoteEvidenceWork) -> bool:
         started = time.perf_counter()
         try:
-            if not self._available:
-                self.metrics.increment("EVIDENCE_OUTBOX_UNAVAILABLE")
-                return False
-            self._queue.put_nowait(item)
-            return True
+            # Serialize the availability transition with the non-blocking put.
+            # Once unavailable() returns, every previously accepted item is
+            # therefore visible to join() and no later item can enter the FIFO.
+            with self._availability_lock:
+                if not self._available:
+                    self.metrics.increment("EVIDENCE_OUTBOX_UNAVAILABLE")
+                    return False
+                self._queue.put_nowait(item)
+                return True
         except Full:
             self.metrics.increment("EVIDENCE_OUTBOX_FULL")
             return False
@@ -422,8 +514,20 @@ class EvidenceOutbox:
     def task_done(self) -> None:
         self._queue.task_done()
 
+    def join(self) -> None:
+        """Wait until every item accepted before shutdown is finalized."""
+
+        self._queue.join()
+
+    def has_unfinished(self) -> bool:
+        """Report whether shutdown would need a live consumer to drain."""
+
+        with self._queue.mutex:
+            return self._queue.unfinished_tasks != 0
+
     def unavailable(self) -> None:
-        self._available = False
+        with self._availability_lock:
+            self._available = False
 
 
 class EvidenceLedgerWorker:
@@ -443,6 +547,7 @@ class EvidenceLedgerWorker:
                 connect = psycopg.connect
             connection = connect(database_url)
         self.outbox, self._store, self._connection = outbox, evidence_store, connection
+        self._connect, self._database_url = connect, database_url
         self._writer = V4AWriter(connection)
         self.metrics = metrics or outbox.metrics
         self._clock = wall_clock
@@ -453,6 +558,49 @@ class EvidenceLedgerWorker:
         self._last_sequence: int | None = None
         self._resolution_contiguous = True
         self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._needs_reconnect = False
+
+    def _reconnect(self) -> None:
+        """Replace every dependency bound to the failed shared connection."""
+
+        if self._connect is None or not self._database_url:
+            raise RuntimeError("evidence ledger reconnect is not configured")
+        connection = self._connect(self._database_url)
+        old = self._connection
+        rebind_store = None
+        try:
+            writer = V4AWriter(connection)
+            rebind_store = getattr(self._store, "rebind_connection", None)
+            if not callable(rebind_store):
+                raise RuntimeError("evidence store cannot rebind its connection")
+            rebind_store(connection)
+            if self._cache_refresher is not None:
+                self._cache_refresher.rebind_connection(connection)
+        except Exception:
+            try:
+                if callable(rebind_store):
+                    rebind_store(old)
+                if self._cache_refresher is not None:
+                    self._cache_refresher.rebind_connection(old)
+            except Exception:
+                pass
+            close = getattr(connection, "close", None)
+            if callable(close):
+                close()
+            raise
+        self._connection = connection
+        self._writer = writer
+        rollback = getattr(old, "rollback", None)
+        if callable(rollback):
+            try:
+                rollback()
+            except Exception:
+                pass
+        close = getattr(old, "close", None)
+        if callable(close):
+            close()
+        self.metrics.increment("evidence_ledger_worker.reconnect_success")
 
     def _load_pending(self) -> list[V4ForecastRecord]:
         """Recover only durable, unresolved forecasts in the conservative window."""
@@ -593,6 +741,15 @@ class EvidenceLedgerWorker:
             except Empty:
                 continue
             while not self._stop.is_set():
+                if self._needs_reconnect:
+                    try:
+                        self._reconnect()
+                    except Exception:
+                        self.metrics.increment(
+                            "evidence_ledger_worker.reconnect_failure")
+                        time.sleep(.1)
+                        continue
+                    self._needs_reconnect = False
                 try:
                     self.process(item)
                     self.outbox.task_done()
@@ -615,15 +772,30 @@ class EvidenceLedgerWorker:
                         self._resolution_contiguous = False
                         self.outbox.task_done()
                         break
+                    self._needs_reconnect = True
                     time.sleep(.1)  # transient off-path retry of the same FIFO head
 
     def start(self) -> threading.Thread:
-        thread = threading.Thread(target=self.run, name="coin-evidence-ledger", daemon=True)
-        thread.start()
-        return thread
+        if self._thread is not None and self._thread.is_alive():
+            return self._thread
+        self._thread = threading.Thread(
+            target=self.run, name="coin-evidence-ledger", daemon=True)
+        self._thread.start()
+        return self._thread
 
     def close(self) -> None:
+        self.outbox.unavailable()
+        if self._thread is not None and self._thread.is_alive():
+            # Keep retrying the exact FIFO head until all accepted work has a
+            # durable or terminal disposition.  Stopping first would silently
+            # abandon queued evidence.
+            self.outbox.join()
+        elif self.outbox.has_unfinished():
+            raise RuntimeError("cannot drain evidence outbox without a live worker")
         self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
         close = getattr(self._connection, "close", None)
         if callable(close):
             close()
+        self._connection = None
