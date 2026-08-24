@@ -351,6 +351,29 @@ class LiveMarketTests(unittest.TestCase):
         self.assertIsNone(value.ndx_age_seconds)
         self.assertEqual(value.ndx_return_bps, (None,) * 6)
 
+    def test_repeated_latest_btc_quote_remains_live_and_is_not_duplicated(self):
+        state = LiveMarketState(clock=lambda: 2.0)
+        payload = json.dumps({"quotes": {"BTC/USD": {
+            "bp": 100.0, "ap": 102.0, "t": "1970-01-01T00:00:01Z",
+        }}}).encode()
+        responses = [BytesIO(payload), BytesIO(payload)]
+
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }), patch(
+            "quant.live_market.urlopen", side_effect=responses,
+        ) as urlopen, patch(
+            "quant.live_market.time.sleep", side_effect=(None, RuntimeError("stop")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                poll_alpaca_g2(state, clock=lambda: 2.0)
+
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(len(state._btc_history.observations), 1)
+        self.assertEqual(
+            dict(state.metrics.snapshot().statuses)["btc_source_status"], "LIVE",
+        )
+
     def test_btc_failure_is_single_attempt_and_cannot_enter_coin_path(self):
         state = MagicMock(spec=LiveMarketState)
         state.metrics = LiveMarketState().metrics

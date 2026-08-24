@@ -286,6 +286,9 @@ class LiveMarketState:
             return False
         with self._lock:
             history = self._btc_history if asset == "BTC" else self._ndx_history
+            latest = history.latest
+            if latest is not None and event_epoch == latest.event_epoch:
+                return price == latest.midpoint
             try:
                 updated = append_bounded(history, MidpointObservation(event_epoch, price))
             except ValueError:

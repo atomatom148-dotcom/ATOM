@@ -451,6 +451,71 @@ def test_state_builder_close_never_closes_connection_under_active_build():
     assert connection.close_calls == 1
 
 
+def test_state_builder_keeps_outcome_trigger_bound_to_its_cohort():
+    class Builder:
+        def __init__(self): self.prepared = []
+        def prepare(self, **candidate): self.prepared.append(candidate)
+        def build_and_publish(self): return "INSERT"
+
+    def cohorts(name):
+        return {horizon: (name, name * 64) for horizon in HORIZONS}
+
+    builder = Builder()
+    worker = V4StateBuildWorker(
+        builder, OfflineStateBuildScheduler(builder.build_and_publish),
+    )
+    worker.submit(symbol="COIN", state_as_of=NOW, cohorts=cohorts("a"),
+                  new_outcome=True)
+    worker.submit(symbol="COIN", state_as_of=NOW + timedelta(seconds=1),
+                  cohorts=cohorts("b"), new_outcome=False)
+    worker.start()
+    deadline = time.monotonic() + 1
+    while not builder.prepared and time.monotonic() < deadline:
+        time.sleep(.01)
+    worker.stop()
+
+    assert len(builder.prepared) == 1
+    assert builder.prepared[0]["cohorts"] == cohorts("a")
+
+
+def test_state_builder_shutdown_drains_pending_outcome_cohorts():
+    started, release = threading.Event(), threading.Event()
+
+    class Builder:
+        def __init__(self): self.prepared = []; self.build_calls = 0
+        def prepare(self, **candidate): self.prepared.append(candidate)
+        def build_and_publish(self):
+            self.build_calls += 1
+            if self.build_calls == 1:
+                started.set()
+                assert release.wait(2)
+            return "INSERT"
+
+    def cohorts(name):
+        return {horizon: (name, name * 64) for horizon in HORIZONS}
+
+    builder = Builder()
+    worker = V4StateBuildWorker(
+        builder, OfflineStateBuildScheduler(builder.build_and_publish),
+    )
+    worker.start()
+    worker.submit(symbol="COIN", state_as_of=NOW, cohorts=cohorts("a"),
+                  new_outcome=True)
+    assert started.wait(1)
+    worker.submit(symbol="COIN", state_as_of=NOW + timedelta(seconds=1),
+                  cohorts=cohorts("b"), new_outcome=True)
+    closer = threading.Thread(target=worker.stop)
+    closer.start()
+    release.set()
+    closer.join(timeout=2)
+
+    assert not closer.is_alive()
+    assert builder.build_calls == 2
+    assert [item["cohorts"] for item in builder.prepared] == [
+        cohorts("a"), cohorts("b"),
+    ]
+
+
 @pytest.mark.parametrize("family_count", (11, 10, 7, 3, 1, 0))
 def test_continuous_cycle_uses_current_subset_without_readiness_gate(family_count):
     v1, v2 = _inputs(family_count)

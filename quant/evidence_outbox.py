@@ -319,7 +319,7 @@ class PostgresV4StateBuilder:
 
 @dataclass(frozen=True, slots=True)
 class V4StateBuildCandidate:
-    """One immutable latest-wins request for the off-FIFO state builder."""
+    """One immutable per-cohort request for the off-FIFO state builder."""
 
     symbol: str
     state_as_of: datetime
@@ -340,7 +340,9 @@ class V4StateBuildWorker:
         self._connection = connection
         self._connect = connect
         self._database_url = database_url
-        self._latest: V4StateBuildCandidate | None = None
+        self._pending_candidates: dict[
+            tuple[str, tuple[tuple[str, str, str], ...]], V4StateBuildCandidate
+        ] = {}
         self._latest_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -388,50 +390,66 @@ class V4StateBuildWorker:
             raise ValueError("cohorts must contain exactly six canonical horizons in order")
         candidate = V4StateBuildCandidate(
             symbol, state_as_of, ordered, bool(new_outcome))
+        if not candidate.new_outcome:
+            return
+        key = (candidate.symbol, candidate.cohorts)
         with self._latest_lock:
-            if self._latest is not None:
+            existing = self._pending_candidates.get(key)
+            if existing is not None:
+                latest = (candidate if candidate.state_as_of >= existing.state_as_of
+                          else existing)
                 candidate = V4StateBuildCandidate(
-                    candidate.symbol, candidate.state_as_of, candidate.cohorts,
-                    candidate.new_outcome or self._latest.new_outcome,
+                    latest.symbol, latest.state_as_of, latest.cohorts, True,
                 )
                 self._metrics.increment("v4_state_build_worker.coalesced")
-            self._latest = candidate
+            self._pending_candidates[key] = candidate
         self._wake.set()
 
-    def _take_latest(self) -> V4StateBuildCandidate | None:
+    def _take_next(self) -> V4StateBuildCandidate | None:
         with self._latest_lock:
-            candidate, self._latest = self._latest, None
-        return candidate
+            if not self._pending_candidates:
+                return None
+            key = next(iter(self._pending_candidates))
+            return self._pending_candidates.pop(key)
+
+    def _has_pending(self) -> bool:
+        with self._latest_lock:
+            return bool(self._pending_candidates)
 
     def run(self) -> None:
+        active: V4StateBuildCandidate | None = None
         pending_generation = False
-        while not self._stop.is_set():
+        while True:
+            if self._stop.is_set() and active is None and not self._has_pending():
+                break
             self._wake.wait(1.0)
             self._wake.clear()
             if not self._recover_if_needed():
                 continue
-            candidate = self._take_latest()
-            if candidate is not None:
+            if active is None:
+                active = self._take_next()
+            if active is not None and not pending_generation:
                 try:
                     self._builder.prepare(
-                        symbol=candidate.symbol,
-                        state_as_of=candidate.state_as_of,
+                        symbol=active.symbol,
+                        state_as_of=active.state_as_of,
                         cohorts={horizon: (cohort_id, cohort_hash)
-                                 for horizon, cohort_id, cohort_hash in candidate.cohorts},
+                                 for horizon, cohort_id, cohort_hash in active.cohorts},
                     )
-                    if candidate.new_outcome:
-                        self._scheduler.note_new_outcome()
-                        pending_generation = True
+                    self._scheduler.note_new_outcome()
+                    pending_generation = True
                 except Exception as error:
                     self._metrics.increment("v4_state_build_worker.failure")
                     if _transient_database_error(error):
                         self._needs_reconnect = True
                         self._recover_if_needed()
+                    else:
+                        active = None
                     continue
             if not pending_generation:
                 continue
             try:
-                status = self._scheduler.run_if_due()
+                status = self._scheduler.run_if_due(force=self._stop.is_set())
             except Exception as error:
                 self._metrics.increment("v4_state_build_worker.failure")
                 if _transient_database_error(error):
@@ -440,6 +458,9 @@ class V4StateBuildWorker:
                 continue
             if status in {"INSERT", "IDEMPOTENT", "SKIPPED_NO_NEW_OUTCOME"}:
                 pending_generation = False
+                active = None
+                if self._has_pending():
+                    self._wake.set()
 
     def start(self) -> threading.Thread:
         if self._thread is not None and self._thread.is_alive():

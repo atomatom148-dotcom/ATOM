@@ -29,6 +29,7 @@ class ForecastRecord:
     created_epoch: float
     data_schema_version: str = DATA_SCHEMA_VERSION
     source_spec_version: str = SOURCE_SPEC_VERSION
+    source_as_of_epoch: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,8 +155,8 @@ class PostgresEvidenceStore:
                             (quant_id, formula_version, cycle_id, symbol, horizon,
                              cutoff_epoch, maturity_epoch, cutoff_midpoint,
                              forecast_bps, created_epoch, data_schema_version,
-                             source_spec_version)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                             source_spec_version, source_as_of_epoch)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT
                             (quant_id, formula_version, cycle_id, symbol, horizon)
                         DO NOTHING
@@ -166,6 +167,7 @@ class PostgresEvidenceStore:
                             row.maturity_epoch, row.cutoff_midpoint,
                             row.forecast_bps, row.created_epoch,
                             row.data_schema_version, row.source_spec_version,
+                            row.source_as_of_epoch,
                         ) for row in forecasts],
                     )
                     if volatility_forecasts is not None:
@@ -473,6 +475,17 @@ def records_for_results(*, results: Sequence[object], cycle_id: str,
     for result in results:
         if result is None:
             continue
+        source_as_of_epoch = getattr(result, "source_as_of_epoch", None)
+        provider_timed = result.quant_id in {"q4_stat_arb", "q10_options_vol"}
+        if source_as_of_epoch is None:
+            if provider_timed:
+                continue
+            source_as_of_epoch = cutoff_epoch
+        if (isinstance(source_as_of_epoch, bool) or
+                not isinstance(source_as_of_epoch, (int, float)) or
+                not math.isfinite(source_as_of_epoch) or
+                source_as_of_epoch > cutoff_epoch):
+            continue
         values = result.forecast_bps
         for horizon, seconds, value in zip(HORIZONS, HORIZON_SECONDS, values):
             if value is None:
@@ -485,7 +498,7 @@ def records_for_results(*, results: Sequence[object], cycle_id: str,
             records.append(ForecastRecord(
                 result.quant_id, result.formula_version, cycle_id, symbol,
                 horizon, cutoff_epoch, maturity, cutoff_midpoint, float(value),
-                created_epoch,
+                created_epoch, source_as_of_epoch=float(source_as_of_epoch),
             ))
     return tuple(records)
 

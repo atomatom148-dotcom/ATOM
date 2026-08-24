@@ -1,5 +1,6 @@
 import math
 import unittest
+from types import SimpleNamespace
 
 from quant.evidence import (
     DATA_SCHEMA_VERSION,
@@ -83,6 +84,33 @@ class MemoryEvidence:
 
 
 class LiveEvidenceTests(unittest.TestCase):
+    def test_directional_records_preserve_provider_source_time(self):
+        result = SimpleNamespace(
+            quant_id="q4_stat_arb", formula_version="stat-arb-v1",
+            forecast_bps=(1.0,) * 6, source_as_of_epoch=98.5,
+        )
+
+        records = records_for_results(
+            results=(result,), cycle_id="COIN:100", symbol="COIN",
+            cutoff_epoch=100.0, cutoff_midpoint=50.0, created_epoch=101.0,
+        )
+
+        self.assertEqual(len(records), 6)
+        self.assertEqual({row.source_as_of_epoch for row in records}, {98.5})
+
+    def test_provider_timed_family_without_source_time_is_not_persisted(self):
+        result = SimpleNamespace(
+            quant_id="q10_options_vol", formula_version="options-v1",
+            forecast_bps=(1.0,) * 6,
+        )
+
+        records = records_for_results(
+            results=(result,), cycle_id="COIN:100", symbol="COIN",
+            cutoff_epoch=100.0, cutoff_midpoint=50.0, created_epoch=101.0,
+        )
+
+        self.assertEqual(records, ())
+
     def populated_state(self):
         store = MemoryEvidence()
         now = [0.0]
@@ -444,10 +472,11 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertEqual(
             authoritative_values[5:],
             (100, 130, 100, 5, 101,
-             DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION),
+             DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None),
         )
         self.assertIn("data_schema_version", cursor.forecast_statement)
         self.assertIn("source_spec_version", cursor.forecast_statement)
+        self.assertIn("source_as_of_epoch", cursor.forecast_statement)
         self.assertEqual(len(cursor.outcomes), 1)
         outcome = cursor.outcomes[first_forecast_id]
         self.assertEqual(outcome[0], 110)

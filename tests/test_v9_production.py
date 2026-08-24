@@ -8,7 +8,9 @@ from quant.evidence import DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION
 from quant.history import MidpointHistory, MidpointObservation
 from quant.live_market import LiveMarketState
 from quant.q10_options_vol import OptionObservation
-from quant.v9_production import PostgresV2StateBuilder, build_live_v1
+from quant.v9_production import (
+    FORMULA_VERSION_MAP, PostgresV2StateBuilder, build_live_v1,
+)
 from quant.v9_v1_contract import HORIZONS, QUANT_IDS
 from quant.web import dashboard_data
 
@@ -248,3 +250,61 @@ def test_v2_batch_builder_uses_read_only_repeatable_read_and_closes_snapshot():
     assert connection.value.fetches == 2
     assert connection.rollbacks == 1
     assert connection.value.closed and connection.closed
+
+
+def test_v2_builder_materializes_provider_time_and_rejects_unproven_rows(monkeypatch):
+    cutoff = NOW - 10.0
+    directional = [
+        (1, "q4_stat_arb", FORMULA_VERSION_MAP["q4_stat_arb"], "cycle", "COIN",
+         "30S", cutoff, cutoff + 30, 1.0, cutoff + 1,
+         DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, cutoff - 2, 2.0, NOW),
+        (2, "q10_options_vol", FORMULA_VERSION_MAP["q10_options_vol"], "cycle", "COIN",
+         "30S", cutoff, cutoff + 30, 1.0, cutoff + 1,
+         DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None, 2.0, NOW),
+        (3, "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"], "cycle", "COIN",
+         "30S", cutoff, cutoff + 30, 1.0, cutoff + 1,
+         DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None, 2.0, NOW),
+    ]
+
+    class Cursor:
+        def __init__(self):
+            self.fetchall_calls = 0
+            self.statements = []
+        def execute(self, sql, parameters):
+            self.statements.append((" ".join(sql.split()), parameters))
+        def fetchone(self): return (NOW,)
+        def fetchall(self):
+            self.fetchall_calls += 1
+            return directional if self.fetchall_calls == 1 else []
+        def close(self): pass
+
+    class Connection:
+        def __init__(self): self.cursor_value = Cursor()
+        def cursor(self): return self.cursor_value
+        def rollback(self): pass
+        def close(self): pass
+
+    captured = {}
+    def dataset(**kwargs):
+        captured[kwargs["horizon"]] = kwargs
+        return SimpleNamespace(horizon=kwargs["horizon"])
+    monkeypatch.setattr("quant.v9_production.build_v2a_dataset", dataset)
+    monkeypatch.setattr("quant.v9_production.build_v2b_calibration", lambda _datasets: object())
+    monkeypatch.setattr("quant.v9_production.build_v2c_covariance", lambda *_args: object())
+    monkeypatch.setattr(
+        "quant.v9_production.build_v2d_evidence_state",
+        lambda **_kwargs: SimpleNamespace(
+            creation_status="VALID", top_level_status="PROVISIONAL"),
+    )
+    connection = Connection()
+
+    PostgresV2StateBuilder(
+        "postgresql://unused", connect=lambda _url: connection,
+    ).build()
+
+    observations = captured["30S"]["observations"]
+    assert [(row.quant_id, row.source_as_of_epoch) for row in observations] == [
+        ("q4_stat_arb", cutoff - 2),
+        ("q1_momentum", cutoff),
+    ]
+    assert "f.source_as_of_epoch" in connection.cursor_value.statements[2][0]
