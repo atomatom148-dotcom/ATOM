@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 import ast
@@ -129,6 +129,81 @@ def test_stage_b_hook_is_after_complete_persistence_loop():
     completion = source.index("len(finalized) == 6")
     submit = source.index("self._simulation_submit(")
     assert persist < completion < submit
+
+
+def test_eligibility_clock_is_immediate_after_six_persistence_results(monkeypatch):
+    from quant.evidence_outbox import (
+        EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork,
+    )
+    from quant.history import MidpointObservation
+
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    output, results = _cycle()
+    events = []
+    forecasts = tuple(SimpleNamespace(
+        **vars(result.forecast),
+        target_endpoint=NOW + timedelta(seconds=seconds),
+        persistence_proof_eligible=True,
+        symbol="COIN",
+        cohort_id="cohort",
+        cohort_hash="a" * 64,
+    ) for result, seconds in zip(results, (30, 60, 300, 900, 1800, 3600)))
+
+    class Connection:
+        def close(self): pass
+
+    class RawStore:
+        def record_cycle_and_resolve(self, *_args, **_kwargs):
+            events.append("raw")
+
+    class Writer:
+        last_write_status = None
+        def persist_forecast(self, forecast, _persisted_at):
+            events.append("persist:" + forecast.horizon)
+            self.last_write_status = "INSERT"
+            return forecast
+
+    class Refresher:
+        def refresh(self, **_kwargs):
+            events.append("cache")
+
+    adapter = SimulationCaptureAdapter(
+        SimpleNamespace(insert=lambda _intent: "INSERTED"),
+        lambda: events.append("eligible_at") or NOW,
+    )
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=RawStore(), connection=Connection(),
+        state_build_submit=lambda **_kwargs: events.append("state_build"),
+        cache_refresher=Refresher(), simulation_submit=adapter.submit,
+    )
+    worker._writer = Writer()
+    observation = MidpointObservation(NOW.timestamp(), 100.0)
+    worker.process(QuoteEvidenceWork(
+        1, "cycle", None, observation, NOW, (), (), forecasts,
+        "cohort", output,
+    ))
+
+    assert events == [
+        "raw", *("persist:" + horizon for horizon in HORIZONS),
+        "eligible_at", "state_build", "cache",
+    ]
+
+    events.clear()
+    invalid_worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=RawStore(), connection=Connection(),
+        state_build_submit=lambda **_kwargs: events.append("state_build"),
+        cache_refresher=Refresher(),
+        simulation_submit=lambda *_args: events.append("invalid_submit"),
+    )
+    invalid_worker._writer = Writer()
+    invalid_worker.process(QuoteEvidenceWork(
+        1, "cycle", None, observation, NOW, (), (), forecasts,
+        "cohort", object(),
+    ))
+    assert events == [
+        "raw", *("persist:" + horizon for horizon in HORIZONS),
+        "state_build", "cache",
+    ]
 
 
 def test_capacity_64_atomic_incoming_drop_and_fifo_order():

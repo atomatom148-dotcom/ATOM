@@ -700,6 +700,16 @@ class EvidenceLedgerWorker:
                     stored.forecast_record_id not in pending_ids):
                 remaining.append(stored)
                 pending_ids.add(stored.forecast_record_id)
+        # SIM-3's single eligibility clock read is the first operation after
+        # all six forecast persistence results are final.  State construction,
+        # cache refresh, and every other derived action happen afterwards.
+        if (self._simulation_submit is not None and
+                isinstance(item.v4d_output, V4DCycleOutput)
+                and len(finalized) == 6):
+            try:
+                self._simulation_submit(item.v4d_output, tuple(finalized))
+            except Exception:
+                pass
         remaining.sort(key=lambda row: (row.target_endpoint, row.forecast_record_id))
         self._pending = remaining
         self._last_sequence = item.sequence
@@ -718,12 +728,6 @@ class EvidenceLedgerWorker:
                 )
             except Exception:
                 self.metrics.increment("v4_state_build_submit.failure")
-        if (self._simulation_submit is not None and item.v4d_output is not None
-                and len(finalized) == 6):
-            try:
-                self._simulation_submit(item.v4d_output, tuple(finalized))
-            except Exception:
-                pass
         if self._cache_refresher is not None and item.state_cohort_id is not None:
             try:
                 self._cache_refresher.refresh(
