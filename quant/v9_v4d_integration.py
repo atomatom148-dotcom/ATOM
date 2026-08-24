@@ -348,12 +348,13 @@ class OfflineStateBuildScheduler:
         with self._lock:
             self._latest_outcome_generation += 1
 
-    def run_if_due(self) -> str:
+    def run_if_due(self, *, force: bool = False) -> str:
         with self._lock:
             now = self._clock()
             if self._latest_outcome_generation == self._built_generation:
                 return "SKIPPED_NO_NEW_OUTCOME"
-            if self._last_build is not None and now - self._last_build < self._interval:
+            if (not force and self._last_build is not None and
+                    now - self._last_build < self._interval):
                 return "SKIPPED_RATE_LIMIT"
             generation = self._latest_outcome_generation
             self._last_build = now

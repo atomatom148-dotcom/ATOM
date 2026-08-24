@@ -28,10 +28,14 @@ class DirectionalResult:
     quant_id: str
     formula_version: str
     forecast_bps: tuple[float, ...]
+    source_as_of_epoch: float | None = None
 
 
 def result(quant_id: str) -> DirectionalResult:
-    return DirectionalResult(quant_id, f"{quant_id}-v1", (1, 2, 3, 4, 5, 6))
+    source_as_of = 0.0 if quant_id in {"q4_stat_arb", "q10_options_vol"} else None
+    return DirectionalResult(
+        quant_id, f"{quant_id}-v1", (1, 2, 3, 4, 5, 6), source_as_of,
+    )
 
 
 def records(results, cycle: int = 1):
@@ -164,7 +168,7 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
     def test_q10_uses_immutable_identity_and_common_coin_cutoff(self):
         q10 = DirectionalResult(
             "q10_options_vol", "coin-options-skew-delta-v2",
-            (1, 2, 3, 4, 5, 6),
+            (1, 2, 3, 4, 5, 6), 0.0,
         )
 
         generated = records((q10,))
