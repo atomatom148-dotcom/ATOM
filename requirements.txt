@@ -1,1 +1,2 @@
 psycopg[binary]
+websocket-client==1.9.0

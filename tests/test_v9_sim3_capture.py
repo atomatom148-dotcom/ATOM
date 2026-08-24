@@ -134,6 +134,7 @@ def test_stage_b_hook_is_after_complete_persistence_loop():
 def test_eligibility_clock_is_immediate_after_six_persistence_results(monkeypatch):
     from quant.evidence_outbox import (
         EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork,
+        TerminalDeliveryError,
     )
     from quant.history import MidpointObservation
 
@@ -196,14 +197,12 @@ def test_eligibility_clock_is_immediate_after_six_persistence_results(monkeypatc
         simulation_submit=lambda *_args: events.append("invalid_submit"),
     )
     invalid_worker._writer = Writer()
-    invalid_worker.process(QuoteEvidenceWork(
-        1, "cycle", None, observation, NOW, (), (), forecasts,
-        "cohort", object(),
-    ))
-    assert events == [
-        "raw", *("persist:" + horizon for horizon in HORIZONS),
-        "state_build", "cache",
-    ]
+    with pytest.raises(TerminalDeliveryError, match="MALFORMED_EVIDENCE_ENVELOPE"):
+        invalid_worker.process(QuoteEvidenceWork(
+            1, "cycle", None, observation, NOW, (), (), forecasts,
+            "cohort", object(),
+        ))
+    assert events == []
 
 
 def test_capacity_64_atomic_incoming_drop_and_fifo_order():

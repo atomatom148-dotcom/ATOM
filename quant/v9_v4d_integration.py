@@ -230,14 +230,24 @@ class V4DCoordinator:
             state = None
         elif state is None:
             state_status = "UNAVAILABLE"
-        self.metrics.increment("v4_state." + state_status)
-        compact = {item.horizon: item for item in state.horizons} if state else {}
         accuracy_state, accuracy_status = (self._accuracy_lookup(
             symbol=v1.symbol, cohort_id=cohort_id,
             requested_cutoff=v1.cutoff_at) if self._accuracy_lookup else
             (None, "UNAVAILABLE"))
         if accuracy_status != "AVAILABLE" or accuracy_state is None:
             accuracy_state = None
+        if self._accuracy_lookup is not None:
+            if (state is None) != (accuracy_state is None):
+                state = accuracy_state = None
+                state_status = "STATE_GENERATION_INCOMPLETE"
+            elif (state is not None and accuracy_state is not None and
+                  (state.symbol, state.cohort_id, state.state_as_of) !=
+                  (accuracy_state.symbol, accuracy_state.cohort_id,
+                   accuracy_state.state_as_of)):
+                state = accuracy_state = None
+                state_status = "STATE_GENERATION_MISMATCH"
+        self.metrics.increment("v4_state." + state_status)
+        compact = {item.horizon: item for item in state.horizons} if state else {}
         accuracy = {item.horizon: item for item in accuracy_state.horizon_states} if accuracy_state else {}
 
         v4_started = self._monotonic()

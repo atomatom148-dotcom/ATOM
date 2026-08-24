@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import json
+import math
 import os
 import signal
 from html import escape
@@ -18,8 +19,9 @@ from .g2_cross_asset import CrossAssetState
 from .history import MidpointHistory
 from .evidence import EvidenceStore, PostgresEvidenceStore
 from .live_market import (
-    LatestMarketDisplay, LiveMarketState, LiveSnapshot, start_alpaca_g2_poller,
-    start_alpaca_options_poller, start_alpaca_poller, start_massive_ndx_poller,
+    MAX_BTC_AGE_SECONDS, LatestMarketDisplay, LiveMarketState, LiveSnapshot,
+    start_alpaca_g2_poller, start_alpaca_options_poller, start_alpaca_poller,
+    start_massive_ndx_poller,
 )
 from .q1_momentum import calculate_momentum
 from .q2_mean_reversion import calculate_mean_reversion
@@ -258,6 +260,11 @@ def dashboard_data(
         else ["UNAVAILABLE"] * 6
     )
     current_epoch = time.time() if now_epoch is None else now_epoch
+    btc_event_epoch = (
+        cross_asset_state.as_of_epoch - cross_asset_state.btc_age_seconds
+        if (cross_asset_state is not None and
+            cross_asset_state.btc_age_seconds is not None) else None
+    )
     return {
         "title": "ATOM QUANT",
         "market": {
@@ -268,6 +275,9 @@ def dashboard_data(
             ),
             "benchmarks": ["BTC", "QQQ", "NDX"],
             "btc": cross_asset_state.btc_price if cross_asset_state else None,
+            "btc_event_epoch": btc_event_epoch,
+            "btc_data_age": (current_epoch - btc_event_epoch
+                             if btc_event_epoch is not None else None),
             "qqq": (market_display.qqq_midpoint if market_display else
                     snapshot.qqq_history.latest.midpoint
                     if snapshot and snapshot.qqq_history.latest else None),
@@ -405,7 +415,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
 </style></head><body><main><h1>ATOM QUANT</h1>
 <h2>MARKET</h2><div class=market>
 <div><div class=label>COIN</div><div class=value data-dashboard-field="market.symbol">{_decimal_cell(market['symbol'])}</div></div>
-<div><div class=label>BTC</div><div class=value data-dashboard-field="market.btc">{_decimal_cell(market['btc'])}</div></div><div><div class=label>QQQ</div><div class=value data-dashboard-field="market.qqq">{_decimal_cell(market['qqq'])}</div></div><div><div class=label>NDX</div><div class=value data-dashboard-field="market.ndx">{_decimal_cell(market['ndx'])}</div></div>
+<div><div class=label>BTC</div><div class=value data-dashboard-field="market.btc"></div></div><div><div class=label>QQQ</div><div class=value data-dashboard-field="market.qqq">{_decimal_cell(market['qqq'])}</div></div><div><div class=label>NDX</div><div class=value data-dashboard-field="market.ndx">{_decimal_cell(market['ndx'])}</div></div>
 <div><div class=label>DATA AGE</div><div class=value data-dashboard-field="market.data_age">{_decimal_cell(market['data_age'], 's')}</div></div><div><div class=label>LAST CYCLE</div><div class=value data-dashboard-field="market.last_cycle">{_cycle_cell(market['last_cycle'])}</div></div></div>
 <h2>FINAL NUMBERS</h2>{_table(horizons, final_numbers.items(), section='final_numbers', decimal=True)}
 <h2>V9 DIRECTIONAL ACCURACY</h2>{_table(PHASE_E_HORIZONS, accuracy_rows, section='v9_accuracy')}
@@ -429,9 +439,35 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     const cell = cells.get(field);
     if (cell) cell.textContent = format(value);
   }};
+  let btcExpiryTimer = null;
+  let btcRenderGeneration = 0;
+  const clearBtc = generation => {{
+    if (generation !== btcRenderGeneration) return;
+    if (btcExpiryTimer !== null) {{
+      clearTimeout(btcExpiryTimer);
+      btcExpiryTimer = null;
+    }}
+    set("market.btc", null, decimal);
+  }};
   const renderLive = data => {{
+    const generation = ++btcRenderGeneration;
+    if (btcExpiryTimer !== null) {{
+      clearTimeout(btcExpiryTimer);
+      btcExpiryTimer = null;
+    }}
+    const btcEvent = Number(data.market.btc_event_epoch);
+    const btcAge = Date.now() / 1000 - btcEvent;
+    const btcLive = data.market.btc_source_status === "LIVE" &&
+      Number.isFinite(btcEvent) && Number.isFinite(btcAge) &&
+      btcAge >= 0 && btcAge < 5;
     set("market.symbol", data.market.symbol, decimal);
-    set("market.btc", data.market.btc, decimal);
+    set("market.btc", btcLive ? data.market.btc : null, decimal);
+    if (btcLive) {{
+      // Expire from the provider timestamp itself.  A hung or delayed refresh
+      // therefore cannot keep a quote visible beyond the five-second limit.
+      const remainingMs = Math.max(0, (btcEvent + 5 - Date.now() / 1000) * 1000);
+      btcExpiryTimer = setTimeout(() => clearBtc(generation), remainingMs);
+    }}
     set("market.qqq", data.market.qqq, decimal);
     set("market.ndx", data.market.ndx, decimal);
     set("market.data_age", data.market.data_age, value => decimal(value, "s"));
@@ -489,13 +525,20 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     }}));
   }};
   const refreshLive = async () => {{
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1000);
     try {{
-      const response = await fetch("/api/live", {{cache: "no-store"}});
+      const response = await fetch("/api/live", {{
+        cache: "no-store", signal: controller.signal
+      }});
       if (!response.ok) throw new Error(`live request failed: ${{response.status}}`);
       renderLive(await response.json());
     }} catch (_) {{
-      // Preserve the last successful display and retry after the target delay.
+      // Network/JSON failures are not permission to retain a BTC price whose
+      // provider age can no longer be proved.
+      clearBtc(++btcRenderGeneration);
     }} finally {{
+      clearTimeout(timeout);
       setTimeout(refreshLive, 250);
     }}
   }};
@@ -529,6 +572,27 @@ def create_app(
 
     del evidence_store  # retained only for backward-compatible construction
     metrics = metrics or getattr(state, "metrics", None) or OperationalMetrics()
+
+    def apply_btc_source_truth(data: dict[str, object]) -> None:
+        statuses = dict(metrics.snapshot().statuses)
+        market = data["market"]
+        base_status = statuses.get("btc_source_status", "NOT_STARTED")
+        age = market.get("btc_data_age")
+        live = (
+            base_status == "LIVE" and
+            isinstance(age, (int, float)) and not isinstance(age, bool) and
+            math.isfinite(float(age)) and 0.0 <= float(age) < MAX_BTC_AGE_SECONDS
+        )
+        market["btc_source_status"] = "LIVE" if live else (
+            "NOT_STARTED" if base_status == "NOT_STARTED" else "UNAVAILABLE")
+        market["btc_stream_location"] = statuses.get(
+            "btc_stream_location", "UNCONFIGURED")
+        reason = statuses.get("btc_source_failure_reason")
+        market["btc_source_failure_reason"] = (
+            None if reason in (None, "NONE") else reason)
+        # Keep the raw cached value/event/age in the API for audit, but never
+        # render stale BTC as an unlabeled current price.
+        market["btc_display"] = market.get("btc") if live else None
 
     def application(environ: dict[str, object], start_response: Callable) -> list[bytes]:
         path = environ.get("PATH_INFO", "")
@@ -615,6 +679,7 @@ def create_app(
                 market_display=market_display, v9_output=v9_output,
                 calculate_missing=False,
             )
+            apply_btc_source_truth(data)
             live = {key: data[key] for key in (
                 "market", "v9", "final_numbers", "v9_accuracy",
                 "quant_families", "options_data",
@@ -650,6 +715,7 @@ def create_app(
             v9_output=v9_output,
             calculate_missing=False,
         )
+        apply_btc_source_truth(data)
         if path == "/":
             status, content_type, body = "200 OK", "text/html; charset=utf-8", dashboard_page(data)
         elif path == "/api/dashboard":
@@ -740,10 +806,12 @@ def main(*, simulator_connection_factory: Callable | None = None,
             accuracy_store=AccuracyStateStore(ledger_connection),
             compact_cache=v9_runtime.compact_cache,
             accuracy_cache=v9_runtime.accuracy_cache,
+            metrics=metrics,
         )
         accuracy_builder = PostgresV4BStateBuilder(state_connection)
         compact_builder = PostgresV4CStateBuilder(state_connection)
-        state_builder = PostgresV4StateBuilder(accuracy_builder, compact_builder)
+        state_builder = PostgresV4StateBuilder(
+            accuracy_builder, compact_builder, connection=state_connection)
         state_scheduler = OfflineStateBuildScheduler(
             state_builder.build_and_publish, metrics=metrics,
         )
@@ -763,6 +831,9 @@ def main(*, simulator_connection_factory: Callable | None = None,
         )
         ledger_worker.start()
         state = LiveMarketState(evidence_outbox=outbox,
+                                evidence_acceptance_ready=ledger_worker.is_runtime_owner,
+                                evidence_handoff_anchor=ledger_worker.runtime_handoff_anchor,
+                                evidence_owner_generation=ledger_worker.runtime_ownership_generation,
                                 v9_cycle_handler=v9_runtime.on_quote,
                                 metrics=metrics)
         poller_threads = [
@@ -771,6 +842,16 @@ def main(*, simulator_connection_factory: Callable | None = None,
             start_massive_ndx_poller(state, stop_event=shutdown_requested),
             start_alpaca_options_poller(state, stop_event=shutdown_requested),
         ]
+        # During a rolling replacement, do not report the new process healthy
+        # until it either owns the evidence session or has captured a real COIN
+        # overlap observation that can bridge the ownership handoff causally.
+        handoff_deadline = time.monotonic() + 15.0
+        while (not state.runtime_handoff_ready() and
+               not shutdown_requested.is_set() and
+               time.monotonic() < handoff_deadline):
+            shutdown_requested.wait(.05)
+        if not state.runtime_handoff_ready():
+            raise RuntimeError("evidence handoff observation unavailable")
         app = create_app(state=state, evidence_cache=evidence_cache,
                          metrics=metrics)
         with make_server(args.host, args.port, app) as server:
@@ -786,13 +867,19 @@ def main(*, simulator_connection_factory: Callable | None = None,
                 # This barrier completes any currently accepted quote and its
                 # outbox put before the ledger transitions to drain-only mode.
                 state.stop_accepting_quotes()
+            # Release the session owner immediately after the producer barrier
+            # and durable FIFO drain.  Network pollers are already stopped and
+            # any late return is rejected by the barrier, so holding the lock
+            # through their socket joins would create an avoidable bracket gap.
+            if ledger_worker is not None:
+                ledger_worker.close()
+                ledger_worker = None
+            elif ledger_connection is not None:
+                ledger_connection.close()
+                ledger_connection = None
             poller_deadline = time.monotonic() + 11.0
             for thread in poller_threads:
                 thread.join(timeout=max(0.0, poller_deadline - time.monotonic()))
-            if ledger_worker is not None:
-                ledger_worker.close()
-            elif ledger_connection is not None:
-                ledger_connection.close()
             if state_build_worker is not None:
                 state_build_worker.close()
             elif state_connection is not None:

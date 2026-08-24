@@ -11,7 +11,8 @@ from quant.v9_v1_contract import HORIZONS, HORIZON_SECONDS
 from quant.v9_v2d_evidence_state import DirectionalCalibrationState
 from quant.v9_v3_synthesis import CANONICAL_FAMILIES
 from quant.v9_v4a_evidence import (
-    _canonical, build_forecast, build_outcome, canonical_target_identity,
+    _canonical, build_forecast, build_outcome, canonical_sha256,
+    canonical_target_identity,
 )
 from quant.v9_v4c_predictive import (
     PROBABILITY_STATE_VERSION, CompactHorizonState, build_v4c_state,
@@ -21,6 +22,7 @@ from quant.v9_v4d_integration import (
     resolve_outcome,
 )
 from quant.evidence_outbox import (
+    EVIDENCE_RECOVERY_CYCLE_QUERY_CHUNK, EVIDENCE_RECOVERY_OUTCOME_LIMIT,
     EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork, TerminalDeliveryError,
     PostgresV4BStateBuilder, PostgresV4CStateBuilder, PostgresV4StateBuilder,
     V4StateBuildWorker, V4StateCacheRefresher,
@@ -137,8 +139,14 @@ def test_unattempted_persistence_and_failed_delivery_are_reported_truthfully():
 
 
 def test_background_cache_refresh_publishes_exact_compatible_state():
-    compact = _empty_state()
-    compact_cache, accuracy_cache = ImmutableStateCache(), ImmutableStateCache()
+    compact = SimpleNamespace(symbol="COIN", cohort_id="cohort", state_as_of=NOW)
+    accuracy = SimpleNamespace(symbol="COIN", cohort_id="cohort", state_as_of=NOW)
+
+    class Cache:
+        def __init__(self): self.values = []
+        def publish(self, value): self.values.append(value)
+
+    compact_cache, accuracy_cache = Cache(), Cache()
 
     class Store:
         def __init__(self, value): self.value = value; self.calls = 0
@@ -146,21 +154,45 @@ def test_background_cache_refresh_publishes_exact_compatible_state():
             self.calls += 1
             return (self.value, "AVAILABLE") if self.value is not None else (None, "UNAVAILABLE")
 
-    compact_store, accuracy_store = Store(compact), Store(None)
+    compact_store, accuracy_store = Store(compact), Store(accuracy)
     V4StateCacheRefresher(
         compact_store=compact_store, accuracy_store=accuracy_store,
         compact_cache=compact_cache, accuracy_cache=accuracy_cache,
     ).refresh(symbol="COIN", cohort_id="cohort", cutoff=NOW)
     assert compact_store.calls == accuracy_store.calls == 1
-    assert compact_cache.latest(symbol="COIN", cohort_id="cohort",
-                                requested_cutoff=NOW) == (compact, "AVAILABLE")
-    assert compact_cache.latest(symbol="COIN", cohort_id="other",
-                                requested_cutoff=NOW) == (None, "UNAVAILABLE")
+    assert compact_cache.values == [compact]
+    assert accuracy_cache.values == [accuracy]
+
+
+def test_background_cache_refresh_rejects_unpaired_generation():
+    compact = SimpleNamespace(symbol="COIN", cohort_id="cohort", state_as_of=NOW)
+    accuracy = SimpleNamespace(
+        symbol="COIN", cohort_id="cohort", state_as_of=NOW - timedelta(seconds=1))
+
+    class Store:
+        def __init__(self, value): self.value = value
+        def latest_json(self, **_kwargs): return self.value, "AVAILABLE"
+    class Cache:
+        def __init__(self): self.values = []
+        def publish(self, value): self.values.append(value)
+
+    metrics = OperationalMetrics()
+    compact_cache, accuracy_cache = Cache(), Cache()
+    V4StateCacheRefresher(
+        compact_store=Store(compact), accuracy_store=Store(accuracy),
+        compact_cache=compact_cache, accuracy_cache=accuracy_cache,
+        metrics=metrics,
+    ).refresh(symbol="COIN", cohort_id="cohort", cutoff=NOW)
+
+    assert compact_cache.values == accuracy_cache.values == []
+    assert dict(metrics.snapshot().statuses)["v4_state_pair_status"] == \
+        "GENERATION_MISMATCH"
 
 
 class _WorkerConnection:
     def cursor(self):
         return SimpleNamespace(execute=lambda *_args: None, fetchall=lambda: (),
+                               fetchone=lambda: (True,),
                                close=lambda: None)
     def commit(self): pass
     def rollback(self): pass
@@ -179,7 +211,8 @@ def test_worker_recovers_only_persisted_proof_eligible_unresolved_forecasts():
 
     class Cursor:
         def execute(self, sql, _params):
-            assert "NOT EXISTS" in sql and "interval '1 hour'" in sql
+            assert ("NOT EXISTS" in sql and "interval '1 hour'" in sql and
+                    "f.symbol='COIN'" in sql)
         def fetchall(self): return ((forecast.forecast_record_hash, payload),)
         def close(self): pass
     class Connection(_WorkerConnection):
@@ -190,6 +223,198 @@ def test_worker_recovers_only_persisted_proof_eligible_unresolved_forecasts():
     assert worker._pending == [forecast]
 
 
+def test_worker_recovers_cross_deploy_forecast_in_exact_provider_bracket():
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecasts = tuple(replace(
+        item.forecast, persisted_at=NOW, persistence_proof_eligible=True)
+        for item in calculated.persistence)
+    due = forecasts[0]
+    rows = tuple((forecast.forecast_record_hash,
+                  json.dumps(_canonical(asdict(forecast)), sort_keys=True))
+                 for forecast in forecasts)
+
+    class Cursor:
+        def execute(self, sql, params):
+            self.sql, self.params = sql, params
+            connection.queries.append((sql, params))
+        def fetchall(self):
+            if "f.target_endpoint > %s" in self.sql:
+                return (rows[0],)
+            if "f.horizon IN" in self.sql:
+                return rows
+            return ()
+        def fetchone(self): return (True,)
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def __init__(self): self.queries = []
+        def cursor(self): return Cursor()
+
+    connection = Connection()
+    submitted = []
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=connection,
+        state_build_submit=lambda **candidate: submitted.append(candidate),
+        wall_clock=lambda: NOW + timedelta(seconds=31),
+    )
+    assert worker._pending == []
+    worker._writer = Writer()
+    previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
+    current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
+    worker.process(QuoteEvidenceWork(
+        1, "replacement-cycle", previous, current,
+        NOW + timedelta(seconds=31), (), (), (),
+    ))
+
+    assert len(worker._writer.outcomes) == 1
+    assert worker._writer.outcomes[0].forecast_record_id == due.forecast_record_id
+    due_sql, due_params = next(
+        (sql, params) for sql, params in connection.queries
+        if "f.target_endpoint > %s" in sql)
+    assert ("f.target_endpoint <= %s" in due_sql and "NOT EXISTS" in due_sql and
+            "f.symbol='COIN'" in due_sql and
+            "now()" not in due_sql and "interval" not in due_sql)
+    assert due_params == (
+        datetime.fromtimestamp(previous.event_epoch, timezone.utc),
+        datetime.fromtimestamp(current.event_epoch, timezone.utc),
+    )
+    assert submitted == [{
+        "symbol": "COIN", "state_as_of": NOW + timedelta(seconds=31),
+        "cohorts": {forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
+                    for forecast in forecasts},
+        "new_outcome": True,
+    }]
+
+
+def test_coin_ledger_never_loads_foreign_symbol_pending_or_due_forecasts():
+    class Cursor:
+        def execute(self, sql, _params): self.sql = sql
+        def fetchall(self):
+            # A shared-table foreign row would be visible to a query that forgot
+            # the official COIN-writer predicate.
+            return () if "f.symbol='COIN'" in self.sql else (("hash", "{}"),)
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def cursor(self): return Cursor()
+
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=Connection())
+    assert worker._pending == []
+    assert worker._load_due(
+        MidpointObservation(1.0, 100.0),
+        MidpointObservation(2.0, 101.0),
+    ) == []
+
+
+def test_due_reconciliation_deduplicates_local_pending_and_rejects_ineligible():
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecasts = tuple(replace(
+        item.forecast, persisted_at=NOW, persistence_proof_eligible=True)
+        for item in calculated.persistence)
+    due = forecasts[0]
+    ineligible = replace(
+        due, persisted_at=due.target_endpoint + timedelta(microseconds=1),
+        persistence_proof_eligible=False)
+    eligible_payload = json.dumps(_canonical(asdict(due)), sort_keys=True)
+    ineligible_payload = json.dumps(_canonical(asdict(ineligible)), sort_keys=True)
+
+    class Cursor:
+        def execute(self, sql, _params): self.sql = sql
+        def fetchall(self):
+            if "f.target_endpoint > %s" in self.sql:
+                return ((due.forecast_record_hash, eligible_payload),
+                        (ineligible.forecast_record_hash, ineligible_payload))
+            if "f.horizon IN" in self.sql:
+                return tuple((forecast.forecast_record_hash,
+                              json.dumps(_canonical(asdict(forecast)), sort_keys=True))
+                             for forecast in forecasts)
+            return ()
+        def fetchone(self): return (True,)
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def cursor(self): return Cursor()
+
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=Connection(),
+        wall_clock=lambda: NOW + timedelta(seconds=31),
+    )
+    worker._pending = [due]
+    worker._writer = Writer()
+    previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
+    current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
+    worker.process(QuoteEvidenceWork(
+        1, due.cycle_id, previous, current, NOW + timedelta(seconds=31),
+        (), (), forecasts,
+    ))
+
+    assert len(worker._writer.outcomes) == 1
+    assert worker._writer.outcomes[0].forecast_record_id == due.forecast_record_id
+
+
+def test_outcome_state_attachment_ignores_unpersisted_same_cycle_lineage():
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None,
+        compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort",
+        cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    durable = tuple(replace(
+        item.forecast, persisted_at=NOW, persistence_proof_eligible=True)
+        for item in calculated.persistence)
+    due = durable[0]
+    unpersisted = tuple(replace(
+        forecast, cohort_id="unpersisted-cohort", cohort_hash="f" * 64)
+        for forecast in durable)
+    rows = tuple((forecast.forecast_record_hash,
+                  json.dumps(_canonical(asdict(forecast)), sort_keys=True))
+                 for forecast in durable)
+
+    class Cursor:
+        def execute(self, sql, _params): self.sql = sql
+        def fetchall(self):
+            if "f.horizon IN" in self.sql:
+                return rows
+            return ()
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def cursor(self): return Cursor()
+
+    submitted = []
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=Connection(),
+        state_build_submit=lambda **candidate: submitted.append(candidate),
+        wall_clock=lambda: NOW + timedelta(seconds=31),
+    )
+    worker._pending = [due]
+    worker._writer = Writer()
+    previous = MidpointObservation(
+        due.target_endpoint.timestamp() - 1, 100.0)
+    current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
+    worker.process(QuoteEvidenceWork(
+        1, due.cycle_id, previous, current, NOW + timedelta(seconds=31),
+        (), (), unpersisted,
+    ))
+
+    assert submitted[0]["new_outcome"] is True
+    assert submitted[0]["cohorts"] == {
+        forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
+        for forecast in durable
+    }
+    assert "unpersisted-cohort" not in {
+        cohort_id for cohort_id, _hash in submitted[0]["cohorts"].values()}
+
+
 class _RawStore:
     def __init__(self): self.calls = []
     def record_cycle_and_resolve(self, *_args, **kwargs): self.calls.append(kwargs)
@@ -198,6 +423,67 @@ class _RawStore:
 def _work(sequence, previous, current, received_at):
     return QuoteEvidenceWork(sequence, f"COIN:{current.event_epoch:.9f}",
         previous, current, received_at, (), (), ())
+
+
+def test_reacquired_worker_discards_stale_fifo_prefix_then_accepts_exact_bridge(
+        monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    raw = _RawStore()
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=raw, connection=_WorkerConnection())
+    anchor = MidpointObservation(12.0, 103.0)
+    worker._handoff_anchor = anchor
+    worker._handoff_fence_anchor = anchor
+
+    stale = _work(
+        1, MidpointObservation(9.0, 100.0),
+        MidpointObservation(10.0, 101.0), NOW)
+    with pytest.raises(TerminalDeliveryError, match="HANDOFF_SUPERSEDED"):
+        worker.process(stale)
+    worker._last_sequence = 1
+    worker._resolution_contiguous = False
+
+    bridge = _work(2, anchor, MidpointObservation(13.0, 105.0), NOW)
+    worker.process(bridge)
+    following = _work(
+        3, bridge.current_observation,
+        MidpointObservation(14.0, 106.0), NOW)
+    worker.process(following)
+
+    assert worker._handoff_fence_anchor is None
+    assert worker._handoff_anchor == following.current_observation
+    assert [call["resolution_enabled"] for call in raw.calls] == [True, True]
+    assert dict(worker.metrics.snapshot().counters)[
+        "evidence_ledger_worker.handoff_superseded"] == 1
+
+
+def test_worker_rejects_non_coin_v4_before_any_evidence_write(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None,
+        compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort",
+        cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    malformed = tuple(
+        replace(item.forecast, symbol="QQQ") for item in calculated.persistence)
+    raw = _RawStore()
+    writer = Writer()
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=raw, connection=_WorkerConnection())
+    worker._writer = writer
+
+    with pytest.raises(TerminalDeliveryError, match="MALFORMED_EVIDENCE_ENVELOPE"):
+        worker.process(QuoteEvidenceWork(
+            1, calculated.cycle_id, None,
+            MidpointObservation(NOW.timestamp(), 100.0), NOW,
+            (), (), malformed,
+        ))
+
+    assert raw.calls == []
+    assert writer.forecasts == [] and writer.outcomes == []
 
 
 def test_worker_uses_captured_resolution_time_and_gap_disables_resolution(monkeypatch):
@@ -261,6 +547,10 @@ def test_terminal_failure_advances_fifo_while_transient_retries_same_head(monkey
     terminal.process = terminal_process
     thread = terminal.start(); thread.join(timeout=1)
     assert terminal_calls == [1, 2]
+    terminal_telemetry = terminal.metrics.snapshot()
+    assert dict(terminal_telemetry.statuses)[
+        "evidence_ledger_worker.last_terminal_failure"] == \
+        "FORECAST_DUPLICATE_CONFLICT"
 
     class OperationalError(Exception): pass
     class AdminShutdown(OperationalError): pass
@@ -294,6 +584,10 @@ def test_terminal_failure_advances_fifo_while_transient_retries_same_head(monkey
     )
     pending = [object()]
     transient._pending = pending
+    def acquire_for_test():
+        transient._owns_runtime = True
+        return True
+    transient._acquire_runtime_ownership = acquire_for_test
     transient_outbox.put_nowait(first)
     transient_calls = []
     def transient_process(item):
@@ -315,6 +609,327 @@ def test_terminal_failure_advances_fifo_while_transient_retries_same_head(monkey
     assert counters["evidence_ledger_worker.reconnect_success"] == 1
     transient.close()
     assert recovered.close_calls == 1
+
+
+def test_runtime_ownership_uses_one_session_advisory_lock(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+
+    class Cursor:
+        def execute(self, sql, params):
+            connection.calls.append((sql, params))
+        def fetchone(self): return (True,)
+        def fetchall(self): return ()
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def __init__(self): self.calls = []
+        def cursor(self): return Cursor()
+
+    connection = Connection()
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=connection)
+
+    assert worker._try_acquire_runtime_ownership() is True
+    assert connection.calls == [(
+        "SELECT pg_try_advisory_lock(%s)",
+        (int.from_bytes(b"ATOMV9EL", "big"),),
+    )]
+
+
+def test_cycle_lineage_lookup_chunks_below_postgres_bind_limit(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+
+    class Cursor:
+        def execute(self, sql, params):
+            connection.calls.append((sql, params))
+        def fetchall(self): return ()
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def __init__(self): self.calls = []
+        def cursor(self): return Cursor()
+
+    connection = Connection()
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=connection)
+    keys = tuple(
+        ("COIN", NOW + timedelta(microseconds=index), f"cycle-{index}", "v3")
+        for index in range(16_383)
+    )
+
+    assert worker._load_cycle_forecasts(keys) == {}
+    assert len(connection.calls) == 4
+    assert all(len(params) <= EVIDENCE_RECOVERY_CYCLE_QUERY_CHUNK * 4 + 6
+               for _sql, params in connection.calls)
+    assert all(len(params) < 65_535 for _sql, params in connection.calls)
+
+
+def test_handoff_anchor_requires_all_six_durable_forecasts_to_be_proof_eligible(
+        monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+
+    class Cursor:
+        sql = ""
+        def execute(self, sql, _params): self.sql = sql
+        def fetchall(self): return ()
+        def close(self): pass
+    cursor = Cursor()
+    class Connection(_WorkerConnection):
+        def cursor(self): return cursor
+
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=Connection())
+    assert worker._load_handoff_anchor() is None
+    assert "bool_and" in cursor.sql
+    assert "persistence_proof_eligible" in cursor.sql
+
+
+@pytest.mark.parametrize("database_url", (
+    "postgresql://user:secret@aws-0-us-west-1.pooler.supabase.com:6543/postgres",
+    "host=aws-0-us-west-1.pooler.supabase.com port=6543 dbname=postgres user=x",
+))
+def test_runtime_ownership_rejects_supabase_transaction_pooler(database_url):
+    with pytest.raises(ValueError, match="session mode"):
+        EvidenceLedgerWorker(
+            EvidenceOutbox(), evidence_store=_RawStore(),
+            connection=_WorkerConnection(), database_url=database_url)
+
+
+def test_runtime_ownership_allows_supabase_session_pooler(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(),
+        connection=_WorkerConnection(),
+        database_url=(
+            "postgresql://user:secret@aws-0-us-west-1.pooler.supabase.com:5432/postgres"),
+    )
+    assert worker.is_runtime_owner() is False
+
+
+def test_legacy_writer_must_be_quiescent_before_runtime_ownership(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    monkeypatch.setattr("quant.evidence_outbox.time.sleep", lambda _seconds: None)
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(),
+        connection=_WorkerConnection(), database_url="postgresql://runtime",
+    )
+    anchors = iter((MidpointObservation(1.0, 100.0),
+                    MidpointObservation(2.0, 101.0)))
+    released = []
+    worker._try_acquire_runtime_ownership = lambda: True
+    worker._load_handoff_anchor = lambda: next(anchors)
+    worker._release_runtime_ownership = lambda: released.append(True)
+
+    assert worker._acquire_runtime_ownership() is False
+    assert released == [True]
+    assert worker.is_runtime_owner() is False
+    assert dict(worker.metrics.snapshot().statuses)[
+        "evidence_runtime_owner_status"] == "WAITING_FOR_LEGACY_WRITER"
+
+
+def test_runtime_ingress_stays_closed_when_recovery_submission_fails(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(),
+        connection=_WorkerConnection(),
+        state_build_submit=lambda **_candidate: (_ for _ in ()).throw(
+            RuntimeError("submit failed")),
+    )
+    worker._try_acquire_runtime_ownership = lambda: True
+    worker._load_handoff_anchor = lambda: None
+    worker._resolved_recovery_cohorts = lambda: ((
+        "COIN", {h: ("cohort", "a" * 64) for h in HORIZONS}, NOW),)
+    released = []
+    worker._release_runtime_ownership = lambda: released.append(True)
+
+    with pytest.raises(RuntimeError, match="submissions failed"):
+        worker._acquire_runtime_ownership()
+    assert released == [True]
+    assert worker.is_runtime_owner() is False
+
+
+def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecasts = tuple(replace(
+        item.forecast, persisted_at=NOW, persistence_proof_eligible=True)
+        for item in calculated.persistence)
+    rows = tuple((forecast.forecast_record_hash,
+                  json.dumps(_canonical(asdict(forecast)), sort_keys=True))
+                 for forecast in forecasts)
+    latest_created_at = NOW + timedelta(minutes=2)
+    outcome = replace(build_outcome(
+        forecast=forecasts[0],
+        target_identity=canonical_target_identity(forecasts[0]),
+        previous_observation_at=forecasts[0].target_endpoint - timedelta(seconds=1),
+        endpoint_observation_at=forecasts[0].target_endpoint,
+        target_resolved_at=forecasts[0].target_endpoint,
+        actual_return_bps=1.0,
+    ), created_at=latest_created_at)
+    recovery_row = (
+        forecasts[0].symbol, forecasts[0].cutoff_at, forecasts[0].cycle_id,
+        forecasts[0].v3_model_version, outcome.outcome_record_hash,
+        json.dumps(_canonical(asdict(outcome)), sort_keys=True),
+        latest_created_at, tuple(forecast.cohort_id for forecast in forecasts),
+        tuple(forecast.cohort_hash for forecast in forecasts), 2,
+    )
+    invalid_newer_row = (
+        forecasts[0].symbol, forecasts[0].cutoff_at, forecasts[0].cycle_id,
+        forecasts[0].v3_model_version, "b" * 64, "{}",
+        latest_created_at + timedelta(seconds=1),
+        tuple(forecast.cohort_id for forecast in forecasts),
+        tuple(forecast.cohort_hash for forecast in forecasts), 2,
+    )
+    combined_id = "v9v4statecohort:" + canonical_sha256(tuple(
+        (forecast.cohort_id, forecast.cohort_hash) for forecast in forecasts))
+
+    class Cursor:
+        def execute(self, sql, _params): self.sql = sql
+        def fetchall(self):
+            if "WITH recent_outcomes" in self.sql:
+                assert "LEFT JOIN eligible_cycles" in self.sql
+                assert "DISTINCT ON" not in self.sql
+                return (recovery_row, invalid_newer_row)
+            if "f.horizon IN" in self.sql:
+                return rows
+            if "FROM public.atom_v9_v4_states" in self.sql:
+                assert "SELECT s.symbol, s.cohort_id" in self.sql
+                assert "count(*) FILTER" in self.sql and "count(*)=2" in self.sql
+                return (("QQQ", combined_id,
+                         latest_created_at + timedelta(minutes=1)),)
+            return ()
+        def fetchone(self): return (True,)
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def cursor(self): return Cursor()
+
+    submitted = []
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=Connection(),
+        state_build_submit=lambda **candidate: submitted.append(candidate),
+        wall_clock=lambda: NOW + timedelta(minutes=3),
+    )
+    worker._submit_recovery_state_build()
+
+    assert submitted == [{
+        "symbol": "COIN", "state_as_of": NOW + timedelta(minutes=3),
+        "cohorts": {forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
+                    for forecast in forecasts},
+        "new_outcome": True,
+    }]
+    assert dict(worker.metrics.snapshot().counters)[
+        "v4_state_build_recovery.submitted"] == 1
+
+
+def test_runtime_owner_replays_every_distinct_uncovered_shutdown_cohort():
+    def cycle(*, cycle_id, formula_version):
+        v1, v2 = _inputs()
+        slots = tuple(SimpleNamespace(**{
+            **vars(slot), "formula_version": formula_version,
+        }) for slot in v1.slots)
+        v1 = SimpleNamespace(**{
+            **vars(v1), "cycle_id": cycle_id, "slots": slots,
+        })
+        calculated = V4DCoordinator(
+            capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+            forecast_writer=None,
+            compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+            state_cohort_id=lambda *_args: "cohort",
+            cutoff_midpoint=lambda _value: 100.0,
+        ).run_cycle()
+        return tuple(replace(
+            item.forecast, persisted_at=NOW,
+            persistence_proof_eligible=True)
+            for item in calculated.persistence)
+
+    first = cycle(cycle_id="cycle-1", formula_version="f1")
+    second = cycle(cycle_id="cycle-2", formula_version="f2")
+    created = (NOW + timedelta(minutes=2), NOW + timedelta(minutes=3))
+
+    def recovery_row(forecasts, created_at, count):
+        outcome = replace(build_outcome(
+            forecast=forecasts[0],
+            target_identity=canonical_target_identity(forecasts[0]),
+            previous_observation_at=(
+                forecasts[0].target_endpoint - timedelta(seconds=1)),
+            endpoint_observation_at=forecasts[0].target_endpoint,
+            target_resolved_at=forecasts[0].target_endpoint,
+            actual_return_bps=1.0,
+        ), created_at=created_at)
+        return (
+            forecasts[0].symbol, forecasts[0].cutoff_at,
+            forecasts[0].cycle_id, forecasts[0].v3_model_version,
+            outcome.outcome_record_hash,
+            json.dumps(_canonical(asdict(outcome)), sort_keys=True),
+            created_at, tuple(item.cohort_id for item in forecasts),
+            tuple(item.cohort_hash for item in forecasts), count,
+        )
+
+    recovery_rows = (
+        recovery_row(first, created[0], 2),
+        recovery_row(second, created[1], 2),
+    )
+    lineage_rows = tuple(
+        (forecast.forecast_record_hash,
+         json.dumps(_canonical(asdict(forecast)), sort_keys=True))
+        for forecasts in (first, second) for forecast in forecasts)
+
+    class Cursor:
+        def execute(self, sql, _params): self.sql = sql
+        def fetchall(self):
+            if "WITH recent_outcomes" in self.sql:
+                return recovery_rows
+            if "f.horizon IN" in self.sql:
+                return lineage_rows
+            if "FROM public.atom_v9_v4_states" in self.sql:
+                return ()
+            return ()
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def cursor(self): return Cursor()
+
+    submitted = []
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=Connection(),
+        state_build_submit=lambda **candidate: submitted.append(candidate),
+        wall_clock=lambda: NOW + timedelta(minutes=4),
+    )
+    worker._submit_recovery_state_build()
+
+    assert len(submitted) == 2
+    assert [candidate["cohorts"] for candidate in submitted] == [
+        {item.horizon: (item.cohort_id, item.cohort_hash) for item in first},
+        {item.horizon: (item.cohort_id, item.cohort_hash) for item in second},
+    ]
+    assert all(candidate["new_outcome"] is True for candidate in submitted)
+
+
+def test_recovery_refuses_to_open_ingress_when_hourly_bound_is_truncated():
+    class Cursor:
+        def execute(self, sql, _params):
+            self.sql = sql
+            if "WITH recent_outcomes" in sql:
+                assert "recent_count" in sql
+                assert "LEFT JOIN eligible_cycles" in sql
+        def fetchall(self):
+            if "WITH recent_outcomes" in self.sql:
+                return ((None, None, None, None, None, None, None, None, None,
+                         EVIDENCE_RECOVERY_OUTCOME_LIMIT + 1),)
+            return ()
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def cursor(self): return Cursor()
+
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=Connection(),
+        state_build_submit=lambda **_candidate: None,
+    )
+    with pytest.raises(RuntimeError, match="exceeded"):
+        worker._resolved_recovery_cohorts()
+    assert dict(worker.metrics.snapshot().counters)[
+        "v4_state_build_recovery.truncated"] == 1
 
 
 def test_state_builder_reconnects_both_builders_and_preserves_generation():
@@ -367,6 +982,116 @@ def test_state_builder_reconnects_both_builders_and_preserves_generation():
     assert dead.close_calls == recovered.close_calls == 1
     assert dict(metrics.snapshot().counters)[
         "v4_state_build_worker.reconnect_success"] == 1
+
+
+def test_state_builder_rate_limit_retains_exact_candidate_until_insert():
+    class Connection:
+        def close(self): pass
+    class Builder:
+        def __init__(self): self.prepared = []
+        def prepare(self, **candidate): self.prepared.append(candidate)
+    class Scheduler:
+        def __init__(self): self.calls = 0; self.noted = 0
+        def note_new_outcome(self): self.noted += 1
+        def run_if_due(self, *, force):
+            self.calls += 1
+            return "SKIPPED_RATE_LIMIT" if self.calls == 1 else "INSERT"
+
+    builder, scheduler = Builder(), Scheduler()
+    worker = V4StateBuildWorker(
+        builder, scheduler, connection=Connection(),
+        shutdown_timeout_seconds=1.0)
+    worker.start()
+    worker.submit(
+        symbol="COIN", state_as_of=NOW,
+        cohorts={h: ("cohort-a", "a" * 64) for h in HORIZONS},
+        new_outcome=True)
+    deadline = time.monotonic() + 2.5
+    while scheduler.calls < 1 and time.monotonic() < deadline:
+        time.sleep(.01)
+    worker._wake.set()
+    while scheduler.calls < 2 and time.monotonic() < deadline:
+        time.sleep(.01)
+    worker.close()
+
+    assert scheduler.calls == 2
+    assert scheduler.noted == 1
+    assert len(builder.prepared) == 1
+
+
+def test_state_builder_terminal_status_does_not_starve_later_cohort():
+    class Connection:
+        def close(self): pass
+    class Builder:
+        def __init__(self): self.prepared = []
+        def prepare(self, **candidate): self.prepared.append(candidate)
+    class Scheduler:
+        def __init__(self): self.results = iter(("STATE_CONFLICT", "INSERT")); self.calls = 0
+        def note_new_outcome(self): pass
+        def run_if_due(self, *, force):
+            self.calls += 1
+            return next(self.results)
+
+    builder, scheduler, metrics = Builder(), Scheduler(), OperationalMetrics()
+    worker = V4StateBuildWorker(
+        builder, scheduler, connection=Connection(), metrics=metrics,
+        shutdown_timeout_seconds=1.0)
+    worker.start()
+    for cohort_id, digest in (("cohort-a", "a" * 64),
+                              ("cohort-b", "b" * 64)):
+        worker.submit(
+            symbol="COIN", state_as_of=NOW,
+            cohorts={h: (cohort_id, digest) for h in HORIZONS},
+            new_outcome=True)
+    deadline = time.monotonic() + 2.5
+    while scheduler.calls < 2 and time.monotonic() < deadline:
+        time.sleep(.01)
+    worker.close()
+
+    assert scheduler.calls == 2
+    assert len(builder.prepared) == 2
+    telemetry = metrics.snapshot()
+    assert dict(telemetry.counters)[
+        "v4_state_build_worker.terminal_status"] == 1
+    assert dict(telemetry.statuses)[
+        "v4_state_build_worker.last_terminal_status"] == "STATE_CONFLICT"
+
+
+def test_state_builder_nontransient_exception_does_not_busy_loop_or_starve():
+    class Connection:
+        def close(self): pass
+    class Builder:
+        def __init__(self): self.prepared = []
+        def prepare(self, **candidate): self.prepared.append(candidate)
+    class Scheduler:
+        def __init__(self): self.calls = 0
+        def note_new_outcome(self): pass
+        def run_if_due(self, *, force):
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("deterministic failure")
+            return "INSERT"
+
+    builder, scheduler, metrics = Builder(), Scheduler(), OperationalMetrics()
+    worker = V4StateBuildWorker(
+        builder, scheduler, connection=Connection(), metrics=metrics,
+        shutdown_timeout_seconds=1.0)
+    worker.start()
+    for cohort_id, digest in (("cohort-a", "a" * 64),
+                              ("cohort-b", "b" * 64)):
+        worker.submit(
+            symbol="COIN", state_as_of=NOW,
+            cohorts={h: (cohort_id, digest) for h in HORIZONS},
+            new_outcome=True)
+    deadline = time.monotonic() + 2.5
+    while scheduler.calls < 2 and time.monotonic() < deadline:
+        time.sleep(.01)
+    worker.close()
+
+    assert scheduler.calls == 2
+    assert len(builder.prepared) == 2
+    assert dict(metrics.snapshot().counters)[
+        "v4_state_build_worker.terminal_exception"] == 1
 
 
 def test_ledger_close_drains_every_accepted_item_before_closing_connection(monkeypatch):
@@ -611,6 +1336,25 @@ def test_latest_compact_state_is_consumed_and_conflict_fails_closed():
     assert [x.final_bps for x in available.final_numbers] == [x.final_bps for x in conflicted.final_numbers]
 
 
+def test_v4d_rejects_mismatched_accuracy_and_compact_generations():
+    v1, v2 = _inputs(1)
+    compact = _empty_state()
+    accuracy = SimpleNamespace(
+        symbol="COIN", cohort_id="cohort",
+        state_as_of=NOW - timedelta(microseconds=1), horizon_states=(),
+    )
+    output = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda captured: v2,
+        forecast_writer=Writer(),
+        compact_state_lookup=lambda **kwargs: (compact, "AVAILABLE"),
+        accuracy_state_lookup=lambda **kwargs: (accuracy, "AVAILABLE"),
+        state_cohort_id=lambda one, two: "cohort",
+    ).run_cycle()
+
+    assert output.v4_state_status == "STATE_GENERATION_MISMATCH"
+    assert output.accuracy == (None,) * 6
+
+
 def test_outcome_is_separate_unverified_append_and_cannot_mutate_forecast():
     v1, v2 = _inputs(1)
     from quant.v9_v3_synthesis import synthesize_v3
@@ -753,37 +1497,78 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
 
 
 def test_combined_builder_keeps_accuracy_and_compact_in_one_generation():
+    class Connection:
+        autocommit = False
+        def __init__(self):
+            self.commits = 0; self.rollbacks = 0; self.events = []
+        def cursor(self):
+            connection = self
+            class Cursor:
+                def execute(self, sql): connection.events.append(sql)
+                def close(self): pass
+            return Cursor()
+        def commit(self): self.commits += 1; self.events.append("COMMIT")
+        def rollback(self): self.rollbacks += 1
     class Builder:
         def __init__(self, result):
             self.result = result; self.prepared = []; self.calls = 0; self.connections = []
         def prepare(self, **candidate): self.prepared.append(candidate)
-        def rebind_connection(self, connection): self.connections.append(connection)
-        def build_and_publish(self): self.calls += 1; return self.result
+        def rebind_connection(self, connection):
+            self._connection = connection
+            self.connections.append(connection)
+        def build_and_publish(self):
+            self.calls += 1
+            self._connection.commit()
+            return self.result
     accuracy, compact = Builder("IDEMPOTENT"), Builder("INSERT")
-    builder = PostgresV4StateBuilder(accuracy, compact)
+    connection = Connection()
+    builder = PostgresV4StateBuilder(
+        accuracy, compact, connection=connection)
     candidate = {"symbol": "COIN", "state_as_of": NOW,
                  "cohorts": {h: ("c", "h") for h in HORIZONS}}
     builder.prepare(**candidate)
-    replacement = object()
+    replacement = Connection()
     builder.rebind_connection(replacement)
     assert builder.build_and_publish() == "INSERT"
     assert accuracy.prepared == compact.prepared == [candidate]
     assert accuracy.calls == compact.calls == 1
-    assert accuracy.connections == compact.connections == [replacement]
+    assert replacement.commits == 1 and replacement.rollbacks == 0
+    assert replacement.events[0] == \
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+    assert replacement.events[-1] == "COMMIT"
+    assert accuracy.connections[0] is compact.connections[0] is replacement
+    assert accuracy.connections[-1] is compact.connections[-1] is replacement
+    assert accuracy.connections[-2].__class__.__name__ == \
+        compact.connections[-2].__class__.__name__ == "_CommitSuppressingConnection"
 
 
-def test_compact_failure_does_not_suppress_accuracy_publication():
+def test_compact_failure_rolls_back_staged_accuracy_publication():
+    class Connection:
+        autocommit = False
+        def __init__(self): self.commits = 0; self.rollbacks = 0
+        def cursor(self):
+            class Cursor:
+                def execute(self, _sql): pass
+                def close(self): pass
+            return Cursor()
+        def commit(self): self.commits += 1
+        def rollback(self): self.rollbacks += 1
     class Accuracy:
-        calls = 0
+        def __init__(self): self.calls = 0
+        def rebind_connection(self, connection): self.connection = connection
         def build_and_publish(self):
             self.calls += 1
+            self.connection.commit()
             return "INSERT"
     class Compact:
+        def rebind_connection(self, _connection): pass
         def build_and_publish(self): raise RuntimeError("compact build failed")
-    accuracy = Accuracy()
+    accuracy, connection = Accuracy(), Connection()
     with pytest.raises(RuntimeError, match="compact build failed"):
-        PostgresV4StateBuilder(accuracy, Compact()).build_and_publish()
+        PostgresV4StateBuilder(
+            accuracy, Compact(), connection=connection).build_and_publish()
     assert accuracy.calls == 1
+    assert connection.commits == 0 and connection.rollbacks == 1
 
 
 def test_new_worker_outcome_submits_v4_state_build_off_fifo(monkeypatch):
@@ -800,16 +1585,27 @@ def test_new_worker_outcome_submits_v4_state_build_off_fifo(monkeypatch):
     due = forecasts[0]
     previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
     current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
+    lineage_rows = tuple((forecast.forecast_record_hash,
+                          json.dumps(_canonical(asdict(forecast)), sort_keys=True))
+                         for forecast in forecasts)
+
+    class LineageCursor:
+        def execute(self, sql, _params): self.sql = sql
+        def fetchall(self):
+            return lineage_rows if "f.horizon IN" in self.sql else ()
+        def close(self): pass
+    class LineageConnection(_WorkerConnection):
+        def cursor(self): return LineageCursor()
 
     submitted = []
     worker = EvidenceLedgerWorker(
-        EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=LineageConnection(),
         state_build_submit=lambda **candidate: submitted.append(candidate),
     )
     worker._pending = [due]
     worker._writer = Writer()
     item = QuoteEvidenceWork(
-        1, "cycle", previous, current, due.target_endpoint,
+        1, calculated.cycle_id, previous, current, due.target_endpoint,
         (), (), forecasts, "cohort", calculated,
     )
 
@@ -856,7 +1652,7 @@ def test_non_new_outcomes_do_not_create_v4b_generation(
     worker._pending = [due]
     worker._writer = StatusWriter()
     item = QuoteEvidenceWork(
-        1, "cycle", previous if previous_present else None, current,
+        1, calculated.cycle_id, previous if previous_present else None, current,
         due.target_endpoint, (), (), forecasts, "cohort", calculated,
     )
 
@@ -895,7 +1691,7 @@ def test_v4_state_build_submit_failure_isolated_from_forecast_delivery(monkeypat
     worker._pending = [due]
     worker._writer = writer
     item = QuoteEvidenceWork(
-        1, "cycle", previous, current, due.target_endpoint,
+        1, calculated.cycle_id, previous, current, due.target_endpoint,
         (), (), forecasts, "cohort", calculated,
     )
 
@@ -945,7 +1741,7 @@ def test_blocked_full_history_builder_cannot_cause_evidence_outbox_drops(monkeyp
     for sequence in range(1, 513):
         item = QuoteEvidenceWork(
             sequence, f"cycle-{sequence}", None, observation, NOW,
-            (), (), forecasts, "cohort", calculated,
+            (), (), (), None, None,
         )
         assert outbox.put_nowait(item) is True
         worker.process(outbox.get())

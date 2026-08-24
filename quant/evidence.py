@@ -73,7 +73,7 @@ class EvidenceStore(Protocol):
 
     def record_cycle_and_resolve(
         self, forecasts: Sequence[ForecastRecord], *, observation_epoch: float,
-        observation_midpoint: float,
+        observation_midpoint: float, resolution_symbol: str,
         volatility_forecasts: Sequence[VolatilityForecastRecord] | None = None,
         previous_observation_epoch: float | None = None,
         resolution_enabled: bool = True,
@@ -109,11 +109,21 @@ class PostgresEvidenceStore:
 
     def record_cycle_and_resolve(
         self, forecasts: Sequence[ForecastRecord], *, observation_epoch: float,
-        observation_midpoint: float,
+        observation_midpoint: float, resolution_symbol: str,
         volatility_forecasts: Sequence[VolatilityForecastRecord] | None = None,
         previous_observation_epoch: float | None = None,
         resolution_enabled: bool = True,
     ) -> None:
+        if not isinstance(resolution_symbol, str) or not resolution_symbol:
+            raise ValueError("resolution_symbol must be a non-empty string")
+        volatility_rows = (() if volatility_forecasts is None
+                           else tuple(volatility_forecasts))
+        supplied_symbols = {
+            row.symbol for row in (*tuple(forecasts), *volatility_rows)
+        }
+        if supplied_symbols and supplied_symbols != {resolution_symbol}:
+            raise ValueError(
+                "every forecast must match the explicit resolution_symbol")
         shared_connection = getattr(self, "_connection", None)
         owner = (self._connect(self._database_url) if shared_connection is None
                  else nullcontext(shared_connection))
@@ -125,9 +135,11 @@ class PostgresEvidenceStore:
                     if resolution_enabled:
                         if previous_observation_epoch is None:
                             cursor.execute(
-                                """SELECT COALESCE(max(resolved_epoch),
+                                """SELECT COALESCE(max(o.resolved_epoch),
                                                    '-Infinity'::double precision)
-                                   FROM forecast_outcomes""", ())
+                                   FROM forecast_outcomes AS o
+                                   JOIN forecasts AS f USING (forecast_id)
+                                   WHERE f.symbol=%s""", (resolution_symbol,))
                             resolution_watermark = cursor.fetchone()[0]
                         else:
                             resolution_watermark = previous_observation_epoch
@@ -141,12 +153,14 @@ class PostgresEvidenceStore:
                             FROM forecasts AS f
                             LEFT JOIN forecast_outcomes AS o USING (forecast_id)
                             WHERE o.forecast_id IS NULL
+                              AND f.symbol = %s
                               AND f.maturity_epoch > %s
                               AND f.maturity_epoch <= %s
                             ON CONFLICT (forecast_id) DO NOTHING
                             """,
                             (observation_midpoint, observation_midpoint,
-                             observation_epoch, resolution_watermark,
+                             observation_epoch, resolution_symbol,
+                             resolution_watermark,
                              observation_epoch),
                         )
                     cursor.executemany(
@@ -174,9 +188,12 @@ class PostgresEvidenceStore:
                         if resolution_enabled:
                             if previous_observation_epoch is None:
                                 cursor.execute(
-                                    """SELECT COALESCE(max(resolved_epoch),
+                                    """SELECT COALESCE(max(o.resolved_epoch),
                                                        '-Infinity'::double precision)
-                                       FROM volatility_forecast_outcomes""", ())
+                                       FROM volatility_forecast_outcomes AS o
+                                       JOIN volatility_forecasts AS f
+                                         USING (forecast_id)
+                                       WHERE f.symbol=%s""", (resolution_symbol,))
                                 volatility_resolution_watermark = cursor.fetchone()[0]
                             else:
                                 volatility_resolution_watermark = previous_observation_epoch
@@ -191,12 +208,13 @@ class PostgresEvidenceStore:
                                 LEFT JOIN volatility_forecast_outcomes AS o
                                     USING (forecast_id)
                                 WHERE o.forecast_id IS NULL
+                                  AND f.symbol = %s
                                   AND f.maturity_epoch > %s
                                   AND f.maturity_epoch <= %s
                                 ON CONFLICT (forecast_id) DO NOTHING
                                 """,
                                 (observation_midpoint, observation_midpoint,
-                                 observation_epoch,
+                                 observation_epoch, resolution_symbol,
                                  volatility_resolution_watermark,
                                  observation_epoch),
                             )
@@ -220,7 +238,7 @@ class PostgresEvidenceStore:
                                 row.maturity_epoch, row.cutoff_midpoint,
                                 row.forecast_volatility_bps, row.created_epoch,
                                 row.data_schema_version, row.source_spec_version,
-                            ) for row in volatility_forecasts],
+                            ) for row in volatility_rows],
                         )
                 if shared_connection is not None:
                     connection.commit()

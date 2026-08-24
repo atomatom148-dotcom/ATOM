@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import math
 import os
+import re
 import threading
 import time
 from typing import Callable
@@ -37,10 +39,14 @@ from .evidence_outbox import EvidenceOutbox, QuoteEvidenceWork
 
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
-ALPACA_BTC_LATEST_QUOTE_URL = (
-    "https://data.alpaca.markets/v1beta3/crypto/us/latest/"
-    "orderbooks?symbols=BTC%2FUSD"
+ALPACA_BTC_STREAM_URL_TEMPLATE = (
+    "wss://stream.data.alpaca.markets/v1beta3/crypto/{location}"
 )
+ALPACA_CRYPTO_LOCATIONS = ("us", "us-1", "eu-1")
+# The only production service is in Render's Oregon region. Alpaca assigns OR
+# to its ``us-1`` crypto location; an explicit environment override remains
+# available if the service moves regions.
+ALPACA_CRYPTO_LOCATION_DEFAULT = "us-1"
 ALPACA_NDX_LATEST_VALUE_URL = (
     "https://data.alpaca.markets/v1beta1/indices/latest/values?index_symbols=NDX"
 )
@@ -51,9 +57,15 @@ MAX_NDX_AGE_SECONDS = 10.0
 HISTORY_SECONDS = 3600.0
 MARKET_DISPLAY_FETCH_SECONDS = 0.25
 QUANT_CYCLE_SECONDS = 1.0
-BTC_FETCH_SECONDS = 0.25
+EVIDENCE_HANDOFF_BUFFER_CAPACITY = 4096
+EVIDENCE_HANDOFF_REPLAY_BATCH = 4
 BTC_SOURCE_TIMEOUT_SECONDS = 1.0
 MAX_BTC_AGE_SECONDS = 5.0
+BTC_RECONNECT_SECONDS = 1.0
+BTC_RECONNECT_MAX_SECONDS = 30.0
+BTC_PUBLISH_INTERVAL_SECONDS = 0.25
+BTC_HISTORY_MAX_OBSERVATIONS = int(
+    HISTORY_SECONDS / BTC_PUBLISH_INTERVAL_SECONDS) + 1
 
 
 def v9_math_core_enabled() -> bool:
@@ -150,6 +162,9 @@ class LiveMarketState:
     def __init__(self, *, clock: Callable[[], float] = time.time,
                  evidence_store: EvidenceStore | None = None,
                  evidence_outbox: EvidenceOutbox | None = None,
+                 evidence_acceptance_ready: Callable[[], bool] | None = None,
+                 evidence_handoff_anchor: Callable[[], MidpointObservation | None] | None = None,
+                 evidence_owner_generation: Callable[[], int | None] | None = None,
                  v9_cycle_handler: Callable[["LiveSnapshot", MidpointObservation | None,
                                              MidpointObservation], object | None] | None = None,
                  metrics: OperationalMetrics | None = None,
@@ -157,6 +172,14 @@ class LiveMarketState:
         self._clock = clock
         self._evidence_store = evidence_store
         self._evidence_outbox = evidence_outbox
+        self._evidence_acceptance_ready = evidence_acceptance_ready
+        self._evidence_handoff_anchor = evidence_handoff_anchor
+        self._evidence_owner_generation = evidence_owner_generation
+        self._observed_owner_generation: int | None = None
+        self._owner_publication_armed = evidence_acceptance_ready is None
+        self._evidence_handoff_quotes = deque()
+        self._handoff_anchor_pending = False
+        self._handoff_observation_ready = threading.Event()
         self._coin_sequence = 0
         # Preserve accepted COIN order through V4 calculation and the one
         # non-blocking outbox handoff.  The state lock remains narrowly scoped
@@ -186,6 +209,34 @@ class LiveMarketState:
         self._publication = LivePublication(
             self._snapshot, self._v9_output, self._g2_state, self._market_display,
         )
+
+    def _runtime_ready(self) -> bool:
+        if self._evidence_acceptance_ready is None:
+            return True
+        try:
+            ready = self._evidence_acceptance_ready() is True
+        except Exception:
+            ready = False
+        if not ready:
+            self._owner_publication_armed = False
+        return ready
+
+    def runtime_handoff_ready(self) -> bool:
+        """A rolling replacement is ready after ownership or one overlap quote."""
+
+        return self._runtime_ready() or self._handoff_observation_ready.is_set()
+
+    def _can_publish(self) -> bool:
+        return self._runtime_ready() and self._owner_publication_armed
+
+    def _outbox_remaining_capacity(self) -> int:
+        method = getattr(self._evidence_outbox, "remaining_capacity", None)
+        if not callable(method):
+            return 1
+        value = method()
+        if isinstance(value, bool) or not isinstance(value, int):
+            return 1
+        return max(0, value)
 
     def update_market_display(
         self, *, coin_midpoint: float | None = None,
@@ -221,7 +272,7 @@ class LiveMarketState:
                     float(qqq_midpoint) if qqq_newer else current.qqq_midpoint,
                     float(qqq_event_epoch) if qqq_newer else current.qqq_event_epoch,
                 )
-                if not self._coin_cycle_pending:
+                if not self._coin_cycle_pending and self._can_publish():
                     self._publication = replace(
                         self._publication, market_display=self._market_display,
                     )
@@ -267,14 +318,15 @@ class LiveMarketState:
                 self._snapshot.option_surface,
             )
             self._refresh_g2(event_epoch)
-            if not self._coin_cycle_pending:
+            if not self._coin_cycle_pending and self._can_publish():
                 self._publication = replace(
                     self._publication, snapshot=self._snapshot,
                     cross_asset_state=self._g2_state,
                 )
         return True
 
-    def accept_g2_price(self, *, asset: str, price: float, event_epoch: float) -> bool:
+    def accept_g2_price(self, *, asset: str, price: float, event_epoch: float,
+                        max_age_seconds: float | None = None) -> bool:
         """Accept a validated BTC or NDX observation without affecting ATOM."""
 
         values = (price, event_epoch)
@@ -285,9 +337,22 @@ class LiveMarketState:
         price, event_epoch = map(float, values)
         if not math.isfinite(price) or price <= 0 or not math.isfinite(event_epoch):
             return False
+        if (max_age_seconds is not None and
+                (isinstance(max_age_seconds, bool) or
+                 not isinstance(max_age_seconds, (int, float)) or
+                 not math.isfinite(float(max_age_seconds)) or
+                 float(max_age_seconds) <= 0)):
+            return False
         if asset == "NDX" and event_epoch > self._clock():
             return False
         with self._lock:
+            # The stream validates age before calling us, but this second clock
+            # read is the atomic acceptance boundary. A quote that becomes
+            # stale while the poller is blocked never enters BTC history.
+            if asset == "BTC" and max_age_seconds is not None:
+                age = self._clock() - event_epoch
+                if age < 0 or age >= float(max_age_seconds):
+                    return False
             history = self._btc_history if asset == "BTC" else self._ndx_history
             latest = history.latest
             if latest is not None and event_epoch == latest.event_epoch:
@@ -297,15 +362,24 @@ class LiveMarketState:
             except ValueError:
                 return False
             if asset == "BTC":
+                if len(updated.observations) > BTC_HISTORY_MAX_OBSERVATIONS:
+                    updated = MidpointHistory(
+                        updated.observations[-BTC_HISTORY_MAX_OBSERVATIONS:])
                 self._btc_history = updated
             else:
                 self._ndx_history = updated
             self._refresh_g2(event_epoch)
-            if not self._coin_cycle_pending:
+            if not self._coin_cycle_pending and self._can_publish():
                 self._publication = replace(
                     self._publication, cross_asset_state=self._g2_state,
                 )
         return True
+
+    def btc_latest_observation(self) -> MidpointObservation | None:
+        """Return the latest bounded BTC point for stream restart deduplication."""
+
+        with self._lock:
+            return self._btc_history.latest
 
     def _refresh_g2(self, event_epoch: float) -> None:
         cutoff = max(self._g2_state.as_of_epoch, event_epoch)
@@ -328,16 +402,248 @@ class LiveMarketState:
         """Serialize one COIN ingress event through its outbox handoff."""
 
         with self._coin_ingress_lock:
+            if not self._accepting_coin_quotes:
+                return False
+            ready = self._runtime_ready()
+            owner_generation = (
+                self._evidence_owner_generation()
+                if ready and self._evidence_owner_generation is not None else None)
+            owner_generation_changed = (
+                owner_generation is not None and
+                self._observed_owner_generation is not None and
+                owner_generation != self._observed_owner_generation)
+            if owner_generation is not None:
+                self._observed_owner_generation = owner_generation
+            if ready and self._evidence_handoff_anchor is not None:
+                durable_anchor = self._evidence_handoff_anchor()
+                local_latest = self._snapshot.history.latest
+                if (durable_anchor is not None and
+                        (owner_generation_changed or local_latest is None or
+                         durable_anchor.event_epoch > local_latest.event_epoch or
+                         (durable_anchor.event_epoch == local_latest.event_epoch and
+                          durable_anchor.midpoint != local_latest.midpoint))):
+                    # Ownership may have been lost and reacquired between two
+                    # provider callbacks.  Compare the cached durable owner
+                    # anchor on every owned ingress so that an unobserved loss
+                    # interval cannot emit a bracket from stale local history.
+                    while (self._evidence_handoff_quotes and
+                           self._evidence_handoff_quotes[0][2] <=
+                           durable_anchor.event_epoch):
+                        self._evidence_handoff_quotes.popleft()
+                    self._seed_midpoint_anchor(durable_anchor)
+                    self._handoff_anchor_pending = False
+                    if local_latest is not None:
+                        self.metrics.increment("evidence_handoff.owner_rebase")
+            remaining_capacity = self._outbox_remaining_capacity()
+            if (not ready or self._evidence_handoff_quotes or
+                    remaining_capacity < 1):
+                first_waiting_quote = not self._evidence_handoff_quotes
+                if not self._buffer_handoff_quote(
+                        bid=bid, ask=ask, event_epoch=event_epoch,
+                        bid_size=bid_size, ask_size=ask_size):
+                    return False
+                if not ready:
+                    if first_waiting_quote:
+                        # Every loss of ownership starts a new durable handoff,
+                        # even when this process has an older local history.
+                        self._handoff_anchor_pending = True
+                    self.metrics.set_status(
+                        "evidence_ingress_status", "BUFFERING_FOR_OWNER")
+                    return True
+                if self._handoff_anchor_pending:
+                    durable_anchor = (self._evidence_handoff_anchor()
+                                      if self._evidence_handoff_anchor is not None
+                                      else None)
+                    if durable_anchor is not None:
+                        while (self._evidence_handoff_quotes and
+                               self._evidence_handoff_quotes[0][2] <=
+                               durable_anchor.event_epoch):
+                            self._evidence_handoff_quotes.popleft()
+                        self._seed_midpoint_anchor(durable_anchor)
+                    elif self._evidence_handoff_quotes:
+                        anchor = self._evidence_handoff_quotes.popleft()
+                        self._seed_handoff_anchor(
+                            bid=anchor[0], ask=anchor[1], event_epoch=anchor[2],
+                            bid_size=anchor[3], ask_size=anchor[4])
+                    self._handoff_anchor_pending = False
+                replay_count = min(
+                    EVIDENCE_HANDOFF_REPLAY_BATCH,
+                    self._outbox_remaining_capacity(),
+                    len(self._evidence_handoff_quotes),
+                )
+                for _index in range(replay_count):
+                    values = self._evidence_handoff_quotes.popleft()
+                    if not self._accept_quote_serialized(
+                            bid=values[0], ask=values[1], event_epoch=values[2],
+                            bid_size=values[3], ask_size=values[4]):
+                        self.metrics.increment(
+                            "evidence_handoff.replay_failure")
+                        self.metrics.set_status(
+                            "evidence_ingress_status", "REPLAY_FAILED")
+                        return False
+                self.metrics.set_status(
+                    "evidence_ingress_status",
+                    "REPLAYING" if self._evidence_handoff_quotes else "ACTIVE",
+                )
+                return True
+            if (self._evidence_acceptance_ready is not None and
+                    self._snapshot.history.latest is None):
+                durable_anchor = (self._evidence_handoff_anchor()
+                                  if self._evidence_handoff_anchor is not None
+                                  else None)
+                if durable_anchor is not None:
+                    self._seed_midpoint_anchor(durable_anchor)
+                    if event_epoch > durable_anchor.event_epoch:
+                        return self._accept_quote_serialized(
+                            bid=bid, ask=ask, event_epoch=event_epoch,
+                            bid_size=bid_size, ask_size=ask_size)
+                else:
+                    self._seed_handoff_anchor(
+                        bid=bid, ask=ask, event_epoch=event_epoch,
+                        bid_size=bid_size, ask_size=ask_size)
+                self.metrics.set_status("evidence_ingress_status", "ACTIVE")
+                return True
+            self.metrics.set_status("evidence_ingress_status", "ACTIVE")
             return self._accept_quote_serialized(
                 bid=bid, ask=ask, event_epoch=event_epoch,
                 bid_size=bid_size, ask_size=ask_size,
             )
 
+    def _buffer_handoff_quote(
+        self, *, bid: float, ask: float, event_epoch: float,
+        bid_size: float | None, ask_size: float | None,
+    ) -> bool:
+        values = (bid, ask, event_epoch)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               for value in values):
+            return False
+        bid, ask, event_epoch = map(float, values)
+        if (not all(map(math.isfinite, (bid, ask, event_epoch))) or
+                bid <= 0 or ask <= 0 or ask < bid):
+            return False
+        if (bid_size is None) != (ask_size is None):
+            return False
+        if bid_size is not None:
+            try:
+                QuoteObservation(event_epoch, bid, ask, bid_size, ask_size)
+            except (TypeError, ValueError):
+                return False
+        if self._evidence_handoff_quotes:
+            prior = self._evidence_handoff_quotes[-1]
+            if event_epoch == prior[2]:
+                if (bid, ask, bid_size, ask_size) == (
+                        prior[0], prior[1], prior[3], prior[4]):
+                    return True
+                self.metrics.increment("evidence_handoff.timestamp_conflict")
+                return False
+            if event_epoch < prior[2]:
+                return False
+        else:
+            latest = self._snapshot.history.latest
+            if latest is not None and event_epoch <= latest.event_epoch:
+                return False
+        if len(self._evidence_handoff_quotes) >= EVIDENCE_HANDOFF_BUFFER_CAPACITY:
+            self.metrics.increment("evidence_handoff.buffer_full")
+            self.metrics.set_status("evidence_ingress_status", "BUFFER_FULL")
+            return False
+        self._evidence_handoff_quotes.append(
+            (bid, ask, event_epoch, bid_size, ask_size))
+        self._handoff_observation_ready.set()
+        return True
+
+    def _seed_handoff_anchor(
+        self, *, bid: float, ask: float, event_epoch: float,
+        bid_size: float | None, ask_size: float | None,
+    ) -> None:
+        """Seed one real provider observation without creating a duplicate cycle."""
+
+        observation = MidpointObservation(
+            float(event_epoch), (float(bid) + float(ask)) / 2.0)
+        with self._lock:
+            current = self._snapshot
+            if current.history.latest is not None:
+                return
+            quote_history = current.quote_history
+            if bid_size is not None and ask_size is not None:
+                quote_history = QuoteHistory((QuoteObservation(
+                    float(event_epoch), float(bid), float(ask),
+                    float(bid_size), float(ask_size)),))
+            self._snapshot = LiveSnapshot(
+                MidpointHistory((observation,)), current.qqq_history,
+                quote_history, current.last_cycle, current.momentum,
+                current.mean_reversion, current.volatility, current.stat_arb,
+                current.microstructure, current.volume_liquidity,
+                current.relative_value, current.cross_asset, current.factor,
+                current.options_vol, current.regime, current.event_session,
+                current.option_observation, current.option_surface,
+            )
+            self._refresh_g2(float(event_epoch))
+
+    def _seed_midpoint_anchor(self, observation: MidpointObservation) -> None:
+        with self._lock:
+            current = self._snapshot
+            causal_history = tuple(
+                item for item in current.history.observations
+                if (item.event_epoch < observation.event_epoch and
+                    item.event_epoch >= observation.event_epoch - HISTORY_SECONDS)
+            )
+            history = MidpointHistory(causal_history + (observation,))
+            quote_history = QuoteHistory(tuple(
+                item for item in current.quote_history.observations
+                if (item.event_epoch < observation.event_epoch and
+                    item.event_epoch >= observation.event_epoch - 300.0)
+            ))
+            # The durable anchor, not this process's pre-loss cache, is now the
+            # only causal predecessor. Derived family output is rebuilt by the
+            # first strictly newer provider quote.
+            self._snapshot = replace(
+                current, history=history, quote_history=quote_history,
+                last_cycle=None, momentum=None, mean_reversion=None,
+                volatility=None, stat_arb=None, microstructure=None,
+                volume_liquidity=None, relative_value=None, cross_asset=None,
+                factor=None, options_vol=None, regime=None, event_session=None,
+            )
+            self._refresh_g2(observation.event_epoch)
+
     def stop_accepting_quotes(self) -> None:
         """Close COIN ingress after any in-flight outbox handoff completes."""
 
         with self._coin_ingress_lock:
+            if self._evidence_handoff_quotes and not self._runtime_ready():
+                # This process never became the authoritative writer.  Its
+                # overlap observations remain useful only to a process that
+                # actually acquires the durable session owner.
+                self.metrics.increment(
+                    "evidence_handoff.non_owner_shutdown")
+                self._evidence_handoff_quotes.clear()
+            if self._handoff_anchor_pending and self._runtime_ready():
+                durable_anchor = (self._evidence_handoff_anchor()
+                                  if self._evidence_handoff_anchor is not None
+                                  else None)
+                if durable_anchor is not None:
+                    while (self._evidence_handoff_quotes and
+                           self._evidence_handoff_quotes[0][2] <=
+                           durable_anchor.event_epoch):
+                        self._evidence_handoff_quotes.popleft()
+                    self._seed_midpoint_anchor(durable_anchor)
+                elif self._evidence_handoff_quotes:
+                    anchor = self._evidence_handoff_quotes.popleft()
+                    self._seed_handoff_anchor(
+                        bid=anchor[0], ask=anchor[1], event_epoch=anchor[2],
+                        bid_size=anchor[3], ask_size=anchor[4])
+                self._handoff_anchor_pending = False
+            while self._evidence_handoff_quotes:
+                capacity = self._outbox_remaining_capacity()
+                if capacity < 1:
+                    time.sleep(.01)
+                    continue
+                values = self._evidence_handoff_quotes.popleft()
+                if not self._accept_quote_serialized(
+                        bid=values[0], ask=values[1], event_epoch=values[2],
+                        bid_size=values[3], ask_size=values[4]):
+                    raise RuntimeError("evidence handoff drain failed")
             self._accepting_coin_quotes = False
+            self.metrics.set_status("evidence_ingress_status", "CLOSED")
 
     def _accept_quote_serialized(
         self, *, bid: float, ask: float, event_epoch: float,
@@ -347,7 +653,6 @@ class LiveMarketState:
 
         if not self._accepting_coin_quotes:
             return False
-
         values = (bid, ask, event_epoch)
         if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
             return False
@@ -489,9 +794,11 @@ class LiveMarketState:
             self._v9_output = output
             self._v9_error = v9_error
             self._coin_cycle_pending = False
-            self._publication = LivePublication(
-                next_snapshot, output, cycle_g2_state, cycle_market_display,
-            )
+            if self._runtime_ready():
+                self._owner_publication_armed = True
+                self._publication = LivePublication(
+                    next_snapshot, output, cycle_g2_state, cycle_market_display,
+                )
         self.metrics.observe("coin_market_state_update_latency_ms",
                              (self._monotonic() - update_started) * 1000)
         return True
@@ -538,7 +845,7 @@ class LiveMarketState:
                 current.regime, current.event_session, observation,
                 current.option_surface,
             )
-            if not self._coin_cycle_pending:
+            if not self._coin_cycle_pending and self._can_publish():
                 self._publication = replace(
                     self._publication, snapshot=self._snapshot,
                 )
@@ -563,16 +870,50 @@ class LiveMarketState:
                 current.cross_asset, current.factor, current.options_vol,
                 current.regime, current.event_session, representative, surface,
             )
-            if not self._coin_cycle_pending:
+            if not self._coin_cycle_pending and self._can_publish():
                 self._publication = replace(
                     self._publication, snapshot=self._snapshot,
                 )
 
 
+_ALPACA_RFC3339 = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[Tt]"
+    r"(?P<time>\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?"
+    r"(?P<zone>[Zz]|[+-]\d{2}:\d{2})$"
+)
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _parse_alpaca_timestamp_identity(value: str) -> tuple[float, int]:
+    """Return a float epoch plus the exact RFC3339 nanosecond identity."""
+
+    if not isinstance(value, str):
+        raise TypeError("Alpaca timestamp must be a string")
+    matched = _ALPACA_RFC3339.fullmatch(value)
+    if matched is None:
+        raise ValueError("Alpaca timestamp must be RFC3339 with a timezone")
+    zone = matched.group("zone")
+    if zone in {"Z", "z"}:
+        zone = "+00:00"
+    parsed = datetime.fromisoformat(
+        f"{matched.group('date')}T{matched.group('time')}{zone}")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("Alpaca timestamp must include a timezone")
+    delta = parsed.astimezone(timezone.utc) - _UNIX_EPOCH
+    whole_seconds = delta.days * 86_400 + delta.seconds
+    fraction = (matched.group("fraction") or "").ljust(9, "0")
+    event_nanoseconds = whole_seconds * 1_000_000_000 + int(fraction or "0")
+    event_epoch = event_nanoseconds / 1_000_000_000.0
+    if not math.isfinite(event_epoch):
+        raise ValueError("Alpaca timestamp is not finite")
+    return event_epoch, event_nanoseconds
+
+
 def parse_alpaca_timestamp(value: str) -> float:
     """Convert Alpaca's RFC 3339 event timestamp to Unix seconds."""
 
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    return _parse_alpaca_timestamp_identity(value)[0]
 
 
 def parse_alpaca_ndx_value(payload: object) -> tuple[float, float]:
@@ -687,46 +1028,299 @@ def poll_alpaca(
             return
 
 
+def alpaca_btc_stream_url() -> str:
+    """Return the one allowlisted crypto venue configured for this runtime."""
+
+    location = os.environ.get(
+        "ALPACA_CRYPTO_LOCATION", ALPACA_CRYPTO_LOCATION_DEFAULT).strip()
+    if location not in ALPACA_CRYPTO_LOCATIONS:
+        raise ValueError("ALPACA_CRYPTO_LOCATION is not allowlisted")
+    return ALPACA_BTC_STREAM_URL_TEMPLATE.format(location=location)
+
+
+def _websocket_timeout(error: Exception) -> bool:
+    return any(base.__name__ in {"TimeoutError", "WebSocketTimeoutException"}
+               for base in type(error).__mro__)
+
+
+def _stream_messages(raw) -> tuple[dict[str, object], ...]:
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    payload = json.loads(raw)
+    if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+        raise ValueError("Alpaca stream payload must be an array of objects")
+    return tuple(payload)
+
+
+class _AlpacaConnectionLimit(RuntimeError):
+    pass
+
+
+class _AlpacaControlFailure(RuntimeError):
+    def __init__(self, message: str, *, reason: str = "CONTROL"):
+        super().__init__(message)
+        self.reason = reason
+
+
+class _AlpacaWatchdogExpired(RuntimeError):
+    pass
+
+
 def poll_alpaca_g2(
-    state: LiveMarketState, *, interval: float = BTC_FETCH_SECONDS,
+    state: LiveMarketState, *, interval: float = BTC_RECONNECT_SECONDS,
     timeout: float = BTC_SOURCE_TIMEOUT_SECONDS,
     clock: Callable[[], float] = time.time,
     monotonic: Callable[[], float] = time.perf_counter,
     stop_event: threading.Event | None = None,
+    websocket_factory: Callable | None = None,
 ) -> None:
-    """Maintain the independent BTC input without blocking the ATOM cycle."""
+    """Maintain BTC from provider-timed Alpaca quotes on its streaming path."""
 
-    headers = {
-        "APCA-API-KEY-ID": os.environ["ALPACA_API_KEY"],
-        "APCA-API-SECRET-KEY": os.environ["ALPACA_SECRET_KEY"],
-    }
-    while stop_event is None or not stop_event.is_set():
-        try:
-            with urlopen(Request(ALPACA_BTC_LATEST_QUOTE_URL, headers=headers),
-                         timeout=timeout) as response:
-                payload = json.load(response)
-            received_at = monotonic()
-            item = payload["orderbooks"]["BTC/USD"]
-            price = (float(item["b"][0]["p"]) +
-                     float(item["a"][0]["p"])) / 2.0
-            event_epoch = parse_alpaca_timestamp(item["t"])
-            quote_age_ms = (clock() - event_epoch) * 1000.0
-            if quote_age_ms < 0 or quote_age_ms >= MAX_BTC_AGE_SECONDS * 1000.0:
-                raise ValueError("Alpaca BTC quote is stale or future-dated")
-            if not state.accept_g2_price(
-                    asset="BTC", price=price, event_epoch=event_epoch):
-                raise ValueError("Alpaca BTC quote was rejected")
-            state.metrics.observe("btc_quote_age_ms", quote_age_ms)
-            state.metrics.observe(
-                "btc_ingest_latency_ms", (monotonic() - received_at) * 1000.0,
-            )
-            state.metrics.set_status("btc_source_status", "LIVE")
-        except Exception as error:
-            state.metrics.set_status("btc_source_status", "UNAVAILABLE")
-            print(f"Alpaca BTC quote poll failed: {error}", flush=True)
+    last_status: str | None = None
+
+    def publish_status(status: str) -> None:
+        nonlocal last_status
+        if status != last_status:
+            state.metrics.set_status("btc_source_status", status)
+            last_status = status
+
+    def wait_before_reconnect(seconds: float) -> bool:
         if stop_event is None:
-            time.sleep(interval)
-        elif stop_event.wait(interval):
+            time.sleep(seconds)
+            return False
+        return stop_event.wait(seconds)
+
+    try:
+        if websocket_factory is None:
+            from websocket import create_connection
+            websocket_factory = create_connection
+        api_key = os.environ["ALPACA_API_KEY"]
+        secret_key = os.environ["ALPACA_SECRET_KEY"]
+        url = alpaca_btc_stream_url()
+    except Exception:
+        state.metrics.increment("btc_stream.configuration_failure")
+        state.metrics.set_status("btc_source_failure_reason", "CONFIGURATION")
+        publish_status("UNAVAILABLE")
+        return
+
+    location = url.rsplit("/", 1)[-1]
+    state.metrics.set_status("btc_stream_location", location)
+    initial = state.btc_latest_observation()
+    last_published_event_epoch = (
+        initial.event_epoch if initial is not None else None)
+    latest_provider_event_nanoseconds = (
+        round(last_published_event_epoch * 1_000_000_000)
+        if last_published_event_epoch is not None else None)
+    latest_provider_price = initial.midpoint if initial is not None else None
+    consecutive_failures = 0
+
+    while stop_event is None or not stop_event.is_set():
+        stream = None
+        try:
+            stream = websocket_factory(url, timeout=timeout)
+            publish_status("UNAVAILABLE")
+            connected_at = clock()
+            session_latest_event_epoch: float | None = None
+            subscription_requested = False
+            subscription_confirmed = False
+            stale_episode = False
+            stream.send(json.dumps({
+                "action": "auth", "key": api_key, "secret": secret_key,
+            }, separators=(",", ":")))
+
+            def require_fresh() -> None:
+                nonlocal stale_episode
+                reference = (connected_at if session_latest_event_epoch is None
+                             else session_latest_event_epoch)
+                age = clock() - reference
+                if age < 0 or age >= MAX_BTC_AGE_SECONDS:
+                    publish_status("UNAVAILABLE")
+                    if not stale_episode:
+                        stale_episode = True
+                        state.metrics.increment(
+                            "btc_stream.watchdog_unavailable")
+                    raise _AlpacaWatchdogExpired(
+                        "Alpaca BTC provider time expired")
+
+            while stop_event is None or not stop_event.is_set():
+                try:
+                    raw = stream.recv()
+                except Exception as error:
+                    if not _websocket_timeout(error):
+                        raise
+                    require_fresh()
+                    continue
+                received_at = monotonic()
+                if raw in (None, "", b""):
+                    raise ConnectionError("Alpaca BTC stream closed")
+                # Irrelevant or malformed traffic must not keep a stale provider
+                # session labeled live.
+                require_fresh()
+                try:
+                    messages = _stream_messages(raw)
+                except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+                    state.metrics.increment("btc_stream.malformed_message")
+                    continue
+                batch_quotes: dict[int, tuple[float, float]] = {}
+                for item in messages:
+                    message_type = item.get("T")
+                    if message_type == "success":
+                        if (item.get("msg") == "authenticated" and
+                                not subscription_requested):
+                            stream.send(json.dumps({
+                                "action": "subscribe", "quotes": ["BTC/USD"],
+                            }, separators=(",", ":")))
+                            subscription_requested = True
+                        continue
+                    if message_type == "subscription":
+                        quotes = item.get("quotes")
+                        if (not subscription_requested or
+                                not isinstance(quotes, list) or
+                                "BTC/USD" not in quotes):
+                            state.metrics.increment(
+                                "btc_stream.subscription_invalid")
+                            raise _AlpacaControlFailure(
+                                "Alpaca BTC subscription was not confirmed",
+                                reason="SUBSCRIPTION")
+                        subscription_confirmed = True
+                        continue
+                    if message_type == "error":
+                        if item.get("code") == 406:
+                            raise _AlpacaConnectionLimit(
+                                "Alpaca BTC stream connection limit")
+                        raise _AlpacaControlFailure(
+                            "Alpaca BTC stream control error", reason="CONTROL")
+                    if message_type != "q" or item.get("S") != "BTC/USD":
+                        continue
+                    if not subscription_confirmed:
+                        state.metrics.increment("btc_stream.quote_before_subscription")
+                        raise _AlpacaControlFailure(
+                            "Alpaca BTC quote preceded subscription confirmation",
+                            reason="SUBSCRIPTION")
+                    try:
+                        raw_bid, raw_ask = item["bp"], item["ap"]
+                        if isinstance(raw_bid, bool) or isinstance(raw_ask, bool):
+                            raise ValueError("boolean quote price")
+                        bid, ask = float(raw_bid), float(raw_ask)
+                        event_epoch, event_nanoseconds = \
+                            _parse_alpaca_timestamp_identity(item["t"])
+                        if (not math.isfinite(bid) or not math.isfinite(ask) or
+                                bid <= 0 or ask < bid):
+                            raise ValueError("invalid quote prices")
+                        quote_age_ms = (clock() - event_epoch) * 1000.0
+                        if (quote_age_ms < 0 or
+                                quote_age_ms >= MAX_BTC_AGE_SECONDS * 1000.0):
+                            raise ValueError("stale or future quote")
+                        price = (bid + ask) / 2.0
+                    except (KeyError, TypeError, ValueError, AttributeError):
+                        state.metrics.increment("btc_stream.quote_rejected")
+                        state.metrics.set_status(
+                            "btc_source_failure_reason", "QUOTE_REJECTED")
+                        publish_status("UNAVAILABLE")
+                        continue
+                    existing = batch_quotes.get(event_nanoseconds)
+                    if existing is not None and existing[1] != price:
+                        state.metrics.increment(
+                            "btc_stream.timestamp_conflict")
+                        publish_status("UNAVAILABLE")
+                        raise _AlpacaControlFailure(
+                            "conflicting Alpaca BTC prices share one timestamp",
+                            reason="TIMESTAMP_CONFLICT")
+                    batch_quotes[event_nanoseconds] = (event_epoch, price)
+
+                for event_nanoseconds in sorted(batch_quotes):
+                    event_epoch, price = batch_quotes[event_nanoseconds]
+                    if (latest_provider_event_nanoseconds is not None and
+                            event_nanoseconds <
+                            latest_provider_event_nanoseconds):
+                        state.metrics.increment("btc_stream.quote_out_of_order")
+                        continue
+                    if (latest_provider_event_nanoseconds is not None and
+                            event_nanoseconds ==
+                            latest_provider_event_nanoseconds):
+                        if price == latest_provider_price:
+                            state.metrics.increment("btc_stream.quote_duplicate")
+                            continue
+                        state.metrics.increment("btc_stream.timestamp_conflict")
+                        publish_status("UNAVAILABLE")
+                        raise _AlpacaControlFailure(
+                            "conflicting Alpaca BTC prices share one timestamp",
+                            reason="TIMESTAMP_CONFLICT")
+                    # Recheck after all frame parsing and ordering. A slow
+                    # consumer must not publish a quote that was fresh only
+                    # when the frame first arrived.
+                    quote_age_ms = (clock() - event_epoch) * 1000.0
+                    if (quote_age_ms < 0 or
+                            quote_age_ms >= MAX_BTC_AGE_SECONDS * 1000.0):
+                        state.metrics.increment("btc_stream.quote_rejected")
+                        state.metrics.set_status(
+                            "btc_source_failure_reason", "QUOTE_STALE")
+                        publish_status("UNAVAILABLE")
+                        continue
+                    latest_provider_event_nanoseconds = event_nanoseconds
+                    latest_provider_price = price
+                    session_latest_event_epoch = event_epoch
+                    stale_episode = False
+                    if (last_published_event_epoch is None or
+                            event_epoch - last_published_event_epoch >=
+                            BTC_PUBLISH_INTERVAL_SECONDS):
+                        if not state.accept_g2_price(
+                                asset="BTC", price=price,
+                                event_epoch=event_epoch,
+                                max_age_seconds=MAX_BTC_AGE_SECONDS):
+                            state.metrics.increment("btc_stream.quote_rejected")
+                            publish_status("UNAVAILABLE")
+                            raise _AlpacaControlFailure(
+                                "validated Alpaca BTC quote was not accepted",
+                                reason="QUOTE_REJECTED")
+                        last_published_event_epoch = event_epoch
+                    state.metrics.observe("btc_quote_age_ms", quote_age_ms)
+                    state.metrics.observe(
+                        "btc_ingest_latency_ms",
+                        (monotonic() - received_at) * 1000.0,
+                    )
+                    publish_status("LIVE")
+                    state.metrics.set_status(
+                        "btc_source_failure_reason", "NONE")
+                    consecutive_failures = 0
+                require_fresh()
+        except _AlpacaConnectionLimit:
+            state.metrics.increment("btc_stream.connection_limit")
+            state.metrics.set_status(
+                "btc_source_failure_reason", "CONNECTION_LIMIT")
+            publish_status("UNAVAILABLE")
+            consecutive_failures += 1
+        except _AlpacaWatchdogExpired:
+            state.metrics.increment("btc_stream.watchdog_reconnect")
+            state.metrics.set_status("btc_source_failure_reason", "WATCHDOG")
+            publish_status("UNAVAILABLE")
+            consecutive_failures += 1
+        except _AlpacaControlFailure as error:
+            state.metrics.increment("btc_stream.control_error")
+            state.metrics.set_status(
+                "btc_source_failure_reason", error.reason)
+            publish_status("UNAVAILABLE")
+            consecutive_failures += 1
+        except Exception:
+            state.metrics.increment("btc_stream.connection_failure")
+            state.metrics.set_status("btc_source_failure_reason", "TRANSPORT")
+            publish_status("UNAVAILABLE")
+            consecutive_failures += 1
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        if stop_event is not None and stop_event.is_set():
+            return
+        backoff = min(
+            BTC_RECONNECT_MAX_SECONDS,
+            max(0.0, interval) * (
+                2 ** min(10, max(0, consecutive_failures - 1))),
+        )
+        if wait_before_reconnect(backoff):
             return
 
 
@@ -798,9 +1392,10 @@ def start_alpaca_options_poller(state: LiveMarketState, *,
 
 
 __all__ = ["LatestMarketDisplay", "LiveMarketState", "LivePublication", "LiveSnapshot",
-           "BTC_FETCH_SECONDS", "BTC_SOURCE_TIMEOUT_SECONDS", "MAX_BTC_AGE_SECONDS",
+           "BTC_RECONNECT_SECONDS", "BTC_SOURCE_TIMEOUT_SECONDS", "MAX_BTC_AGE_SECONDS",
            "MARKET_DISPLAY_FETCH_SECONDS", "QUANT_CYCLE_SECONDS", "parse_alpaca_ndx_value",
-           "parse_alpaca_timestamp", "parse_massive_ndx_snapshot", "poll_alpaca",
+           "alpaca_btc_stream_url", "parse_alpaca_timestamp",
+           "parse_massive_ndx_snapshot", "poll_alpaca",
            "poll_alpaca_g2", "poll_massive_ndx", "start_alpaca_g2_poller",
            "start_alpaca_options_poller", "start_alpaca_poller",
            "start_massive_ndx_poller"]

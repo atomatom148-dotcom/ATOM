@@ -8,13 +8,17 @@ from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 
 from quant.live_market import (
-    ALPACA_BTC_LATEST_QUOTE_URL, ALPACA_LATEST_QUOTES_URL, BTC_FETCH_SECONDS,
+    ALPACA_BTC_STREAM_URL_TEMPLATE, ALPACA_CRYPTO_LOCATION_DEFAULT,
+    ALPACA_LATEST_QUOTES_URL, BTC_HISTORY_MAX_OBSERVATIONS,
+    BTC_PUBLISH_INTERVAL_SECONDS, BTC_RECONNECT_SECONDS,
     BTC_SOURCE_TIMEOUT_SECONDS, MAX_BTC_AGE_SECONDS,
     ALPACA_NDX_LATEST_VALUE_URL, MARKET_DISPLAY_FETCH_SECONDS, LiveMarketState,
-    MASSIVE_NDX_SNAPSHOT_URL, parse_alpaca_ndx_value, parse_alpaca_timestamp,
-    parse_massive_ndx_snapshot, poll_alpaca, poll_alpaca_g2, poll_massive_ndx,
+    MASSIVE_NDX_SNAPSHOT_URL, alpaca_btc_stream_url, parse_alpaca_ndx_value,
+    parse_alpaca_timestamp, parse_massive_ndx_snapshot, poll_alpaca,
+    poll_alpaca_g2, poll_massive_ndx,
 )
 from quant.web import create_app
+from quant.history import MidpointObservation
 
 
 def request_json(app):
@@ -25,6 +29,13 @@ def request_json(app):
 
     body = b"".join(app({"PATH_INFO": "/api/dashboard"}, start_response))
     return json.loads(body)
+
+
+def request_path_json(app, path):
+    response = {}
+    def start_response(status, _headers): response["status"] = status
+    body = b"".join(app({"PATH_INFO": path}, start_response))
+    return response["status"], json.loads(body)
 
 
 class LiveMarketTests(unittest.TestCase):
@@ -116,6 +127,234 @@ class LiveMarketTests(unittest.TestCase):
         self.assertFalse(state.accept_quote(
             bid=100.0, ask=102.0, event_epoch=2.0))
         self.assertEqual(len(outbox.items), 1)
+
+    def test_owner_handoff_uses_durable_watermark_and_never_replays_overlap(self):
+        ready = [False]
+        anchor = MidpointObservation(2.0, 101.0)
+
+        class CapturingOutbox:
+            def __init__(self): self.items = []
+            def remaining_capacity(self): return 256 - len(self.items)
+            def put_nowait(self, item): self.items.append(item); return True
+
+        outbox = CapturingOutbox()
+        state = LiveMarketState(
+            clock=lambda: 10.0, evidence_outbox=outbox,
+            evidence_acceptance_ready=lambda: ready[0],
+            evidence_handoff_anchor=lambda: anchor if ready[0] else None,
+        )
+        state.update_market_display(
+            coin_midpoint=100.0, coin_event_epoch=1.0)
+        self.assertTrue(state.accept_quote(
+            bid=99.0, ask=101.0, event_epoch=1.0))
+        self.assertTrue(state.accept_quote(
+            bid=100.0, ask=102.0, event_epoch=2.0))
+        self.assertEqual(outbox.items, [])
+        self.assertIsNone(state.publication().market_display.coin_event_epoch)
+        self.assertIsNone(state.publication().snapshot.history.latest)
+
+        ready[0] = True
+        state.update_market_display(
+            coin_midpoint=102.0, coin_event_epoch=3.0)
+        # The raw display remains frozen until the first owned V9/evidence cycle.
+        self.assertIsNone(state.publication().market_display.coin_event_epoch)
+        self.assertTrue(state.accept_quote(
+            bid=101.0, ask=103.0, event_epoch=3.0))
+
+        self.assertEqual(len(outbox.items), 1)
+        self.assertEqual(outbox.items[0].previous_observation, anchor)
+        self.assertEqual(outbox.items[0].current_observation.event_epoch, 3.0)
+        self.assertEqual(state.publication().market_display.coin_event_epoch, 3.0)
+        self.assertEqual(
+            tuple(item.event_epoch for item in state.snapshot().history.observations),
+            (2.0, 3.0),
+        )
+
+    def test_reacquired_owner_rebases_nonempty_history_to_new_durable_anchor(self):
+        ready = [True]
+        anchor = [MidpointObservation(9.0, 100.0)]
+
+        class CapturingOutbox:
+            def __init__(self): self.items = []
+            def remaining_capacity(self): return 256 - len(self.items)
+            def put_nowait(self, item): self.items.append(item); return True
+
+        outbox = CapturingOutbox()
+        state = LiveMarketState(
+            clock=lambda: 20.0, evidence_outbox=outbox,
+            evidence_acceptance_ready=lambda: ready[0],
+            evidence_handoff_anchor=lambda: anchor[0] if ready[0] else None,
+        )
+        self.assertTrue(state.accept_quote(
+            bid=100.0, ask=102.0, event_epoch=10.0))
+        ready[0] = False
+        for epoch in (11.0, 12.0, 13.0):
+            self.assertTrue(state.accept_quote(
+                bid=epoch + 90.0, ask=epoch + 92.0,
+                event_epoch=epoch))
+
+        # Another owner persisted through t=12 while this process was waiting.
+        anchor[0] = MidpointObservation(12.0, 103.0)
+        ready[0] = True
+        self.assertTrue(state.accept_quote(
+            bid=104.0, ask=106.0, event_epoch=14.0))
+
+        brackets = [
+            (item.previous_observation.event_epoch,
+             item.current_observation.event_epoch)
+            for item in outbox.items
+        ]
+        self.assertEqual(brackets, [(9.0, 10.0), (12.0, 13.0), (13.0, 14.0)])
+        self.assertEqual(
+            tuple(item.event_epoch for item in
+                  state.input_snapshot().history.observations),
+            (9.0, 10.0, 12.0, 13.0, 14.0),
+        )
+
+    def test_reacquisition_between_quotes_still_rebases_to_durable_anchor(self):
+        ready = [True]
+        generation = [1]
+        anchor = [MidpointObservation(9.0, 100.0)]
+
+        class CapturingOutbox:
+            def __init__(self): self.items = []
+            def remaining_capacity(self): return 256 - len(self.items)
+            def put_nowait(self, item): self.items.append(item); return True
+
+        outbox = CapturingOutbox()
+        state = LiveMarketState(
+            evidence_outbox=outbox,
+            evidence_acceptance_ready=lambda: ready[0],
+            evidence_handoff_anchor=lambda: anchor[0] if ready[0] else None,
+            evidence_owner_generation=lambda: generation[0] if ready[0] else None,
+        )
+        self.assertTrue(state.accept_quote(
+            bid=100.0, ask=102.0, event_epoch=10.0))
+
+        # No quote observes this process's ownership-loss interval.
+        ready[0] = False
+        anchor[0] = MidpointObservation(12.0, 103.0)
+        generation[0] = 2
+        ready[0] = True
+        self.assertTrue(state.accept_quote(
+            bid=104.0, ask=106.0, event_epoch=13.0))
+
+        self.assertEqual([
+            (item.previous_observation.event_epoch,
+             item.current_observation.event_epoch)
+            for item in outbox.items
+        ], [(9.0, 10.0), (12.0, 13.0)])
+        self.assertEqual(
+            tuple(item.event_epoch for item in
+                  state.input_snapshot().history.observations),
+            (9.0, 10.0, 12.0, 13.0),
+        )
+        self.assertEqual(dict(state.metrics.snapshot().counters)[
+            "evidence_handoff.owner_rebase"], 1)
+
+    def test_new_owner_generation_rebases_even_when_local_history_is_ahead(self):
+        ready = [True]
+        generation = [1]
+        anchor = [MidpointObservation(9.0, 100.0)]
+
+        class CapturingOutbox:
+            def __init__(self): self.items = []
+            def remaining_capacity(self): return 256 - len(self.items)
+            def put_nowait(self, item): self.items.append(item); return True
+
+        outbox = CapturingOutbox()
+        state = LiveMarketState(
+            evidence_outbox=outbox,
+            evidence_acceptance_ready=lambda: ready[0],
+            evidence_handoff_anchor=lambda: anchor[0] if ready[0] else None,
+            evidence_owner_generation=lambda: generation[0] if ready[0] else None,
+        )
+        self.assertTrue(state.accept_quote(
+            bid=104.0, ask=106.0, event_epoch=13.0))
+
+        # Local t=13 is still unacknowledged when a different owner advances
+        # only to t=12; no quote observes the loss interval in this process.
+        ready[0] = False
+        anchor[0] = MidpointObservation(12.0, 103.0)
+        generation[0] = 2
+        ready[0] = True
+        self.assertTrue(state.accept_quote(
+            bid=105.0, ask=107.0, event_epoch=14.0))
+
+        self.assertEqual([
+            (item.previous_observation.event_epoch,
+             item.current_observation.event_epoch)
+            for item in outbox.items
+        ], [(9.0, 13.0), (12.0, 14.0)])
+        self.assertEqual(
+            tuple(item.event_epoch for item in
+                  state.input_snapshot().history.observations),
+            (9.0, 12.0, 14.0),
+        )
+
+    def test_shutdown_rebases_owned_tail_after_reacquisition(self):
+        ready = [True]
+        anchor = [MidpointObservation(9.0, 100.0)]
+
+        class CapturingOutbox:
+            def __init__(self): self.items = []
+            def remaining_capacity(self): return 256 - len(self.items)
+            def put_nowait(self, item): self.items.append(item); return True
+
+        outbox = CapturingOutbox()
+        state = LiveMarketState(
+            evidence_outbox=outbox,
+            evidence_acceptance_ready=lambda: ready[0],
+            evidence_handoff_anchor=lambda: anchor[0] if ready[0] else None,
+        )
+        self.assertTrue(state.accept_quote(
+            bid=100.0, ask=102.0, event_epoch=10.0))
+        ready[0] = False
+        for epoch in (11.0, 12.0, 13.0):
+            self.assertTrue(state.accept_quote(
+                bid=epoch + 90.0, ask=epoch + 92.0,
+                event_epoch=epoch))
+        anchor[0] = MidpointObservation(12.0, 103.0)
+        ready[0] = True
+        state.stop_accepting_quotes()
+
+        tail = outbox.items[-1]
+        self.assertEqual(tail.previous_observation.event_epoch, 12.0)
+        self.assertEqual(tail.current_observation.event_epoch, 13.0)
+
+    def test_shutdown_drains_owned_handoff_tail_but_discards_non_owner_overlap(self):
+        ready = [False]
+        anchor = MidpointObservation(2.0, 101.0)
+        class CapturingOutbox:
+            def __init__(self): self.items = []
+            def remaining_capacity(self): return 256 - len(self.items)
+            def put_nowait(self, item): self.items.append(item); return True
+        outbox = CapturingOutbox()
+        state = LiveMarketState(
+            clock=lambda: 10.0, evidence_outbox=outbox,
+            evidence_acceptance_ready=lambda: ready[0],
+            evidence_handoff_anchor=lambda: anchor if ready[0] else None,
+        )
+        for epoch in (1.0, 2.0, 3.0):
+            self.assertTrue(state.accept_quote(
+                bid=99.0 + epoch, ask=101.0 + epoch, event_epoch=epoch))
+        ready[0] = True
+        state.stop_accepting_quotes()
+        self.assertEqual(len(outbox.items), 1)
+        self.assertEqual(outbox.items[0].previous_observation, anchor)
+        self.assertEqual(outbox.items[0].current_observation.event_epoch, 3.0)
+
+        waiting_outbox = CapturingOutbox()
+        waiting = LiveMarketState(
+            evidence_outbox=waiting_outbox,
+            evidence_acceptance_ready=lambda: False,
+        )
+        self.assertTrue(waiting.accept_quote(
+            bid=99.0, ask=101.0, event_epoch=1.0))
+        waiting.stop_accepting_quotes()
+        self.assertEqual(waiting_outbox.items, [])
+        self.assertEqual(dict(waiting.metrics.snapshot().counters)[
+            "evidence_handoff.non_owner_shutdown"], 1)
 
     def test_market_display_accepts_only_newer_provider_values_and_is_frozen(self):
         state = LiveMarketState()
@@ -310,89 +549,225 @@ class LiveMarketTests(unittest.TestCase):
         self.assertIsNone(value.ndx_price)
         self.assertIsNone(value.ndx_age_seconds)
 
-    def test_g2_poller_requests_only_btc_and_leaves_ndx_missing(self):
+    def test_g2_stream_authenticates_subscribes_and_preserves_provider_time(self):
         state = LiveMarketState(clock=lambda: 2.0)
-        response = BytesIO(json.dumps({
-            "orderbooks": {
-                "BTC/USD": {
-                    "b": [{"p": 100.0, "s": 1.0}],
-                    "a": [{"p": 102.0, "s": 1.0}],
-                    "t": "1970-01-01T00:00:01Z",
-                },
-            },
-        }).encode())
+        stop = threading.Event()
+
+        class Stream:
+            def __init__(self):
+                self.sent = []; self.closed = False
+                self.messages = [
+                    '[{"T":"success","msg":"connected"}]',
+                    '[{"T":"success","msg":"authenticated"}]',
+                    '[{"T":"subscription","quotes":["BTC/USD"]}]',
+                    ('[{"T":"q","S":"BTC/USD","bp":100.0,"bs":1.0,'
+                     '"ap":102.0,"as":1.0,"t":"1970-01-01T00:00:01Z"}]'),
+                ]
+            def send(self, value): self.sent.append(json.loads(value))
+            def recv(self):
+                value = self.messages.pop(0)
+                if not self.messages: stop.set()
+                return value
+            def close(self): self.closed = True
+
+        stream = Stream()
+        factory = MagicMock(return_value=stream)
 
         with patch.dict(os.environ, {
             "ALPACA_API_KEY": "key",
             "ALPACA_SECRET_KEY": "secret",
-        }), patch(
-            "quant.live_market.urlopen", return_value=response,
-        ) as urlopen, patch(
-            "quant.live_market.time.sleep", side_effect=RuntimeError("stop"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "stop"):
-                poll_alpaca_g2(state, clock=lambda: 2.0,
-                               monotonic=iter((10.0, 10.002)).__next__)
+        }, clear=False):
+            poll_alpaca_g2(
+                state, clock=lambda: 2.0, monotonic=lambda: 10.0,
+                stop_event=stop, websocket_factory=factory,
+            )
 
-        self.assertEqual(urlopen.call_count, 1)
-        self.assertEqual(urlopen.call_args.kwargs["timeout"],
+        factory.assert_called_once_with(
+            ALPACA_BTC_STREAM_URL_TEMPLATE.format(
+                location=ALPACA_CRYPTO_LOCATION_DEFAULT),
+            timeout=BTC_SOURCE_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(factory.call_args.kwargs["timeout"],
                          BTC_SOURCE_TIMEOUT_SECONDS)
-        self.assertEqual(
-            urlopen.call_args.args[0].full_url, ALPACA_BTC_LATEST_QUOTE_URL,
-        )
-        self.assertEqual(
-            ALPACA_BTC_LATEST_QUOTE_URL,
-            "https://data.alpaca.markets/v1beta3/crypto/us/latest/"
-            "orderbooks?symbols=BTC%2FUSD",
-        )
+        self.assertEqual(stream.sent, [
+            {"action": "auth", "key": "key", "secret": "secret"},
+            {"action": "subscribe", "quotes": ["BTC/USD"]},
+        ])
+        self.assertTrue(stream.closed)
         value = state.cross_asset_state()
         self.assertEqual(value.btc_price, 101.0)
+        self.assertEqual(state._btc_history.latest.event_epoch, 1.0)
         telemetry = state.metrics.snapshot()
         distributions = dict(telemetry.distributions)
         self.assertEqual(distributions["btc_quote_age_ms"].p50, 1000.0)
-        self.assertAlmostEqual(distributions["btc_ingest_latency_ms"].p50, 2.0)
+        self.assertEqual(distributions["btc_ingest_latency_ms"].p50, 0.0)
         self.assertEqual(dict(telemetry.statuses)["btc_source_status"], "LIVE")
+        self.assertEqual(dict(telemetry.statuses)["btc_stream_location"],
+                         ALPACA_CRYPTO_LOCATION_DEFAULT)
         self.assertIsNone(value.ndx_price)
         self.assertIsNone(value.ndx_age_seconds)
         self.assertEqual(value.ndx_return_bps, (None,) * 6)
 
-    def test_repeated_latest_btc_quote_remains_live_and_is_not_duplicated(self):
+    def test_repeated_stream_quote_remains_live_and_is_not_duplicated(self):
         state = LiveMarketState(clock=lambda: 2.0)
-        payload = json.dumps({"orderbooks": {"BTC/USD": {
-            "b": [{"p": 100.0, "s": 1.0}],
-            "a": [{"p": 102.0, "s": 1.0}],
-            "t": "1970-01-01T00:00:01Z",
-        }}}).encode()
-        responses = [BytesIO(payload), BytesIO(payload)]
+        stop = threading.Event()
+        quote = ('[{"T":"q","S":"BTC/USD","bp":100.0,"ap":102.0,'
+                 '"t":"1970-01-01T00:00:01Z"}]')
+
+        class Stream:
+            def __init__(self):
+                self.messages = [
+                    '[{"T":"success","msg":"authenticated"}]',
+                    '[{"T":"subscription","quotes":["BTC/USD"]}]',
+                    quote, quote,
+                ]
+            def send(self, _value): pass
+            def recv(self):
+                value = self.messages.pop(0)
+                if not self.messages: stop.set()
+                return value
+            def close(self): pass
 
         with patch.dict(os.environ, {
             "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
-        }), patch(
-            "quant.live_market.urlopen", side_effect=responses,
-        ) as urlopen, patch(
-            "quant.live_market.time.sleep", side_effect=(None, RuntimeError("stop")),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "stop"):
-                poll_alpaca_g2(state, clock=lambda: 2.0)
+        }, clear=False):
+            poll_alpaca_g2(
+                state, clock=lambda: 2.0, monotonic=lambda: 0.0,
+                stop_event=stop, websocket_factory=lambda *_args, **_kwargs: Stream(),
+            )
 
-        self.assertEqual(urlopen.call_count, 2)
         self.assertEqual(len(state._btc_history.observations), 1)
         self.assertEqual(
             dict(state.metrics.snapshot().statuses)["btc_source_status"], "LIVE",
         )
 
-    def test_btc_failure_is_single_attempt_and_cannot_enter_coin_path(self):
-        state = MagicMock(spec=LiveMarketState)
-        state.metrics = LiveMarketState().metrics
+    def test_distinct_nanosecond_quotes_do_not_collapse_into_a_false_conflict(self):
+        first = "2024-07-24T07:38:06.884904780Z"
+        second = "2024-07-24T07:38:06.884904791Z"
+        now = parse_alpaca_timestamp(second) + 1.0
+        state = LiveMarketState(clock=lambda: now)
+        stop = threading.Event()
+
+        class Stream:
+            def __init__(self):
+                self.messages = [
+                    '[{"T":"success","msg":"authenticated"}]',
+                    '[{"T":"subscription","quotes":["BTC/USD"]}]',
+                    json.dumps([
+                        {"T": "q", "S": "BTC/USD", "bp": 100.0,
+                         "ap": 102.0, "t": first},
+                        {"T": "q", "S": "BTC/USD", "bp": 101.0,
+                         "ap": 103.0, "t": second},
+                    ]),
+                ]
+            def send(self, _value): pass
+            def recv(self):
+                value = self.messages.pop(0)
+                if not self.messages: stop.set()
+                return value
+            def close(self): pass
+
         with patch.dict(os.environ, {
             "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
-        }), patch(
-            "quant.live_market.urlopen", side_effect=TimeoutError("slow source"),
-        ) as source, patch(
+        }, clear=False):
+            poll_alpaca_g2(
+                state, clock=lambda: now, monotonic=lambda: 0.0,
+                stop_event=stop,
+                websocket_factory=lambda *_args, **_kwargs: Stream(),
+            )
+
+        telemetry = state.metrics.snapshot()
+        self.assertNotIn("btc_stream.timestamp_conflict",
+                         dict(telemetry.counters))
+        self.assertNotIn("btc_stream.control_error", dict(telemetry.counters))
+        self.assertEqual(dict(telemetry.statuses)["btc_source_status"], "LIVE")
+        self.assertEqual(len(state._btc_history.observations), 1)
+
+    def test_no_data_after_subscription_keeps_exponential_backoff(self):
+        state = LiveMarketState(clock=lambda: 0.0)
+
+        class Stop:
+            def __init__(self): self.waits = []
+            def is_set(self): return False
+            def wait(self, seconds):
+                self.waits.append(seconds)
+                return len(self.waits) == 3
+        stop = Stop()
+
+        class NoData:
+            def __init__(self):
+                self.messages = [
+                    '[{"T":"success","msg":"authenticated"}]',
+                    '[{"T":"subscription","quotes":["BTC/USD"]}]',
+                    None,
+                ]
+            def send(self, _value): pass
+            def recv(self): return self.messages.pop(0)
+            def close(self): pass
+
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }, clear=False):
+            poll_alpaca_g2(
+                state, interval=1.0, clock=lambda: 0.0,
+                stop_event=stop,
+                websocket_factory=lambda *_args, **_kwargs: NoData(),
+            )
+
+        self.assertEqual(stop.waits, [1.0, 2.0, 4.0])
+
+    def test_quote_that_becomes_stale_at_atomic_acceptance_is_never_stored(self):
+        now = [2.0]
+        state = LiveMarketState(clock=lambda: now[0])
+        original_accept = state.accept_g2_price
+        stop = threading.Event()
+
+        def delayed_accept(**kwargs):
+            now[0] = 7.0
+            return original_accept(**kwargs)
+        state.accept_g2_price = delayed_accept
+
+        class Stream:
+            def __init__(self):
+                self.messages = [
+                    '[{"T":"success","msg":"authenticated"}]',
+                    '[{"T":"subscription","quotes":["BTC/USD"]}]',
+                    ('[{"T":"q","S":"BTC/USD","bp":100.0,'
+                     '"ap":102.0,"t":"1970-01-01T00:00:01Z"}]'),
+                ]
+            def send(self, _value): pass
+            def recv(self):
+                value = self.messages.pop(0)
+                if not self.messages: stop.set()
+                return value
+            def close(self): pass
+
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }, clear=False):
+            poll_alpaca_g2(
+                state, clock=lambda: now[0], stop_event=stop,
+                websocket_factory=lambda *_args, **_kwargs: Stream(),
+            )
+
+        self.assertIsNone(state.btc_latest_observation())
+        telemetry = state.metrics.snapshot()
+        self.assertEqual(dict(telemetry.counters)[
+            "btc_stream.quote_rejected"], 1)
+        self.assertEqual(dict(telemetry.statuses)[
+            "btc_source_failure_reason"], "QUOTE_REJECTED")
+
+    def test_btc_connection_failure_retries_without_entering_coin_path(self):
+        state = MagicMock(spec=LiveMarketState)
+        state.metrics = LiveMarketState().metrics
+        source = MagicMock(side_effect=TimeoutError("slow source"))
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }, clear=False), patch(
             "quant.live_market.time.sleep", side_effect=RuntimeError("stop"),
         ):
             with self.assertRaisesRegex(RuntimeError, "stop"):
-                poll_alpaca_g2(state)
+                poll_alpaca_g2(state, websocket_factory=source)
 
         source.assert_called_once()
         self.assertEqual(source.call_args.kwargs["timeout"],
@@ -417,12 +792,11 @@ class LiveMarketTests(unittest.TestCase):
 
         with patch.dict(os.environ, {
             "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
-        }), patch(
-            "quant.live_market.urlopen", side_effect=blocked_source,
-        ), patch("quant.live_market.time.sleep", side_effect=RuntimeError("stop")):
+        }, clear=False), patch(
+            "quant.live_market.time.sleep", side_effect=RuntimeError("stop")):
             def run_poller():
                 try:
-                    poll_alpaca_g2(state)
+                    poll_alpaca_g2(state, websocket_factory=blocked_source)
                 except RuntimeError as error:
                     self.assertEqual(str(error), "stop")
 
@@ -441,30 +815,301 @@ class LiveMarketTests(unittest.TestCase):
         state = LiveMarketState(clock=lambda: 100.0)
         self.assertTrue(state.accept_g2_price(
             asset="BTC", price=99.0, event_epoch=99.0))
-        response = BytesIO(json.dumps({"orderbooks": {"BTC/USD": {
-            "b": [{"p": 100.0, "s": 1.0}],
-            "a": [{"p": 102.0, "s": 1.0}],
-            "t": "1970-01-01T00:01:30Z",
-        }}}).encode())
+        stop = threading.Event()
+
+        class Stream:
+            def __init__(self):
+                self.messages = [
+                    '[{"T":"success","msg":"authenticated"}]',
+                    '[{"T":"subscription","quotes":["BTC/USD"]}]',
+                    ('[{"T":"q","S":"BTC/USD","bp":100.0,"ap":102.0,'
+                     '"t":"1970-01-01T00:01:30Z"}]'),
+                ]
+            def send(self, _value): pass
+            def recv(self):
+                value = self.messages.pop(0)
+                if not self.messages: stop.set()
+                return value
+            def close(self): pass
+
         with patch.dict(os.environ, {
             "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
-        }), patch(
-            "quant.live_market.urlopen", return_value=response,
-        ), patch(
-            "quant.live_market.time.sleep", side_effect=RuntimeError("stop"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "stop"):
-                poll_alpaca_g2(state, clock=lambda: 100.0)
+        }, clear=False):
+            poll_alpaca_g2(
+                state, clock=lambda: 100.0, stop_event=stop,
+                websocket_factory=lambda *_args, **_kwargs: Stream(),
+            )
 
         value = state.cross_asset_state()
         self.assertEqual(value.btc_price, 99.0)
         self.assertEqual(state._btc_history.latest.event_epoch, 99.0)
         self.assertEqual(MAX_BTC_AGE_SECONDS, 5.0)
-        self.assertEqual(BTC_FETCH_SECONDS, 0.25)
+        self.assertEqual(BTC_RECONNECT_SECONDS, 1.0)
         self.assertEqual(
             dict(state.metrics.snapshot().statuses)["btc_source_status"],
             "UNAVAILABLE",
         )
+
+    def test_btc_stream_watchdog_and_connection_limit_recovery(self):
+        state = LiveMarketState(clock=lambda: 10.0)
+        stop = threading.Event()
+
+        class Limited:
+            def send(self, _value): pass
+            def recv(self):
+                return '[{"T":"error","code":406,"msg":"connection limit exceeded"}]'
+            def close(self): pass
+        class Recovered:
+            def __init__(self):
+                self.messages = [
+                    '[{"T":"success","msg":"authenticated"}]',
+                    '[{"T":"subscription","quotes":["BTC/USD"]}]',
+                    ('[{"T":"q","S":"BTC/USD","bp":100.0,"ap":102.0,'
+                     '"t":"1970-01-01T00:00:09Z"}]'),
+                ]
+            def send(self, _value): pass
+            def recv(self):
+                value = self.messages.pop(0)
+                if not self.messages: stop.set()
+                return value
+            def close(self): pass
+
+        factory = MagicMock(side_effect=(Limited(), Recovered()))
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }, clear=False):
+            poll_alpaca_g2(
+                state, interval=0.0, clock=lambda: 10.0,
+                monotonic=lambda: 0.0, stop_event=stop,
+                websocket_factory=factory,
+            )
+
+        telemetry = state.metrics.snapshot()
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual(dict(telemetry.counters)["btc_stream.connection_limit"], 1)
+        self.assertEqual(dict(telemetry.statuses)["btc_source_status"], "LIVE")
+
+    def test_btc_stream_watchdog_fails_closed_after_five_silent_seconds(self):
+        state = LiveMarketState(clock=lambda: 0.0)
+        stop = threading.Event()
+
+        class WebSocketTimeoutException(Exception): pass
+        class Silent:
+            def __init__(self): self.calls = 0
+            def send(self, _value): pass
+            def recv(self):
+                self.calls += 1
+                if self.calls == 2:
+                    stop.set()
+                raise WebSocketTimeoutException("no provider event")
+            def close(self): pass
+
+        clock = iter((0.0, 4.9, 5.0)).__next__
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }, clear=False):
+            poll_alpaca_g2(
+                state, clock=clock, stop_event=stop,
+                websocket_factory=lambda *_args, **_kwargs: Silent(),
+            )
+
+        telemetry = state.metrics.snapshot()
+        self.assertEqual(
+            dict(telemetry.counters)["btc_stream.watchdog_unavailable"], 1)
+        self.assertEqual(
+            dict(telemetry.statuses)["btc_source_status"], "UNAVAILABLE")
+
+    def test_btc_stream_location_is_allowlisted(self):
+        self.assertEqual(ALPACA_CRYPTO_LOCATION_DEFAULT, "us-1")
+        with patch.dict(os.environ, {"ALPACA_CRYPTO_LOCATION": "invalid"}):
+            with self.assertRaisesRegex(ValueError, "allowlisted"):
+                alpaca_btc_stream_url()
+
+    def test_btc_api_status_and_ui_value_are_derived_from_provider_age(self):
+        state = LiveMarketState(clock=lambda: 1.0)
+        self.assertTrue(state.accept_g2_price(
+            asset="BTC", price=101.0, event_epoch=1.0))
+        state.metrics.set_status("btc_source_status", "LIVE")
+        state.metrics.set_status("btc_stream_location", "us")
+        app = create_app(state=state, clock=lambda: 10.0)
+
+        for path in ("/api/live", "/api/dashboard"):
+            status, payload = request_path_json(app, path)
+            self.assertEqual(status, "200 OK")
+            market = payload["market"]
+            self.assertEqual(market["btc"], 101.0)
+            self.assertEqual(market["btc_event_epoch"], 1.0)
+            self.assertEqual(market["btc_data_age"], 9.0)
+            self.assertEqual(market["btc_source_status"], "UNAVAILABLE")
+            self.assertIsNone(market["btc_display"])
+            self.assertEqual(market["btc_stream_location"], "us")
+
+        html = b"".join(create_app(
+            state=state, clock=lambda: 10.0)(
+                {"PATH_INFO": "/"}, lambda _status, _headers: None)).decode()
+        self.assertIn('data-dashboard-field="market.btc"></div>', html)
+
+    def test_malformed_traffic_cannot_mask_stale_stream_and_reconnects(self):
+        state = LiveMarketState(clock=lambda: now[0])
+        stop = threading.Event()
+        now = [0.0]
+
+        class StaleTraffic:
+            def __init__(self):
+                self.messages = [
+                    (0.0, '[{"T":"success","msg":"authenticated"}]'),
+                    (0.0, '[{"T":"subscription","quotes":["BTC/USD"]}]'),
+                    (5.1, "not-json"),
+                ]
+                self.closed = False
+            def send(self, _value): pass
+            def recv(self):
+                now[0], value = self.messages.pop(0)
+                return value
+            def close(self): self.closed = True
+
+        class Fresh:
+            def __init__(self):
+                self.messages = [
+                    (6.0, '[{"T":"success","msg":"authenticated"}]'),
+                    (6.0, '[{"T":"subscription","quotes":["BTC/USD"]}]'),
+                    (6.5, ('[{"T":"q","S":"BTC/USD","bp":100.0,'
+                           '"ap":102.0,"t":"1970-01-01T00:00:06Z"}]')),
+                ]
+            def send(self, _value): pass
+            def recv(self):
+                now[0], value = self.messages.pop(0)
+                if not self.messages: stop.set()
+                return value
+            def close(self): pass
+
+        stale, fresh = StaleTraffic(), Fresh()
+        factory = MagicMock(side_effect=(stale, fresh))
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }, clear=False):
+            poll_alpaca_g2(
+                state, interval=0.0, clock=lambda: now[0],
+                monotonic=lambda: 0.0, stop_event=stop,
+                websocket_factory=factory,
+            )
+
+        telemetry = state.metrics.snapshot()
+        self.assertTrue(stale.closed)
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual(dict(telemetry.counters)[
+            "btc_stream.watchdog_reconnect"], 1)
+        self.assertEqual(dict(telemetry.statuses)["btc_source_status"], "LIVE")
+        self.assertEqual(state.btc_latest_observation().event_epoch, 6.0)
+
+    def test_stream_burst_is_coalesced_and_history_has_a_hard_cap(self):
+        state = LiveMarketState(clock=lambda: 20.0)
+        stop = threading.Event()
+        quotes = ",".join(
+            ('{"T":"q","S":"BTC/USD","bp":100.0,"ap":102.0,'
+             f'"t":"1970-01-01T00:00:{16.0 + index * .01:05.2f}Z"}}')
+            for index in range(400)
+        )
+
+        class Burst:
+            def __init__(self):
+                self.messages = [
+                    '[{"T":"success","msg":"authenticated"}]',
+                    '[{"T":"subscription","quotes":["BTC/USD"]}]',
+                    "[" + quotes + "]",
+                ]
+            def send(self, _value): pass
+            def recv(self):
+                value = self.messages.pop(0)
+                if not self.messages: stop.set()
+                return value
+            def close(self): pass
+
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }, clear=False):
+            poll_alpaca_g2(
+                state, clock=lambda: 20.0, monotonic=lambda: 0.0,
+                stop_event=stop,
+                websocket_factory=lambda *_args, **_kwargs: Burst(),
+            )
+        self.assertLessEqual(len(state._btc_history.observations), 17)
+        self.assertEqual(BTC_PUBLISH_INTERVAL_SECONDS, .25)
+        self.assertEqual(BTC_HISTORY_MAX_OBSERVATIONS, 14_401)
+
+        with patch("quant.live_market.BTC_HISTORY_MAX_OBSERVATIONS", 4):
+            bounded = LiveMarketState(clock=lambda: 20.0)
+            for index in range(10):
+                self.assertTrue(bounded.accept_g2_price(
+                    asset="BTC", price=100.0 + index,
+                    event_epoch=10.0 + index))
+            self.assertEqual(len(bounded._btc_history.observations), 4)
+
+    def test_wrong_subscription_and_missing_credentials_fail_closed(self):
+        state = LiveMarketState(clock=lambda: 1.0)
+        stop = threading.Event()
+        class WrongSubscription:
+            def __init__(self):
+                self.messages = [
+                    '[{"T":"success","msg":"authenticated"}]',
+                    '[{"T":"subscription","quotes":[]}]',
+                ]
+            def send(self, _value): pass
+            def recv(self):
+                value = self.messages.pop(0)
+                if not self.messages: stop.set()
+                return value
+            def close(self): pass
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }, clear=False):
+            poll_alpaca_g2(
+                state, stop_event=stop,
+                websocket_factory=lambda *_args, **_kwargs: WrongSubscription())
+        counters = dict(state.metrics.snapshot().counters)
+        self.assertEqual(counters["btc_stream.subscription_invalid"], 1)
+        self.assertIsNone(state.btc_latest_observation())
+
+        missing = LiveMarketState()
+        with patch.dict(os.environ, {}, clear=True):
+            poll_alpaca_g2(
+                missing, websocket_factory=lambda *_args, **_kwargs: None)
+        telemetry = missing.metrics.snapshot()
+        self.assertEqual(dict(telemetry.counters)[
+            "btc_stream.configuration_failure"], 1)
+        self.assertEqual(dict(telemetry.statuses)["btc_source_status"],
+                         "UNAVAILABLE")
+
+    def test_alpaca_timestamp_and_boolean_quote_validation_are_fail_closed(self):
+        for invalid in (1, True, "1970-01-01T00:00:01"):
+            with self.subTest(value=invalid), self.assertRaises(
+                    (TypeError, ValueError)):
+                parse_alpaca_timestamp(invalid)
+
+        state = LiveMarketState(clock=lambda: 2.0)
+        stop = threading.Event()
+        class BooleanQuote:
+            def __init__(self):
+                self.messages = [
+                    '[{"T":"success","msg":"authenticated"}]',
+                    '[{"T":"subscription","quotes":["BTC/USD"]}]',
+                    ('[{"T":"q","S":"BTC/USD","bp":true,"ap":2.0,'
+                     '"t":"1970-01-01T00:00:01Z"}]'),
+                ]
+            def send(self, _value): pass
+            def recv(self):
+                value = self.messages.pop(0)
+                if not self.messages: stop.set()
+                return value
+            def close(self): pass
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
+        }, clear=False):
+            poll_alpaca_g2(
+                state, stop_event=stop,
+                websocket_factory=lambda *_args, **_kwargs: BooleanQuote())
+        self.assertEqual(dict(state.metrics.snapshot().counters)[
+            "btc_stream.quote_rejected"], 1)
 
     def test_massive_ndx_poller_stops_after_one_forbidden_response(self):
         state = LiveMarketState(clock=lambda: 101.0)
