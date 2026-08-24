@@ -23,3 +23,29 @@ Restart, stale, blocked-model, exact-six hydration tests. Reason codes on UNAVAI
 Calibration / Truth credit from eligible resolves only. Still no broker.
 
 **Rule:** Quant pipeline first. Platform never.
+
+## Paper simulator phases
+
+The simulator is an isolated downstream research path governed by `SIMULATION_FREEZE.md`. SIM-0A is documentation-only. Only SIM-1 becomes authorized after SIM-0A is merged, and no later phase may be implemented early.
+
+### SIM-0 — Architecture freeze
+
+### SIM-1 — Immutable contracts, identities, statuses, canonical serialization, and tests
+
+### SIM-2 — Append-only persistence and least-privilege runtime role
+
+### SIM-3 — Asynchronous immutable V4D forecast capture
+
+### SIM-4 — Causal executable entry selection
+
+### SIM-5 — Six-horizon causal resolution
+
+### SIM-6 — Compact accuracy and P&L state
+
+### SIM-7 — Read-only simulation page
+
+### SIM-8 — Security, isolation, and freeze audit
+
+### SIM-9 — Database-backed market-open acceptance
+
+### SIM-10 — Continuous evidence operation
