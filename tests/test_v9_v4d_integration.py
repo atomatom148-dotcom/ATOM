@@ -62,7 +62,8 @@ def _inputs(family_count=1, unavailable_horizon=None):
             100.0, 1.0, 1.0, "PROVISIONAL", ()) for quant_id in ids) if active else ()
         n = len(calibrations)
         states.append(SimpleNamespace(
-            horizon=horizon, directional_calibrations=calibrations,
+            horizon=horizon, status="PROVISIONAL" if active else "UNAVAILABLE",
+            reason_codes=(), directional_calibrations=calibrations,
             ordered_quant_ids=ids if active else (),
             pair_support_boolean_matrix=tuple(tuple(True for _ in range(n)) for _ in range(n)),
             stabilized_covariance_matrix=tuple(tuple(float(i == j) for j in range(n)) for i in range(n)) if n > 1 else None,

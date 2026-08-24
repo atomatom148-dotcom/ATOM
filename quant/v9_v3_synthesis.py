@@ -241,6 +241,14 @@ def synthesize_v3(v1: V1Input, v2: V2EvidenceState) -> V3Output:
         state = by_horizon.get(horizon)
         if state is None or not evidence_compatible:
             results.append(_unavailable(horizon, "V2_EVIDENCE_VERSION_MISMATCH")); continue
+        state_status = getattr(state, "status", None)
+        if state_status == "UNAVAILABLE":
+            results.append(_unavailable(
+                horizon, "V2_HORIZON_UNAVAILABLE",
+                *getattr(state, "reason_codes", ())))
+            continue
+        if state_status not in {"MATURE", "PROVISIONAL"}:
+            results.append(_unavailable(horizon, "V2_HORIZON_STATUS_INVALID")); continue
         calibrations = {item.quant_id: item for item in state.directional_calibrations}
         slots = {item.quant_id: item for item in v1.slots if item.horizon == horizon}
         eligible = tuple(q for q in CANONICAL_FAMILIES
@@ -283,14 +291,19 @@ def synthesize_v3(v1: V1Input, v2: V2EvidenceState) -> V3Output:
         q3 = slots.get("q3_volatility")
         diagnostic = (float(q3.value_bps) if q3 and q3.availability_state == "FRESH" and
                       q3.value_bps is not None and math.isfinite(q3.value_bps) else None)
-        provisional = (state.covariance_status == "PROVISIONAL" or
+        provisional = (state_status == "PROVISIONAL" or
+                       state.covariance_status == "PROVISIONAL" or
                        any(calibrations[q].status == "PROVISIONAL" for q in used))
+        reasons = []
+        if state_status == "PROVISIONAL":
+            reasons.append("V2_HORIZON_PROVISIONAL")
+        if state.covariance_status == "PROVISIONAL" and not state.dependence_modeled:
+            reasons.append("DIAGONAL_PROVISIONAL")
         results.append(V3HorizonResult(
             horizon, HORIZON_SECONDS[horizon], mu, variance,
             "PROVISIONAL" if provisional else "MATURE", used, weights, len(eligible),
             mode, q3_diagnostic_magnitude_bps=diagnostic,
-            reason_codes=("DIAGONAL_PROVISIONAL",) if
-            state.covariance_status == "PROVISIONAL" and not state.dependence_modeled else (),
+            reason_codes=tuple(sorted(reasons)),
         ))
     overall = ("UNAVAILABLE" if all(r.status == "UNAVAILABLE" for r in results) else
                "MATURE" if all(r.status == "MATURE" for r in results) else "PROVISIONAL")

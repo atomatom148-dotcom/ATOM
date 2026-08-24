@@ -14,7 +14,8 @@ def _cal(q, *, a=0.0, c=1.0, residual=1.0, status="MATURE"):
 
 
 def _inputs(ids=("q1_momentum", "q2_mean_reversion"), *, matrix=None, support=None,
-            values=None, covariance_status="MATURE", dependence=True, horizon="30S"):
+            values=None, covariance_status="MATURE", dependence=True, horizon="30S",
+            horizon_status="MATURE"):
     ids = tuple(ids); n = len(ids)
     matrix = matrix or tuple(tuple(float(i == j) for j in range(n)) for i in range(n))
     support = support or tuple(tuple(True for _ in range(n)) for _ in range(n))
@@ -43,7 +44,8 @@ def _inputs(ids=("q1_momentum", "q2_mean_reversion"), *, matrix=None, support=No
     for h in HORIZONS:
         active = h == horizon
         states.append(SimpleNamespace(
-            horizon=h, directional_calibrations=tuple(_cal(q) for q in ids) if active else (),
+            horizon=h, status=horizon_status if active else "UNAVAILABLE",
+            reason_codes=(), directional_calibrations=tuple(_cal(q) for q in ids) if active else (),
             ordered_quant_ids=ids if active else (), pair_support_boolean_matrix=support if active else (),
             stabilized_covariance_matrix=matrix if active else None,
             covariance_status=covariance_status if active else "UNAVAILABLE",
@@ -101,6 +103,28 @@ def test_diagonal_provisional_is_usable_and_provisional():
     result = _first(*_inputs(covariance_status="PROVISIONAL", dependence=False))
     assert result.status == "PROVISIONAL"
     assert result.reason_codes == ("DIAGONAL_PROVISIONAL",)
+
+
+def test_unavailable_v2_horizon_fails_closed_even_with_usable_payload():
+    result = _first(*_inputs(horizon_status="UNAVAILABLE"))
+    assert result.status == "UNAVAILABLE"
+    assert result.expected_return_bps is None
+    assert result.predictive_variance_bps2 is None
+    assert result.used_quant_ids == ()
+    assert "V2_HORIZON_UNAVAILABLE" in result.reason_codes
+
+
+def test_v3_never_promotes_provisional_v2_horizon_to_mature():
+    result = _first(*_inputs(horizon_status="PROVISIONAL"))
+    assert result.status == "PROVISIONAL"
+    assert result.expected_return_bps is not None
+    assert result.reason_codes == ("V2_HORIZON_PROVISIONAL",)
+
+
+def test_unknown_v2_horizon_status_fails_closed():
+    result = _first(*_inputs(horizon_status="AVAILABLE"))
+    assert result.status == "UNAVAILABLE"
+    assert result.reason_codes == ("V2_HORIZON_STATUS_INVALID",)
 
 
 @pytest.mark.parametrize("unsupported", ("q8_cross_asset", "q10_options_vol"))
