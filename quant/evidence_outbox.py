@@ -58,6 +58,19 @@ _TERMINAL_FAILURE_REASONS = frozenset({
 })
 
 
+def _v4_cohort_scope(cohorts: dict[str, tuple[str, str]]) -> tuple[str, tuple[str, ...]]:
+    """Return a bound SQL predicate for the exact six state cohorts."""
+
+    if tuple(cohorts) != HORIZONS:
+        raise ValueError("cohorts must contain exactly six canonical horizons in order")
+    clause = " OR ".join(
+        "(f.horizon=%s AND f.record_json->>'cohort_id'=%s "
+        "AND f.record_json->>'cohort_hash'=%s)" for _horizon in HORIZONS)
+    params = tuple(value for horizon in HORIZONS
+                   for value in (horizon, *cohorts[horizon]))
+    return clause, params
+
+
 class TerminalDeliveryError(RuntimeError):
     """An immutable envelope cannot succeed if retried."""
 
@@ -141,18 +154,20 @@ class PostgresV4BStateBuilder:
         if self._candidate is None:
             return "SKIPPED_NO_CANDIDATE"
         symbol, state_as_of, cohorts = self._candidate
+        cohort_scope, cohort_params = _v4_cohort_scope(cohorts)
         cursor = self._connection.cursor()
         try:
             cursor.execute(
-                """SELECT f.forecast_record_hash, f.record_json,
+                f"""SELECT f.forecast_record_hash, f.record_json,
                           o.outcome_record_hash, o.record_json
                    FROM public.atom_v9_v4_forecasts AS f
                    JOIN public.atom_v9_v4_outcomes AS o
                      USING (forecast_record_id)
                    WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
+                     AND ({cohort_scope})
                    ORDER BY f.cutoff_at, f.forecast_record_id,
                             o.created_at, o.outcome_record_id""",
-                (symbol, state_as_of, state_as_of),
+                (symbol, state_as_of, state_as_of, *cohort_params),
             )
             rows = tuple(cursor.fetchall())
             commit = getattr(self._connection, "commit", None)
@@ -203,18 +218,20 @@ class PostgresV4CStateBuilder:
         if self._candidate is None:
             return "SKIPPED_NO_CANDIDATE"
         symbol, state_as_of, cohorts = self._candidate
+        cohort_scope, cohort_params = _v4_cohort_scope(cohorts)
         cursor = self._connection.cursor()
         try:
             cursor.execute(
-                """SELECT f.forecast_record_hash, f.record_json,
+                f"""SELECT f.forecast_record_hash, f.record_json,
                           o.outcome_record_hash, o.record_json
                    FROM public.atom_v9_v4_forecasts AS f
                    JOIN public.atom_v9_v4_outcomes AS o
                      USING (forecast_record_id)
                    WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
+                     AND ({cohort_scope})
                    ORDER BY f.cutoff_at, f.forecast_record_id,
                             o.created_at, o.outcome_record_id""",
-                (symbol, state_as_of, state_as_of),
+                (symbol, state_as_of, state_as_of, *cohort_params),
             )
             rows = tuple(cursor.fetchall())
             commit = getattr(self._connection, "commit", None)

@@ -1406,6 +1406,8 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
         def execute(self, sql, params):
             assert "atom_v9_v4_forecasts" in sql and "atom_v9_v4_outcomes" in sql
             assert "o.created_at<=%s" in sql
+            assert "f.record_json->>'cohort_id'=%s" in sql
+            assert "f.record_json->>'cohort_hash'=%s" in sql
             self.params = params
         def fetchall(self):
             return ((forecast.forecast_record_hash,
@@ -1428,13 +1430,19 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
     connection = Connection()
     builder = PostgresV4BStateBuilder(connection, state_store=store,
                                       wall_clock=lambda: NOW + timedelta(minutes=2))
-    cohorts = {h: ("cohort", "b" * 64) for h in HORIZONS}
+    cohorts = {item.forecast.horizon:
+               (item.forecast.cohort_id, item.forecast.cohort_hash)
+               for item in calculated.persistence}
     as_of = NOW + timedelta(minutes=1)
     builder.prepare(symbol="COIN", state_as_of=as_of, cohorts=cohorts)
 
     assert builder.build_and_publish() == "INSERT"
     assert captured == {"symbol": "COIN", "state_as_of": as_of,
                         "cohorts": cohorts, "evidence": ((forecast, outcome),)}
+    assert connection.cursor_value.params == (
+        "COIN", as_of, as_of,
+        *(value for horizon in HORIZONS for value in (horizon, *cohorts[horizon])),
+    )
     assert store.calls == [(state, NOW + timedelta(minutes=2))]
 
 
@@ -1457,12 +1465,16 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
         def execute(self, sql, params):
             assert "atom_v9_v4_forecasts" in sql and "atom_v9_v4_outcomes" in sql
             assert "o.created_at<=%s" in sql
+            assert "f.record_json->>'cohort_id'=%s" in sql
+            assert "f.record_json->>'cohort_hash'=%s" in sql
+            self.params = params
         def fetchall(self):
             return ((forecast.forecast_record_hash, json.dumps(_canonical(asdict(forecast))),
                      outcome.outcome_record_hash, json.dumps(_canonical(asdict(outcome)))),)
         def close(self): pass
     class Connection(_WorkerConnection):
-        def cursor(self): return Cursor()
+        def __init__(self): self.cursor_value = Cursor()
+        def cursor(self): return self.cursor_value
 
     import quant.evidence_outbox as module
     calls = {"threshold": 0, "scale": 0, "range": 0, "state": 0}
@@ -1477,7 +1489,8 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
 
     store = SimpleNamespace(calls=[])
     store.insert = lambda state, created: store.calls.append((state, created)) or "INSERT"
-    builder = PostgresV4CStateBuilder(Connection(), state_store=store,
+    connection = Connection()
+    builder = PostgresV4CStateBuilder(connection, state_store=store,
                                       wall_clock=lambda: NOW + timedelta(minutes=2))
     cohorts = {item.forecast.horizon:
                (item.forecast.cohort_id, item.forecast.cohort_hash)
@@ -1491,6 +1504,10 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
     assert state.state_version == PROBABILITY_STATE_VERSION
     assert state.cohort_id == "v9v4statecohort:" + module.canonical_sha256(
         tuple(cohorts[horizon] for horizon in HORIZONS))
+    assert connection.cursor_value.params == (
+        "COIN", as_of, as_of,
+        *(value for horizon in HORIZONS for value in (horizon, *cohorts[horizon])),
+    )
     assert state.horizons[0].range_status == "UNAVAILABLE"
     assert all(item.range_status == "UNAVAILABLE" for item in state.horizons)
     assert store.calls[0][1] == NOW + timedelta(minutes=2)
