@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import json
+import math
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -15,13 +16,14 @@ from quant.historical_replay import (
     HistoricalSipQuote, OneSessionReplayClock, ReplayFrame, TARGET_SPEC_ID,
     build_replay_v2_as_of, calculate_replay_families,
 )
-from quant.history import MidpointHistory
+from quant.history import MidpointHistory, MidpointObservation
 from quant.q1_momentum import FORMULA_VERSION as Q1_VERSION
 from quant.q10_options_vol import FORMULA_VERSION as Q10_VERSION
 from quant.quote_history import QuoteHistory
 from quant.v9_v2a_dataset import (
     DIRECTIONAL_BPS, RawFamilyObservation, RawTarget, TargetIdentity,
 )
+from quant.v9_v2d_evidence_state import v2d_state_hash
 
 
 EASTERN = ZoneInfo("America/New_York")
@@ -283,6 +285,68 @@ def test_clock_preserves_exact_source_ns_when_float_epochs_would_collide():
     assert all(frame.coin_source_as_of_ns <= frame.cutoff_ns for frame in frames)
 
 
+@pytest.mark.parametrize("utc_hour", [13, 22])
+def test_replay_frame_cannot_bypass_rth_with_direct_construction(utc_hour):
+    exact = int(datetime(
+        2026, 1, 5, utc_hour, 0, tzinfo=timezone.utc,
+    ).timestamp() * 1_000_000_000)
+    with pytest.raises(ValueError, match="current-session RTH"):
+        ReplayFrame(
+            exact, exact, exact, None,
+            MidpointHistory(), MidpointHistory(), QuoteHistory(),
+        )
+
+
+def test_replay_frame_rejects_premarket_history_even_at_rth_cutoff():
+    cutoff = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
+    exact = int(cutoff.timestamp() * 1_000_000_000)
+    premarket = MidpointHistory((MidpointObservation(
+        cutoff.timestamp() - 1, 100.0,
+    ),))
+    with pytest.raises(ValueError, match="current-session RTH"):
+        ReplayFrame(
+            exact, exact, exact, None,
+            premarket, MidpointHistory(), QuoteHistory(),
+        )
+
+
+def test_replay_frame_binds_histories_to_exact_source_markers():
+    opened, _closed = _session()
+    open_ns = _ns(opened)
+    qqq_history = MidpointHistory((MidpointObservation(
+        opened.timestamp(), 500.0,
+    ),))
+    with pytest.raises(ValueError, match="source markers"):
+        ReplayFrame(
+            open_ns, open_ns, open_ns, None,
+            MidpointHistory(), qqq_history, QuoteHistory(),
+        )
+
+    cutoff_ns = _ns(opened + timedelta(seconds=2))
+    newer_coin = MidpointHistory((MidpointObservation(
+        opened.timestamp() + 1, 100.0,
+    ),))
+    with pytest.raises(ValueError, match="source markers"):
+        ReplayFrame(
+            cutoff_ns, cutoff_ns, open_ns, None,
+            newer_coin, MidpointHistory(), QuoteHistory(),
+        )
+
+    one_ulp = math.nextafter(opened.timestamp(), math.inf)
+    two_ulps = math.nextafter(one_ulp, math.inf)
+    ReplayFrame(
+        cutoff_ns, cutoff_ns, open_ns, None,
+        MidpointHistory((MidpointObservation(one_ulp, 100.0),)),
+        MidpointHistory(), QuoteHistory(),
+    )
+    with pytest.raises(ValueError, match="source markers"):
+        ReplayFrame(
+            cutoff_ns, cutoff_ns, open_ns, None,
+            MidpointHistory((MidpointObservation(two_ulps, 100.0),)),
+            MidpointHistory(), QuoteHistory(),
+        )
+
+
 def test_reader_rejects_boolean_market_fields():
     opened, closed = _session()
     invalid = {**_payload("2026-01-05T14:30:00Z"), "bs": True}
@@ -378,7 +442,7 @@ def _versions():
     )
 
 
-STATE_AS_OF = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc).timestamp()
+STATE_AS_OF = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc).timestamp()
 TARGET_CUTOFF = STATE_AS_OF - 30.0
 
 
@@ -451,6 +515,37 @@ def test_replay_v2_rejects_future_target_before_dataset_construction():
 def test_replay_v2_rejects_every_future_family_timestamp(change):
     with pytest.raises(RuntimeError, match="REPLAY_LOOKAHEAD_VIOLATION"):
         _build(targets=(_target(),), observations=(_observation(**change),))
+
+
+@pytest.mark.parametrize("change", [
+    {"source_as_of_epoch": TARGET_CUTOFF + 1},
+    {"available_epoch": STATE_AS_OF},
+    {"forecast_cutoff_epoch": TARGET_CUTOFF + 1},
+])
+def test_replay_v2_rejects_causal_attachment_violations(change):
+    with pytest.raises(RuntimeError, match="REPLAY_LOOKAHEAD_VIOLATION"):
+        _build(targets=(_target(),), observations=(_observation(**change),))
+
+
+def test_replay_v2_rejects_premarket_targets_and_sources():
+    premarket_cutoff = datetime(
+        2026, 1, 5, 14, 29, 30, tzinfo=timezone.utc,
+    ).timestamp()
+    premarket_target = replace(
+        _target(), cutoff_epoch=premarket_cutoff,
+        maturity_epoch=premarket_cutoff + 30,
+    )
+    with pytest.raises(RuntimeError, match="REPLAY_TARGET_TIMING_VIOLATION"):
+        _build(targets=(premarket_target,))
+
+    premarket_source = datetime(
+        2026, 1, 5, 14, 29, 59, tzinfo=timezone.utc,
+    ).timestamp()
+    with pytest.raises(RuntimeError, match="REPLAY_LOOKAHEAD_VIOLATION"):
+        _build(
+            targets=(_target(),),
+            observations=(_observation(source_as_of_epoch=premarket_source),),
+        )
 
 
 def test_replay_v2_rejects_observation_without_visible_resolved_target():
@@ -526,3 +621,46 @@ def test_replay_v2_run_identity_is_part_of_replay_provenance_hash():
     assert first.replay_state_id != second.replay_state_id
     with pytest.raises(ValueError, match="identity"):
         replace(first, replay_run_id="tampered-run")
+    tampered_v2 = replace(first.v2_state, top_level_status="MATURE")
+    with pytest.raises(ValueError, match="inner identity"):
+        replace(first, v2_state=tampered_v2)
+
+
+def _rehash_v2(state):
+    digest = v2d_state_hash(state)
+    return replace(state, state_hash=digest, state_id=f"v9v2:{digest}")
+
+
+def test_replay_envelope_rejects_canonical_unauthorized_inner_states():
+    baseline = _build()
+    first_horizon = baseline.v2_state.horizon_state_tuple[0]
+    forged_lineage = (
+        replace(first_horizon.family_lineage[0], formula_version="WRONG_FORMULA"),
+        *first_horizon.family_lineage[1:],
+    )
+    forged_horizon = replace(first_horizon, family_lineage=forged_lineage)
+    forged_formula = _rehash_v2(replace(
+        baseline.v2_state,
+        horizon_state_tuple=(forged_horizon,
+                             *baseline.v2_state.horizon_state_tuple[1:]),
+    ))
+    with pytest.raises(ValueError, match="not an authorized baseline"):
+        replace(baseline, v2_state=forged_formula)
+
+    after_hours = datetime(
+        2026, 1, 5, 22, 0, tzinfo=timezone.utc,
+    ).timestamp()
+    forged_time = _rehash_v2(replace(
+        baseline.v2_state, state_as_of=after_hours,
+    ))
+    with pytest.raises(ValueError, match="not an authorized baseline"):
+        replace(baseline, v2_state=forged_time)
+
+    promoted_horizon = replace(first_horizon, status="MATURE")
+    promoted_status = _rehash_v2(replace(
+        baseline.v2_state, top_level_status="PROVISIONAL",
+        horizon_state_tuple=(promoted_horizon,
+                             *baseline.v2_state.horizon_state_tuple[1:]),
+    ))
+    with pytest.raises(ValueError, match="not an authorized baseline"):
+        replace(baseline, v2_state=promoted_status)

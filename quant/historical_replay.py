@@ -34,11 +34,22 @@ from .q11_regime import FORMULA_VERSION as Q11_VERSION, calculate_regime
 from .q12_event_session import FORMULA_VERSION as Q12_VERSION, calculate_event_session
 from .quote_history import QuoteHistory, QuoteObservation
 from .v9_v2a_dataset import (
-    HORIZON_SECONDS, RawFamilyObservation, RawTarget, build_v2a_dataset,
+    DIRECTIONAL_FAMILIES, HORIZON_SECONDS, METHOD_VERSION as V2A_METHOD_VERSION,
+    Q3, SYMBOL as V2_SYMBOL, FamilyLineage, RawFamilyObservation, RawTarget,
+    build_v2a_dataset,
 )
-from .v9_v2b_calibration import build_v2b_calibration
-from .v9_v2c_covariance import build_v2c_covariance
-from .v9_v2d_evidence_state import V2EvidenceState, build_v2d_evidence_state
+from .v9_v2b_calibration import (
+    FORMULA_VERSION as V2B_METHOD_VERSION, build_v2b_calibration,
+)
+from .v9_v2c_covariance import METHOD_VERSION as V2C_METHOD_VERSION, build_v2c_covariance
+from .v9_v2d_evidence_state import (
+    CALIBRATION_METHOD_VERSION, COVARIANCE_METHOD_VERSION,
+    EFFECTIVE_N_METHOD_VERSION, MODEL_FAMILY as V2_MODEL_FAMILY,
+    NUMERICAL_CANONICALIZATION_VERSION,
+    STATE_SCHEMA_VERSION as V2_STATE_SCHEMA_VERSION,
+    STATE_VERSION as V2_STATE_VERSION, V2EvidenceState, build_v2d_evidence_state,
+    v2d_state_hash,
+)
 
 
 ALPACA_HISTORICAL_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes"
@@ -323,6 +334,40 @@ class ReplayFrame:
         expected = (SOURCE_SPEC_SHARES
                     if self.coin_source_as_of_ns >= _SIZE_SHARES_START_NS
                     else SOURCE_SPEC_ROUND_LOTS)
+        cutoff_at = datetime.fromtimestamp(
+            self.cutoff_ns / _NANOSECONDS, timezone.utc,
+        ).astimezone(_EASTERN)
+        local_cutoff = cutoff_at.timetz().replace(tzinfo=None)
+        session_open = cutoff_at.replace(
+            hour=9, minute=30, second=0, microsecond=0,
+        )
+        session_open_ns = _datetime_ns(session_open)
+        history_epochs = tuple(
+            row.event_epoch for history in (
+                self.coin_history, self.qqq_history, self.coin_quote_history,
+            ) for row in history.observations
+        )
+        if (not time(9, 30) <= local_cutoff < time(16, 0) or
+                self.coin_source_as_of_ns < session_open_ns or
+                (self.qqq_source_as_of_ns is not None and
+                 self.qqq_source_as_of_ns < session_open_ns) or
+                any(epoch < session_open.timestamp() or
+                    epoch > self.cutoff_epoch for epoch in history_epochs)):
+            raise ValueError("replay frame must contain only current-session RTH data")
+        coin_source_epoch = self.coin_source_as_of_epoch
+        qqq_source_epoch = self.qqq_source_as_of_epoch
+        coin_source_ceiling = math.nextafter(coin_source_epoch, math.inf)
+        qqq_source_ceiling = (None if qqq_source_epoch is None else
+                              math.nextafter(qqq_source_epoch, math.inf))
+        if (any(row.event_epoch > coin_source_ceiling
+                for row in self.coin_history.observations) or
+                any(row.event_epoch > coin_source_ceiling
+                    for row in self.coin_quote_history.observations) or
+                (qqq_source_epoch is None and self.qqq_history.observations) or
+                (qqq_source_epoch is not None and any(
+                    row.event_epoch > qqq_source_ceiling
+                    for row in self.qqq_history.observations))):
+            raise ValueError("replay histories exceed their exact source markers")
         if (self.source != SOURCE or
                 self.data_schema_version != DATA_SCHEMA_VERSION or
                 self.source_spec_version != expected or
@@ -406,6 +451,14 @@ class HistoricalReplayV2State:
                 self.v2_state.target_data_schema_version != DATA_SCHEMA_VERSION or
                 self.v2_state.target_source_spec_version != self.source_spec_version):
             raise ValueError("historical replay V2 envelope lineage is invalid")
+        inner_hash = v2d_state_hash(self.v2_state)
+        if (self.v2_state.state_hash != inner_hash or
+                self.v2_state.state_id != f"v9v2:{inner_hash}"):
+            raise ValueError("historical replay V2 inner identity is invalid")
+        if not _authorized_replay_v2_state(
+            self.v2_state, source_spec_version=self.source_spec_version,
+        ):
+            raise ValueError("historical replay V2 state is not an authorized baseline")
         expected = _replay_state_hash(
             replay_run_id=self.replay_run_id,
             historical_session=self.historical_session,
@@ -430,6 +483,101 @@ def _replay_state_hash(
     return hashlib.sha256(json.dumps(
         identity, ensure_ascii=True, separators=(",", ":"),
     ).encode()).hexdigest()
+
+
+def _authorized_replay_v2_state(
+    state: V2EvidenceState, *, source_spec_version: str,
+) -> bool:
+    local_as_of = datetime.fromtimestamp(
+        state.state_as_of, timezone.utc,
+    ).astimezone(_EASTERN)
+    expected_directional = tuple(
+        quant_id for quant_id in DIRECTIONAL_FAMILIES
+        if quant_id in ALLOWED_FORMULA_VERSIONS
+    )
+    expected_lineage = tuple(FamilyLineage(
+        quant_id, ALLOWED_FORMULA_VERSIONS[quant_id],
+        DATA_SCHEMA_VERSION, source_spec_version,
+    ) for quant_id in (*expected_directional, Q3))
+    horizon_states = state.horizon_state_tuple
+    expected_source_spec = (
+        SOURCE_SPEC_SHARES
+        if state.state_as_of >= _SIZE_SHARES_START_NS / _NANOSECONDS
+        else SOURCE_SPEC_ROUND_LOTS
+    )
+    if (state.state_schema_version != V2_STATE_SCHEMA_VERSION or
+            state.state_version != V2_STATE_VERSION or
+            state.model_family != V2_MODEL_FAMILY or
+            state.symbol != V2_SYMBOL or
+            state.v2a_method_version != V2A_METHOD_VERSION or
+            state.v2b_method_version != V2B_METHOD_VERSION or
+            state.v2c_method_version != V2C_METHOD_VERSION or
+            state.effective_n_method_version != EFFECTIVE_N_METHOD_VERSION or
+            state.calibration_method_version != CALIBRATION_METHOD_VERSION or
+            state.covariance_method_version != COVARIANCE_METHOD_VERSION or
+            state.numerical_canonicalization_version !=
+            NUMERICAL_CANONICALIZATION_VERSION or
+            source_spec_version != expected_source_spec or
+            state.creation_status != "VALID" or
+            not time(9, 30) <= local_as_of.timetz().replace(tzinfo=None) < time(16, 0) or
+            tuple(item.horizon for item in horizon_states) != tuple(HORIZON_SECONDS)):
+        return False
+    verified_statuses = []
+    for item in horizon_states:
+        expected_calibrations = tuple(
+            (quant_id, ALLOWED_FORMULA_VERSIONS[quant_id],
+             DATA_SCHEMA_VERSION, source_spec_version)
+            for quant_id in expected_directional
+        )
+        actual_calibrations = tuple(
+            (row.quant_id, row.formula_version, row.data_schema_version,
+             row.source_spec_version)
+            for row in item.directional_calibrations
+        )
+        q3_identity = (
+            item.q3.quant_id, item.q3.formula_version,
+            item.q3.data_schema_version, item.q3.source_spec_version,
+        )
+        usable = tuple(
+            row for row in item.directional_calibrations
+            if row.status != "UNAVAILABLE"
+        )
+        covariance = item.stabilized_covariance_matrix
+        covariance_usable = (
+            item.covariance_status != "UNAVAILABLE" and
+            covariance is not None and
+            len(covariance) == len(item.directional_calibrations) and
+            all(len(row) == len(item.directional_calibrations)
+                for row in covariance)
+        )
+        if not usable or not covariance_usable:
+            verified_status = "UNAVAILABLE"
+        elif (all(row.status == "MATURE"
+                  for row in item.directional_calibrations) and
+              item.covariance_status == "MATURE" and
+              item.q3.status == "MATURE" and
+              "HETEROGENEOUS_COMPONENT_CUTOFF" not in item.reason_codes):
+            verified_status = "MATURE"
+        else:
+            verified_status = "PROVISIONAL"
+        if (item.horizon_seconds != HORIZON_SECONDS[item.horizon] or
+                item.status != verified_status or
+                item.family_lineage != expected_lineage or
+                item.ordered_quant_ids != expected_directional or
+                actual_calibrations != expected_calibrations or
+                q3_identity != (
+                    Q3, ALLOWED_FORMULA_VERSIONS[Q3],
+                    DATA_SCHEMA_VERSION, source_spec_version,
+                )):
+            return False
+        verified_statuses.append(verified_status)
+    expected_top = (
+        "MATURE" if all(status == "MATURE" for status in verified_statuses) else
+        "UNAVAILABLE" if all(status == "UNAVAILABLE"
+                             for status in verified_statuses) else
+        "PROVISIONAL"
+    )
+    return state.top_level_status == expected_top
 
 
 class OneSessionReplayClock:
@@ -629,8 +777,16 @@ def build_replay_v2_as_of(
             for row in target_rows
         ):
             raise RuntimeError("REPLAY_LOOKAHEAD_VIOLATION")
+        if any(
+            row.horizon != horizon or
+            row.maturity_epoch != row.cutoff_epoch + HORIZON_SECONDS[horizon] or
+            row.resolved_epoch < row.maturity_epoch or
+            not _same_rth_target_window(row.cutoff_epoch, row.maturity_epoch)
+            for row in target_rows
+        ):
+            raise RuntimeError("REPLAY_TARGET_TIMING_VIOLATION")
         visible_identities = {
-            (row.cycle_id, row.cutoff_epoch, row.maturity_epoch)
+            (row.cycle_id, row.cutoff_epoch, row.maturity_epoch): row
             for row in target_rows
         }
         for row in observation_rows:
@@ -649,6 +805,20 @@ def build_replay_v2_as_of(
                 raise RuntimeError("REPLAY_LOOKAHEAD_VIOLATION")
             if identity not in visible_identities:
                 raise RuntimeError("REPLAY_UNRESOLVED_OBSERVATION")
+            target = visible_identities[identity]
+            if not (
+                row.horizon == horizon and
+                row.target_identity.cutoff_epoch == row.forecast_cutoff_epoch ==
+                target.cutoff_epoch and
+                row.target_identity.maturity_epoch == target.maturity_epoch and
+                row.source_as_of_epoch <= row.forecast_cutoff_epoch <=
+                row.available_epoch < target.maturity_epoch and
+                _rth_source_for_cutoff(
+                    row.source_as_of_epoch, row.forecast_cutoff_epoch,
+                ) and
+                row.availability_state == "FRESH"
+            ):
+                raise RuntimeError("REPLAY_LOOKAHEAD_VIOLATION")
         targets[horizon] = target_rows
         observations[horizon] = observation_rows
 
@@ -700,6 +870,24 @@ def _session_bounds(session_open: datetime, session_close: datetime) -> tuple[in
             closed.timetz().replace(tzinfo=None) != time(16, 0)):
         raise ValueError("historical replay requires one complete 09:30-16:00 ET session")
     return open_ns, close_ns
+
+
+def _same_rth_target_window(cutoff_epoch: float, maturity_epoch: float) -> bool:
+    cutoff = datetime.fromtimestamp(cutoff_epoch, timezone.utc).astimezone(_EASTERN)
+    maturity = datetime.fromtimestamp(maturity_epoch, timezone.utc).astimezone(_EASTERN)
+    cutoff_time = cutoff.timetz().replace(tzinfo=None)
+    maturity_time = maturity.timetz().replace(tzinfo=None)
+    return (cutoff.date() == maturity.date() and
+            time(9, 30) <= cutoff_time < time(16, 0) and
+            cutoff < maturity and maturity_time <= time(16, 0))
+
+
+def _rth_source_for_cutoff(source_epoch: float, cutoff_epoch: float) -> bool:
+    source = datetime.fromtimestamp(source_epoch, timezone.utc).astimezone(_EASTERN)
+    cutoff = datetime.fromtimestamp(cutoff_epoch, timezone.utc).astimezone(_EASTERN)
+    source_time = source.timetz().replace(tzinfo=None)
+    return (source.date() == cutoff.date() and
+            time(9, 30) <= source_time < time(16, 0))
 
 
 def _monotonic_epoch(

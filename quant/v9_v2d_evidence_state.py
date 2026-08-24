@@ -161,6 +161,14 @@ def _digest(value: object, *, excluded: frozenset[str] = frozenset()) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def v2d_state_hash(state: V2EvidenceState) -> str:
+    """Recompute the canonical identity of an assembled V2D state."""
+
+    if not isinstance(state, V2EvidenceState):
+        raise TypeError("state must be a V2EvidenceState")
+    return _digest(state, excluded=frozenset(("state_hash", "state_id")))
+
+
 def _all_finite(value: object) -> bool:
     if isinstance(value, float):
         return math.isfinite(value)
@@ -423,7 +431,7 @@ def build_v2d_evidence_state(*, state_as_of: float,
         manifest, component_tuple, horizon_tuple, tuple(sorted(exclusion.items())),
         top, creation, tuple(sorted(top_reasons)), "", "",
     )
-    state_hash = _digest(shell, excluded=frozenset(("state_hash", "state_id")))
+    state_hash = v2d_state_hash(shell)
     result = replace(shell, state_hash=state_hash, state_id="v9v2:" + state_hash)
     if not _all_finite(result):
         raise ValueError("non-finite float in assembled V2D state")
