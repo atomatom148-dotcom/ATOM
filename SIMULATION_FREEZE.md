@@ -571,8 +571,8 @@ The runtime role must not own the table and must not bypass RLS.
 
 SIM-2 must use the existing SIM-1:
 
-- `serialize_intent`
-- `deserialize_intent`
+- `serialize_simulation_trade_intent`
+- `deserialize_simulation_trade_intent`
 
 `record_json` stores the JSON object obtained from the canonical serialized intent.
 
@@ -582,7 +582,7 @@ Raw JSONB bytes are never treated as the mathematical hash input.
 
 Every loaded row must:
 
-1. Deserialize through `deserialize_intent`.
+1. Deserialize through `deserialize_simulation_trade_intent`.
 2. Recalculate and validate `intent_hash` and `intent_id`.
 3. Match every duplicated relational column exactly.
 4. Reject missing, unknown, malformed, or noncanonical content.
