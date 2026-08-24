@@ -516,6 +516,49 @@ def test_state_builder_shutdown_drains_pending_outcome_cohorts():
     ]
 
 
+def test_state_builder_shutdown_is_bounded_during_database_outage():
+    started = threading.Event()
+
+    class OperationalError(Exception): pass
+    class Connection:
+        def __init__(self): self.close_calls = 0
+        def close(self): self.close_calls += 1
+    class Builder:
+        def prepare(self, **_candidate): pass
+        def rebind_connection(self, _connection): pass
+        def build_and_publish(self):
+            started.set()
+            raise OperationalError("database unavailable")
+
+    connection = Connection()
+    builder = Builder()
+    metrics = OperationalMetrics()
+    worker = V4StateBuildWorker(
+        builder, OfflineStateBuildScheduler(builder.build_and_publish),
+        connection=connection,
+        connect=lambda _url: (_ for _ in ()).throw(
+            OperationalError("database unavailable")),
+        database_url="postgresql://runtime", metrics=metrics,
+        shutdown_timeout_seconds=.05,
+    )
+    worker.start()
+    worker.submit(
+        symbol="COIN", state_as_of=NOW,
+        cohorts={horizon: ("cohort", "a" * 64) for horizon in HORIZONS},
+        new_outcome=True,
+    )
+    assert started.wait(1)
+
+    before = time.monotonic()
+    worker.stop()
+
+    assert time.monotonic() - before < .5
+    assert not worker._thread.is_alive()
+    assert connection.close_calls == 1
+    assert dict(metrics.snapshot().counters)[
+        "v4_state_build_worker.shutdown_abandoned"] == 1
+
+
 @pytest.mark.parametrize("family_count", (11, 10, 7, 3, 1, 0))
 def test_continuous_cycle_uses_current_subset_without_readiness_gate(family_count):
     v1, v2 = _inputs(family_count)
@@ -772,6 +815,8 @@ def test_new_worker_outcome_submits_v4_state_build_off_fifo(monkeypatch):
 
     worker.process(item)
     assert len(submitted) == 1 and submitted[0]["new_outcome"] is True
+    assert submitted[0]["state_as_of"] == worker._writer.outcomes[0].created_at
+    assert submitted[0]["state_as_of"] >= due.target_endpoint
     assert submitted[0]["cohorts"] == {
         forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
         for forecast in forecasts

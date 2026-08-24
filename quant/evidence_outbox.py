@@ -37,6 +37,8 @@ from .v9_sim3_capture import FinalizedV4PersistenceResult
 
 
 EVIDENCE_OUTBOX_CAPACITY = 256
+STATE_BUILD_SHUTDOWN_TIMEOUT_SECONDS = 20.0
+STATE_BUILD_SHUTDOWN_JOIN_GRACE_SECONDS = 0.25
 
 
 class TerminalDeliveryError(RuntimeError):
@@ -333,7 +335,8 @@ class V4StateBuildWorker:
     def __init__(self, state_builder: PostgresV4StateBuilder,
                  scheduler: OfflineStateBuildScheduler, *, connection=None,
                  connect: Callable | None = None, database_url: str | None = None,
-                 metrics: OperationalMetrics | None = None):
+                 metrics: OperationalMetrics | None = None,
+                 shutdown_timeout_seconds: float = STATE_BUILD_SHUTDOWN_TIMEOUT_SECONDS):
         self._builder = state_builder
         self._scheduler = scheduler
         self._metrics = metrics or OperationalMetrics()
@@ -348,6 +351,10 @@ class V4StateBuildWorker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._needs_reconnect = False
+        self._shutdown_timeout_seconds = float(shutdown_timeout_seconds)
+        self._shutdown_deadline: float | None = None
+        self._shutdown_abandonment_recorded = threading.Event()
+        self._shutdown_abandonment_lock = threading.Lock()
 
     def _reconnect(self) -> None:
         if self._connect is None or not self._database_url:
@@ -416,51 +423,79 @@ class V4StateBuildWorker:
         with self._latest_lock:
             return bool(self._pending_candidates)
 
+    def _shutdown_expired(self) -> bool:
+        return (self._stop.is_set() and self._shutdown_deadline is not None and
+                time.monotonic() >= self._shutdown_deadline)
+
+    def _record_shutdown_abandonment(self) -> None:
+        with self._shutdown_abandonment_lock:
+            if not self._shutdown_abandonment_recorded.is_set():
+                self._shutdown_abandonment_recorded.set()
+                self._metrics.increment("v4_state_build_worker.shutdown_abandoned")
+
+    def _close_connection(self) -> None:
+        connection, self._connection = self._connection, None
+        close = getattr(connection, "close", None)
+        if callable(close):
+            close()
+
     def run(self) -> None:
         active: V4StateBuildCandidate | None = None
         pending_generation = False
-        while True:
-            if self._stop.is_set() and active is None and not self._has_pending():
-                break
-            self._wake.wait(1.0)
-            self._wake.clear()
-            if not self._recover_if_needed():
-                continue
-            if active is None:
-                active = self._take_next()
-            if active is not None and not pending_generation:
+        try:
+            while True:
+                if self._shutdown_expired():
+                    if active is not None or pending_generation or self._has_pending():
+                        self._record_shutdown_abandonment()
+                    break
+                if self._stop.is_set() and active is None and not self._has_pending():
+                    break
+                wait_seconds = 1.0
+                if self._stop.is_set() and self._shutdown_deadline is not None:
+                    wait_seconds = max(
+                        0.0, min(wait_seconds,
+                                 self._shutdown_deadline - time.monotonic()))
+                self._wake.wait(wait_seconds)
+                self._wake.clear()
+                if not self._recover_if_needed():
+                    continue
+                if active is None:
+                    active = self._take_next()
+                if active is not None and not pending_generation:
+                    try:
+                        self._builder.prepare(
+                            symbol=active.symbol,
+                            state_as_of=active.state_as_of,
+                            cohorts={horizon: (cohort_id, cohort_hash)
+                                     for horizon, cohort_id, cohort_hash in active.cohorts},
+                        )
+                        self._scheduler.note_new_outcome()
+                        pending_generation = True
+                    except Exception as error:
+                        self._metrics.increment("v4_state_build_worker.failure")
+                        if _transient_database_error(error):
+                            self._needs_reconnect = True
+                            self._recover_if_needed()
+                        else:
+                            active = None
+                        continue
+                if not pending_generation:
+                    continue
                 try:
-                    self._builder.prepare(
-                        symbol=active.symbol,
-                        state_as_of=active.state_as_of,
-                        cohorts={horizon: (cohort_id, cohort_hash)
-                                 for horizon, cohort_id, cohort_hash in active.cohorts},
-                    )
-                    self._scheduler.note_new_outcome()
-                    pending_generation = True
+                    status = self._scheduler.run_if_due(force=self._stop.is_set())
                 except Exception as error:
                     self._metrics.increment("v4_state_build_worker.failure")
                     if _transient_database_error(error):
                         self._needs_reconnect = True
                         self._recover_if_needed()
-                    else:
-                        active = None
                     continue
-            if not pending_generation:
-                continue
-            try:
-                status = self._scheduler.run_if_due(force=self._stop.is_set())
-            except Exception as error:
-                self._metrics.increment("v4_state_build_worker.failure")
-                if _transient_database_error(error):
-                    self._needs_reconnect = True
-                    self._recover_if_needed()
-                continue
-            if status in {"INSERT", "IDEMPOTENT", "SKIPPED_NO_NEW_OUTCOME"}:
-                pending_generation = False
-                active = None
-                if self._has_pending():
-                    self._wake.set()
+                if status in {"INSERT", "IDEMPOTENT", "SKIPPED_NO_NEW_OUTCOME"}:
+                    pending_generation = False
+                    active = None
+                    if self._has_pending():
+                        self._wake.set()
+        finally:
+            self._close_connection()
 
     def start(self) -> threading.Thread:
         if self._thread is not None and self._thread.is_alive():
@@ -471,15 +506,21 @@ class V4StateBuildWorker:
         return self._thread
 
     def stop(self) -> None:
+        if self._shutdown_deadline is None:
+            self._shutdown_deadline = (
+                time.monotonic() + self._shutdown_timeout_seconds)
         self._stop.set()
         self._wake.set()
         if self._thread is not None:
             # Never close a recovered connection underneath an active build.
-            self._thread.join()
-        close = getattr(self._connection, "close", None)
-        if callable(close):
-            close()
-        self._connection = None
+            # Its own deadline ends retries.  A small, still-bounded scheduling
+            # grace lets the worker execute ``finally`` and close its connection.
+            self._thread.join(timeout=(self._shutdown_timeout_seconds +
+                                       STATE_BUILD_SHUTDOWN_JOIN_GRACE_SECONDS))
+            if self._thread.is_alive():
+                self._record_shutdown_abandonment()
+        if self._thread is None or not self._thread.is_alive():
+            self._close_connection()
 
     def close(self) -> None:
         self.stop()
@@ -674,6 +715,7 @@ class EvidenceLedgerWorker:
         previous, current = item.previous_observation, item.current_observation
         remaining = []
         new_outcome = False
+        latest_outcome_created_at: datetime | None = None
         if previous is not None:
             for forecast in self._pending:
                 endpoint = forecast.target_endpoint.timestamp()
@@ -683,6 +725,7 @@ class EvidenceLedgerWorker:
                     # A missing exact bracket is intentionally never reconstructed.
                     continue
                 elif not gap:
+                    outcome_created_at = self._clock()
                     resolve_outcome(
                         writer=self._writer, forecast=forecast,
                         target_identity=canonical_target_identity(forecast),
@@ -691,9 +734,14 @@ class EvidenceLedgerWorker:
                         target_resolved_at=item.received_at,
                         actual_return_bps=10_000.0 * math.log(
                             current.midpoint / forecast.cutoff_midpoint),
+                        created_at=outcome_created_at,
                         metrics=self.metrics,
                     )
-                    new_outcome = new_outcome or self._writer.last_write_status == "INSERT"
+                    inserted = self._writer.last_write_status == "INSERT"
+                    new_outcome = new_outcome or inserted
+                    if (inserted and (latest_outcome_created_at is None or
+                                     outcome_created_at > latest_outcome_created_at)):
+                        latest_outcome_created_at = outcome_created_at
                     if self._writer.last_write_status == "OUTCOME_CONFLICT":
                         raise TerminalDeliveryError("OUTCOME_CONFLICT")
         else:
@@ -739,10 +787,12 @@ class EvidenceLedgerWorker:
             item.received_at,
             datetime.fromtimestamp(current.event_epoch, timezone.utc),
         )
+        state_as_of = (refresh_cutoff if latest_outcome_created_at is None else
+                       max(refresh_cutoff, latest_outcome_created_at))
         if self._state_build_submit is not None and len(item.v4) == 6:
             try:
                 self._state_build_submit(
-                    symbol=item.v4[0].symbol, state_as_of=refresh_cutoff,
+                    symbol=item.v4[0].symbol, state_as_of=state_as_of,
                     cohorts={forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
                              for forecast in item.v4},
                     new_outcome=new_outcome,

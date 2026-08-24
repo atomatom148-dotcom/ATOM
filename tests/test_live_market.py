@@ -313,10 +313,10 @@ class LiveMarketTests(unittest.TestCase):
     def test_g2_poller_requests_only_btc_and_leaves_ndx_missing(self):
         state = LiveMarketState(clock=lambda: 2.0)
         response = BytesIO(json.dumps({
-            "quotes": {
+            "orderbooks": {
                 "BTC/USD": {
-                    "bp": 100.0,
-                    "ap": 102.0,
+                    "b": [{"p": 100.0, "s": 1.0}],
+                    "a": [{"p": 102.0, "s": 1.0}],
                     "t": "1970-01-01T00:00:01Z",
                 },
             },
@@ -340,6 +340,11 @@ class LiveMarketTests(unittest.TestCase):
         self.assertEqual(
             urlopen.call_args.args[0].full_url, ALPACA_BTC_LATEST_QUOTE_URL,
         )
+        self.assertEqual(
+            ALPACA_BTC_LATEST_QUOTE_URL,
+            "https://data.alpaca.markets/v1beta3/crypto/us/latest/"
+            "orderbooks?symbols=BTC%2FUSD",
+        )
         value = state.cross_asset_state()
         self.assertEqual(value.btc_price, 101.0)
         telemetry = state.metrics.snapshot()
@@ -353,8 +358,10 @@ class LiveMarketTests(unittest.TestCase):
 
     def test_repeated_latest_btc_quote_remains_live_and_is_not_duplicated(self):
         state = LiveMarketState(clock=lambda: 2.0)
-        payload = json.dumps({"quotes": {"BTC/USD": {
-            "bp": 100.0, "ap": 102.0, "t": "1970-01-01T00:00:01Z",
+        payload = json.dumps({"orderbooks": {"BTC/USD": {
+            "b": [{"p": 100.0, "s": 1.0}],
+            "a": [{"p": 102.0, "s": 1.0}],
+            "t": "1970-01-01T00:00:01Z",
         }}}).encode()
         responses = [BytesIO(payload), BytesIO(payload)]
 
@@ -434,8 +441,10 @@ class LiveMarketTests(unittest.TestCase):
         state = LiveMarketState(clock=lambda: 100.0)
         self.assertTrue(state.accept_g2_price(
             asset="BTC", price=99.0, event_epoch=99.0))
-        response = BytesIO(json.dumps({"quotes": {"BTC/USD": {
-            "bp": 100.0, "ap": 102.0, "t": "1970-01-01T00:01:30Z",
+        response = BytesIO(json.dumps({"orderbooks": {"BTC/USD": {
+            "b": [{"p": 100.0, "s": 1.0}],
+            "a": [{"p": 102.0, "s": 1.0}],
+            "t": "1970-01-01T00:01:30Z",
         }}}).encode())
         with patch.dict(os.environ, {
             "ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret",
