@@ -163,7 +163,7 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
 
     def test_q10_uses_immutable_identity_and_common_coin_cutoff(self):
         q10 = DirectionalResult(
-            "q10_options_vol", "coin-options-skew-delta-v1",
+            "q10_options_vol", "coin-options-skew-delta-v2",
             (1, 2, 3, 4, 5, 6),
         )
 
@@ -173,7 +173,7 @@ class DirectionalEvidenceExpansionTests(unittest.TestCase):
         self.assertEqual({row.quant_id for row in generated}, {"q10_options_vol"})
         self.assertEqual(
             {row.formula_version for row in generated},
-            {"coin-options-skew-delta-v1"},
+            {"coin-options-skew-delta-v2"},
         )
         self.assertEqual({row.cycle_id for row in generated}, {"COIN:1.000000000"})
         self.assertEqual({row.symbol for row in generated}, {"COIN"})

@@ -7,7 +7,7 @@ import math
 
 
 QUANT_ID = "q10_options_vol"
-FORMULA_VERSION = "coin-options-skew-delta-v1"
+FORMULA_VERSION = "coin-options-skew-delta-v2"
 HORIZON_SECONDS = (30, 60, 300, 900, 1800, 3600)
 MAX_SIGNAL_BPS = 25.0
 MAX_SURFACE_AGE_SECONDS = 30.0
@@ -78,6 +78,12 @@ class OptionSurface:
         if not self.calls and not self.puts:
             raise ValueError("an option surface must contain a real snapshot")
         observations = self.calls + self.puts
+        if (isinstance(self.event_epoch, bool) or
+                not isinstance(self.event_epoch, (int, float)) or
+                not math.isfinite(self.event_epoch)):
+            raise ValueError("surface event_epoch must be finite")
+        if self.event_epoch != min(item.event_epoch for item in observations):
+            raise ValueError("surface event_epoch must be the earliest provider timestamp")
         if any(item.expiration != self.expiration for item in observations):
             raise ValueError("all option observations must use the surface expiration")
         if tuple(sorted(self.calls, key=lambda item: (item.strike, item.contract_symbol))) != self.calls:
@@ -90,6 +96,7 @@ class OptionSurface:
 class OptionsVolResult:
     quant_id: str
     formula_version: str
+    source_as_of_epoch: float
     forecast_bps: tuple[float, float, float, float, float, float]
 
 
@@ -105,8 +112,12 @@ def calculate_options_vol(
     cutoff_epoch = float(cutoff_epoch)
     if not math.isfinite(cutoff_epoch) or not math.isfinite(surface.event_epoch):
         return None
-    surface_age = cutoff_epoch - surface.event_epoch
-    if surface_age < 0 or surface_age > MAX_SURFACE_AGE_SECONDS:
+    observations = surface.calls + surface.puts
+    if any(
+        cutoff_epoch - item.event_epoch < 0 or
+        cutoff_epoch - item.event_epoch > MAX_SURFACE_AGE_SECONDS
+        for item in observations
+    ):
         return None
 
     call_ivs = tuple(float(item.implied_volatility) for item in surface.calls
@@ -138,7 +149,7 @@ def calculate_options_vol(
     forecasts = tuple(one_hour_bps * seconds / 3600 for seconds in HORIZON_SECONDS)
     if len(forecasts) != 6 or not all(map(math.isfinite, forecasts)):
         return None
-    return OptionsVolResult(QUANT_ID, FORMULA_VERSION, forecasts)
+    return OptionsVolResult(QUANT_ID, FORMULA_VERSION, surface.event_epoch, forecasts)
 
 
 __all__ = [

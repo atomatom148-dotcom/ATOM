@@ -1,7 +1,7 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import FrozenInstanceError, replace
-from pathlib import Path
 from types import SimpleNamespace
+import ast
 import inspect
 import threading
 import time
@@ -131,6 +131,81 @@ def test_stage_b_hook_is_after_complete_persistence_loop():
     assert persist < completion < submit
 
 
+def test_eligibility_clock_is_immediate_after_six_persistence_results(monkeypatch):
+    from quant.evidence_outbox import (
+        EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork,
+    )
+    from quant.history import MidpointObservation
+
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    output, results = _cycle()
+    events = []
+    forecasts = tuple(SimpleNamespace(
+        **vars(result.forecast),
+        target_endpoint=NOW + timedelta(seconds=seconds),
+        persistence_proof_eligible=True,
+        symbol="COIN",
+        cohort_id="cohort",
+        cohort_hash="a" * 64,
+    ) for result, seconds in zip(results, (30, 60, 300, 900, 1800, 3600)))
+
+    class Connection:
+        def close(self): pass
+
+    class RawStore:
+        def record_cycle_and_resolve(self, *_args, **_kwargs):
+            events.append("raw")
+
+    class Writer:
+        last_write_status = None
+        def persist_forecast(self, forecast, _persisted_at):
+            events.append("persist:" + forecast.horizon)
+            self.last_write_status = "INSERT"
+            return forecast
+
+    class Refresher:
+        def refresh(self, **_kwargs):
+            events.append("cache")
+
+    adapter = SimulationCaptureAdapter(
+        SimpleNamespace(insert=lambda _intent: "INSERTED"),
+        lambda: events.append("eligible_at") or NOW,
+    )
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=RawStore(), connection=Connection(),
+        state_build_submit=lambda **_kwargs: events.append("state_build"),
+        cache_refresher=Refresher(), simulation_submit=adapter.submit,
+    )
+    worker._writer = Writer()
+    observation = MidpointObservation(NOW.timestamp(), 100.0)
+    worker.process(QuoteEvidenceWork(
+        1, "cycle", None, observation, NOW, (), (), forecasts,
+        "cohort", output,
+    ))
+
+    assert events == [
+        "raw", *("persist:" + horizon for horizon in HORIZONS),
+        "eligible_at", "state_build", "cache",
+    ]
+
+    events.clear()
+    invalid_worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=RawStore(), connection=Connection(),
+        state_build_submit=lambda **_kwargs: events.append("state_build"),
+        cache_refresher=Refresher(),
+        simulation_submit=lambda *_args: events.append("invalid_submit"),
+    )
+    invalid_worker._writer = Writer()
+    invalid_worker.process(QuoteEvidenceWork(
+        1, "cycle", None, observation, NOW, (), (), forecasts,
+        "cohort", object(),
+    ))
+    assert events == [
+        "raw", *("persist:" + horizon for horizon in HORIZONS),
+        "state_build", "cache",
+    ]
+
+
 def test_capacity_64_atomic_incoming_drop_and_fifo_order():
     output, results = _cycle()
     release = threading.Event()
@@ -258,13 +333,39 @@ def test_missing_configuration_startup_failure_and_request_path_isolation():
     assert "SimulationIntentStore" not in source
 
 
-def test_exact_authorized_five_file_scope():
-    root = Path(__file__).parents[1]
-    import subprocess
-    changed = subprocess.check_output(
-        ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
-        cwd=root, text=True).splitlines()
-    assert set(changed) == {
-        "quant/live_market.py", "quant/evidence_outbox.py", "quant/web.py",
-        "quant/v9_sim3_capture.py", "tests/test_v9_sim3_capture.py",
-    }
+def test_sim3_integration_boundary_is_static_and_history_independent():
+    import quant.evidence_outbox as evidence_outbox
+    import quant.live_market as live_market
+    import quant.web as web
+
+    live_tree = ast.parse(inspect.getsource(live_market))
+    sim_imports = [node for node in ast.walk(live_tree)
+                   if isinstance(node, ast.ImportFrom) and
+                   node.module and "sim" in node.module]
+    assert sim_imports == []
+    handoffs = [
+        keyword for node in ast.walk(live_tree) if isinstance(node, ast.Call)
+        for keyword in node.keywords if keyword.arg == "v4d_output"
+    ]
+    assert len(handoffs) == 1
+    assert isinstance(handoffs[0].value, ast.Name)
+    assert handoffs[0].value.id == "output"
+
+    outbox_tree = ast.parse(inspect.getsource(evidence_outbox))
+    imports = [node for node in ast.walk(outbox_tree)
+               if isinstance(node, ast.ImportFrom) and
+               node.module == "v9_sim3_capture"]
+    assert len(imports) == 1
+    assert [alias.name for alias in imports[0].names] == [
+        "FinalizedV4PersistenceResult",
+    ]
+    submit_calls = [node for node in ast.walk(outbox_tree)
+                    if isinstance(node, ast.Call) and
+                    isinstance(node.func, ast.Attribute) and
+                    node.func.attr == "_simulation_submit"]
+    assert len(submit_calls) == 1
+
+    assert "SimulationCapture" not in inspect.getsource(web.create_app)
+    startup = inspect.getsource(web._start_sim3)
+    assert "SimulationIntentStore" in startup
+    assert "SimulationCaptureAdapter" in startup

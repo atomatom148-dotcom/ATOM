@@ -2,6 +2,8 @@ from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import json
+import threading
+import time
 
 import pytest
 
@@ -21,7 +23,7 @@ from quant.v9_v4d_integration import (
 from quant.evidence_outbox import (
     EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork, TerminalDeliveryError,
     PostgresV4BStateBuilder, PostgresV4CStateBuilder, PostgresV4StateBuilder,
-    V4StateCacheRefresher,
+    V4StateBuildWorker, V4StateCacheRefresher,
 )
 from quant.history import MidpointObservation
 from quant.live_market import LiveMarketState
@@ -57,11 +59,13 @@ def _inputs(family_count=1, unavailable_horizon=None):
     for horizon in HORIZONS:
         active = horizon != unavailable_horizon
         calibrations = tuple(DirectionalCalibrationState(
-            quant_id, "f1", 0.0, 1.0, ((0.0, 0.0), (0.0, 0.0)),
+            quant_id, "f1", "schema", "source", "dataset",
+            0.0, 1.0, ((0.0, 0.0), (0.0, 0.0)),
             100.0, 1.0, 1.0, "PROVISIONAL", ()) for quant_id in ids) if active else ()
         n = len(calibrations)
         states.append(SimpleNamespace(
-            horizon=horizon, directional_calibrations=calibrations,
+            horizon=horizon, status="PROVISIONAL" if active else "UNAVAILABLE",
+            reason_codes=(), directional_calibrations=calibrations,
             ordered_quant_ids=ids if active else (),
             pair_support_boolean_matrix=tuple(tuple(True for _ in range(n)) for _ in range(n)),
             stabilized_covariance_matrix=tuple(tuple(float(i == j) for j in range(n)) for i in range(n)) if n > 1 else None,
@@ -259,19 +263,192 @@ def test_terminal_failure_advances_fifo_while_transient_retries_same_head(monkey
     assert terminal_calls == [1, 2]
 
     class OperationalError(Exception): pass
+    class AdminShutdown(OperationalError): pass
+    class RecoverableConnection(_WorkerConnection):
+        def __init__(self, name):
+            self.name = name
+            self.close_calls = 0
+            self.rollback_calls = 0
+        def close(self): self.close_calls += 1
+        def rollback(self): self.rollback_calls += 1
+    class RebindStore(_RawStore):
+        def __init__(self): super().__init__(); self.connections = []
+        def rebind_connection(self, connection): self.connections.append(connection)
+    class RebindRefresher:
+        def __init__(self): self.connections = []
+        def rebind_connection(self, connection): self.connections.append(connection)
+
+    dead, recovered = RecoverableConnection("dead"), RecoverableConnection("recovered")
+    attempts = []
+    def connect(_database_url):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise AdminShutdown("database still unavailable")
+        return recovered
+    store, refresher = RebindStore(), RebindRefresher()
     transient_outbox = EvidenceOutbox()
-    transient = EvidenceLedgerWorker(transient_outbox, evidence_store=_RawStore(),
-                                     connection=_WorkerConnection())
+    transient = EvidenceLedgerWorker(
+        transient_outbox, evidence_store=store, connection=dead,
+        connect=connect, database_url="postgresql://runtime",
+        cache_refresher=refresher,
+    )
+    pending = [object()]
+    transient._pending = pending
     transient_outbox.put_nowait(first)
     transient_calls = []
     def transient_process(item):
         transient_calls.append(item.sequence)
         if len(transient_calls) == 1:
-            raise OperationalError("database unavailable")
+            raise AdminShutdown("database unavailable")
+        assert transient._connection is recovered
+        assert transient._writer.connection is recovered
         transient._stop.set()
     transient.process = transient_process
     thread = transient.start(); thread.join(timeout=1)
     assert transient_calls == [1, 1]
+    assert attempts == [1, 1]
+    assert store.connections == refresher.connections == [recovered]
+    assert transient._pending is pending
+    assert (dead.rollback_calls, dead.close_calls) == (1, 1)
+    counters = dict(transient.metrics.snapshot().counters)
+    assert counters["evidence_ledger_worker.reconnect_failure"] == 1
+    assert counters["evidence_ledger_worker.reconnect_success"] == 1
+    transient.close()
+    assert recovered.close_calls == 1
+
+
+def test_state_builder_reconnects_both_builders_and_preserves_generation():
+    class OperationalError(Exception): pass
+    class AdminShutdown(OperationalError): pass
+    class Connection:
+        def __init__(self, name): self.name = name; self.close_calls = 0
+        def close(self): self.close_calls += 1
+    class Builder:
+        def __init__(self):
+            self.prepared = []
+            self.connections = []
+            self.build_calls = 0
+        def prepare(self, **candidate): self.prepared.append(candidate)
+        def rebind_connection(self, connection): self.connections.append(connection)
+        def build_and_publish(self):
+            self.build_calls += 1
+            if self.build_calls == 1:
+                clock[0] = 61.0
+                raise AdminShutdown("state connection lost")
+            return "INSERT"
+
+    clock = [0.0]
+    dead, recovered = Connection("dead"), Connection("recovered")
+    builder = Builder()
+    scheduler = OfflineStateBuildScheduler(
+        builder.build_and_publish, monotonic_clock=lambda: clock[0],
+    )
+    metrics = OperationalMetrics()
+    worker = V4StateBuildWorker(
+        builder, scheduler, connection=dead,
+        connect=lambda _database_url: recovered,
+        database_url="postgresql://runtime", metrics=metrics,
+    )
+    worker.start()
+    worker.submit(
+        symbol="COIN", state_as_of=NOW,
+        cohorts={horizon: ("cohort", "a" * 64) for horizon in HORIZONS},
+        new_outcome=True,
+    )
+    deadline = time.monotonic() + 2.5
+    while builder.build_calls < 2 and time.monotonic() < deadline:
+        time.sleep(.01)
+    worker.close()
+
+    assert builder.build_calls == 2
+    assert len(builder.prepared) == 1
+    assert builder.connections == [recovered]
+    assert scheduler._latest_outcome_generation == scheduler._built_generation == 1
+    assert dead.close_calls == recovered.close_calls == 1
+    assert dict(metrics.snapshot().counters)[
+        "v4_state_build_worker.reconnect_success"] == 1
+
+
+def test_ledger_close_drains_every_accepted_item_before_closing_connection(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    started, release = threading.Event(), threading.Event()
+
+    class Connection(_WorkerConnection):
+        def __init__(self): self.close_calls = 0
+        def close(self): self.close_calls += 1
+
+    connection = Connection()
+    outbox = EvidenceOutbox()
+    worker = EvidenceLedgerWorker(
+        outbox, evidence_store=_RawStore(), connection=connection)
+    previous = MidpointObservation(NOW.timestamp(), 100.0)
+    current = MidpointObservation(NOW.timestamp() + 1, 101.0)
+    items = tuple(_work(n, previous, current, NOW + timedelta(seconds=n))
+                  for n in (1, 2))
+    for item in items:
+        assert outbox.put_nowait(item)
+    processed = []
+
+    def process(item):
+        processed.append(item.sequence)
+        if item.sequence == 1:
+            started.set()
+            assert release.wait(2)
+
+    worker.process = process
+    worker.start()
+    assert started.wait(1)
+    closer = threading.Thread(target=worker.close)
+    closer.start()
+    time.sleep(.02)
+    assert closer.is_alive()
+    assert connection.close_calls == 0
+    assert outbox.put_nowait(items[0]) is False
+    release.set()
+    closer.join(timeout=2)
+
+    assert not closer.is_alive()
+    assert processed == [1, 2]
+    assert connection.close_calls == 1
+
+
+def test_state_builder_close_never_closes_connection_under_active_build():
+    started, release = threading.Event(), threading.Event()
+
+    class Connection:
+        def __init__(self): self.close_calls = 0
+        def close(self): self.close_calls += 1
+
+    class Builder:
+        def prepare(self, **_candidate): pass
+        def build_and_publish(self):
+            started.set()
+            assert release.wait(2)
+            return "INSERT"
+
+    connection = Connection()
+    builder = Builder()
+    worker = V4StateBuildWorker(
+        builder, OfflineStateBuildScheduler(builder.build_and_publish),
+        connection=connection,
+    )
+    worker.start()
+    worker.submit(
+        symbol="COIN", state_as_of=NOW,
+        cohorts={horizon: ("cohort", "a" * 64) for horizon in HORIZONS},
+        new_outcome=True,
+    )
+    assert started.wait(1)
+    closer = threading.Thread(target=worker.close)
+    closer.start()
+    time.sleep(.02)
+    assert closer.is_alive()
+    assert connection.close_calls == 0
+    release.set()
+    closer.join(timeout=2)
+
+    assert not closer.is_alive()
+    assert connection.close_calls == 1
 
 
 @pytest.mark.parametrize("family_count", (11, 10, 7, 3, 1, 0))
@@ -469,17 +646,22 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
 
 def test_combined_builder_keeps_accuracy_and_compact_in_one_generation():
     class Builder:
-        def __init__(self, result): self.result = result; self.prepared = []; self.calls = 0
+        def __init__(self, result):
+            self.result = result; self.prepared = []; self.calls = 0; self.connections = []
         def prepare(self, **candidate): self.prepared.append(candidate)
+        def rebind_connection(self, connection): self.connections.append(connection)
         def build_and_publish(self): self.calls += 1; return self.result
     accuracy, compact = Builder("IDEMPOTENT"), Builder("INSERT")
     builder = PostgresV4StateBuilder(accuracy, compact)
     candidate = {"symbol": "COIN", "state_as_of": NOW,
                  "cohorts": {h: ("c", "h") for h in HORIZONS}}
     builder.prepare(**candidate)
+    replacement = object()
+    builder.rebind_connection(replacement)
     assert builder.build_and_publish() == "INSERT"
     assert accuracy.prepared == compact.prepared == [candidate]
     assert accuracy.calls == compact.calls == 1
+    assert accuracy.connections == compact.connections == [replacement]
 
 
 def test_compact_failure_does_not_suppress_accuracy_publication():
@@ -496,7 +678,7 @@ def test_compact_failure_does_not_suppress_accuracy_publication():
     assert accuracy.calls == 1
 
 
-def test_new_worker_outcome_triggers_cadenced_v4b_build(monkeypatch):
+def test_new_worker_outcome_submits_v4_state_build_off_fifo(monkeypatch):
     monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
     v1, v2 = _inputs()
     calculated = V4DCoordinator(
@@ -511,17 +693,10 @@ def test_new_worker_outcome_triggers_cadenced_v4b_build(monkeypatch):
     previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
     current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
 
-    class Builder:
-        def __init__(self): self.prepared = []
-        def prepare(self, **kwargs): self.prepared.append(kwargs)
-    class Scheduler:
-        def __init__(self): self.notes = 0; self.runs = 0
-        def note_new_outcome(self): self.notes += 1
-        def run_if_due(self): self.runs += 1
-    builder, scheduler = Builder(), Scheduler()
+    submitted = []
     worker = EvidenceLedgerWorker(
         EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
-        state_builder=builder, state_build_scheduler=scheduler,
+        state_build_submit=lambda **candidate: submitted.append(candidate),
     )
     worker._pending = [due]
     worker._writer = Writer()
@@ -531,8 +706,8 @@ def test_new_worker_outcome_triggers_cadenced_v4b_build(monkeypatch):
     )
 
     worker.process(item)
-    assert scheduler.notes == scheduler.runs == 1
-    assert builder.prepared[0]["cohorts"] == {
+    assert len(submitted) == 1 and submitted[0]["new_outcome"] is True
+    assert submitted[0]["cohorts"] == {
         forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
         for forecast in forecasts
     }
@@ -563,16 +738,10 @@ def test_non_new_outcomes_do_not_create_v4b_generation(
         def persist_outcome(self, record, created_at):
             self.last_write_status = outcome_status
             return record
-    class Builder:
-        def prepare(self, **_kwargs): pass
-    class Scheduler:
-        def __init__(self): self.notes = 0; self.runs = 0
-        def note_new_outcome(self): self.notes += 1
-        def run_if_due(self): self.runs += 1
-    scheduler = Scheduler()
+    submitted = []
     worker = EvidenceLedgerWorker(
         EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
-        state_builder=Builder(), state_build_scheduler=scheduler,
+        state_build_submit=lambda **candidate: submitted.append(candidate),
     )
     worker._pending = [due]
     worker._writer = StatusWriter()
@@ -584,14 +753,14 @@ def test_non_new_outcomes_do_not_create_v4b_generation(
     if raises:
         with pytest.raises(TerminalDeliveryError, match="OUTCOME_CONFLICT"):
             worker.process(item)
-        assert scheduler.runs == 0
+        assert submitted == []
     else:
         worker.process(item)
-        assert scheduler.runs == 1
-    assert scheduler.notes == expected_notes
+        assert len(submitted) == 1
+        assert submitted[0]["new_outcome"] is bool(expected_notes)
 
 
-def test_v4b_builder_failure_isolated_from_forecast_delivery(monkeypatch):
+def test_v4_state_build_submit_failure_isolated_from_forecast_delivery(monkeypatch):
     monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
     v1, v2 = _inputs()
     calculated = V4DCoordinator(
@@ -606,15 +775,12 @@ def test_v4b_builder_failure_isolated_from_forecast_delivery(monkeypatch):
     previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
     current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
 
-    class Builder:
-        def prepare(self, **_kwargs): pass
-    class FailingScheduler:
-        def note_new_outcome(self): pass
-        def run_if_due(self): raise RuntimeError("offline builder failed")
+    def failing_submit(**_kwargs):
+        raise RuntimeError("offline builder unavailable")
     writer = Writer()
     worker = EvidenceLedgerWorker(
         EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
-        state_builder=Builder(), state_build_scheduler=FailingScheduler(),
+        state_build_submit=failing_submit,
     )
     worker._pending = [due]
     worker._writer = writer
@@ -627,7 +793,57 @@ def test_v4b_builder_failure_isolated_from_forecast_delivery(monkeypatch):
     assert len(writer.outcomes) == 1
     assert len(writer.forecasts) == 6
     assert any(number.final_bps is not None for number in calculated.final_numbers)
-    assert dict(worker.metrics.snapshot().counters)["v4b_state_builder.failure"] == 1
+    assert dict(worker.metrics.snapshot().counters)["v4_state_build_submit.failure"] == 1
+
+
+def test_blocked_full_history_builder_cannot_cause_evidence_outbox_drops(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecasts = tuple(item.forecast for item in calculated.persistence)
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingBuilder:
+        def prepare(self, **_candidate): pass
+        def build_and_publish(self):
+            started.set()
+            assert release.wait(2)
+            return "INSERT"
+
+    metrics = OperationalMetrics()
+    builder = BlockingBuilder()
+    scheduler = OfflineStateBuildScheduler(builder.build_and_publish, metrics=metrics)
+    background = V4StateBuildWorker(builder, scheduler, metrics=metrics)
+    background.start()
+    cohorts = {forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
+               for forecast in forecasts}
+    background.submit(symbol="COIN", state_as_of=NOW, cohorts=cohorts,
+                      new_outcome=True)
+    assert started.wait(1)
+
+    outbox = EvidenceOutbox(metrics=metrics)
+    worker = EvidenceLedgerWorker(
+        outbox, evidence_store=_RawStore(), connection=_WorkerConnection(),
+        state_build_submit=background.submit,
+    )
+    worker._writer = Writer()
+    observation = MidpointObservation(NOW.timestamp(), 100.0)
+    for sequence in range(1, 513):
+        item = QuoteEvidenceWork(
+            sequence, f"cycle-{sequence}", None, observation, NOW,
+            (), (), forecasts, "cohort", calculated,
+        )
+        assert outbox.put_nowait(item) is True
+        worker.process(outbox.get())
+        outbox.task_done()
+
+    assert dict(metrics.snapshot().counters).get("EVIDENCE_OUTBOX_FULL", 0) == 0
+    release.set()
+    background.stop()
 
 
 def test_metrics_have_percentiles_and_do_not_change_forecast():

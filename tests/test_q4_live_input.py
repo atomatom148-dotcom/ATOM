@@ -5,6 +5,7 @@ from quant.live_market import ALPACA_LATEST_QUOTES_URL, LiveMarketState
 from quant.q1_momentum import calculate_momentum
 from quant.q2_mean_reversion import calculate_mean_reversion
 from quant.q3_volatility import calculate_volatility
+from quant.q4_stat_arb import FORMULA_VERSION
 from quant.web import dashboard_data
 
 
@@ -66,6 +67,25 @@ class Q4LiveInputTests(unittest.TestCase):
         self.assertIsNotNone(state.snapshot().stat_arb)
         data = dashboard_data(snapshot=state.snapshot(), now_epoch=190.0)
         self.assertEqual(data["quant_families"][3]["values"], list(state.snapshot().stat_arb.forecast_bps))
+
+    def test_q4_preserves_exact_paired_qqq_provider_timestamp(self):
+        state = LiveMarketState()
+        for index in range(20):
+            feed_pair(state, index, qqq_offset=-0.25)
+        result = state.snapshot().stat_arb
+        self.assertIsNotNone(result)
+        self.assertEqual(result.cutoff_epoch, 190.0)
+        self.assertEqual(result.source_as_of_epoch, 189.75)
+        self.assertEqual(result.formula_version, "coin-market-residual-ar1-v2")
+        self.assertEqual(result.formula_version, FORMULA_VERSION)
+
+    def test_q4_fails_closed_when_latest_paired_provider_time_is_stale(self):
+        state = LiveMarketState()
+        for index in range(20):
+            feed_pair(state, index)
+        self.assertIsNotNone(state.snapshot().stat_arb)
+        self.assertTrue(state.accept_quote(bid=199, ask=201, event_epoch=1000))
+        self.assertIsNone(state.snapshot().stat_arb)
 
     def test_market_qqq_uses_latest_valid_midpoint(self):
         state = LiveMarketState()

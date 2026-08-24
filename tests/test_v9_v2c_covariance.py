@@ -6,7 +6,7 @@ import pytest
 
 from quant.v9_v2a_dataset import (
     DIRECTIONAL_BPS, MAGNITUDE_BPS, Q3, RawFamilyObservation, RawTarget,
-    TargetIdentity, build_v2a_dataset,
+    TargetIdentity, build_v2a_dataset, v2a_dataset_hash,
 )
 from quant.v9_v2b_calibration import calibrate_v2b, effective_n
 from quant.v9_v2c_covariance import (
@@ -43,9 +43,15 @@ def _inputs(ys, families, *, q3=None):
 
 def _identity_calibrations(dataset, calibration, status="MATURE"):
     directional = tuple(replace(item, calibration_intercept=0.0,
-                                calibration_slope=1.0, status=status)
+                                calibration_slope=1.0, status=status,
+                                dataset_hash=dataset.dataset_hash)
                         for item in calibration.directional)
-    return replace(calibration, directional=directional)
+    return replace(calibration, directional=directional,
+                   input_manifest=((dataset.horizon, dataset.dataset_hash),))
+
+
+def _rehash(dataset):
+    return replace(dataset, dataset_hash=v2a_dataset_hash(dataset))
 
 
 def test_residual_pair_fixture_order_q3_exclusion_and_immutability():
@@ -71,7 +77,7 @@ def test_exact_v2a_pair_support_is_not_reconstructed_or_imputed():
     dataset, calibration = _inputs(
         (1.0, 2.0, 3.0),
         {"q1_momentum": (0.0, 0.0, 0.0), "q2_mean_reversion": (0.0, 0.0, 0.0)})
-    dataset = replace(dataset, pair_support=())
+    dataset = _rehash(replace(dataset, pair_support=()))
     result = build_v2c_covariance(dataset, _identity_calibrations(dataset, calibration))
     assert result.pairwise_raw_synchronized_n_matrix[0][1] == 0
     assert result.pair_support_boolean_matrix[0][1] is False
@@ -138,15 +144,17 @@ def test_psd_projection_and_ridge_diagnostics():
 def test_complete_case_fallback_and_no_scale_unavailable():
     dataset, calibration = _inputs(
         (1, 3, 2), {"q1_momentum": (0, 0, 0), "q2_mean_reversion": (0, 0, 0)})
-    dataset = replace(dataset, complete_case_target_identities=())
+    dataset = _rehash(replace(dataset, complete_case_target_identities=()))
     result = build_v2c_covariance(dataset, _identity_calibrations(dataset, calibration))
     assert result.status == "PROVISIONAL" and not result.dependence_modeled
     assert result.shrinkage_method is None and result.shrinkage_intensity is None
     assert "COMPLETE_CASE_DEPENDENCE_UNAVAILABLE" in result.reason_codes
     flat_dataset, flat_cal = _inputs((1, 1, 1), {"q1_momentum": (0, 0, 0)})
     unavailable = build_v2c_covariance(
-        replace(flat_dataset, complete_case_target_identities=()),
-        _identity_calibrations(flat_dataset, flat_cal))
+        _rehash(replace(flat_dataset, complete_case_target_identities=())),
+        _identity_calibrations(
+            _rehash(replace(flat_dataset, complete_case_target_identities=())),
+            flat_cal))
     assert unavailable.status == "UNAVAILABLE" and unavailable.numerical_ridge is None
 
 
@@ -155,9 +163,12 @@ def test_rejected_complete_case_retains_finite_covariance_but_blocks_maturity():
         (1, 3, 6), {"q1_momentum": (0, 0, 0), "q2_mean_reversion": (0, 0, 0)})
     missing = dict(enumerate(dataset.directional_subsets))
     subset = missing[0]
-    broken = replace(dataset, directional_subsets=(replace(subset, observations=subset.observations[:-1]),
-                                                    dataset.directional_subsets[1]))
-    result = build_v2c_covariance(broken, _identity_calibrations(dataset, calibration, "MATURE"))
+    broken = _rehash(replace(
+        dataset, directional_subsets=(
+            replace(subset, observations=subset.observations[:-1]),
+            dataset.directional_subsets[1])))
+    result = build_v2c_covariance(
+        broken, _identity_calibrations(broken, calibration, "MATURE"))
     assert result.complete_case_n == 2
     assert "COMPLETE_CASE_INTEGRITY_REJECTED" in result.reason_codes
     assert result.status == "PROVISIONAL"
@@ -182,7 +193,13 @@ def test_nonfinite_residual_is_rejected_without_manufacturing_scale():
     dataset, calibration = _inputs((1, 2, 3), {"q1_momentum": (0, 0, 0)})
     item = replace(calibration.directional[0], calibration_intercept=math.nan,
                    status="MATURE")
-    result = build_v2c_covariance(dataset, replace(calibration, directional=(item,)))
-    assert result.status == "UNAVAILABLE"
-    assert "NONFINITE_RESIDUAL" in result.reason_codes
-    assert result.pair_support_boolean_matrix == ((False,),)
+    with pytest.raises(ValueError, match="non-finite V2-B component"):
+        build_v2c_covariance(
+            dataset, replace(calibration, directional=(item,)))
+
+
+def test_covariance_requires_exact_v2b_dataset_manifest():
+    dataset, calibration = _inputs((1, 2, 3), {"q1_momentum": (0, 1, 2)})
+    with pytest.raises(ValueError, match="input manifest"):
+        build_v2c_covariance(
+            dataset, replace(calibration, input_manifest=()))

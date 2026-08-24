@@ -223,6 +223,7 @@ def final_numbers(result: V3HorizonResult,
 
 class AccuracyStateStore:
     def __init__(self, connection): self.connection = connection
+    def rebind_connection(self, connection): self.connection = connection
 
     def insert(self, state: AccuracyState, created_at: datetime) -> str:
         cursor=self.connection.cursor()

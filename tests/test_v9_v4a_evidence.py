@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import threading
 import unittest
 
 from quant.v9_v3_synthesis import (
@@ -45,8 +46,10 @@ class FakeCursor:
         self.insert_count = 0
         self.last_insert_parameters = None
         self.closed = False
+        self.statements = []
 
     def execute(self, sql, _parameters):
+        self.statements.append((sql, _parameters))
         if sql.startswith("INSERT"):
             self.insert_count += 1
             self.last_insert_parameters = _parameters
@@ -340,7 +343,7 @@ class V4AContractTests(unittest.TestCase):
         self.assertEqual(selection.raw_resolved_n, 1)
         self.assertEqual(selection.selected_ids, (other_horizon.forecast_record_id,))
 
-    def test_writer_preserves_forecast_conflicts_and_idempotency(self):
+    def test_writer_locks_and_rejects_forecast_conflicts_without_insert(self):
         f = self.forecast()
         cursor = FakeCursor([(f.forecast_record_hash,)])
         connection = FakeConnection(cursor)
@@ -357,10 +360,15 @@ class V4AContractTests(unittest.TestCase):
         writer = V4AWriter(FakeConnection(cursor))
         stored = writer.persist_forecast(conflicting, T0)
         self.assertEqual(writer.last_write_status, "FORECAST_DUPLICATE_CONFLICT")
-        self.assertEqual(cursor.insert_count, 1)
+        self.assertEqual(cursor.insert_count, 0)
         self.assertFalse(stored.persistence_proof_eligible)
+        self.assertEqual(
+            cursor.statements[0][0],
+            "SELECT pg_catalog.pg_advisory_xact_lock(%s)",
+        )
+        self.assertIsInstance(cursor.statements[0][1][0], int)
 
-    def test_writer_preserves_outcome_conflicts_and_idempotency(self):
+    def test_writer_locks_and_rejects_outcome_conflicts_without_insert(self):
         f = dataclasses.replace(self.forecast(), persisted_at=T0)
         o = build_outcome(forecast=f, target_identity="target",
                           endpoint_observation_at=f.target_endpoint,
@@ -377,7 +385,118 @@ class V4AContractTests(unittest.TestCase):
         writer = V4AWriter(FakeConnection(cursor))
         writer.persist_outcome(conflicting, T0)
         self.assertEqual(writer.last_write_status, "OUTCOME_CONFLICT")
-        self.assertEqual(cursor.insert_count, 1)
+        self.assertEqual(cursor.insert_count, 0)
+        self.assertEqual(
+            cursor.statements[0][0],
+            "SELECT pg_catalog.pg_advisory_xact_lock(%s)",
+        )
+
+    def test_writer_refuses_autocommit_that_would_release_lock_before_check(self):
+        connection = FakeConnection(FakeCursor([]))
+        connection.autocommit = True
+        with self.assertRaisesRegex(ValueError, "requires a transaction"):
+            V4AWriter(connection)
+
+    def test_historical_multi_hash_groups_always_fail_closed(self):
+        forecast = self.forecast()
+        cursor = FakeCursor([
+            (forecast.forecast_record_hash,), ("f" * 64,),
+        ])
+        writer = V4AWriter(FakeConnection(cursor))
+        stored = writer.persist_forecast(forecast, T0)
+        self.assertEqual(writer.last_write_status, "FORECAST_DUPLICATE_CONFLICT")
+        self.assertEqual(cursor.insert_count, 0)
+        self.assertFalse(stored.persistence_proof_eligible)
+
+        persisted = dataclasses.replace(forecast, persisted_at=T0)
+        outcome = build_outcome(
+            forecast=persisted, target_identity="target",
+            endpoint_observation_at=persisted.target_endpoint,
+            target_resolved_at=persisted.target_endpoint,
+            actual_return_bps=1.0,
+        )
+        cursor = FakeCursor([
+            (outcome.outcome_record_hash,), ("e" * 64,),
+        ])
+        writer = V4AWriter(FakeConnection(cursor))
+        writer.persist_outcome(outcome, T0)
+        self.assertEqual(writer.last_write_status, "OUTCOME_CONFLICT")
+        self.assertEqual(cursor.insert_count, 0)
+
+    def test_logical_lock_key_is_stable_signed_and_kind_separated(self):
+        key = self.forecast().logical_key
+        forecast_key = V4AWriter._logical_lock_id("FORECAST", key)
+        self.assertEqual(
+            forecast_key, V4AWriter._logical_lock_id("FORECAST", key),
+        )
+        self.assertNotEqual(
+            forecast_key, V4AWriter._logical_lock_id("OUTCOME", key),
+        )
+        self.assertTrue(-(2**63) <= forecast_key < 2**63)
+
+    def test_advisory_lock_serializes_concurrent_logical_writers(self):
+        class SharedDatabase:
+            def __init__(self):
+                self.rows = []
+                self.locks = {}
+                self.guard = threading.Lock()
+
+        class Cursor:
+            def __init__(self, connection):
+                self.connection = connection
+                self.rows = ()
+            def execute(self, sql, parameters):
+                if "pg_advisory_xact_lock" in sql:
+                    with self.connection.database.guard:
+                        lock = self.connection.database.locks.setdefault(
+                            parameters[0], threading.Lock())
+                    lock.acquire()
+                    self.connection.held.append(lock)
+                elif sql.startswith("SELECT forecast_record_hash"):
+                    with self.connection.database.guard:
+                        self.rows = tuple(self.connection.database.rows)
+                elif sql.startswith("INSERT INTO atom_v9_v4_forecasts"):
+                    with self.connection.database.guard:
+                        self.connection.database.rows.append(
+                            (parameters[1], parameters[8]))
+            def fetchall(self): return self.rows
+            def close(self): pass
+
+        class Connection:
+            autocommit = False
+            def __init__(self, database):
+                self.database = database
+                self.held = []
+            def cursor(self): return Cursor(self)
+            def commit(self):
+                while self.held:
+                    self.held.pop().release()
+            rollback = commit
+
+        def persist(database, record, statuses, barrier):
+            writer = V4AWriter(Connection(database))
+            barrier.wait()
+            writer.persist_forecast(record, T0)
+            statuses.append(writer.last_write_status)
+
+        forecast = self.forecast()
+        for candidates, expected in (
+            ((forecast, forecast), {"INSERT", "IDEMPOTENT"}),
+            ((forecast, dataclasses.replace(
+                forecast, forecast_record_hash="f" * 64,
+                forecast_record_id="v9v4f:" + "f" * 64,
+            )), {"INSERT", "FORECAST_DUPLICATE_CONFLICT"}),
+        ):
+            database, statuses = SharedDatabase(), []
+            barrier = threading.Barrier(2)
+            threads = [threading.Thread(
+                target=persist, args=(database, candidate, statuses, barrier),
+            ) for candidate in candidates]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join(timeout=1)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(set(statuses), expected)
+            self.assertEqual(len(database.rows), 1)
 
 
 class V4AMigrationTests(unittest.TestCase):

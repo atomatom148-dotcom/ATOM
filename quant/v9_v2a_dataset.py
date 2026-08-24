@@ -17,8 +17,8 @@ import math
 from typing import Iterable
 
 
-DATASET_SCHEMA_VERSION = "V9-V2A-DATASET-1"
-METHOD_VERSION = "V9-V2A-1"
+DATASET_SCHEMA_VERSION = "V9-V2A-DATASET-2"
+METHOD_VERSION = "V9-V2A-2"
 SYMBOL = "COIN"
 HORIZON_SECONDS = dict(zip(("30S", "1M", "5M", "15M", "30M", "1H"),
                            (30, 60, 300, 900, 1800, 3600)))
@@ -105,6 +105,14 @@ class FamilySubset:
     observations: tuple[FamilyObservation, ...]
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class FamilyLineage:
+    quant_id: str
+    formula_version: str
+    data_schema_version: str
+    source_spec_version: str
+
+
 @dataclass(frozen=True, slots=True)
 class PairSupport:
     left_quant_id: str
@@ -130,6 +138,7 @@ class V2ADataset:
     target_data_schema_version: str
     target_source_spec_version: str
     horizon: str
+    family_lineage: tuple[FamilyLineage, ...]
     raw_resolved_count: int
     skeleton: tuple[TargetOrigin, ...]
     directional_subsets: tuple[FamilySubset, ...]
@@ -175,6 +184,11 @@ def _hash(dataset: V2ADataset) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def v2a_dataset_hash(dataset: V2ADataset) -> str:
+    """Recalculate the canonical V2-A identity for lineage verification."""
+    return _hash(dataset)
+
+
 def build_v2a_dataset(
     *, state_as_of: float, horizon: str, target_spec_id: str,
     target_data_schema_version: str, target_source_spec_version: str,
@@ -202,6 +216,11 @@ def build_v2a_dataset(
             continue
         if any(not _finite(x) for x in numeric):
             exclude("NONFINITE_VALUE")
+            continue
+        if (row.maturity_epoch !=
+                row.cutoff_epoch + HORIZON_SECONDS[horizon] or
+                row.resolved_epoch < row.maturity_epoch):
+            exclude("TARGET_TIMING_MISMATCH")
             continue
         if row.resolved_epoch > state_as_of:
             exclude("TARGET_UNRESOLVED"); continue
@@ -232,18 +251,28 @@ def build_v2a_dataset(
             skeleton.append(target)
         else:
             exclude("OVERLAP_REMOVED")
-    skeleton_ids = {row.identity for row in skeleton}
+    skeleton_by_identity = {row.identity: row for row in skeleton}
 
     version_rows = tuple(family_versions)
     versions = {q: (formula, schema, source)
                 for q, formula, schema, source in version_rows}
     if len(versions) != len(version_rows):
         raise ValueError("family_versions contains a duplicate quant_id")
+    family_order = (*DIRECTIONAL_FAMILIES, Q3)
+    if any(q not in family_order or any(
+            not isinstance(value, str) or not value
+            for value in (q, formula, schema, source))
+           for q, formula, schema, source in version_rows):
+        raise ValueError("family_versions contains invalid lineage")
+    family_lineage = tuple(
+        FamilyLineage(q, *versions[q]) for q in family_order if q in versions
+    )
     eligible: dict[tuple[str, TargetIdentity], list[RawFamilyObservation]] = {}
     for row in observations:
         if row.quant_id not in (*DIRECTIONAL_FAMILIES, Q3) or row.symbol != symbol or row.horizon != horizon:
             exclude("MALFORMED_RECORD"); continue
-        if row.target_identity not in skeleton_ids:
+        target = skeleton_by_identity.get(row.target_identity)
+        if target is None:
             exclude("MISSING_SYNCHRONIZED_FAMILY"); continue
         wanted = versions.get(row.quant_id)
         if wanted is None:
@@ -262,7 +291,10 @@ def build_v2a_dataset(
             exclude("MALFORMED_RECORD"); continue
         if row.forecast_cutoff_epoch > state_as_of or row.available_epoch > state_as_of:
             exclude("FUTURE_INPUT"); continue
-        if row.source_as_of_epoch > row.forecast_cutoff_epoch:
+        if row.forecast_cutoff_epoch != target.cutoff_epoch:
+            exclude("FAMILY_TARGET_MISMATCH"); continue
+        if not (row.source_as_of_epoch <= row.forecast_cutoff_epoch <=
+                row.available_epoch < target.identity.maturity_epoch):
             exclude("FORECAST_NOT_CAUSAL"); continue
         if row.availability_state != "FRESH":
             exclude("FORECAST_NOT_CAUSAL"); continue
@@ -303,10 +335,12 @@ def build_v2a_dataset(
     diagnostics = tuple(ExclusionCount(k, counts[k]) for k in sorted(counts))
     draft = V2ADataset(DATASET_SCHEMA_VERSION, METHOD_VERSION, symbol, state_as_of,
                        start, end, target_spec_id, target_data_schema_version,
-                       target_source_spec_version, horizon, raw_resolved,
+                       target_source_spec_version, horizon, family_lineage,
+                       raw_resolved,
                        tuple(skeleton), tuple(subsets), q3_subset, pairs, complete,
                        diagnostics, "")
     return V2ADataset(**{**asdict(draft), "skeleton": draft.skeleton,
+                         "family_lineage": draft.family_lineage,
                          "directional_subsets": draft.directional_subsets,
                          "q3_subset": draft.q3_subset, "pair_support": draft.pair_support,
                          "complete_case_target_identities": draft.complete_case_target_identities,

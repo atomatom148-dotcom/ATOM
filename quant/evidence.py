@@ -101,6 +101,11 @@ class PostgresEvidenceStore:
         self._connect = psycopg.connect
         self._connection = connection
 
+    def rebind_connection(self, connection) -> None:
+        """Move shared-connection operation to a recovered DB session."""
+
+        self._connection = connection
+
     def record_cycle_and_resolve(
         self, forecasts: Sequence[ForecastRecord], *, observation_epoch: float,
         observation_midpoint: float,
@@ -111,90 +116,45 @@ class PostgresEvidenceStore:
         shared_connection = getattr(self, "_connection", None)
         owner = (self._connect(self._database_url) if shared_connection is None
                  else nullcontext(shared_connection))
-        with owner as connection:
-            with connection.cursor() as cursor:
-                # Quotes arrive strictly in event-time order, so this is the first
-                # eligible observation seen by this single-process resolver.
-                if resolution_enabled:
-                    if previous_observation_epoch is None:
-                        cursor.execute(
-                            """SELECT COALESCE(max(resolved_epoch), '-Infinity'::double precision)
-                               FROM forecast_outcomes""", ())
-                        resolution_watermark = cursor.fetchone()[0]
-                    else:
-                        resolution_watermark = previous_observation_epoch
-                    cursor.execute(
-                    """
-                    INSERT INTO forecast_outcomes
-                        (forecast_id, maturity_midpoint, outcome_bps, resolved_epoch)
-                    SELECT f.forecast_id, %s,
-                           10000 * ln(%s / f.cutoff_midpoint), %s
-                    FROM forecasts AS f
-                    LEFT JOIN forecast_outcomes AS o USING (forecast_id)
-                    WHERE o.forecast_id IS NULL
-                      AND f.maturity_epoch > %s
-                      AND f.maturity_epoch <= %s
-                    ON CONFLICT (forecast_id) DO NOTHING
-                    """,
-                        (observation_midpoint, observation_midpoint,
-                         observation_epoch, resolution_watermark,
-                         observation_epoch),
-                    )
-                cursor.executemany(
-                    """
-                    INSERT INTO forecasts
-                        (quant_id, formula_version, cycle_id, symbol, horizon,
-                         cutoff_epoch, maturity_epoch, cutoff_midpoint,
-                         forecast_bps, created_epoch, data_schema_version,
-                         source_spec_version)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT
-                        (quant_id, formula_version, cycle_id, symbol, horizon)
-                    DO NOTHING
-                    """,
-                    [(
-                        row.quant_id, row.formula_version, row.cycle_id,
-                        row.symbol, row.horizon, row.cutoff_epoch,
-                        row.maturity_epoch, row.cutoff_midpoint,
-                        row.forecast_bps, row.created_epoch,
-                        row.data_schema_version, row.source_spec_version,
-                    ) for row in forecasts],
-                )
-                if volatility_forecasts is not None:
+        try:
+            with owner as connection:
+                with connection.cursor() as cursor:
+                    # Quotes arrive strictly in event-time order, so this is the
+                    # first eligible observation seen by this process resolver.
                     if resolution_enabled:
                         if previous_observation_epoch is None:
                             cursor.execute(
-                                """SELECT COALESCE(max(resolved_epoch), '-Infinity'::double precision)
-                                   FROM volatility_forecast_outcomes""", ())
-                            volatility_resolution_watermark = cursor.fetchone()[0]
+                                """SELECT COALESCE(max(resolved_epoch),
+                                                   '-Infinity'::double precision)
+                                   FROM forecast_outcomes""", ())
+                            resolution_watermark = cursor.fetchone()[0]
                         else:
-                            volatility_resolution_watermark = previous_observation_epoch
+                            resolution_watermark = previous_observation_epoch
                         cursor.execute(
-                        """
-                        INSERT INTO volatility_forecast_outcomes
-                            (forecast_id, maturity_midpoint, realized_move_bps,
-                             resolved_epoch)
-                        SELECT f.forecast_id, %s,
-                               abs(10000 * ln(%s / f.cutoff_midpoint)), %s
-                        FROM volatility_forecasts AS f
-                        LEFT JOIN volatility_forecast_outcomes AS o
-                            USING (forecast_id)
-                        WHERE o.forecast_id IS NULL
-                          AND f.maturity_epoch > %s
-                          AND f.maturity_epoch <= %s
-                        ON CONFLICT (forecast_id) DO NOTHING
-                        """,
+                            """
+                            INSERT INTO forecast_outcomes
+                                (forecast_id, maturity_midpoint, outcome_bps,
+                                 resolved_epoch)
+                            SELECT f.forecast_id, %s,
+                                   10000 * ln(%s / f.cutoff_midpoint), %s
+                            FROM forecasts AS f
+                            LEFT JOIN forecast_outcomes AS o USING (forecast_id)
+                            WHERE o.forecast_id IS NULL
+                              AND f.maturity_epoch > %s
+                              AND f.maturity_epoch <= %s
+                            ON CONFLICT (forecast_id) DO NOTHING
+                            """,
                             (observation_midpoint, observation_midpoint,
-                             observation_epoch, volatility_resolution_watermark,
+                             observation_epoch, resolution_watermark,
                              observation_epoch),
                         )
                     cursor.executemany(
                         """
-                        INSERT INTO volatility_forecasts
+                        INSERT INTO forecasts
                             (quant_id, formula_version, cycle_id, symbol, horizon,
                              cutoff_epoch, maturity_epoch, cutoff_midpoint,
-                             forecast_volatility_bps, created_epoch,
-                             data_schema_version, source_spec_version)
+                             forecast_bps, created_epoch, data_schema_version,
+                             source_spec_version)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT
                             (quant_id, formula_version, cycle_id, symbol, horizon)
@@ -204,12 +164,73 @@ class PostgresEvidenceStore:
                             row.quant_id, row.formula_version, row.cycle_id,
                             row.symbol, row.horizon, row.cutoff_epoch,
                             row.maturity_epoch, row.cutoff_midpoint,
-                            row.forecast_volatility_bps, row.created_epoch,
+                            row.forecast_bps, row.created_epoch,
                             row.data_schema_version, row.source_spec_version,
-                        ) for row in volatility_forecasts],
+                        ) for row in forecasts],
                     )
+                    if volatility_forecasts is not None:
+                        if resolution_enabled:
+                            if previous_observation_epoch is None:
+                                cursor.execute(
+                                    """SELECT COALESCE(max(resolved_epoch),
+                                                       '-Infinity'::double precision)
+                                       FROM volatility_forecast_outcomes""", ())
+                                volatility_resolution_watermark = cursor.fetchone()[0]
+                            else:
+                                volatility_resolution_watermark = previous_observation_epoch
+                            cursor.execute(
+                                """
+                                INSERT INTO volatility_forecast_outcomes
+                                    (forecast_id, maturity_midpoint,
+                                     realized_move_bps, resolved_epoch)
+                                SELECT f.forecast_id, %s,
+                                       abs(10000 * ln(%s / f.cutoff_midpoint)), %s
+                                FROM volatility_forecasts AS f
+                                LEFT JOIN volatility_forecast_outcomes AS o
+                                    USING (forecast_id)
+                                WHERE o.forecast_id IS NULL
+                                  AND f.maturity_epoch > %s
+                                  AND f.maturity_epoch <= %s
+                                ON CONFLICT (forecast_id) DO NOTHING
+                                """,
+                                (observation_midpoint, observation_midpoint,
+                                 observation_epoch,
+                                 volatility_resolution_watermark,
+                                 observation_epoch),
+                            )
+                        cursor.executemany(
+                            """
+                            INSERT INTO volatility_forecasts
+                                (quant_id, formula_version, cycle_id, symbol,
+                                 horizon, cutoff_epoch, maturity_epoch,
+                                 cutoff_midpoint, forecast_volatility_bps,
+                                 created_epoch, data_schema_version,
+                                 source_spec_version)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT
+                                (quant_id, formula_version, cycle_id, symbol,
+                                 horizon)
+                            DO NOTHING
+                            """,
+                            [(
+                                row.quant_id, row.formula_version, row.cycle_id,
+                                row.symbol, row.horizon, row.cutoff_epoch,
+                                row.maturity_epoch, row.cutoff_midpoint,
+                                row.forecast_volatility_bps, row.created_epoch,
+                                row.data_schema_version, row.source_spec_version,
+                            ) for row in volatility_forecasts],
+                        )
+                if shared_connection is not None:
+                    connection.commit()
+        except Exception:
             if shared_connection is not None:
-                connection.commit()
+                rollback = getattr(shared_connection, "rollback", None)
+                if callable(rollback):
+                    try:
+                        rollback()
+                    except Exception:
+                        pass
+            raise
 
     def counts(self) -> tuple[int, int]:
         with self._connect(self._database_url) as connection:

@@ -131,6 +131,16 @@ class LatestMarketDisplay:
     qqq_event_epoch: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class LivePublication:
+    """One immutable market/V9 publication captured under one lock."""
+
+    snapshot: LiveSnapshot
+    v9_output: object | None
+    cross_asset_state: CrossAssetState
+    market_display: LatestMarketDisplay
+
+
 class LiveMarketState:
     """Thread-safe causal live state with separate COIN and QQQ histories."""
 
@@ -149,6 +159,7 @@ class LiveMarketState:
         # non-blocking outbox handoff.  The state lock remains narrowly scoped
         # and no database work is permitted inside this ingress boundary.
         self._coin_ingress_lock = threading.Lock()
+        self._accepting_coin_quotes = True
         self._v9_cycle_handler = v9_cycle_handler
         self.metrics = metrics or OperationalMetrics()
         self.metrics.set_status("btc_source_status", "NOT_STARTED")
@@ -168,6 +179,10 @@ class LiveMarketState:
         self._market_display = LatestMarketDisplay()
         self._v9_output: object | None = None
         self._v9_error: str | None = None
+        self._coin_cycle_pending = False
+        self._publication = LivePublication(
+            self._snapshot, self._v9_output, self._g2_state, self._market_display,
+        )
 
     def update_market_display(
         self, *, coin_midpoint: float | None = None,
@@ -203,6 +218,10 @@ class LiveMarketState:
                     float(qqq_midpoint) if qqq_newer else current.qqq_midpoint,
                     float(qqq_event_epoch) if qqq_newer else current.qqq_event_epoch,
                 )
+                if not self._coin_cycle_pending:
+                    self._publication = replace(
+                        self._publication, market_display=self._market_display,
+                    )
                 changed = True
         return changed
 
@@ -210,7 +229,7 @@ class LiveMarketState:
         """Return the current immutable display snapshot."""
 
         with self._lock:
-            return self._market_display
+            return self._publication.market_display
 
     def accept_qqq_quote(self, *, bid: float, ask: float, event_epoch: float) -> bool:
         """Store one validated QQQ midpoint without inventing or resampling data."""
@@ -245,6 +264,11 @@ class LiveMarketState:
                 self._snapshot.option_surface,
             )
             self._refresh_g2(event_epoch)
+            if not self._coin_cycle_pending:
+                self._publication = replace(
+                    self._publication, snapshot=self._snapshot,
+                    cross_asset_state=self._g2_state,
+                )
         return True
 
     def accept_g2_price(self, *, asset: str, price: float, event_epoch: float) -> bool:
@@ -271,6 +295,10 @@ class LiveMarketState:
             else:
                 self._ndx_history = updated
             self._refresh_g2(event_epoch)
+            if not self._coin_cycle_pending:
+                self._publication = replace(
+                    self._publication, cross_asset_state=self._g2_state,
+                )
         return True
 
     def _refresh_g2(self, event_epoch: float) -> None:
@@ -285,7 +313,7 @@ class LiveMarketState:
         """Return the latest already-maintained immutable G2-A state."""
 
         with self._lock:
-            return self._g2_state
+            return self._publication.cross_asset_state
 
     def accept_quote(
         self, *, bid: float, ask: float, event_epoch: float,
@@ -299,11 +327,20 @@ class LiveMarketState:
                 bid_size=bid_size, ask_size=ask_size,
             )
 
+    def stop_accepting_quotes(self) -> None:
+        """Close COIN ingress after any in-flight outbox handoff completes."""
+
+        with self._coin_ingress_lock:
+            self._accepting_coin_quotes = False
+
     def _accept_quote_serialized(
         self, *, bid: float, ask: float, event_epoch: float,
         bid_size: float | None = None, ask_size: float | None = None,
     ) -> bool:
         """Validate a quote, preserve its event time, and run Q1-Q3."""
+
+        if not self._accepting_coin_quotes:
+            return False
 
         values = (bid, ask, event_epoch)
         if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
@@ -404,43 +441,68 @@ class LiveMarketState:
             self._refresh_g2(event_epoch)
             self._coin_sequence += 1
             sequence = self._coin_sequence
+            self._coin_cycle_pending = True
+            cycle_g2_state = self._g2_state
+            cycle_market_display = self._market_display
         output = None
+        v9_error = None
         if self._v9_cycle_handler is not None:
             try:
                 output = self._v9_cycle_handler(
                     next_snapshot, previous_observation, observation,
                 )
             except Exception as error:
-                with self._lock:
-                    self._v9_error = type(error).__name__
-            else:
-                if output is not None:
-                    with self._lock:
-                        self._v9_error = None
+                v9_error = type(error).__name__
         delivery_status = "NOT_CONFIGURED"
         if self._evidence_outbox is not None:
-            v4 = tuple(result.forecast for result in output.persistence) if output else ()
-            delivered = self._evidence_outbox.put_nowait(QuoteEvidenceWork(
-                sequence=sequence,
-                cycle_id=f"COIN:{event_epoch:.9f}",
-                previous_observation=previous_observation,
-                current_observation=observation,
-                received_at=datetime.fromtimestamp(cycle, timezone.utc),
-                directional=tuple(forecasts), q3=tuple(volatility_forecasts), v4=v4,
-                state_cohort_id=getattr(output, "state_cohort_id", None),
-                v4d_output=output,
-            ))
-            delivery_status = "ENQUEUED" if delivered else "DROPPED"
+            try:
+                v4 = tuple(result.forecast for result in output.persistence) if output else ()
+                delivered = self._evidence_outbox.put_nowait(QuoteEvidenceWork(
+                    sequence=sequence,
+                    cycle_id=f"COIN:{event_epoch:.9f}",
+                    previous_observation=previous_observation,
+                    current_observation=observation,
+                    received_at=datetime.fromtimestamp(cycle, timezone.utc),
+                    directional=tuple(forecasts), q3=tuple(volatility_forecasts), v4=v4,
+                    state_cohort_id=getattr(output, "state_cohort_id", None),
+                    v4d_output=output,
+                ))
+                delivery_status = "ENQUEUED" if delivered else "DROPPED"
+            except Exception as error:
+                delivery_status = "FAILED"
+                v9_error = v9_error or type(error).__name__
+                self.metrics.increment("evidence_outbox.failure")
         if output is not None:
-            if hasattr(output, "evidence_delivery_status"):
-                output = replace(output, evidence_delivery_status=delivery_status)
-            with self._lock:
-                self._v9_output = output
+            try:
+                if hasattr(output, "evidence_delivery_status"):
+                    output = replace(output, evidence_delivery_status=delivery_status)
+            except Exception as error:
+                output = None
+                v9_error = v9_error or type(error).__name__
+        with self._lock:
+            self._v9_output = output
+            self._v9_error = v9_error
+            self._coin_cycle_pending = False
+            self._publication = LivePublication(
+                next_snapshot, output, cycle_g2_state, cycle_market_display,
+            )
         self.metrics.observe("coin_market_state_update_latency_ms",
                              (self._monotonic() - update_started) * 1000)
         return True
 
     def snapshot(self) -> LiveSnapshot:
+        with self._lock:
+            return self._publication.snapshot
+
+    def publication(self) -> LivePublication:
+        """Return market, V9, cross-asset, and display state from one commit."""
+
+        with self._lock:
+            return self._publication
+
+    def input_snapshot(self) -> LiveSnapshot:
+        """Return the latest accepted inputs, including a cycle still in flight."""
+
         with self._lock:
             return self._snapshot
 
@@ -448,7 +510,7 @@ class LiveMarketState:
         """Return the latest complete immutable V1→V4D cycle, if available."""
 
         with self._lock:
-            return self._v9_output
+            return self._publication.v9_output
 
     def v9_error(self) -> str | None:
         with self._lock:
@@ -470,6 +532,10 @@ class LiveMarketState:
                 current.regime, current.event_session, observation,
                 current.option_surface,
             )
+            if not self._coin_cycle_pending:
+                self._publication = replace(
+                    self._publication, snapshot=self._snapshot,
+                )
 
     def accept_option_surface(self, surface: OptionSurface, *, midpoint: float) -> None:
         """Atomically publish a complete surface and its dashboard anchor call."""
@@ -491,6 +557,10 @@ class LiveMarketState:
                 current.cross_asset, current.factor, current.options_vol,
                 current.regime, current.event_session, representative, surface,
             )
+            if not self._coin_cycle_pending:
+                self._publication = replace(
+                    self._publication, snapshot=self._snapshot,
+                )
 
 
 def parse_alpaca_timestamp(value: str) -> float:
@@ -555,6 +625,7 @@ def parse_massive_ndx_snapshot(payload: object) -> tuple[float, float]:
 def poll_alpaca(
     state: LiveMarketState, *, interval: float = MARKET_DISPLAY_FETCH_SECONDS,
     monotonic: Callable[[], float] = time.monotonic,
+    stop_event: threading.Event | None = None,
 ) -> None:
     """Continuously fetch latest COIN and QQQ quotes in one Alpaca request."""
 
@@ -565,7 +636,7 @@ def poll_alpaca(
         "APCA-API-SECRET-KEY": secret_key,
     }
     last_quant_cycle: float | None = None
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             request = Request(ALPACA_LATEST_QUOTES_URL, headers=headers)
             with urlopen(request, timeout=10) as response:
@@ -604,7 +675,10 @@ def poll_alpaca(
                 )
         except Exception as error:  # Keep web-process health independent of market data.
             print(f"Alpaca quote poll failed: {error}", flush=True)
-        time.sleep(interval)
+        if stop_event is None:
+            time.sleep(interval)
+        elif stop_event.wait(interval):
+            return
 
 
 def poll_alpaca_g2(
@@ -612,6 +686,7 @@ def poll_alpaca_g2(
     timeout: float = BTC_SOURCE_TIMEOUT_SECONDS,
     clock: Callable[[], float] = time.time,
     monotonic: Callable[[], float] = time.perf_counter,
+    stop_event: threading.Event | None = None,
 ) -> None:
     """Maintain the independent BTC input without blocking the ATOM cycle."""
 
@@ -619,7 +694,7 @@ def poll_alpaca_g2(
         "APCA-API-KEY-ID": os.environ["ALPACA_API_KEY"],
         "APCA-API-SECRET-KEY": os.environ["ALPACA_SECRET_KEY"],
     }
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             with urlopen(Request(ALPACA_BTC_LATEST_QUOTE_URL, headers=headers),
                          timeout=timeout) as response:
@@ -642,14 +717,18 @@ def poll_alpaca_g2(
         except Exception as error:
             state.metrics.set_status("btc_source_status", "UNAVAILABLE")
             print(f"Alpaca BTC quote poll failed: {error}", flush=True)
-        time.sleep(interval)
+        if stop_event is None:
+            time.sleep(interval)
+        elif stop_event.wait(interval):
+            return
 
 
-def poll_massive_ndx(state: LiveMarketState, *, interval: float = 1.0) -> None:
+def poll_massive_ndx(state: LiveMarketState, *, interval: float = 1.0,
+                     stop_event: threading.Event | None = None) -> None:
     """Maintain the independent real-time NDX input without blocking ATOM."""
 
     headers = {"Authorization": f"Bearer {os.environ['MASSIVE_API_KEY']}"}
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             with urlopen(Request(MASSIVE_NDX_SNAPSHOT_URL, headers=headers),
                          timeout=10) as response:
@@ -668,38 +747,50 @@ def poll_massive_ndx(state: LiveMarketState, *, interval: float = 1.0) -> None:
             print(f"Massive NDX snapshot poll failed: {error}", flush=True)
         except Exception as error:
             print(f"Massive NDX snapshot poll failed: {error}", flush=True)
-        time.sleep(interval)
+        if stop_event is None:
+            time.sleep(interval)
+        elif stop_event.wait(interval):
+            return
 
 
-def start_alpaca_poller(state: LiveMarketState) -> threading.Thread:
-    thread = threading.Thread(target=poll_alpaca, args=(state,), daemon=True)
+def start_alpaca_poller(state: LiveMarketState, *,
+                        stop_event: threading.Event | None = None) -> threading.Thread:
+    thread = threading.Thread(
+        target=poll_alpaca, args=(state,), kwargs={"stop_event": stop_event}, daemon=True)
     thread.start()
     return thread
 
 
-def start_alpaca_g2_poller(state: LiveMarketState) -> threading.Thread:
-    thread = threading.Thread(target=poll_alpaca_g2, args=(state,), daemon=True)
+def start_alpaca_g2_poller(state: LiveMarketState, *,
+                           stop_event: threading.Event | None = None) -> threading.Thread:
+    thread = threading.Thread(
+        target=poll_alpaca_g2, args=(state,), kwargs={"stop_event": stop_event}, daemon=True)
     thread.start()
     return thread
 
 
-def start_massive_ndx_poller(state: LiveMarketState) -> threading.Thread:
-    thread = threading.Thread(target=poll_massive_ndx, args=(state,), daemon=True)
+def start_massive_ndx_poller(state: LiveMarketState, *,
+                             stop_event: threading.Event | None = None) -> threading.Thread:
+    thread = threading.Thread(
+        target=poll_massive_ndx, args=(state,), kwargs={"stop_event": stop_event}, daemon=True)
     thread.start()
     return thread
 
 
-def start_alpaca_options_poller(state: LiveMarketState) -> threading.Thread:
+def start_alpaca_options_poller(state: LiveMarketState, *,
+                                stop_event: threading.Event | None = None) -> threading.Thread:
     """Start the independent ten-second backend options ingestion loop."""
 
     from .options_market import poll_alpaca_options
 
-    thread = threading.Thread(target=poll_alpaca_options, args=(state,), daemon=True)
+    thread = threading.Thread(
+        target=poll_alpaca_options, args=(state,),
+        kwargs={"stop_event": stop_event}, daemon=True)
     thread.start()
     return thread
 
 
-__all__ = ["LatestMarketDisplay", "LiveMarketState", "LiveSnapshot",
+__all__ = ["LatestMarketDisplay", "LiveMarketState", "LivePublication", "LiveSnapshot",
            "BTC_FETCH_SECONDS", "BTC_SOURCE_TIMEOUT_SECONDS", "MAX_BTC_AGE_SECONDS",
            "MARKET_DISPLAY_FETCH_SECONDS", "QUANT_CYCLE_SECONDS", "parse_alpaca_ndx_value",
            "parse_alpaca_timestamp", "parse_massive_ndx_snapshot", "poll_alpaca",

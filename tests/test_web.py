@@ -1,6 +1,7 @@
 import json
 import subprocess
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -64,7 +65,10 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertTrue(all(value is None for family in payload["quant_families"] for value in family["values"]))
         self.assertIsNone(payload["market"]["data_age"])
         self.assertIsNone(payload["market"]["event_epoch"])
-        self.assertEqual(payload["v9"], {"forecast_cutoff": None, "forecast_age": None})
+        self.assertEqual(payload["v9"], {
+            "forecast_cutoff": None, "forecast_age": None,
+            "horizon_statuses": ["UNAVAILABLE"] * 6,
+        })
         self.assertIsNone(payload["market"]["last_cycle"])
 
     def test_page_formats_live_values_without_rounding_api_values(self):
@@ -174,9 +178,18 @@ class WebSurfaceTests(unittest.TestCase):
         )
         v9_output = SimpleNamespace(
             v1=SimpleNamespace(cutoff_at=datetime.fromtimestamp(100.0, timezone.utc)),
+            v3=SimpleNamespace(horizon_results=tuple(
+                SimpleNamespace(horizon=horizon, status=status)
+                for horizon, status in zip(
+                    ("30S", "1M", "5M", "15M", "30M", "1H"),
+                    ("MATURE", "PROVISIONAL", "UNAVAILABLE",
+                     "MATURE", "PROVISIONAL", "UNAVAILABLE"),
+                )
+            )),
             final_numbers=(),
         )
-        with patch.object(state, "v9_output", return_value=v9_output):
+        publication = replace(state.publication(), v9_output=v9_output)
+        with patch.object(state, "publication", return_value=publication):
             payload = json.loads(request(
                 create_app(state=state, clock=lambda: 105.0), "/api/live"
             )["body"])
@@ -185,6 +198,10 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertEqual(payload["market"]["data_age"], -1.0)
         self.assertEqual(payload["v9"]["forecast_cutoff"], 100.0)
         self.assertEqual(payload["v9"]["forecast_age"], 5.0)
+        self.assertEqual(payload["v9"]["horizon_statuses"], [
+            "MATURE", "PROVISIONAL", "UNAVAILABLE",
+            "MATURE", "PROVISIONAL", "UNAVAILABLE",
+        ])
 
     def test_live_endpoint_falls_back_to_history_event_epoch(self):
         state = LiveMarketState()
@@ -209,8 +226,7 @@ class WebSurfaceTests(unittest.TestCase):
                 return function(*args, **kwargs)
             return wrapper
 
-        for name in ("snapshot", "cross_asset_state", "market_display", "v9_output"):
-            setattr(state, name, traced(name, getattr(state, name)))
+        state.publication = traced("publication", state.publication)
 
         def clock():
             order.append("clock")
@@ -218,10 +234,7 @@ class WebSurfaceTests(unittest.TestCase):
 
         request(create_app(state=state, clock=clock), "/api/live")
 
-        self.assertGreater(order.index("clock"), order.index("snapshot"))
-        self.assertGreater(order.index("clock"), order.index("cross_asset_state"))
-        self.assertGreater(order.index("clock"), order.index("market_display"))
-        self.assertGreater(order.index("clock"), order.index("v9_output"))
+        self.assertEqual(order, ["publication", "clock"])
 
     def test_live_renderer_updates_every_market_field(self):
         page = request(create_app(), "/")["body"].decode()
@@ -296,7 +309,8 @@ class WebSurfaceTests(unittest.TestCase):
 
         state = LiveMarketState()
         output = SimpleNamespace(final_numbers=(), accuracy=())
-        with patch.object(state, "v9_output", return_value=output):
+        publication = replace(state.publication(), v9_output=output)
+        with patch.object(state, "publication", return_value=publication):
             response = request(create_app(state=state, evidence_store=Store()), "/api/live")
 
         self.assertEqual(response["status"], "200 OK")

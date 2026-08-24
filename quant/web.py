@@ -6,10 +6,11 @@ import argparse
 from dataclasses import asdict, dataclass
 import json
 import os
+import signal
 from html import escape
 import time
 from datetime import datetime, timezone
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Callable, Iterable
 from wsgiref.simple_server import make_server
 
@@ -248,6 +249,14 @@ def dashboard_data(
     v1_output = getattr(v9_output, "v1", None)
     forecast_cutoff = (v1_output.cutoff_at.timestamp()
                        if v1_output is not None else None)
+    v3_output = getattr(v9_output, "v3", None)
+    v3_horizons = getattr(v3_output, "horizon_results", ())
+    horizon_statuses = (
+        [item.status for item in v3_horizons]
+        if (len(v3_horizons) == 6 and
+            tuple(item.horizon for item in v3_horizons) == PHASE_E_HORIZONS)
+        else ["UNAVAILABLE"] * 6
+    )
     current_epoch = time.time() if now_epoch is None else now_epoch
     return {
         "title": "ATOM QUANT",
@@ -279,6 +288,7 @@ def dashboard_data(
             "forecast_cutoff": forecast_cutoff,
             "forecast_age": (current_epoch - forecast_cutoff
                              if forecast_cutoff is not None else None),
+            "horizon_statuses": horizon_statuses,
         },
         "horizons": list(HORIZON_LABELS),
         "final_numbers": final_values,
@@ -542,7 +552,7 @@ def create_app(
                                       ("Content-Length", str(len(body)))])
             return [body]
         if path == "/api/g2-cross-asset":
-            value = state.cross_asset_state() if state is not None else None
+            value = state.publication().cross_asset_state if state is not None else None
             body = json.dumps(
                 asdict(value) if value is not None else None,
                 separators=(",", ":"), allow_nan=False,
@@ -591,10 +601,13 @@ def create_app(
                                     ("Content-Length", str(len(body)))])
             return [body]
         if path == "/api/live":
-            snapshot = state.snapshot() if state is not None else None
-            cross_asset_state = state.cross_asset_state() if state is not None else None
-            market_display = state.market_display() if state is not None else None
-            v9_output = state.v9_output() if state is not None else None
+            publication = state.publication() if state is not None else None
+            snapshot = publication.snapshot if publication is not None else None
+            cross_asset_state = (
+                publication.cross_asset_state if publication is not None else None
+            )
+            market_display = publication.market_display if publication is not None else None
+            v9_output = publication.v9_output if publication is not None else None
             as_of_epoch = clock()
             data = dashboard_data(
                 history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
@@ -619,9 +632,13 @@ def create_app(
                 ("Content-Length", str(len(body))),
             ])
             return [body]
-        snapshot = state.snapshot() if state is not None else None
-        cross_asset_state = state.cross_asset_state() if state is not None else None
-        v9_output = state.v9_output() if state is not None else None
+        publication = state.publication() if state is not None else None
+        snapshot = publication.snapshot if publication is not None else None
+        cross_asset_state = (
+            publication.cross_asset_state if publication is not None else None
+        )
+        market_display = publication.market_display if publication is not None else None
+        v9_output = publication.v9_output if publication is not None else None
         as_of_epoch = clock()
         cached = evidence_cache.snapshot() if evidence_cache is not None else DashboardEvidenceSnapshot()
         counts = cached.counts
@@ -629,7 +646,8 @@ def create_app(
         data = dashboard_data(
             history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
             now_epoch=as_of_epoch, evidence_counts=counts, phase_e_cohorts=cohorts,
-            cross_asset_state=cross_asset_state, v9_output=v9_output,
+            cross_asset_state=cross_asset_state, market_display=market_display,
+            v9_output=v9_output,
             calculate_missing=False,
         )
         if path == "/":
@@ -663,6 +681,21 @@ def _start_sim3(simulator_connection_factory: Callable | None,
         return None
 
 
+def _install_shutdown_handlers(shutdown_requested: Event) -> dict[int, object]:
+    """Translate Render/terminal signals into the coordinated drain path."""
+
+    previous = {}
+    for signal_number in (signal.SIGTERM, signal.SIGINT):
+        previous[signal_number] = signal.getsignal(signal_number)
+        signal.signal(signal_number, lambda _signum, _frame: shutdown_requested.set())
+    return previous
+
+
+def _restore_shutdown_handlers(previous: dict[int, object]) -> None:
+    for signal_number, handler in previous.items():
+        signal.signal(signal_number, handler)
+
+
 def main(*, simulator_connection_factory: Callable | None = None,
          simulator_utc_clock: Callable[[], datetime] =
          lambda: datetime.now(timezone.utc)) -> None:
@@ -670,71 +703,109 @@ def main(*, simulator_connection_factory: Callable | None = None,
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
     args = parser.parse_args()
-    database_url = os.environ["DATABASE_URL"]
-    evidence_store = PostgresEvidenceStore(database_url)
-    evidence_cache = DashboardEvidenceCache(evidence_store)
-    evidence_cache.start()
-    from .v9_production import (
-        ImmutableV2StateProvider, PostgresV2StateBuilder, ProductionV9Runtime,
-    )
-    metrics = OperationalMetrics()
-    v2_provider = ImmutableV2StateProvider(
-        PostgresV2StateBuilder(database_url), metrics=metrics,
-    )
-    v2_provider.start()
-    v9_runtime = ProductionV9Runtime(database_url, v2_provider, metrics=metrics)
-    from .evidence_outbox import (
-        EvidenceLedgerWorker, EvidenceOutbox, PostgresV4BStateBuilder,
-        PostgresV4CStateBuilder, PostgresV4StateBuilder,
-        V4StateCacheRefresher,
-    )
-    from .v9_v4d_integration import OfflineStateBuildScheduler
-    from .v9_v4b_accuracy import AccuracyStateStore
-    from .v9_v4c_predictive import V4CStateStore
-    import psycopg
-    outbox = EvidenceOutbox(metrics=metrics)
-    ledger_connection = psycopg.connect(database_url)
-    cache_refresher = V4StateCacheRefresher(
-        compact_store=V4CStateStore(ledger_connection),
-        accuracy_store=AccuracyStateStore(ledger_connection),
-        compact_cache=v9_runtime.compact_cache,
-        accuracy_cache=v9_runtime.accuracy_cache,
-    )
-    accuracy_builder = PostgresV4BStateBuilder(ledger_connection)
-    compact_builder = PostgresV4CStateBuilder(ledger_connection)
-    state_builder = PostgresV4StateBuilder(accuracy_builder, compact_builder)
-    state_scheduler = OfflineStateBuildScheduler(
-        state_builder.build_and_publish, metrics=metrics,
-    )
-    sim3 = _start_sim3(simulator_connection_factory, simulator_utc_clock)
+    shutdown_requested = Event()
+    previous_handlers = _install_shutdown_handlers(shutdown_requested)
+    ledger_worker = state_build_worker = v9_runtime = sim3 = None
+    ledger_connection = state_connection = None
+    state = None
+    poller_threads: list[Thread] = []
     try:
+        database_url = os.environ["DATABASE_URL"]
+        evidence_store = PostgresEvidenceStore(database_url)
+        evidence_cache = DashboardEvidenceCache(evidence_store)
+        evidence_cache.start()
+        from .v9_production import (
+            ImmutableV2StateProvider, PostgresV2StateBuilder, ProductionV9Runtime,
+        )
+        metrics = OperationalMetrics()
+        v2_provider = ImmutableV2StateProvider(
+            PostgresV2StateBuilder(database_url), metrics=metrics,
+        )
+        v2_provider.start()
+        v9_runtime = ProductionV9Runtime(database_url, v2_provider, metrics=metrics)
+        from .evidence_outbox import (
+            EvidenceLedgerWorker, EvidenceOutbox, PostgresV4BStateBuilder,
+            PostgresV4CStateBuilder, PostgresV4StateBuilder,
+            V4StateBuildWorker, V4StateCacheRefresher,
+        )
+        from .v9_v4d_integration import OfflineStateBuildScheduler
+        from .v9_v4b_accuracy import AccuracyStateStore
+        from .v9_v4c_predictive import V4CStateStore
+        import psycopg
+        outbox = EvidenceOutbox(metrics=metrics)
+        ledger_connection = psycopg.connect(database_url)
+        state_connection = psycopg.connect(database_url)
+        cache_refresher = V4StateCacheRefresher(
+            compact_store=V4CStateStore(ledger_connection),
+            accuracy_store=AccuracyStateStore(ledger_connection),
+            compact_cache=v9_runtime.compact_cache,
+            accuracy_cache=v9_runtime.accuracy_cache,
+        )
+        accuracy_builder = PostgresV4BStateBuilder(state_connection)
+        compact_builder = PostgresV4CStateBuilder(state_connection)
+        state_builder = PostgresV4StateBuilder(accuracy_builder, compact_builder)
+        state_scheduler = OfflineStateBuildScheduler(
+            state_builder.build_and_publish, metrics=metrics,
+        )
+        state_build_worker = V4StateBuildWorker(
+            state_builder, state_scheduler, connection=state_connection,
+            connect=psycopg.connect, database_url=database_url, metrics=metrics)
+        state_build_worker.start()
+        sim3 = _start_sim3(simulator_connection_factory, simulator_utc_clock)
         ledger_worker = EvidenceLedgerWorker(
             outbox, evidence_store=PostgresEvidenceStore(
                 database_url, connection=ledger_connection),
             connection=ledger_connection,
+            connect=psycopg.connect, database_url=database_url,
             metrics=metrics, cache_refresher=cache_refresher,
-            state_builder=state_builder,
-            state_build_scheduler=state_scheduler,
+            state_build_submit=state_build_worker.submit,
             simulation_submit=sim3.submit if sim3 is not None else None,
         )
         ledger_worker.start()
         state = LiveMarketState(evidence_outbox=outbox,
                                 v9_cycle_handler=v9_runtime.on_quote,
                                 metrics=metrics)
-        start_alpaca_poller(state)
-        start_alpaca_g2_poller(state)
-        start_massive_ndx_poller(state)
-        start_alpaca_options_poller(state)
+        poller_threads = [
+            start_alpaca_poller(state, stop_event=shutdown_requested),
+            start_alpaca_g2_poller(state, stop_event=shutdown_requested),
+            start_massive_ndx_poller(state, stop_event=shutdown_requested),
+            start_alpaca_options_poller(state, stop_event=shutdown_requested),
+        ]
         app = create_app(state=state, evidence_cache=evidence_cache,
                          metrics=metrics)
         with make_server(args.host, args.port, app) as server:
+            Thread(
+                target=lambda: (shutdown_requested.wait(), server.shutdown()),
+                name="atom-shutdown-watcher", daemon=True,
+            ).start()
             server.serve_forever()
     finally:
-        if sim3 is not None:
-            try:
-                sim3.stop()
-            except Exception:
-                pass
+        try:
+            shutdown_requested.set()
+            if state is not None:
+                # This barrier completes any currently accepted quote and its
+                # outbox put before the ledger transitions to drain-only mode.
+                state.stop_accepting_quotes()
+            poller_deadline = time.monotonic() + 11.0
+            for thread in poller_threads:
+                thread.join(timeout=max(0.0, poller_deadline - time.monotonic()))
+            if ledger_worker is not None:
+                ledger_worker.close()
+            elif ledger_connection is not None:
+                ledger_connection.close()
+            if state_build_worker is not None:
+                state_build_worker.close()
+            elif state_connection is not None:
+                state_connection.close()
+            if v9_runtime is not None:
+                v9_runtime.close()
+            if sim3 is not None:
+                try:
+                    sim3.stop()
+                except Exception:
+                    pass
+        finally:
+            _restore_shutdown_handlers(previous_handlers)
 
 
 if __name__ == "__main__":

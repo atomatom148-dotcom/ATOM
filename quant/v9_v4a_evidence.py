@@ -411,8 +411,16 @@ class V4AWriter:
     """Least-privilege DB-API writer: its SQL surface is SELECT plus INSERT."""
 
     def __init__(self, connection):
+        if getattr(connection, "autocommit", False):
+            raise ValueError("V4A logical uniqueness requires a transaction")
         self.connection = connection
         self.last_write_status: str | None = None
+
+    @staticmethod
+    def _logical_lock_id(namespace: str, logical_key: tuple[object, ...]) -> int:
+        digest = canonical_sha256(
+            ("ATOM_TRUE_V9_V4A_LOGICAL_LOCK_1", namespace, logical_key))
+        return int.from_bytes(bytes.fromhex(digest[:16]), "big", signed=True)
 
     def persist_forecast(self, record: ForecastRecord, persisted_at: datetime) -> ForecastRecord:
         eligible = persisted_at <= record.target_endpoint
@@ -421,10 +429,21 @@ class V4AWriter:
                          persistence_reason=None if eligible else "FORECAST_PERSISTED_AFTER_TARGET_ENDPOINT")
         cursor = self.connection.cursor()
         try:
+            cursor.execute(
+                "SELECT pg_catalog.pg_advisory_xact_lock(%s)",
+                (self._logical_lock_id("FORECAST", record.logical_key),),
+            )
             cursor.execute("SELECT forecast_record_hash, record_json FROM atom_v9_v4_forecasts WHERE symbol=%s AND cutoff_at=%s AND horizon=%s AND cycle_id=%s AND v3_model_version=%s", record.logical_key)
             rows = tuple(cursor.fetchall())
             hashes = tuple(row[0] for row in rows)
-            if record.forecast_record_hash in hashes:
+            distinct_hashes = set(hashes)
+            if len(distinct_hashes) > 1:
+                self.last_write_status = "FORECAST_DUPLICATE_CONFLICT"
+                stored = replace(stored, persistence_proof_eligible=False,
+                                 persistence_reason="FORECAST_DUPLICATE_CONFLICT")
+                _commit_if_supported(self.connection)
+                return stored
+            if record.forecast_record_hash in distinct_hashes:
                 self.last_write_status = "IDEMPOTENT"
                 _commit_if_supported(self.connection)
                 original = next(row for row in rows if row[0] == record.forecast_record_hash)
@@ -432,12 +451,13 @@ class V4AWriter:
                     return deserialize_forecast_record(
                         original[1], expected_hash=record.forecast_record_hash)
                 return stored
-            if hashes:
+            if distinct_hashes:
                 self.last_write_status = "FORECAST_DUPLICATE_CONFLICT"
                 stored = replace(stored, persistence_proof_eligible=False,
                                  persistence_reason="FORECAST_DUPLICATE_CONFLICT")
-            else:
-                self.last_write_status = "INSERT"
+                _commit_if_supported(self.connection)
+                return stored
+            self.last_write_status = "INSERT"
             cursor.execute("INSERT INTO atom_v9_v4_forecasts (forecast_record_id, forecast_record_hash, symbol, cutoff_at, target_endpoint, horizon, cycle_id, v3_model_version, record_json, persisted_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                            (record.forecast_record_id, record.forecast_record_hash,
                             record.symbol, record.cutoff_at, record.target_endpoint, record.horizon,
@@ -455,10 +475,19 @@ class V4AWriter:
         stored = replace(record, created_at=created_at)
         cursor = self.connection.cursor()
         try:
+            cursor.execute(
+                "SELECT pg_catalog.pg_advisory_xact_lock(%s)",
+                (self._logical_lock_id("OUTCOME", record.logical_key),),
+            )
             cursor.execute("SELECT outcome_record_hash, record_json FROM atom_v9_v4_outcomes WHERE forecast_record_id=%s AND target_identity=%s", record.logical_key)
             rows = tuple(cursor.fetchall())
             hashes = tuple(row[0] for row in rows)
-            if record.outcome_record_hash in hashes:
+            distinct_hashes = set(hashes)
+            if len(distinct_hashes) > 1:
+                self.last_write_status = "OUTCOME_CONFLICT"
+                _commit_if_supported(self.connection)
+                return stored
+            if record.outcome_record_hash in distinct_hashes:
                 self.last_write_status = "IDEMPOTENT"
                 _commit_if_supported(self.connection)
                 original = next(row for row in rows if row[0] == record.outcome_record_hash)
@@ -466,7 +495,11 @@ class V4AWriter:
                     return deserialize_outcome_record(
                         original[1], expected_hash=record.outcome_record_hash)
                 return stored
-            self.last_write_status = "OUTCOME_CONFLICT" if hashes else "INSERT"
+            if distinct_hashes:
+                self.last_write_status = "OUTCOME_CONFLICT"
+                _commit_if_supported(self.connection)
+                return stored
+            self.last_write_status = "INSERT"
             cursor.execute("INSERT INTO atom_v9_v4_outcomes (outcome_record_id, outcome_record_hash, forecast_record_id, target_identity, record_json, created_at) VALUES (%s,%s,%s,%s,%s,%s)",
                            (record.outcome_record_id, record.outcome_record_hash,
                             record.forecast_record_id, record.target_identity,

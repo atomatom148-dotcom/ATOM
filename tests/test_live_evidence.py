@@ -460,6 +460,31 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertEqual(len(cursor.outcomes), 1)
         self.assertEqual(cursor.outcomes[first_forecast_id], outcome)
 
+    def test_shared_connection_rolls_back_before_worker_recovery(self):
+        class OperationalError(Exception): pass
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def execute(self, *_args): pass
+            def executemany(self, *_args):
+                raise OperationalError("connection lost")
+        class Connection:
+            def __init__(self): self.rollbacks = 0
+            def cursor(self): return Cursor()
+            def rollback(self): self.rollbacks += 1
+
+        connection = Connection()
+        store = object.__new__(PostgresEvidenceStore)
+        store._database_url = "postgresql://test"
+        store._connection = connection
+        store._connect = None
+        with self.assertRaises(OperationalError):
+            store.record_cycle_and_resolve(
+                (), observation_epoch=100, observation_midpoint=100,
+                resolution_enabled=False,
+            )
+        self.assertEqual(connection.rollbacks, 1)
+
     def test_store_contract_has_no_update_or_delete_api(self):
         self.assertFalse(hasattr(EvidenceStore, "update"))
         self.assertFalse(hasattr(EvidenceStore, "delete"))

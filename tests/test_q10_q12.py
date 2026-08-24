@@ -78,7 +78,8 @@ class OptionsVolTests(unittest.TestCase):
         delta_asymmetry = (call_delta - put_delta) / (call_delta + put_delta)
         expected_hour = 25 * (.5 * iv_asymmetry + .5 * delta_asymmetry)
         self.assertEqual(result.formula_version, FORMULA_VERSION)
-        self.assertEqual(FORMULA_VERSION, "coin-options-skew-delta-v1")
+        self.assertEqual(result.source_as_of_epoch, 100)
+        self.assertEqual(FORMULA_VERSION, "coin-options-skew-delta-v2")
         self.assertAlmostEqual(result.forecast_bps[-1], expected_hour)
         self.assertGreater(iv_asymmetry, 0)
         self.assertGreater(delta_asymmetry, 0)
@@ -137,6 +138,28 @@ class OptionsVolTests(unittest.TestCase):
             self.assertIsNotNone(calculate_options_vol(surface, cutoff_epoch=130))
             self.assertIsNone(calculate_options_vol(surface, cutoff_epoch=130.000001))
             self.assertIsNone(calculate_options_vol(surface, cutoff_epoch=99.999999))
+
+    def test_every_surface_constituent_must_be_causal_and_surface_time_is_earliest(self):
+        causal = self.surface(event_epoch=100)
+        future_call = option(
+            contract_symbol="CALL-FUTURE", event_epoch=101,
+            expiration_epoch=200, strike=202, implied_volatility=.6, delta=.6,
+        )
+        mixed = OptionSurface(
+            100, causal.expiration, causal.calls + (future_call,), causal.puts,
+        )
+        self.assertIsNone(calculate_options_vol(mixed, cutoff_epoch=100))
+        with self.assertRaisesRegex(ValueError, "earliest provider timestamp"):
+            OptionSurface(101, causal.expiration, mixed.calls, mixed.puts)
+
+        stale_put = option(
+            contract_symbol="PUT-STALE", event_epoch=69,
+            expiration_epoch=200, strike=199, implied_volatility=.6, delta=-.6,
+        )
+        stale = OptionSurface(
+            69, causal.expiration, causal.calls, (stale_put,) + causal.puts,
+        )
+        self.assertIsNone(calculate_options_vol(stale, cutoff_epoch=100))
 
     def test_live_cycle_populates_q10_row_from_surface_and_keeps_panel_contract(self):
         state = LiveMarketState(clock=lambda: 101)

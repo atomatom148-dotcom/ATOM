@@ -60,8 +60,19 @@ class ParsingAndSelectionTests(unittest.TestCase):
     def test_one_sided_or_crossed_quotes_do_not_derive_values(self):
         for quote in ({"bp": 1}, {"ap": 2}, {"bp": 3, "ap": 2}):
             with self.subTest(quote=quote):
+                quote["t"] = "2026-08-20T14:30:01.123456Z"
                 item = parse_alpaca_option_snapshot(contract("X"), {"latestQuote": quote}, cutoff_epoch=CUTOFF)
                 self.assertIsNone(item.premium); self.assertIsNone(item.spread)
+
+    def test_missing_malformed_or_naive_provider_time_fails_closed(self):
+        for timestamp in (None, 123, "not-a-time", "2026-08-20T14:30:01"):
+            quote = {"bp": 1, "ap": 2}
+            if timestamp is not None:
+                quote["t"] = timestamp
+            with self.subTest(timestamp=timestamp), self.assertRaises(ValueError):
+                parse_alpaca_option_snapshot(
+                    contract("X"), {"latestQuote": quote}, cutoff_epoch=CUTOFF,
+                )
 
     def test_filters_coin_active_unexpired_and_prefers_calls(self):
         values = [contract("OTHER", underlying_symbol="QQQ"), contract("OLD", expiration="2026-08-19"),
@@ -101,6 +112,10 @@ class ParsingAndSelectionTests(unittest.TestCase):
         contracts += [contract(f"P{x}", strike=str(x), kind="put") for x in range(198, 203)]
         snapshots = {item["symbol"]: snapshot() for item in contracts}
         snapshots.pop("C200")
+        snapshots["C198"] = snapshot(latestQuote={
+            "bp": 9.25, "ap": 10.75, "t": "2026-08-20T14:29:59Z",
+        })
+        snapshots["P198"] = snapshot(latestQuote={"bp": 9.25, "ap": 10.75})
         snapshots["P200"] = snapshot(impliedVolatility=None, greeks={"delta": None})
         pages = [{"option_contracts": contracts}, {"snapshots": snapshots}]
 
@@ -117,8 +132,10 @@ class ParsingAndSelectionTests(unittest.TestCase):
         self.assertEqual(parse_qs(urlparse(snapshot_url).query), {"limit": ["1000"]})
         self.assertNotIn("symbols", snapshot_url)
         self.assertEqual(len(surface.calls), 4)
-        self.assertEqual(len(surface.puts), 5)
+        self.assertEqual(len(surface.puts), 4)
+        self.assertEqual(surface.event_epoch, 1787236199.0)
         self.assertNotIn("C200", [item.contract_symbol for item in surface.calls])
+        self.assertNotIn("P198", [item.contract_symbol for item in surface.puts])
         put = next(item for item in surface.puts if item.contract_symbol == "P200")
         self.assertIsNone(put.implied_volatility)
         self.assertIsNone(put.delta)
@@ -142,7 +159,9 @@ class RuntimeTests(unittest.TestCase):
         state.accept_quote(bid=199, ask=201, event_epoch=CUTOFF - 1)
         original = parse_alpaca_option_snapshot(contract("KEEP"), snapshot(), cutoff_epoch=CUTOFF)
         put = parse_alpaca_option_snapshot(contract("KEEP-P", kind="put"), snapshot(), cutoff_epoch=CUTOFF)
-        original_surface = OptionSurface(CUTOFF, "2026-09-19", (original,), (put,))
+        original_surface = OptionSurface(
+            original.event_epoch, "2026-09-19", (original,), (put,),
+        )
         state.accept_option_surface(original_surface, midpoint=200)
         stopped = threading.Event()
         def stop(_):
@@ -166,7 +185,9 @@ class RuntimeTests(unittest.TestCase):
         state = LiveMarketState(clock=lambda: CUTOFF)
         state.accept_quote(bid=199, ask=201, event_epoch=CUTOFF - 1)
         original = parse_alpaca_option_snapshot(contract("KEEP"), snapshot(), cutoff_epoch=CUTOFF)
-        original_surface = OptionSurface(CUTOFF, "2026-09-19", (original,), ())
+        original_surface = OptionSurface(
+            original.event_epoch, "2026-09-19", (original,), (),
+        )
         state.accept_option_surface(original_surface, midpoint=200)
         error = HTTPError("https://key:secret@example.test", 400, "Bad Request",
                           {"Authorization": "key secret"},
@@ -191,7 +212,9 @@ class RuntimeTests(unittest.TestCase):
         low_z = parse_alpaca_option_snapshot(contract("LOW-Z", strike="195"), snapshot(), cutoff_epoch=CUTOFF)
         low_a = parse_alpaca_option_snapshot(contract("LOW-A", strike="195"), snapshot(), cutoff_epoch=CUTOFF)
         put = parse_alpaca_option_snapshot(contract("PUT", strike="200", kind="put"), snapshot(), cutoff_epoch=CUTOFF)
-        surface = OptionSurface(CUTOFF, "2026-09-19", (low_a, low_z, high), (put,))
+        surface = OptionSurface(
+            low_a.event_epoch, "2026-09-19", (low_a, low_z, high), (put,),
+        )
         state.accept_option_surface(surface, midpoint=200)
         published = state.snapshot()
         self.assertIs(published.option_surface, surface)
