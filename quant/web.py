@@ -228,6 +228,23 @@ def dashboard_data(
              else f"{item.range_lower_bps:.2f} to {item.range_upper_bps:.2f}")
             for item in results
         ]
+    accuracy_by_horizon = {
+        item.horizon: item for item in
+        (getattr(v9_output, "accuracy", ()) if v9_output is not None else ())
+        if item is not None
+    }
+    v9_accuracy = []
+    for horizon in PHASE_E_HORIZONS:
+        item = accuracy_by_horizon.get(horizon)
+        available = item is not None and item.directional_accuracy is not None
+        v9_accuracy.append({
+            "horizon": horizon,
+            "directional_wins": item.directional_wins if available else None,
+            "directional_losses": item.directional_losses if available else None,
+            "directional_accuracy": item.directional_accuracy if available else None,
+            "directional_effective_n": item.directional_effective_n if available else None,
+            "status": item.status if available else "UNAVAILABLE",
+        })
     v1_output = getattr(v9_output, "v1", None)
     forecast_cutoff = (v1_output.cutoff_at.timestamp()
                        if v1_output is not None else None)
@@ -265,6 +282,7 @@ def dashboard_data(
         },
         "horizons": list(HORIZON_LABELS),
         "final_numbers": final_values,
+        "v9_accuracy": v9_accuracy,
         "quant_families": families,
         "options_data": options_data,
         "evidence": {
@@ -318,10 +336,26 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     market = data["market"]
     horizons = data["horizons"]
     final_numbers = data["final_numbers"]
+    v9_accuracy = data["v9_accuracy"]
     families = data["quant_families"]
     options = data["options_data"]
     evidence = data["evidence"]
     phase_e = data["phase_e_cohorts"]
+    accuracy_rows = (
+        ("WINS", [item["directional_wins"] for item in v9_accuracy]),
+        ("LOSSES", [item["directional_losses"] for item in v9_accuracy]),
+        ("ACCURACY", [
+            "—" if item["directional_accuracy"] is None
+            else f'{item["directional_accuracy"] * 100:.1f}%'
+            for item in v9_accuracy
+        ]),
+        ("EFFECTIVE N", [
+            "—" if item["directional_effective_n"] is None
+            else f'{item["directional_effective_n"]:.2f}'
+            for item in v9_accuracy
+        ]),
+        ("STATUS", [item["status"] for item in v9_accuracy]),
+    )
     phase_e_headers = ("FAMILY/HORIZON", "EFFECTIVE N", "ELIGIBLE", "ACC", "RMSE", "MAE", "BIAS", "COVERAGE")
     def phase_e_row(cohort: dict[str, object]) -> tuple[object, ...]:
         return (
@@ -364,6 +398,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
 <div><div class=label>BTC</div><div class=value data-dashboard-field="market.btc">{_decimal_cell(market['btc'])}</div></div><div><div class=label>QQQ</div><div class=value data-dashboard-field="market.qqq">{_decimal_cell(market['qqq'])}</div></div><div><div class=label>NDX</div><div class=value data-dashboard-field="market.ndx">{_decimal_cell(market['ndx'])}</div></div>
 <div><div class=label>DATA AGE</div><div class=value data-dashboard-field="market.data_age">{_decimal_cell(market['data_age'], 's')}</div></div><div><div class=label>LAST CYCLE</div><div class=value data-dashboard-field="market.last_cycle">{_cycle_cell(market['last_cycle'])}</div></div></div>
 <h2>FINAL NUMBERS</h2>{_table(horizons, final_numbers.items(), section='final_numbers', decimal=True)}
+<h2>V9 DIRECTIONAL ACCURACY</h2>{_table(PHASE_E_HORIZONS, accuracy_rows, section='v9_accuracy')}
 <h2>12 QUANT FAMILIES</h2>{_table(horizons, ((item['name'], item['values']) for item in families), section='quant_families', decimal=True)}
 <h2>OPTIONS DATA</h2><div>EXPIRATION: <span data-dashboard-field="options_data.expiration">{_cell(options['expiration'])}</span></div>{option_table('calls')}{option_table('puts')}
 <h2>EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in evidence.items()), section='evidence')}{phase_e_table}
@@ -394,6 +429,17 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     Object.entries(data.final_numbers).forEach(([name, values]) =>
       values.forEach((value, index) => set(`final_numbers.${{name}}.${{index}}`, value,
         name === "RANGE" ? text : decimal)));
+    const accuracyRows = {{
+      "WINS": data.v9_accuracy.map(item => item.directional_wins ?? "—"),
+      "LOSSES": data.v9_accuracy.map(item => item.directional_losses ?? "—"),
+      "ACCURACY": data.v9_accuracy.map(item => item.directional_accuracy == null ? "—" :
+        (item.directional_accuracy * 100).toFixed(1) + "%"),
+      "EFFECTIVE N": data.v9_accuracy.map(item => item.directional_effective_n == null ? "—" :
+        Number(item.directional_effective_n).toFixed(2)),
+      "STATUS": data.v9_accuracy.map(item => item.status)
+    }};
+    Object.entries(accuracyRows).forEach(([name, values]) =>
+      values.forEach((value, index) => set(`v9_accuracy.${{name}}.${{index}}`, value)));
     data.quant_families.forEach(family => family.values.forEach((value, index) =>
       set(`quant_families.${{family.name}}.${{index}}`, value, decimal)));
     set("options_data.expiration", data.options_data.expiration);
@@ -557,7 +603,8 @@ def create_app(
                 calculate_missing=False,
             )
             live = {key: data[key] for key in (
-                "market", "v9", "final_numbers", "quant_families", "options_data",
+                "market", "v9", "final_numbers", "v9_accuracy",
+                "quant_families", "options_data",
             )}
             body = json.dumps(
                 live, separators=(",", ":"), allow_nan=False,
