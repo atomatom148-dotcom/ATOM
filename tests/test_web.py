@@ -134,7 +134,8 @@ class WebSurfaceTests(unittest.TestCase):
         page = request(create_app(), "/")["body"].decode()
         script = page.split("<script>", 1)[1].split("</script>", 1)[0]
 
-        self.assertIn('fetch("/api/live", {cache: "no-store"})', page)
+        self.assertIn('fetch("/api/live", {', page)
+        self.assertIn('signal: controller.signal', page)
         self.assertIn('fetch("/api/dashboard", {cache: "no-store"})', page)
         self.assertIn("setTimeout(refreshLive, 250)", page)
         self.assertIn("setTimeout(refreshEvidence, 30000)", page)
@@ -241,7 +242,22 @@ class WebSurfaceTests(unittest.TestCase):
 
         for field in ("symbol", "btc", "qqq", "ndx", "data_age", "last_cycle"):
             self.assertIn(f'data-dashboard-field="market.{field}"', page)
+        for field in ("symbol", "qqq", "ndx", "data_age", "last_cycle"):
             self.assertIn(f'set("market.{field}", data.market.{field}', page)
+        self.assertIn(
+            'set("market.btc", btcLive ? data.market.btc : null', page)
+
+    def test_initial_html_never_embeds_a_btc_quote_before_client_age_check(self):
+        state = LiveMarketState()
+        state.accept_g2_price(
+            asset="BTC", price=70_000.0, event_epoch=1_700_000_000.0)
+        page = request(create_app(
+            state=state, clock=lambda: 1_700_000_001.0), "/")["body"].decode()
+
+        self.assertIn(
+            'data-dashboard-field="market.btc"></div>', page)
+        self.assertNotIn(
+            'data-dashboard-field="market.btc">70000.00</div>', page)
 
     def test_live_renderer_updates_final_quant_options_and_evidence_cells(self):
         page = request(create_app(), "/")["body"].decode()
@@ -324,13 +340,92 @@ class WebSurfaceTests(unittest.TestCase):
         self.assertIn('value == null ? "" : Number(value).toFixed(2)', page)
         self.assertNotIn('value || 0', page)
 
-    def test_poll_failure_keeps_values_and_allows_timeout_to_retry(self):
+    def test_live_browser_revalidates_btc_age_and_blanks_on_poll_failure(self):
         page = request(create_app(), "/")["body"].decode()
 
         failure_handler = page.split("} catch (_) {", 1)[1].split("}", 1)[0]
         self.assertNotIn("render", failure_handler)
-        self.assertNotIn("textContent", failure_handler)
+        self.assertIn('clearBtc(++btcRenderGeneration)', failure_handler)
+        self.assertIn("Date.now() / 1000 - btcEvent", page)
+        self.assertIn('btcAge >= 0 && btcAge < 5', page)
+        self.assertIn("new AbortController()", page)
+        self.assertIn("controller.abort()", page)
         self.assertIn("setTimeout(refreshLive, 250)", page)
+        self.assertIn("btcEvent + 5 - Date.now() / 1000", page)
+        self.assertIn("btcExpiryTimer = setTimeout", page)
+        self.assertIn("generation !== btcRenderGeneration", page)
+
+    def test_btc_expires_at_provider_deadline_while_next_fetch_hangs(self):
+        page = request(create_app(), "/")["body"].decode()
+        script = page.split("<script>", 1)[1].split("</script>", 1)[0]
+        payload = {
+            "market": {
+                "symbol": 100.0, "btc": 70_000.0, "qqq": None,
+                "ndx": None, "data_age": 0.0, "last_cycle": None,
+                "btc_event_epoch": 1_700_000_000.0,
+                "btc_source_status": "LIVE",
+            },
+            "final_numbers": {}, "v9_accuracy": [], "quant_families": [],
+            "options_data": {"expiration": None, "calls": [], "puts": []},
+        }
+        harness = f"""
+const source = {json.dumps(script)};
+let nowMs = 1700000004000;
+let nextTimer = 1;
+const timers = new Map();
+global.Date.now = () => nowMs;
+global.setTimeout = (fn, delay = 0) => {{
+  const id = nextTimer++;
+  timers.set(id, {{fn, due: nowMs + Number(delay)}});
+  return id;
+}};
+global.clearTimeout = id => timers.delete(id);
+const btcCell = {{dataset: {{dashboardField: "market.btc"}}, textContent: ""}};
+const body = {{replaceChildren: () => {{}}}};
+global.document = {{
+  querySelectorAll: () => [btcCell],
+  getElementById: () => body,
+  createElement: () => ({{textContent: "", replaceChildren: () => {{}}}}),
+}};
+let fetchCalls = 0;
+global.fetch = () => {{
+  fetchCalls += 1;
+  if (fetchCalls === 1) return Promise.resolve({{
+    ok: true, json: () => Promise.resolve({json.dumps(payload)})
+  }});
+  return new Promise(() => {{}});
+}};
+async function flush() {{
+  for (let i = 0; i < 12; i += 1) await Promise.resolve();
+}}
+async function advance(milliseconds) {{
+  const target = nowMs + milliseconds;
+  while (true) {{
+    const due = [...timers.entries()]
+      .filter(([, timer]) => timer.due <= target)
+      .sort((a, b) => a[1].due - b[1].due || a[0] - b[0])[0];
+    if (!due) break;
+    timers.delete(due[0]);
+    nowMs = due[1].due;
+    due[1].fn();
+    await flush();
+  }}
+  nowMs = target;
+  await flush();
+}}
+(async () => {{
+  eval(source);
+  await advance(250);
+  if (btcCell.textContent !== "70000.00")
+    throw new Error("fresh BTC was not rendered: " + btcCell.textContent);
+  await advance(850);
+  if (btcCell.textContent !== "")
+    throw new Error("BTC survived provider deadline: " + btcCell.textContent);
+}})().catch(error => {{ console.error(error); process.exitCode = 1; }});
+"""
+        result = subprocess.run(
+            ["node", "-"], input=harness, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_phase_e_dashboard_mapping_order_format_and_raw_precision(self):
         quant_ids = tuple(

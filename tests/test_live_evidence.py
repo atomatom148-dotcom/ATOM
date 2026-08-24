@@ -233,7 +233,9 @@ class LiveEvidenceTests(unittest.TestCase):
                     )
                     return
                 self.assert_conflict_safe(statement)
-                midpoint, _, resolved_epoch, _, _ = parameters
+                midpoint, _, resolved_epoch, symbol, _, _ = parameters
+                if symbol != "COIN":
+                    raise AssertionError("wrong resolution symbol")
                 if 1 not in self.outcomes:
                     self.outcomes[1] = (
                         midpoint,
@@ -275,11 +277,13 @@ class LiveEvidenceTests(unittest.TestCase):
         store._connect = lambda _: Connection(cursor)
 
         store.record_cycle_and_resolve(
-            (), observation_epoch=131, observation_midpoint=110
+            (), observation_epoch=131, observation_midpoint=110,
+            resolution_symbol="COIN",
         )
         first = cursor.outcomes[1]
         store.record_cycle_and_resolve(
-            (), observation_epoch=140, observation_midpoint=120
+            (), observation_epoch=140, observation_midpoint=120,
+            resolution_symbol="COIN",
         )
 
         self.assertEqual(len(cursor.outcomes), 1)
@@ -317,15 +321,40 @@ class LiveEvidenceTests(unittest.TestCase):
         store._connect = lambda _: Connection(cursor)
         store.record_cycle_and_resolve(
             (), observation_epoch=131, observation_midpoint=110,
+            resolution_symbol="COIN",
         )
 
         watermark_sql, watermark_parameters = cursor.statements[0]
         resolution_sql, resolution_parameters = cursor.statements[1]
-        self.assertIn("max(resolved_epoch)", watermark_sql)
-        self.assertEqual(watermark_parameters, ())
+        self.assertIn("max(o.resolved_epoch)", watermark_sql)
+        self.assertEqual(watermark_parameters, ("COIN",))
+        self.assertIn("f.symbol = %s", resolution_sql)
         self.assertIn("f.maturity_epoch > %s", resolution_sql)
         self.assertIn("f.maturity_epoch <= %s", resolution_sql)
-        self.assertEqual(resolution_parameters, (110, 110, 131, 123.0, 131))
+        self.assertEqual(
+            resolution_parameters, (110, 110, 131, "COIN", 123.0, 131))
+
+    def test_postgres_resolver_rejects_mixed_symbol_envelopes_before_sql(self):
+        directional = ForecastRecord(
+            "q1_momentum", "v1", "cycle", "QQQ", "30S",
+            100, 130, 100, 5, 101,
+        )
+        volatility = VolatilityForecastRecord(
+            "q3_volatility", "v1", "cycle", "QQQ", "30S",
+            100, 130, 100, 5, 101,
+        )
+        store = object.__new__(PostgresEvidenceStore)
+
+        for forecasts, volatility_forecasts in (
+                ((directional,), ()), ((), (volatility,))):
+            with self.subTest(volatility=bool(volatility_forecasts)):
+                with self.assertRaisesRegex(ValueError, "resolution_symbol"):
+                    store.record_cycle_and_resolve(
+                        forecasts, observation_epoch=131,
+                        observation_midpoint=110,
+                        resolution_symbol="COIN",
+                        volatility_forecasts=volatility_forecasts,
+                    )
 
     def test_postgres_q3_uses_separate_append_only_volatility_tables(self):
         class Cursor:
@@ -358,6 +387,7 @@ class LiveEvidenceTests(unittest.TestCase):
 
         store.record_cycle_and_resolve(
             (), observation_epoch=100, observation_midpoint=100,
+            resolution_symbol="COIN",
             volatility_forecasts=(row,),
         )
 
@@ -366,7 +396,9 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertIn("INSERT INTO volatility_forecast_outcomes", volatility_resolution_sql)
         self.assertIn("abs(10000 * ln(%s / f.cutoff_midpoint))", volatility_resolution_sql)
         self.assertIn("ON CONFLICT (forecast_id) DO NOTHING", volatility_resolution_sql)
-        self.assertEqual(resolution_parameters, (100, 100, 100, -math.inf, 100))
+        self.assertIn("f.symbol = %s", volatility_resolution_sql)
+        self.assertEqual(
+            resolution_parameters, (100, 100, 100, "COIN", -math.inf, 100))
         self.assertIn("INSERT INTO volatility_forecasts", volatility_insert_sql)
         self.assertIn("data_schema_version", volatility_insert_sql)
         self.assertIn("source_spec_version", volatility_insert_sql)
@@ -396,7 +428,10 @@ class LiveEvidenceTests(unittest.TestCase):
                         default=-math.inf,
                     )
                     return
-                midpoint, _, resolved_epoch, watermark, observation_epoch = parameters
+                (midpoint, _, resolved_epoch, symbol, watermark,
+                 observation_epoch) = parameters
+                if symbol != "COIN":
+                    raise AssertionError("wrong resolution symbol")
                 for forecast_id, values in self.forecasts.values():
                     if (forecast_id not in self.outcomes
                             and values[6] > watermark
@@ -454,7 +489,8 @@ class LiveEvidenceTests(unittest.TestCase):
         )
 
         store.record_cycle_and_resolve(
-            (original,), observation_epoch=100, observation_midpoint=100
+            (original,), observation_epoch=100, observation_midpoint=100,
+            resolution_symbol="COIN",
         )
         identity = (
             original.quant_id, original.formula_version, original.cycle_id,
@@ -462,7 +498,8 @@ class LiveEvidenceTests(unittest.TestCase):
         )
         first_forecast_id, first_values = cursor.forecasts[identity]
         store.record_cycle_and_resolve(
-            (conflicting,), observation_epoch=131, observation_midpoint=110
+            (conflicting,), observation_epoch=131, observation_midpoint=110,
+            resolution_symbol="COIN",
         )
 
         self.assertEqual(len(cursor.forecasts), 1)
@@ -484,7 +521,8 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertEqual(outcome[2], 131)
 
         store.record_cycle_and_resolve(
-            (), observation_epoch=140, observation_midpoint=120
+            (), observation_epoch=140, observation_midpoint=120,
+            resolution_symbol="COIN",
         )
         self.assertEqual(len(cursor.outcomes), 1)
         self.assertEqual(cursor.outcomes[first_forecast_id], outcome)
@@ -510,6 +548,7 @@ class LiveEvidenceTests(unittest.TestCase):
         with self.assertRaises(OperationalError):
             store.record_cycle_and_resolve(
                 (), observation_epoch=100, observation_midpoint=100,
+                resolution_symbol="COIN",
                 resolution_enabled=False,
             )
         self.assertEqual(connection.rollbacks, 1)
