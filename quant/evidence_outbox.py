@@ -286,6 +286,98 @@ class PostgresV4StateBuilder:
 
 
 @dataclass(frozen=True, slots=True)
+class V4StateBuildCandidate:
+    """One immutable latest-wins request for the off-FIFO state builder."""
+
+    symbol: str
+    state_as_of: datetime
+    cohorts: tuple[tuple[str, str, str], ...]
+    new_outcome: bool
+
+
+class V4StateBuildWorker:
+    """Run full-history V4 state construction outside the evidence FIFO."""
+
+    def __init__(self, state_builder: PostgresV4StateBuilder,
+                 scheduler: OfflineStateBuildScheduler, *,
+                 metrics: OperationalMetrics | None = None):
+        self._builder = state_builder
+        self._scheduler = scheduler
+        self._metrics = metrics or OperationalMetrics()
+        self._latest: V4StateBuildCandidate | None = None
+        self._latest_lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def submit(self, *, symbol: str, state_as_of: datetime,
+               cohorts: dict[str, tuple[str, str]], new_outcome: bool) -> None:
+        ordered = tuple((horizon, *cohorts[horizon]) for horizon in HORIZONS)
+        if tuple(cohorts) != HORIZONS:
+            raise ValueError("cohorts must contain exactly six canonical horizons in order")
+        candidate = V4StateBuildCandidate(
+            symbol, state_as_of, ordered, bool(new_outcome))
+        with self._latest_lock:
+            if self._latest is not None:
+                candidate = V4StateBuildCandidate(
+                    candidate.symbol, candidate.state_as_of, candidate.cohorts,
+                    candidate.new_outcome or self._latest.new_outcome,
+                )
+                self._metrics.increment("v4_state_build_worker.coalesced")
+            self._latest = candidate
+        self._wake.set()
+
+    def _take_latest(self) -> V4StateBuildCandidate | None:
+        with self._latest_lock:
+            candidate, self._latest = self._latest, None
+        return candidate
+
+    def run(self) -> None:
+        pending_generation = False
+        while not self._stop.is_set():
+            self._wake.wait(1.0)
+            self._wake.clear()
+            candidate = self._take_latest()
+            if candidate is not None:
+                try:
+                    self._builder.prepare(
+                        symbol=candidate.symbol,
+                        state_as_of=candidate.state_as_of,
+                        cohorts={horizon: (cohort_id, cohort_hash)
+                                 for horizon, cohort_id, cohort_hash in candidate.cohorts},
+                    )
+                    if candidate.new_outcome:
+                        self._scheduler.note_new_outcome()
+                        pending_generation = True
+                except Exception:
+                    self._metrics.increment("v4_state_build_worker.failure")
+                    continue
+            if not pending_generation:
+                continue
+            try:
+                status = self._scheduler.run_if_due()
+            except Exception:
+                self._metrics.increment("v4_state_build_worker.failure")
+                continue
+            if status in {"INSERT", "IDEMPOTENT", "SKIPPED_NO_NEW_OUTCOME"}:
+                pending_generation = False
+
+    def start(self) -> threading.Thread:
+        if self._thread is not None and self._thread.is_alive():
+            return self._thread
+        self._thread = threading.Thread(
+            target=self.run, name="v4-state-builder", daemon=True)
+        self._thread.start()
+        return self._thread
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+
+@dataclass(frozen=True, slots=True)
 class QuoteEvidenceWork:
     """One complete, immutable COIN event envelope."""
 
@@ -342,8 +434,7 @@ class EvidenceLedgerWorker:
                  database_url: str | None = None,
                  metrics: OperationalMetrics | None = None,
                  cache_refresher: V4StateCacheRefresher | None = None,
-                 state_builder: PostgresV4BStateBuilder | None = None,
-                 state_build_scheduler: OfflineStateBuildScheduler | None = None,
+                 state_build_submit: Callable | None = None,
                  simulation_submit: Callable | None = None,
                  wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
         if connection is None:
@@ -356,8 +447,7 @@ class EvidenceLedgerWorker:
         self.metrics = metrics or outbox.metrics
         self._clock = wall_clock
         self._cache_refresher = cache_refresher
-        self._state_builder = state_builder
-        self._state_build_scheduler = state_build_scheduler
+        self._state_build_submit = state_build_submit
         self._simulation_submit = simulation_submit
         self._pending: list[V4ForecastRecord] = self._load_pending()
         self._last_sequence: int | None = None
@@ -470,21 +560,16 @@ class EvidenceLedgerWorker:
             item.received_at,
             datetime.fromtimestamp(current.event_epoch, timezone.utc),
         )
-        if (self._state_builder is not None and
-                self._state_build_scheduler is not None and len(item.v4) == 6):
+        if self._state_build_submit is not None and len(item.v4) == 6:
             try:
-                self._state_builder.prepare(
+                self._state_build_submit(
                     symbol=item.v4[0].symbol, state_as_of=refresh_cutoff,
                     cohorts={forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
                              for forecast in item.v4},
+                    new_outcome=new_outcome,
                 )
-                if new_outcome:
-                    self._state_build_scheduler.note_new_outcome()
-                self._state_build_scheduler.run_if_due()
             except Exception:
-                # Statistical publication is isolated from the evidence ledger.
-                # The pending scheduler generation remains retryable.
-                self.metrics.increment("v4b_state_builder.failure")
+                self.metrics.increment("v4_state_build_submit.failure")
         if (self._simulation_submit is not None and item.v4d_output is not None
                 and len(finalized) == 6):
             try:

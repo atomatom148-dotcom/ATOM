@@ -2,6 +2,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import json
+import threading
 
 import pytest
 
@@ -21,7 +22,7 @@ from quant.v9_v4d_integration import (
 from quant.evidence_outbox import (
     EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork, TerminalDeliveryError,
     PostgresV4BStateBuilder, PostgresV4CStateBuilder, PostgresV4StateBuilder,
-    V4StateCacheRefresher,
+    V4StateBuildWorker, V4StateCacheRefresher,
 )
 from quant.history import MidpointObservation
 from quant.live_market import LiveMarketState
@@ -496,7 +497,7 @@ def test_compact_failure_does_not_suppress_accuracy_publication():
     assert accuracy.calls == 1
 
 
-def test_new_worker_outcome_triggers_cadenced_v4b_build(monkeypatch):
+def test_new_worker_outcome_submits_v4_state_build_off_fifo(monkeypatch):
     monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
     v1, v2 = _inputs()
     calculated = V4DCoordinator(
@@ -511,17 +512,10 @@ def test_new_worker_outcome_triggers_cadenced_v4b_build(monkeypatch):
     previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
     current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
 
-    class Builder:
-        def __init__(self): self.prepared = []
-        def prepare(self, **kwargs): self.prepared.append(kwargs)
-    class Scheduler:
-        def __init__(self): self.notes = 0; self.runs = 0
-        def note_new_outcome(self): self.notes += 1
-        def run_if_due(self): self.runs += 1
-    builder, scheduler = Builder(), Scheduler()
+    submitted = []
     worker = EvidenceLedgerWorker(
         EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
-        state_builder=builder, state_build_scheduler=scheduler,
+        state_build_submit=lambda **candidate: submitted.append(candidate),
     )
     worker._pending = [due]
     worker._writer = Writer()
@@ -531,8 +525,8 @@ def test_new_worker_outcome_triggers_cadenced_v4b_build(monkeypatch):
     )
 
     worker.process(item)
-    assert scheduler.notes == scheduler.runs == 1
-    assert builder.prepared[0]["cohorts"] == {
+    assert len(submitted) == 1 and submitted[0]["new_outcome"] is True
+    assert submitted[0]["cohorts"] == {
         forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
         for forecast in forecasts
     }
@@ -563,16 +557,10 @@ def test_non_new_outcomes_do_not_create_v4b_generation(
         def persist_outcome(self, record, created_at):
             self.last_write_status = outcome_status
             return record
-    class Builder:
-        def prepare(self, **_kwargs): pass
-    class Scheduler:
-        def __init__(self): self.notes = 0; self.runs = 0
-        def note_new_outcome(self): self.notes += 1
-        def run_if_due(self): self.runs += 1
-    scheduler = Scheduler()
+    submitted = []
     worker = EvidenceLedgerWorker(
         EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
-        state_builder=Builder(), state_build_scheduler=scheduler,
+        state_build_submit=lambda **candidate: submitted.append(candidate),
     )
     worker._pending = [due]
     worker._writer = StatusWriter()
@@ -584,14 +572,14 @@ def test_non_new_outcomes_do_not_create_v4b_generation(
     if raises:
         with pytest.raises(TerminalDeliveryError, match="OUTCOME_CONFLICT"):
             worker.process(item)
-        assert scheduler.runs == 0
+        assert submitted == []
     else:
         worker.process(item)
-        assert scheduler.runs == 1
-    assert scheduler.notes == expected_notes
+        assert len(submitted) == 1
+        assert submitted[0]["new_outcome"] is bool(expected_notes)
 
 
-def test_v4b_builder_failure_isolated_from_forecast_delivery(monkeypatch):
+def test_v4_state_build_submit_failure_isolated_from_forecast_delivery(monkeypatch):
     monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
     v1, v2 = _inputs()
     calculated = V4DCoordinator(
@@ -606,15 +594,12 @@ def test_v4b_builder_failure_isolated_from_forecast_delivery(monkeypatch):
     previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
     current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
 
-    class Builder:
-        def prepare(self, **_kwargs): pass
-    class FailingScheduler:
-        def note_new_outcome(self): pass
-        def run_if_due(self): raise RuntimeError("offline builder failed")
+    def failing_submit(**_kwargs):
+        raise RuntimeError("offline builder unavailable")
     writer = Writer()
     worker = EvidenceLedgerWorker(
         EvidenceOutbox(), evidence_store=_RawStore(), connection=_WorkerConnection(),
-        state_builder=Builder(), state_build_scheduler=FailingScheduler(),
+        state_build_submit=failing_submit,
     )
     worker._pending = [due]
     worker._writer = writer
@@ -627,7 +612,57 @@ def test_v4b_builder_failure_isolated_from_forecast_delivery(monkeypatch):
     assert len(writer.outcomes) == 1
     assert len(writer.forecasts) == 6
     assert any(number.final_bps is not None for number in calculated.final_numbers)
-    assert dict(worker.metrics.snapshot().counters)["v4b_state_builder.failure"] == 1
+    assert dict(worker.metrics.snapshot().counters)["v4_state_build_submit.failure"] == 1
+
+
+def test_blocked_full_history_builder_cannot_cause_evidence_outbox_drops(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None, compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort", cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecasts = tuple(item.forecast for item in calculated.persistence)
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingBuilder:
+        def prepare(self, **_candidate): pass
+        def build_and_publish(self):
+            started.set()
+            assert release.wait(2)
+            return "INSERT"
+
+    metrics = OperationalMetrics()
+    builder = BlockingBuilder()
+    scheduler = OfflineStateBuildScheduler(builder.build_and_publish, metrics=metrics)
+    background = V4StateBuildWorker(builder, scheduler, metrics=metrics)
+    background.start()
+    cohorts = {forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
+               for forecast in forecasts}
+    background.submit(symbol="COIN", state_as_of=NOW, cohorts=cohorts,
+                      new_outcome=True)
+    assert started.wait(1)
+
+    outbox = EvidenceOutbox(metrics=metrics)
+    worker = EvidenceLedgerWorker(
+        outbox, evidence_store=_RawStore(), connection=_WorkerConnection(),
+        state_build_submit=background.submit,
+    )
+    worker._writer = Writer()
+    observation = MidpointObservation(NOW.timestamp(), 100.0)
+    for sequence in range(1, 513):
+        item = QuoteEvidenceWork(
+            sequence, f"cycle-{sequence}", None, observation, NOW,
+            (), (), forecasts, "cohort", calculated,
+        )
+        assert outbox.put_nowait(item) is True
+        worker.process(outbox.get())
+        outbox.task_done()
+
+    assert dict(metrics.snapshot().counters).get("EVIDENCE_OUTBOX_FULL", 0) == 0
+    release.set()
+    background.stop()
 
 
 def test_metrics_have_percentiles_and_do_not_change_forecast():

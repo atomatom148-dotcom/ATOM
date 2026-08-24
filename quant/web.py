@@ -686,7 +686,7 @@ def main(*, simulator_connection_factory: Callable | None = None,
     from .evidence_outbox import (
         EvidenceLedgerWorker, EvidenceOutbox, PostgresV4BStateBuilder,
         PostgresV4CStateBuilder, PostgresV4StateBuilder,
-        V4StateCacheRefresher,
+        V4StateBuildWorker, V4StateCacheRefresher,
     )
     from .v9_v4d_integration import OfflineStateBuildScheduler
     from .v9_v4b_accuracy import AccuracyStateStore
@@ -694,18 +694,22 @@ def main(*, simulator_connection_factory: Callable | None = None,
     import psycopg
     outbox = EvidenceOutbox(metrics=metrics)
     ledger_connection = psycopg.connect(database_url)
+    state_connection = psycopg.connect(database_url)
     cache_refresher = V4StateCacheRefresher(
         compact_store=V4CStateStore(ledger_connection),
         accuracy_store=AccuracyStateStore(ledger_connection),
         compact_cache=v9_runtime.compact_cache,
         accuracy_cache=v9_runtime.accuracy_cache,
     )
-    accuracy_builder = PostgresV4BStateBuilder(ledger_connection)
-    compact_builder = PostgresV4CStateBuilder(ledger_connection)
+    accuracy_builder = PostgresV4BStateBuilder(state_connection)
+    compact_builder = PostgresV4CStateBuilder(state_connection)
     state_builder = PostgresV4StateBuilder(accuracy_builder, compact_builder)
     state_scheduler = OfflineStateBuildScheduler(
         state_builder.build_and_publish, metrics=metrics,
     )
+    state_build_worker = V4StateBuildWorker(
+        state_builder, state_scheduler, metrics=metrics)
+    state_build_worker.start()
     sim3 = _start_sim3(simulator_connection_factory, simulator_utc_clock)
     try:
         ledger_worker = EvidenceLedgerWorker(
@@ -713,8 +717,7 @@ def main(*, simulator_connection_factory: Callable | None = None,
                 database_url, connection=ledger_connection),
             connection=ledger_connection,
             metrics=metrics, cache_refresher=cache_refresher,
-            state_builder=state_builder,
-            state_build_scheduler=state_scheduler,
+            state_build_submit=state_build_worker.submit,
             simulation_submit=sim3.submit if sim3 is not None else None,
         )
         ledger_worker.start()
@@ -730,6 +733,8 @@ def main(*, simulator_connection_factory: Callable | None = None,
         with make_server(args.host, args.port, app) as server:
             server.serve_forever()
     finally:
+        state_build_worker.stop()
+        state_connection.close()
         if sim3 is not None:
             try:
                 sim3.stop()
