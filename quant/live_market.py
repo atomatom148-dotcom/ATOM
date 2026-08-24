@@ -37,7 +37,10 @@ from .evidence_outbox import EvidenceOutbox, QuoteEvidenceWork
 
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
-ALPACA_BTC_LATEST_QUOTE_URL = "https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes?symbols=BTC%2FUSD"
+ALPACA_BTC_LATEST_QUOTE_URL = (
+    "https://data.alpaca.markets/v1beta3/crypto/us/latest/"
+    "orderbooks?symbols=BTC%2FUSD"
+)
 ALPACA_NDX_LATEST_VALUE_URL = (
     "https://data.alpaca.markets/v1beta1/indices/latest/values?index_symbols=NDX"
 )
@@ -703,8 +706,9 @@ def poll_alpaca_g2(
                          timeout=timeout) as response:
                 payload = json.load(response)
             received_at = monotonic()
-            item = payload["quotes"]["BTC/USD"]
-            price = (float(item["bp"]) + float(item["ap"])) / 2.0
+            item = payload["orderbooks"]["BTC/USD"]
+            price = (float(item["b"][0]["p"]) +
+                     float(item["a"][0]["p"])) / 2.0
             event_epoch = parse_alpaca_timestamp(item["t"])
             quote_age_ms = (clock() - event_epoch) * 1000.0
             if quote_age_ms < 0 or quote_age_ms >= MAX_BTC_AGE_SECONDS * 1000.0:
