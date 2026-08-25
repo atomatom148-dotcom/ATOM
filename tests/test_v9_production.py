@@ -268,15 +268,15 @@ def test_v2_builder_materializes_provider_time_and_rejects_unproven_rows(monkeyp
         (1, "q4_stat_arb", FORMULA_VERSION_MAP["q4_stat_arb"], "cycle", "COIN",
          "30S", cutoff, cutoff + 30, 1.0, cutoff + 1,
          DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, cutoff - 2, 2.0, NOW,
-         cutoff + 1, NOW),
+         cutoff + 1, NOW - 3),
         (2, "q10_options_vol", FORMULA_VERSION_MAP["q10_options_vol"], "cycle", "COIN",
          "30S", cutoff, cutoff + 30, 1.0, cutoff + 1,
          DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None, 2.0, NOW,
-         cutoff + 1, NOW),
+         cutoff + 1, NOW - 2),
         (3, "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"], "cycle", "COIN",
          "30S", cutoff, cutoff + 30, 1.0, cutoff + 1,
          DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None, 2.0, NOW,
-         cutoff + 1, NOW),
+         cutoff + 1, NOW - 1),
     ]
 
     class Cursor:
@@ -320,4 +320,7 @@ def test_v2_builder_materializes_provider_time_and_rejects_unproven_rows(monkeyp
         ("q4_stat_arb", cutoff - 2),
         ("q1_momentum", cutoff),
     ]
+    targets = captured["30S"]["targets"]
+    assert len(targets) == 3
+    assert {row.resolved_epoch for row in targets} == {NOW - 1}
     assert "f.source_as_of_epoch" in connection.cursor_value.statements[2][0]

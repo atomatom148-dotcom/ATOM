@@ -65,10 +65,11 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertIn("o.realized_move_bps", metric_sql)
         self.assertIn("NULL::double precision AS directional_accuracy", metric_sql)
         self.assertNotIn("outcome_bps", metric_sql)
-        self.assertEqual(metric_parameters, (100.0,) * 13)
+        self.assertEqual(metric_parameters, (100.0,) * 14)
         self.assertIn("read_legacy_evidence_publication", metric_sql)
         self.assertIn("VOLATILITY_FORECAST", metric_sql)
         self.assertIn("VOLATILITY_OUTCOME", metric_sql)
+        self.assertIn("fp.commit_observed_at <= to_timestamp(%s)", metric_sql)
 
     def test_result_is_frozen_and_exact_cohort_fields_are_preserved(self):
         cursor = Cursor((
@@ -93,8 +94,9 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertIn("read_legacy_evidence_publication", sql)
         self.assertIn("DIRECTIONAL_FORECAST", sql)
         self.assertIn("DIRECTIONAL_OUTCOME", sql)
+        self.assertIn("fp.commit_observed_at <= to_timestamp(%s)", sql)
         self.assertIn("GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon", sql)
-        self.assertEqual(cursor.executions[0][1], (123.5,) * 15)
+        self.assertEqual(cursor.executions[0][1], (123.5,) * 16)
         self.assertEqual(sql.count("f.maturity_epoch <= %s"), 8)
         self.assertEqual(sql.count("o.resolved_epoch <= %s"), 6)
         self.assertIn("NULLIF(count(*) FILTER", sql)
@@ -277,11 +279,12 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertEqual(len(cursor.executions), 2)
         sql, parameters = cursor.executions[1]
         normalized = " ".join(sql.split())
-        self.assertEqual(parameters, (123.5, 123.5, 123.5))
+        self.assertEqual(parameters, (123.5, 123.5, 123.5, 123.5))
         self.assertIn("f.maturity_epoch <= %s", normalized)
         self.assertIn("read_legacy_evidence_publication", normalized)
         self.assertIn("DIRECTIONAL_FORECAST", normalized)
         self.assertIn("DIRECTIONAL_OUTCOME", normalized)
+        self.assertIn("fp.commit_observed_at <= to_timestamp(%s)", normalized)
         self.assertIn("o.resolved_epoch <= %s", normalized)
         self.assertIn("f.cutoff_epoch, f.forecast_id", normalized)
         self.assertRegex(normalized, r"ORDER BY .* f.cutoff_epoch, f.forecast_id")

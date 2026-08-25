@@ -164,10 +164,18 @@ class PostgresEvidenceStore:
                             """,
                             (observation_epoch, resolution_symbol),
                         )
-        except Exception:
-            # A gated or unavailable proof facility must not promote evidence.
-            # Readers fail closed because no authoritative proof row exists.
-            return
+        except Exception as error:
+            # A deliberately unapplied protected migration leaves these objects
+            # absent; readers then fail closed because no proof can exist.
+            if getattr(error, "sqlstate", None) in {
+                "3F000",  # invalid_schema_name
+                "42P01",  # undefined_table
+                "42883",  # undefined_function
+            }:
+                return
+            # Transient database failures must reach the worker retry loop so a
+            # committed ledger row is not permanently left without its proof.
+            raise
 
     def record_cycle_and_resolve(
         self, forecasts: Sequence[ForecastRecord], *, observation_epoch: float,
@@ -397,7 +405,8 @@ class PostgresEvidenceStore:
                         WHERE o.forecast_id=f.forecast_id
                           AND op.commit_observed_at<=to_timestamp(%s)
                     ) AS o ON true
-                    WHERE fp.commit_observed_at < to_timestamp(f.maturity_epoch)
+                    WHERE fp.commit_observed_at <= to_timestamp(%s)
+                      AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                     GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon
                     ORDER BY f.quant_id, f.formula_version, f.symbol,
                              CASE f.horizon
@@ -406,7 +415,7 @@ class PostgresEvidenceStore:
                                  WHEN '30M' THEN 5 WHEN '1H' THEN 6
                              END
                     """,
-                    (as_of_epoch,) * 15,
+                    (as_of_epoch,) * 16,
                 )
                 rows = cursor.fetchall()
                 cursor.execute(
@@ -422,6 +431,7 @@ class PostgresEvidenceStore:
                         'DIRECTIONAL_OUTCOME', o.forecast_id
                     ) AS op ON true
                     WHERE f.maturity_epoch <= %s
+                      AND fp.commit_observed_at <= to_timestamp(%s)
                       AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                       AND op.commit_observed_at <= to_timestamp(%s)
                       AND o.resolved_epoch <= %s
@@ -433,7 +443,7 @@ class PostgresEvidenceStore:
                              END,
                              f.cutoff_epoch, f.forecast_id
                     """,
-                    (as_of_epoch, as_of_epoch, as_of_epoch),
+                    (as_of_epoch, as_of_epoch, as_of_epoch, as_of_epoch),
                 )
                 effective_rows = cursor.fetchall()
 
@@ -521,7 +531,8 @@ class PostgresEvidenceStore:
                         WHERE o.forecast_id=f.forecast_id
                           AND op.commit_observed_at<=to_timestamp(%s)
                     ) AS o ON true
-                    WHERE fp.commit_observed_at < to_timestamp(f.maturity_epoch)
+                    WHERE fp.commit_observed_at <= to_timestamp(%s)
+                      AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                     GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon
                     ORDER BY f.quant_id, f.formula_version, f.symbol,
                              CASE f.horizon
@@ -530,7 +541,7 @@ class PostgresEvidenceStore:
                                  WHEN '30M' THEN 5 WHEN '1H' THEN 6
                              END
                     """,
-                    (as_of_epoch,) * 13,
+                    (as_of_epoch,) * 14,
                 )
                 rows = cursor.fetchall()
                 cursor.execute(
@@ -546,6 +557,7 @@ class PostgresEvidenceStore:
                         'VOLATILITY_OUTCOME', o.forecast_id
                     ) AS op ON true
                     WHERE f.maturity_epoch <= %s
+                      AND fp.commit_observed_at <= to_timestamp(%s)
                       AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                       AND op.commit_observed_at <= to_timestamp(%s)
                       AND o.resolved_epoch <= %s
@@ -557,7 +569,7 @@ class PostgresEvidenceStore:
                              END,
                              f.cutoff_epoch, f.forecast_id
                     """,
-                    (as_of_epoch, as_of_epoch, as_of_epoch),
+                    (as_of_epoch, as_of_epoch, as_of_epoch, as_of_epoch),
                 )
                 effective_rows = cursor.fetchall()
 

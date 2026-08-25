@@ -35,6 +35,21 @@ FOR EACH STATEMENT EXECUTE FUNCTION atom_v9_internal.reject_commit_proof_mutatio
 -- Supabase-compatible ownership handoff for SECURITY DEFINER functions.
 GRANT CREATE ON SCHEMA atom_v9_internal TO atom_v9_proof_owner;
 
+GRANT SELECT ON public.forecasts, public.forecast_outcomes,
+    public.volatility_forecasts, public.volatility_forecast_outcomes
+TO atom_v9_proof_owner;
+
+CREATE POLICY forecasts_proof_owner_select
+ON public.forecasts FOR SELECT TO atom_v9_proof_owner USING (true);
+CREATE POLICY forecast_outcomes_proof_owner_select
+ON public.forecast_outcomes FOR SELECT TO atom_v9_proof_owner USING (true);
+CREATE POLICY volatility_forecasts_proof_owner_select
+ON public.volatility_forecasts FOR SELECT TO atom_v9_proof_owner USING (true);
+CREATE POLICY volatility_outcomes_proof_owner_select
+ON public.volatility_forecast_outcomes
+FOR SELECT TO atom_v9_proof_owner USING (true);
+
+
 CREATE FUNCTION atom_v9_internal.record_legacy_evidence_publication(
     p_kind text, p_id bigint
 ) RETURNS void

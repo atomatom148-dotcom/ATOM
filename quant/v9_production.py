@@ -175,6 +175,14 @@ class PostgresV2StateBuilder:
         observations_by_horizon: dict[str, list[RawFamilyObservation]] = {
             h: [] for h in HORIZONS
         }
+        target_available_by_identity: dict[TargetIdentity, float] = {}
+        for row in directional_rows:
+            identity = TargetIdentity(str(row[3]), float(row[6]), float(row[7]))
+            available = float(row[16])
+            target_available_by_identity[identity] = max(
+                available, target_available_by_identity.get(identity, available),
+            )
+
         for row in directional_rows:
             (record_id, quant_id, formula_version, cycle_id, symbol, horizon,
              cutoff, maturity, value, created, schema, source, source_as_of,
@@ -186,7 +194,8 @@ class PostgresV2StateBuilder:
             targets_by_horizon[str(horizon)].append(RawTarget(
                 int(record_id), str(cycle_id), str(symbol), TARGET_SPEC_ID,
                 str(schema), str(source), str(horizon), float(cutoff),
-                float(maturity), float(outcome_available), float(outcome),
+                float(maturity), target_available_by_identity[identity],
+                float(outcome),
             ))
             if (str(quant_id) in {"q4_stat_arb", "q10_options_vol"} and
                     source_as_of is None):
