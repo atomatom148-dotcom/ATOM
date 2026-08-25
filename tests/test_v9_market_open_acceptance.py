@@ -7,6 +7,7 @@ import json
 import math
 import os
 import time
+from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
@@ -407,6 +408,27 @@ def _poll_verified_outcome(database_url: str, forecast):
     )
 
 
+def test_market_open_workflow_scopes_credentials_and_pins_dependencies():
+    workflow = Path(".github/workflows/v9-market-open-acceptance.yml").read_text(
+        encoding="utf-8"
+    )
+    job_header, _steps = workflow.split("    steps:", 1)
+    assert "DATABASE_URL:" not in job_header
+    assert "ATOM_V9_RUNTIME_DATABASE_URL" not in workflow
+    assert "ATOM_V9_ACCEPTANCE_READONLY_DATABASE_URL" in workflow
+    assert "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" in workflow
+    assert "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065" in workflow
+    assert "--only-binary=:all:" in workflow
+    requirements = Path(".github/requirements/v9-market-open.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert requirements == [
+        "exchange-calendars==4.13.2",
+        "psycopg[binary]==3.3.4",
+        "pytest==9.1.1",
+    ]
+
+
 @market_open_only
 def test_market_open_database_backed_v1_through_website_and_verified_outcome():
     _skip_if_xnys_closed()
@@ -436,8 +458,8 @@ def test_market_open_database_backed_v1_through_website_and_verified_outcome():
 
     current_user, privileges = _database_read(
         database_url, runtime_permissions, deadline=time.monotonic() + 45)
-    assert current_user == "atom_v9_v4_runtime"
-    assert privileges == (True, True, False, False)
+    assert current_user != "atom_v9_v4_runtime"
+    assert privileges == (True, False, False, False)
     baseline_surplus = _logical_duplicate_surplus(
         database_url, deadline=time.monotonic() + 45)
 
