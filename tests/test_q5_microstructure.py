@@ -12,6 +12,7 @@ class MicrostructureTests(unittest.TestCase):
         for sizes, sign in (([(3,1),(3,1)], 1), ([(1,3),(1,3)], -1), ([(2,2),(2,2)], 0)):
             result = calculate_microstructure(self.history(sizes), cutoff_epoch=10)
             self.assertEqual(len(result.forecast_bps), 6)
+            self.assertEqual(result.source_as_of_epoch, 10)
             self.assertEqual((result.forecast_bps[0] > 0)-(result.forecast_bps[0] < 0), sign)
 
     def test_missing_zero_depth_future_and_immutability(self):
@@ -22,6 +23,7 @@ class MicrostructureTests(unittest.TestCase):
         result = calculate_microstructure(history, cutoff_epoch=10)
         self.assertGreater(result.forecast_bps[0], 0)
         self.assertEqual(history.observations, original)
+        self.assertIsNone(calculate_microstructure(history, cutoff_epoch=11))
 
     def test_invalid_quotes_and_history_order_rejected(self):
         invalid = ((0, 0, 2, 1, 1), (0, 2, 1, 1, 1), (0, 1, 2, -1, 1), (float('nan'),1,2,1,1))

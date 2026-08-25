@@ -26,6 +26,7 @@ class FactorResult:
     beta: float
     current_qqq_return: float
     factor_return: float
+    source_as_of_epoch: float | None = None
 
 
 def _synchronize(coin: tuple[MidpointObservation, ...], qqq: tuple[MidpointObservation, ...]):
@@ -49,6 +50,8 @@ def calculate_factor(
     coin = coin_history.within(cutoff=cutoff_epoch, lookback=LOOKBACK_SECONDS)
     qqq = tuple(item for item in qqq_history.observations if item.event_epoch <= cutoff_epoch)
     pairs = _synchronize(coin, qqq)
+    if not pairs or pairs[-1][0].event_epoch != cutoff_epoch:
+        return None
     returns = tuple(
         (math.log(current[1].midpoint / previous[1].midpoint),
          math.log(current[0].midpoint / previous[0].midpoint))
@@ -73,6 +76,7 @@ def calculate_factor(
     return FactorResult(
         QUANT_ID, FORMULA_VERSION, cutoff_epoch, forecasts,
         alpha, beta, current_signal, factor_return,
+        source_as_of_epoch=pairs[-1][1].event_epoch,
     )
 
 

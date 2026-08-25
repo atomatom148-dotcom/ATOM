@@ -26,6 +26,7 @@ class RelativeValueResult:
     historical_relative_mean: float
     current_relative_return: float
     relative_displacement: float
+    source_as_of_epoch: float | None = None
 
 
 def _synchronize(
@@ -51,6 +52,8 @@ def calculate_relative_value(
     coin = coin_history.within(cutoff=cutoff_epoch, lookback=LOOKBACK_SECONDS)
     qqq = tuple(item for item in qqq_history.observations if item.event_epoch <= cutoff_epoch)
     pairs = _synchronize(coin, qqq)
+    if not pairs or pairs[-1][0].event_epoch != cutoff_epoch:
+        return None
     if len(pairs) < MIN_SYNCHRONIZED_OBSERVATIONS:
         return None
     relative_returns = tuple(
@@ -77,6 +80,7 @@ def calculate_relative_value(
     return RelativeValueResult(
         QUANT_ID, FORMULA_VERSION, cutoff_epoch, forecasts,
         historical_relative_mean, current_relative_return, displacement,
+        source_as_of_epoch=pairs[-1][1].event_epoch,
     )
 
 
