@@ -859,11 +859,13 @@ class EvidenceLedgerWorker:
 
     def _validated_forecasts(self, rows, *, invalid_metric: str) -> list[V4ForecastRecord]:
         recovered = []
+        proof_reader = V4AWriter(self._connection)
         for expected_hash, payload in rows:
             try:
                 record = deserialize_forecast_record(
                     payload, expected_hash=str(expected_hash))
-            except ValueError:
+                record = proof_reader.read_forecast_commit_proof(record)
+            except (ValueError, LookupError):
                 self.metrics.increment(invalid_metric)
                 continue
             if record.persistence_proof_eligible is True:
@@ -1502,11 +1504,15 @@ class EvidenceLedgerWorker:
         finalized = []
         for forecast in item.v4:
             stored = self._writer.persist_forecast(forecast, self._clock())
-            if self._writer.last_write_status in {
+            write_status = self._writer.last_write_status
+            if write_status in {
                     "FORECAST_DUPLICATE_CONFLICT", "OUTCOME_CONFLICT"}:
-                raise TerminalDeliveryError(self._writer.last_write_status)
-            status = ("INSERTED" if self._writer.last_write_status == "INSERT"
-                      else self._writer.last_write_status)
+                raise TerminalDeliveryError(write_status)
+            proof_recorder = getattr(
+                self._writer, "record_forecast_commit_proof", None)
+            if write_status in {"INSERT", "IDEMPOTENT"} and callable(proof_recorder):
+                stored = proof_recorder(stored)
+            status = ("INSERTED" if write_status == "INSERT" else write_status)
             finalized.append(FinalizedV4PersistenceResult(
                 forecast.horizon, status, stored))
             if (stored.persistence_proof_eligible is True and

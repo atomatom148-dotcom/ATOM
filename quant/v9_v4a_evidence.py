@@ -29,6 +29,9 @@ EVIDENCE_ORIGINS = frozenset(("PRODUCTION", "CAUSAL_REPLAY"))
 TARGET_TIMING_REASON = "TARGET_TIMING_UNVERIFIED"
 TARGET_TIMING_METHOD_VERSION = "ATOM_TRUE_V9_V4_TARGET_FIRST_AT_OR_AFTER_1"
 OVERLAP_METHOD_VERSION = "ATOM_TRUE_V9_V4_OVERLAP_1"
+COMMIT_PROOF_METHOD = "POST_COMMIT_DB_OBSERVATION_V1"
+COMMIT_PROOF_MISSING_REASON = "FORECAST_COMMIT_PROOF_MISSING"
+COMMIT_PROOF_LATE_REASON = "FORECAST_COMMITTED_AT_OR_AFTER_TARGET_ENDPOINT"
 
 
 def _timestamp(value: datetime) -> str:
@@ -326,8 +329,12 @@ def build_outcome(*, forecast: ForecastRecord, target_identity: str,
         target_resolved_at >= endpoint_observation_at
     )
     reasons = [] if timing_verified else [TARGET_TIMING_REASON]
-    if forecast.persisted_at is None or forecast.persisted_at > forecast.target_endpoint:
-        reasons.append("FORECAST_PERSISTED_AFTER_TARGET_ENDPOINT")
+    if forecast.persistence_proof_eligible is not True:
+        reasons.append(forecast.persistence_reason or COMMIT_PROOF_MISSING_REASON)
+    elif forecast.persisted_at is None:
+        reasons.append(COMMIT_PROOF_MISSING_REASON)
+    elif forecast.persisted_at >= forecast.target_endpoint:
+        reasons.append(COMMIT_PROOF_LATE_REASON)
     if actual_return_bps is not None and (
             isinstance(actual_return_bps, bool) or
             not isinstance(actual_return_bps, (int, float)) or
@@ -422,11 +429,81 @@ class V4AWriter:
             ("ATOM_TRUE_V9_V4A_LOGICAL_LOCK_1", namespace, logical_key))
         return int.from_bytes(bytes.fromhex(digest[:16]), "big", signed=True)
 
+    @staticmethod
+    def _without_commit_proof(record: ForecastRecord) -> ForecastRecord:
+        return replace(
+            record,
+            persisted_at=None,
+            persistence_proof_eligible=False,
+            persistence_reason=COMMIT_PROOF_MISSING_REASON,
+        )
+
+    @staticmethod
+    def _apply_commit_proof(record: ForecastRecord, row) -> ForecastRecord:
+        if row is None or len(row) != 6:
+            return V4AWriter._without_commit_proof(record)
+        (record_id, record_hash, observed_at, target_endpoint,
+         proof_eligible, proof_method) = row
+        if (str(record_id) != record.forecast_record_id or
+                str(record_hash) != record.forecast_record_hash or
+                target_endpoint != record.target_endpoint or
+                proof_method != COMMIT_PROOF_METHOD or
+                not isinstance(observed_at, datetime) or
+                observed_at.tzinfo is None):
+            raise ValueError("forecast commit proof failed integrity validation")
+        eligible = bool(proof_eligible) and observed_at < target_endpoint
+        return replace(
+            record,
+            persisted_at=observed_at,
+            persistence_proof_eligible=eligible,
+            persistence_reason=None if eligible else COMMIT_PROOF_LATE_REASON,
+        )
+
+    def record_forecast_commit_proof(self, record: ForecastRecord) -> ForecastRecord:
+        """Observe a previously committed forecast in a separate transaction."""
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(
+                "SELECT forecast_record_id, forecast_record_hash, "
+                "commit_observed_at, target_endpoint, proof_eligible, proof_method "
+                "FROM atom_v9_internal.record_forecast_commit_proof(%s)",
+                (record.forecast_record_id,),
+            )
+            row = cursor.fetchone()
+            _commit_if_supported(self.connection)
+            return self._apply_commit_proof(record, row)
+        except Exception:
+            _rollback_if_supported(self.connection)
+            raise
+        finally:
+            _close_if_supported(cursor)
+
+    def read_forecast_commit_proof(self, record: ForecastRecord) -> ForecastRecord:
+        """Hydrate eligibility only from the narrow authoritative proof reader."""
+        cursor = self.connection.cursor()
+        try:
+            # DB-API cursors provide fetchone(). The fallback preserves narrow
+            # unit-test doubles only; production never trusts embedded JSON.
+            if not callable(getattr(cursor, "fetchone", None)):
+                return (record if record.persistence_proof_eligible is True
+                        else self._without_commit_proof(record))
+            cursor.execute(
+                "SELECT forecast_record_id, forecast_record_hash, "
+                "commit_observed_at, target_endpoint, proof_eligible, proof_method "
+                "FROM atom_v9_internal.read_forecast_commit_proof(%s)",
+                (record.forecast_record_id,),
+            )
+            row = cursor.fetchone()
+            _commit_if_supported(self.connection)
+            return self._apply_commit_proof(record, row)
+        except Exception:
+            _rollback_if_supported(self.connection)
+            raise
+        finally:
+            _close_if_supported(cursor)
+
     def persist_forecast(self, record: ForecastRecord, persisted_at: datetime) -> ForecastRecord:
-        eligible = persisted_at <= record.target_endpoint
-        stored = replace(record, persisted_at=persisted_at,
-                         persistence_proof_eligible=eligible,
-                         persistence_reason=None if eligible else "FORECAST_PERSISTED_AFTER_TARGET_ENDPOINT")
+        stored = self._without_commit_proof(record)
         cursor = self.connection.cursor()
         try:
             cursor.execute(
@@ -448,8 +525,8 @@ class V4AWriter:
                 _commit_if_supported(self.connection)
                 original = next(row for row in rows if row[0] == record.forecast_record_hash)
                 if len(original) > 1 and original[1] is not None:
-                    return deserialize_forecast_record(
-                        original[1], expected_hash=record.forecast_record_hash)
+                    return self._without_commit_proof(deserialize_forecast_record(
+                        original[1], expected_hash=record.forecast_record_hash))
                 return stored
             if distinct_hashes:
                 self.last_write_status = "FORECAST_DUPLICATE_CONFLICT"
