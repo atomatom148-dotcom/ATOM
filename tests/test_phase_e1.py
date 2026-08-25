@@ -65,7 +65,11 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertIn("o.realized_move_bps", metric_sql)
         self.assertIn("NULL::double precision AS directional_accuracy", metric_sql)
         self.assertNotIn("outcome_bps", metric_sql)
-        self.assertEqual(metric_parameters, (100.0,) * 12)
+        self.assertEqual(metric_parameters, (100.0,) * 14)
+        self.assertIn("read_legacy_evidence_publication", metric_sql)
+        self.assertIn("VOLATILITY_FORECAST", metric_sql)
+        self.assertIn("VOLATILITY_OUTCOME", metric_sql)
+        self.assertIn("fp.commit_observed_at <= to_timestamp(%s)", metric_sql)
 
     def test_result_is_frozen_and_exact_cohort_fields_are_preserved(self):
         cursor = Cursor((
@@ -86,9 +90,13 @@ class PhaseEStoreTests(unittest.TestCase):
         cursor = Cursor()
         store_with(cursor).phase_e_cohorts(123.5)
         sql = " ".join(cursor.executions[0][0].split())
-        self.assertIn("LEFT JOIN forecast_outcomes AS o USING (forecast_id)", sql)
+        self.assertIn("LEFT JOIN LATERAL", sql)
+        self.assertIn("read_legacy_evidence_publication", sql)
+        self.assertIn("DIRECTIONAL_FORECAST", sql)
+        self.assertIn("DIRECTIONAL_OUTCOME", sql)
+        self.assertIn("fp.commit_observed_at <= to_timestamp(%s)", sql)
         self.assertIn("GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon", sql)
-        self.assertEqual(cursor.executions[0][1], (123.5,) * 14)
+        self.assertEqual(cursor.executions[0][1], (123.5,) * 16)
         self.assertEqual(sql.count("f.maturity_epoch <= %s"), 8)
         self.assertEqual(sql.count("o.resolved_epoch <= %s"), 6)
         self.assertIn("NULLIF(count(*) FILTER", sql)
@@ -214,7 +222,7 @@ class PhaseEStoreTests(unittest.TestCase):
         store_with(cursor).phase_e_cohorts(1.0)
         sql = re.sub(r"--[^\n]*|/\*.*?\*/", "", cursor.executions[0][0],
                      flags=re.DOTALL).upper()
-        self.assertEqual(len(re.findall(r"\bSELECT\b", sql)), 1)
+        self.assertTrue(sql.lstrip().startswith("SELECT"))
         for forbidden in ("INSERT", "UPDATE", "DELETE", "ALTER", "DROP", "CREATE", "TRUNCATE"):
             self.assertIsNone(re.search(rf"\b{forbidden}\b", sql))
         normalized = " ".join(sql.split())
@@ -271,9 +279,12 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertEqual(len(cursor.executions), 2)
         sql, parameters = cursor.executions[1]
         normalized = " ".join(sql.split())
-        self.assertEqual(parameters, (123.5, 123.5))
+        self.assertEqual(parameters, (123.5, 123.5, 123.5, 123.5))
         self.assertIn("f.maturity_epoch <= %s", normalized)
-        self.assertIn("o.forecast_id IS NOT NULL", normalized)
+        self.assertIn("read_legacy_evidence_publication", normalized)
+        self.assertIn("DIRECTIONAL_FORECAST", normalized)
+        self.assertIn("DIRECTIONAL_OUTCOME", normalized)
+        self.assertIn("fp.commit_observed_at <= to_timestamp(%s)", normalized)
         self.assertIn("o.resolved_epoch <= %s", normalized)
         self.assertIn("f.cutoff_epoch, f.forecast_id", normalized)
         self.assertRegex(normalized, r"ORDER BY .* f.cutoff_epoch, f.forecast_id")
