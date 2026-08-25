@@ -248,7 +248,21 @@ def test_worker_recovers_cross_deploy_forecast_in_exact_provider_bracket():
             if "f.horizon IN" in self.sql:
                 return rows
             return ()
-        def fetchone(self): return (True,)
+        def fetchone(self):
+            if "read_forecast_commit_proof" in self.sql:
+                forecast = next(
+                    item for item in forecasts
+                    if item.forecast_record_id == self.params[0]
+                )
+                return (
+                    forecast.forecast_record_id,
+                    forecast.forecast_record_hash,
+                    forecast.persisted_at,
+                    forecast.target_endpoint,
+                    True,
+                    "POST_COMMIT_DB_OBSERVATION_V1",
+                )
+            return (True,)
         def close(self): pass
     class Connection(_WorkerConnection):
         def __init__(self): self.queries = []
@@ -786,7 +800,8 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
         (forecast.cohort_id, forecast.cohort_hash) for forecast in forecasts))
 
     class Cursor:
-        def execute(self, sql, _params): self.sql = sql
+        def execute(self, sql, params):
+            self.sql, self.params = sql, params
         def fetchall(self):
             if "WITH recent_outcomes" in self.sql:
                 assert "LEFT JOIN eligible_cycles" in self.sql
@@ -800,7 +815,21 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
                 return (("QQQ", combined_id,
                          latest_created_at + timedelta(minutes=1)),)
             return ()
-        def fetchone(self): return (True,)
+        def fetchone(self):
+            if "read_forecast_commit_proof" in self.sql:
+                forecast = next(
+                    item for item in forecasts
+                    if item.forecast_record_id == self.params[0]
+                )
+                return (
+                    forecast.forecast_record_id,
+                    forecast.forecast_record_hash,
+                    forecast.persisted_at,
+                    forecast.target_endpoint,
+                    True,
+                    "POST_COMMIT_DB_OBSERVATION_V1",
+                )
+            return (True,)
         def close(self): pass
     class Connection(_WorkerConnection):
         def cursor(self): return Cursor()
