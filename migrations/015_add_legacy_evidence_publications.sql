@@ -3,6 +3,10 @@
 SET LOCAL lock_timeout = '2s';
 SET LOCAL statement_timeout = '15s';
 
+-- Supabase's migration executor must temporarily be able to transfer the
+-- SECURITY DEFINER functions to the controlled NOLOGIN owner.
+GRANT atom_v9_proof_owner TO postgres;
+
 CREATE TABLE atom_v9_internal.legacy_evidence_publications (
     evidence_kind text NOT NULL CHECK (evidence_kind IN (
         'DIRECTIONAL_FORECAST', 'DIRECTIONAL_OUTCOME',
@@ -122,3 +126,4 @@ GRANT EXECUTE ON FUNCTION
 TO atom_v9_v4_runtime;
 
 REVOKE CREATE ON SCHEMA atom_v9_internal FROM atom_v9_proof_owner;
+REVOKE atom_v9_proof_owner FROM postgres;
