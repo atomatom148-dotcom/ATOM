@@ -63,10 +63,13 @@ def calculate_cross_asset(
     betas = []
     for lag in LEAD_LAGS_SECONDS:
         regression_pairs = []
+        lagged_index = -1
         for ending, coin_return, _ in returns:
-            lagged = next((item for item in reversed(returns) if item[0] <= ending - lag), None)
-            if lagged is not None:
-                regression_pairs.append((lagged[2], coin_return))
+            while (lagged_index + 1 < len(returns) and
+                   returns[lagged_index + 1][0] <= ending - lag):
+                lagged_index += 1
+            if lagged_index >= 0:
+                regression_pairs.append((returns[lagged_index][2], coin_return))
         denominator = sum(x * x for x, _ in regression_pairs)
         if denominator <= 0:
             return None
