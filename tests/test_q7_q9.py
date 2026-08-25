@@ -84,6 +84,7 @@ def nested_cross_asset_reference(coin_history, qqq_history, *, cutoff_epoch):
     return CrossAssetResult(
         Q8_QUANT_ID, Q8_FORMULA_VERSION, cutoff_epoch, forecasts,
         betas[0], betas[1], current_signal, lead_signal,
+        source_as_of_epoch=pairs[-1][1].event_epoch,
     )
 
 
@@ -108,6 +109,8 @@ class RelativeValueTests(unittest.TestCase):
         expected = -10_000 * (1 - math.exp(-30 / 900)) * result.relative_displacement
         self.assertAlmostEqual(result.forecast_bps[0], expected)
         self.assertEqual(original, (coin.observations, qqq.observations))
+        self.assertEqual(result.source_as_of_epoch, 570)
+        self.assertIsNone(calculate_relative_value(coin, qqq, cutoff_epoch=571))
 
     def test_negative_displacement_reverts_positive(self):
         q_returns = [0.001] * 19
@@ -182,6 +185,8 @@ class CrossAssetTests(unittest.TestCase):
         self.assertAlmostEqual(result.forecast_bps[0] * 2, result.forecast_bps[1])
         self.assertTrue(all(value == result.forecast_bps[1] for value in result.forecast_bps[1:]))
         self.assertEqual(original, (coin.observations, qqq.observations))
+        self.assertEqual(result.source_as_of_epoch, 960)
+        self.assertIsNone(calculate_cross_asset(coin, qqq, cutoff_epoch=961))
 
     def test_negative_current_signal_and_failure_rules(self):
         q_returns = [0.001 + i * 0.00001 for i in range(31)] + [-0.001]
@@ -209,6 +214,8 @@ class FactorTests(unittest.TestCase):
         self.assertAlmostEqual(result.forecast_bps[0] * 2, result.forecast_bps[1])
         self.assertTrue(all(value == result.forecast_bps[1] for value in result.forecast_bps[1:]))
         self.assertEqual(original, (coin.observations, qqq.observations))
+        self.assertEqual(result.source_as_of_epoch, 900)
+        self.assertIsNone(calculate_factor(coin, qqq, cutoff_epoch=901))
 
     def test_negative_stale_minimum_and_denominator_rules(self):
         q_returns = [0.001 + 0.0001 * math.sin(i) for i in range(29)] + [-0.01]

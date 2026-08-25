@@ -16,6 +16,7 @@ class VolumeLiquidityTests(unittest.TestCase):
         self.assertEqual(result.mean_depth, 4)
         self.assertEqual(len(result.forecast_bps), 6)
         self.assertGreater(result.forecast_bps[0], 0)
+        self.assertEqual(result.source_as_of_epoch, 10)
         negative = QuoteHistory((QuoteObservation(0,99,101,1,3), QuoteObservation(10,99,101,1,3)))
         self.assertLess(calculate_volume_liquidity(negative, cutoff_epoch=10).forecast_bps[0], 0)
 
@@ -28,6 +29,7 @@ class VolumeLiquidityTests(unittest.TestCase):
         original = history.observations
         self.assertGreater(calculate_volume_liquidity(history, cutoff_epoch=10).forecast_bps[0], 0)
         self.assertEqual(history.observations, original)
+        self.assertIsNone(calculate_volume_liquidity(history, cutoff_epoch=11))
 
 
 if __name__ == '__main__': unittest.main()

@@ -27,6 +27,7 @@ class CrossAssetResult:
     beta_60: float
     current_qqq_return: float
     lead_signal: float
+    source_as_of_epoch: float | None = None
 
 
 def _synchronize(coin: tuple[MidpointObservation, ...], qqq: tuple[MidpointObservation, ...]):
@@ -50,6 +51,8 @@ def calculate_cross_asset(
     coin = coin_history.within(cutoff=cutoff_epoch, lookback=LOOKBACK_SECONDS)
     qqq = tuple(item for item in qqq_history.observations if item.event_epoch <= cutoff_epoch)
     pairs = _synchronize(coin, qqq)
+    if not pairs or pairs[-1][0].event_epoch != cutoff_epoch:
+        return None
     returns = tuple(
         (current[0].event_epoch,
          math.log(current[0].midpoint / previous[0].midpoint),
@@ -85,6 +88,7 @@ def calculate_cross_asset(
     return CrossAssetResult(
         QUANT_ID, FORMULA_VERSION, cutoff_epoch, forecasts,
         betas[0], betas[1], current_signal, lead_signal,
+        source_as_of_epoch=pairs[-1][1].event_epoch,
     )
 
 

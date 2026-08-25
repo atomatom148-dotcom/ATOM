@@ -22,6 +22,7 @@ class VolumeLiquidityResult:
     liquidity_factor: float
     mean_relative_spread_bps: float
     mean_depth: float
+    source_as_of_epoch: float | None = None
 
 
 def quote_liquidity(quote: QuoteObservation) -> tuple[float, float, float] | None:
@@ -38,7 +39,7 @@ def calculate_volume_liquidity(history: QuoteHistory, *, cutoff_epoch: float) ->
     """Map causal five-minute quote liquidity to exact-six BPS forecasts."""
 
     observations = history.within(cutoff=cutoff_epoch, lookback=LOOKBACK_SECONDS)
-    if len(observations) < 2:
+    if len(observations) < 2 or observations[-1].event_epoch != cutoff_epoch:
         return None
     values = tuple(quote_liquidity(item) for item in observations)
     if any(value is None for value in values):
@@ -52,6 +53,7 @@ def calculate_volume_liquidity(history: QuoteHistory, *, cutoff_epoch: float) ->
     return VolumeLiquidityResult(
         QUANT_ID, FORMULA_VERSION, cutoff_epoch, forecasts,
         liquidity_factor, mean_spread, mean_depth,
+        source_as_of_epoch=observations[-1].event_epoch,
     )
 
 

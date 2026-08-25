@@ -19,7 +19,10 @@ NOW = 1_800_000_000.0
 
 
 def _live_snapshot():
-    directional = SimpleNamespace(forecast_bps=tuple(float(i) for i in range(6)))
+    directional = SimpleNamespace(
+        forecast_bps=tuple(float(i) for i in range(6)),
+        source_as_of_epoch=NOW,
+    )
     q4 = SimpleNamespace(
         forecast_bps=directional.forecast_bps, source_as_of_epoch=NOW - 2.0,
     )
@@ -72,10 +75,17 @@ def test_live_v1_has_exact_72_typed_current_slots_and_v2_identity():
     source_times = {
         quant_id: {slot.source_as_of_at.timestamp() for slot in v1.slots
                    if slot.quant_id == quant_id}
-        for quant_id in ("q4_stat_arb", "q10_options_vol")
+        for quant_id in (
+            "q4_stat_arb", "q5_microstructure", "q6_volume_liquidity",
+            "q7_relative_value", "q8_cross_asset", "q9_factor",
+            "q10_options_vol",
+        )
     }
     assert source_times == {
-        "q4_stat_arb": {NOW - 2.0}, "q10_options_vol": {NOW - 3.0},
+        "q4_stat_arb": {NOW - 2.0},
+        "q5_microstructure": {NOW}, "q6_volume_liquidity": {NOW},
+        "q7_relative_value": {NOW}, "q8_cross_asset": {NOW},
+        "q9_factor": {NOW}, "q10_options_vol": {NOW - 3.0},
     }
 
 
@@ -83,7 +93,7 @@ def test_live_v1_has_exact_72_typed_current_slots_and_v2_identity():
 def test_live_v1_fails_closed_without_q4_or_q10_provider_time(family):
     snapshot = _live_snapshot()
     setattr(snapshot, family, SimpleNamespace(forecast_bps=(1.0,) * 6))
-    with pytest.raises(RuntimeError, match="PROVIDER_TIMESTAMP_UNAVAILABLE"):
+    with pytest.raises(RuntimeError, match="SOURCE_TIMESTAMP_UNAVAILABLE"):
         build_live_v1(snapshot, _v2_identity())
 
 
