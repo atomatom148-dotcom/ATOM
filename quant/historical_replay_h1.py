@@ -48,7 +48,7 @@ from .v9_v3_synthesis import synthesize_v3
 from .v9_v4a_evidence import canonical_sha256
 
 
-H1_RUNNER_VERSION = "ATOM-TRUE-V9-H1-RUNNER-1"
+H1_RUNNER_VERSION = "ATOM-TRUE-V9-H1-RUNNER-2"
 _NANOSECONDS = 1_000_000_000
 _REFRESH_NS = 3_600 * _NANOSECONDS
 _COMPLETE_EDGE_NS = 5 * _NANOSECONDS
@@ -69,6 +69,7 @@ _RESULT_NAMES = {
     "q12_event_session": "q12_event_session",
 }
 _FORMULA_VERSIONS = {**ALLOWED_FORMULA_VERSIONS, _Q10: Q10_VERSION}
+_SYMBOL_ORDER = {"COIN": 0, "QQQ": 1}
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +91,9 @@ class QuoteCoverage:
     last_quote_lead_ns: int | None
     p99_gap_ns: int | None
     max_gap_ns: int | None
+    max_gap_start_ns: int | None
+    max_gap_end_ns: int | None
+    over_limit_gap_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +166,7 @@ class H1ReplayReport:
     dataset_digest: str
     configuration_digest: str
     session_digest: str
+    execution_stage: str
     data_status: str
     data_reason_codes: tuple[str, ...]
     quote_counts: tuple[tuple[str, int], ...]
@@ -237,6 +242,69 @@ def _nearest_rank_p99(values: Iterable[int]) -> int | None:
     if not ordered:
         return None
     return ordered[max(0, math.ceil(0.99 * len(ordered)) - 1)]
+
+
+def _quote_coverage(
+    *, symbol: str, rows: tuple[HistoricalSipQuote, ...],
+    open_ns: int, close_ns: int,
+) -> QuoteCoverage:
+    gaps = tuple(
+        (previous.provider_event_ns, current.provider_event_ns,
+         current.provider_event_ns - previous.provider_event_ns)
+        for previous, current in zip(rows, rows[1:])
+    )
+    maximum = max(gaps, key=lambda item: item[2], default=None)
+    return QuoteCoverage(
+        symbol,
+        len(rows),
+        None if not rows else rows[0].provider_event_ns,
+        None if not rows else rows[-1].provider_event_ns,
+        None if not rows else rows[0].provider_event_ns - open_ns,
+        None if not rows else close_ns - rows[-1].provider_event_ns,
+        _nearest_rank_p99(item[2] for item in gaps),
+        None if maximum is None else maximum[2],
+        None if maximum is None else maximum[0],
+        None if maximum is None else maximum[1],
+        sum(item[2] > _COMPLETE_GAP_NS for item in gaps),
+    )
+
+
+def _validate_quote_sequence(
+    quotes: tuple[HistoricalSipQuote, ...], *, open_ns: int, close_ns: int,
+) -> None:
+    keys = tuple(
+        (row.provider_event_ns, _SYMBOL_ORDER[row.symbol]) for row in quotes
+    )
+    if any(current > following for current, following in zip(keys, keys[1:])):
+        raise ValueError("historical quotes must be in canonical chronological order")
+    if any(not open_ns <= row.provider_event_ns < close_ns for row in quotes):
+        raise ValueError("historical quote is outside the replay session")
+    last_by_symbol: dict[str, int] = {}
+    for row in quotes:
+        previous = last_by_symbol.get(row.symbol)
+        if previous is not None and row.provider_event_ns <= previous:
+            raise ValueError(
+                "historical quote timestamps must be strictly increasing")
+        last_by_symbol[row.symbol] = row.provider_event_ns
+
+
+def _coverage_reason_codes(
+    quote_coverage: tuple[QuoteCoverage, ...],
+) -> tuple[str, ...]:
+    reasons = []
+    for coverage in quote_coverage:
+        if coverage.count < 2:
+            reasons.append(f"{coverage.symbol}_INSUFFICIENT_QUOTES")
+        if (coverage.first_quote_delay_ns is None or
+                coverage.first_quote_delay_ns > _COMPLETE_EDGE_NS):
+            reasons.append(f"{coverage.symbol}_OPEN_EDGE_GAP")
+        if (coverage.last_quote_lead_ns is None or
+                coverage.last_quote_lead_ns > _COMPLETE_EDGE_NS):
+            reasons.append(f"{coverage.symbol}_CLOSE_EDGE_GAP")
+        if (coverage.max_gap_ns is None or
+                coverage.max_gap_ns > _COMPLETE_GAP_NS):
+            reasons.append(f"{coverage.symbol}_INTERQUOTE_GAP")
+    return tuple(sorted(reasons))
 
 
 def _cycle_id(frame: ReplayFrame) -> str:
@@ -425,6 +493,7 @@ def _configuration_digest(
 def run_h1_session(
     *, reader: object, session_open: datetime, session_close: datetime,
     replay_run_id: str, monotonic_clock: Callable[[], float] = time.perf_counter,
+    preflight_only: bool = False,
 ) -> H1ReplayReport:
     """Run one complete RTH session without any external write."""
 
@@ -432,6 +501,8 @@ def run_h1_session(
         raise ValueError("replay_run_id must be 1-128 characters")
     if not callable(getattr(reader, "read_session", None)):
         raise TypeError("reader must provide read_session")
+    if not isinstance(preflight_only, bool):
+        raise TypeError("preflight_only must be bool")
     open_ns, close_ns = _ns(session_open), _ns(session_close)
     local_open = session_open.astimezone(_EASTERN)
     local_close = session_close.astimezone(_EASTERN)
@@ -448,6 +519,7 @@ def run_h1_session(
     read_decode_seconds = _elapsed(monotonic_clock, started)
     if any(not isinstance(row, HistoricalSipQuote) for row in quotes):
         raise TypeError("reader returned a non-historical quote")
+    _validate_quote_sequence(quotes, open_ns=open_ns, close_ns=close_ns)
 
     quote_counts = tuple(
         (symbol, sum(row.symbol == symbol for row in quotes))
@@ -458,43 +530,13 @@ def run_h1_session(
         for symbol in ("COIN", "QQQ")
     }
     quote_coverage = tuple(
-        QuoteCoverage(
-            symbol,
-            len(rows),
-            None if not rows else rows[0].provider_event_ns,
-            None if not rows else rows[-1].provider_event_ns,
-            None if not rows else rows[0].provider_event_ns - open_ns,
-            None if not rows else close_ns - rows[-1].provider_event_ns,
-            _nearest_rank_p99(
-                current.provider_event_ns - previous.provider_event_ns
-                for previous, current in zip(rows, rows[1:])
-            ),
-            max((current.provider_event_ns - previous.provider_event_ns
-                 for previous, current in zip(rows, rows[1:])), default=None),
+        _quote_coverage(
+            symbol=symbol, rows=rows, open_ns=open_ns, close_ns=close_ns,
         )
         for symbol, rows in by_symbol.items()
     )
-    data_reasons = []
-    for coverage in quote_coverage:
-        if coverage.count < 2:
-            data_reasons.append(f"{coverage.symbol}_INSUFFICIENT_QUOTES")
-        if (coverage.first_quote_delay_ns is None or
-                coverage.first_quote_delay_ns > _COMPLETE_EDGE_NS):
-            data_reasons.append(f"{coverage.symbol}_OPEN_EDGE_GAP")
-        if (coverage.last_quote_lead_ns is None or
-                coverage.last_quote_lead_ns > _COMPLETE_EDGE_NS):
-            data_reasons.append(f"{coverage.symbol}_CLOSE_EDGE_GAP")
-        if (coverage.max_gap_ns is None or
-                coverage.max_gap_ns > _COMPLETE_GAP_NS):
-            data_reasons.append(f"{coverage.symbol}_INTERQUOTE_GAP")
-    data_reason_codes = tuple(sorted(data_reasons))
+    data_reason_codes = _coverage_reason_codes(quote_coverage)
     data_status = "CERTIFIED" if not data_reason_codes else "DATA_INCOMPLETE"
-    coin_quotes = by_symbol["COIN"]
-    if not coin_quotes:
-        raise RuntimeError("REPLAY_DATA_UNAVAILABLE")
-    coin_by_ns = {row.provider_event_ns: row for row in coin_quotes}
-    accepted_coin_quotes: list[HistoricalSipQuote] = []
-    accepted_coin_times: list[int] = []
     dataset_digest = canonical_sha256(tuple(
         (row.symbol, row.provider_event_ns, row.bid, row.ask,
          row.bid_size, row.ask_size, row.source, row.data_schema_version,
@@ -504,6 +546,63 @@ def run_h1_session(
     config_digest = _configuration_digest(
         session_open_ns=open_ns, session_close_ns=close_ns,
     )
+    first_quote_ns = tuple(
+        (symbol, rows[0].provider_event_ns if rows else None)
+        for symbol, rows in by_symbol.items()
+    )
+    last_quote_ns = tuple(
+        (symbol, rows[-1].provider_event_ns if rows else None)
+        for symbol, rows in by_symbol.items()
+    )
+    rth_seconds = (close_ns - open_ns) // _NANOSECONDS
+    if data_status != "CERTIFIED" or preflight_only:
+        execution_stage = (
+            "PREFLIGHT_REJECTED" if data_status != "CERTIFIED"
+            else "PREFLIGHT_ONLY"
+        )
+        report_data_status = (
+            data_status if execution_stage == "PREFLIGHT_REJECTED"
+            else "DATA_COMPLETE"
+        )
+        family_coverage = tuple(
+            FamilyCoverage(quant_id, horizon, 0, 0, 0)
+            for quant_id in QUANT_IDS for horizon in HORIZONS
+        )
+        v3_coverage = tuple(
+            V3Coverage(horizon, 0, 0, 0, 0) for horizon in HORIZONS
+        )
+        resolution_coverage = tuple(
+            ResolutionCoverage(horizon, 0, 0, 0, 0, 0, None, None)
+            for horizon in HORIZONS
+        )
+        session_digest = canonical_sha256({
+            "dataset_digest": dataset_digest,
+            "configuration_digest": config_digest,
+            "execution_stage": execution_stage,
+            "data_status": report_data_status,
+            "data_reason_codes": data_reason_codes,
+            "quote_coverage": quote_coverage,
+        })
+        total_seconds = _elapsed(monotonic_clock, total_started)
+        timings = ReplayTimings(
+            read_decode_seconds, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            total_seconds,
+        )
+        return H1ReplayReport(
+            H1_RUNNER_VERSION, replay_run_id, EVIDENCE_ORIGIN,
+            local_open.date().isoformat(), open_ns, close_ns,
+            dataset_digest, config_digest, session_digest, execution_stage,
+            report_data_status, data_reason_codes, quote_counts,
+            first_quote_ns, last_quote_ns, quote_coverage,
+            0, int(rth_seconds), 0.0, 0, 0.0, 0, 0.0,
+            family_coverage, v3_coverage, resolution_coverage, (), (),
+            "DATA_UNAVAILABLE", 0, timings, None, (),
+        )
+
+    coin_quotes = by_symbol["COIN"]
+    coin_by_ns = {row.provider_event_ns: row for row in coin_quotes}
+    accepted_coin_quotes: list[HistoricalSipQuote] = []
+    accepted_coin_times: list[int] = []
 
     family_mutable = {
         (quant_id, horizon): [0, 0]
@@ -781,6 +880,7 @@ def run_h1_session(
     session_digest = canonical_sha256({
         "dataset_digest": dataset_digest,
         "configuration_digest": config_digest,
+        "execution_stage": "REPLAY_COMPLETE",
         "stream_digest": stream_digest.hexdigest(),
         "resolution_digest": resolution_digest.hexdigest(),
         "data_status": data_status,
@@ -820,7 +920,7 @@ def run_h1_session(
     return H1ReplayReport(
         H1_RUNNER_VERSION, replay_run_id, EVIDENCE_ORIGIN,
         local_open.date().isoformat(), open_ns, close_ns,
-        dataset_digest, config_digest, session_digest,
+        dataset_digest, config_digest, session_digest, "REPLAY_COMPLETE",
         data_status, data_reason_codes, quote_counts,
         first_quote_ns, last_quote_ns, quote_coverage,
         frame_count, int(rth_seconds), frame_count / rth_seconds,
@@ -845,6 +945,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument("session", help="complete RTH session date (YYYY-MM-DD)")
     parser.add_argument("--run-id", help="replay run identity")
+    parser.add_argument(
+        "--preflight-only", action="store_true",
+        help="validate retained quote coverage without running V9",
+    )
     arguments = parser.parse_args(None if argv is None else tuple(argv))
     try:
         day = date.fromisoformat(arguments.session)
@@ -855,9 +959,16 @@ def main(argv: Iterable[str] | None = None) -> int:
         reader=AlpacaHistoricalSipReader.from_environment(),
         session_open=opened, session_close=closed,
         replay_run_id=arguments.run_id or f"h1-{day.isoformat()}",
+        preflight_only=arguments.preflight_only,
     )
     print(json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":")))
-    return 0 if report.data_status == "CERTIFIED" else 2
+    passed = (
+        (report.execution_stage == "PREFLIGHT_ONLY" and
+         report.data_status == "DATA_COMPLETE") or
+        (report.execution_stage == "REPLAY_COMPLETE" and
+         report.data_status == "CERTIFIED")
+    )
+    return 0 if passed else 2
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised through the CLI entry.

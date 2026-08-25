@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -47,13 +49,21 @@ class _Reader:
         return self.rows
 
 
-def _run(rows, *, run_id="h1-test"):
+def _run(rows, *, run_id="h1-test", enforce_preflight=False,
+         preflight_only=False):
+    import quant.historical_replay_h1 as module
+
     opened, closed = _session()
     reader = _Reader(rows)
-    report = run_h1_session(
-        reader=reader, session_open=opened, session_close=closed,
-        replay_run_id=run_id,
+    context = (
+        patch.object(module, "_coverage_reason_codes", return_value=())
+        if not enforce_preflight else nullcontext()
     )
+    with context:
+        report = run_h1_session(
+            reader=reader, session_open=opened, session_close=closed,
+            replay_run_id=run_id, preflight_only=preflight_only,
+        )
     assert reader.calls == [(opened, closed)]
     return report
 
@@ -72,6 +82,18 @@ def _dense_then_refresh():
         _quote("COIN", at, bid=101.0),
         _quote("QQQ", at, bid=501.0),
     ))
+    return _canonical(*rows)
+
+
+def _complete_five_second_rows():
+    opened, _closed = _session()
+    rows = []
+    for offset in range(0, 23_400, 5):
+        at = opened + timedelta(seconds=offset)
+        rows.extend((
+            _quote("COIN", at, bid=100.0 + offset / 1_000_000),
+            _quote("QQQ", at, bid=500.0 + offset / 1_000_000),
+        ))
     return _canonical(*rows)
 
 
@@ -115,6 +137,7 @@ def test_h1_runs_reader_clock_families_v2_v1_v3_and_outcomes_end_to_end():
     assert report.session_digest
     assert report.timings.persistence_seconds == 0.0
     assert report.timings.total_seconds >= 0.0
+    assert report.execution_stage == "REPLAY_COMPLETE"
     assert report.data_status == "DATA_INCOMPLETE"
     assert "30S_ENDPOINT_GAP" in report.data_reason_codes
     assert report.replay_factor is None
@@ -138,19 +161,205 @@ def test_h1_mathematical_digests_are_repeatable_and_exclude_timings_and_run_id()
 
 def test_h1_rejects_certification_when_usable_quotes_have_over_five_second_gap():
     opened, closed = _session()
+    rows = [_quote("COIN", opened), _quote("QQQ", opened, bid=500.0)]
+    rows.extend(
+        _quote("COIN", opened + timedelta(seconds=offset), bid=100.1)
+        for offset in range(6, 23_400, 5)
+    )
+    rows.extend(
+        _quote("QQQ", opened + timedelta(seconds=offset), bid=500.1)
+        for offset in range(5, 23_400, 5)
+    )
+
+    report = _run(_canonical(*rows), enforce_preflight=True)
+
+    assert report.data_status == "DATA_INCOMPLETE"
+    assert report.execution_stage == "PREFLIGHT_REJECTED"
+    assert "COIN_INTERQUOTE_GAP" in report.data_reason_codes
+    coin = report.quote_coverage[0]
+    assert coin.max_gap_ns == 6 * NANOSECONDS
+    assert coin.max_gap_start_ns == int(opened.timestamp()) * NANOSECONDS
+    assert coin.max_gap_end_ns == (
+        int(opened.timestamp()) + 6
+    ) * NANOSECONDS
+    assert coin.over_limit_gap_count == 1
+    assert coin.p99_gap_ns == 5 * NANOSECONDS
+    assert coin.first_quote_delay_ns == 0
+    assert coin.last_quote_lead_ns == 4 * NANOSECONDS
+    assert coin.count == 4_680
+    assert report.quote_counts == (("COIN", 4_680), ("QQQ", 4_680))
+    assert report.frame_count == 0
+    assert report.timings.quant_seconds == 0.0
+    assert report.timings.alignment_seconds == 0.0
+    assert report.timings.resolution_seconds == 0.0
+    assert report.timings.v2_seconds == 0.0
+    assert report.timings.v1_seconds == 0.0
+    assert report.timings.v3_seconds == 0.0
+    assert report.timings.persistence_seconds == 0.0
+    assert all(row.total == 0 for row in report.family_coverage)
+    assert all(row.total == 0 for row in report.v3_coverage)
+    assert all(row.forecasts == 0 for row in report.resolution_coverage)
+    assert report.resolution_samples == ()
+    assert report.v2_refreshes == ()
+    assert report.qqq_attached_frame_count == 0
+    assert report.qqq_fresh_frame_count == 0
+    assert report.replay_factor is None
+    assert report.projected_seconds == ()
+
+
+def test_h1_preflight_gap_ties_keep_first_interval_and_count_all_violations():
+    opened, _closed = _session()
+    rows = _canonical(
+        _quote("COIN", opened),
+        _quote("QQQ", opened, bid=500.0),
+        _quote("QQQ", opened + timedelta(seconds=1), bid=500.1),
+        _quote("COIN", opened + timedelta(seconds=6), bid=100.1),
+        _quote("COIN", opened + timedelta(seconds=12), bid=100.2),
+    )
+
+    report = _run(rows, enforce_preflight=True)
+    coin = report.quote_coverage[0]
+
+    assert coin.max_gap_ns == 6 * NANOSECONDS
+    assert coin.max_gap_start_ns == int(opened.timestamp()) * NANOSECONDS
+    assert coin.max_gap_end_ns == (
+        int(opened.timestamp()) + 6
+    ) * NANOSECONDS
+    assert coin.over_limit_gap_count == 2
+
+
+def test_h1_preflight_rejection_never_enters_clock_or_quant(monkeypatch):
+    import quant.historical_replay_h1 as module
+
+    opened, closed = _session()
     rows = _canonical(
         _quote("COIN", opened),
         _quote("QQQ", opened, bid=500.0),
         _quote("COIN", opened + timedelta(seconds=6), bid=100.1),
-        _quote("QQQ", opened + timedelta(seconds=6), bid=500.1),
-        _quote("COIN", closed - timedelta(seconds=1), bid=101.0),
-        _quote("QQQ", closed - timedelta(seconds=1), bid=501.0),
+        _quote("QQQ", opened + timedelta(seconds=1), bid=500.1),
     )
 
-    report = _run(rows)
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("preflight rejection entered replay")
 
+    monkeypatch.setattr(module, "OneSessionReplayClock", unexpected)
+    monkeypatch.setattr(module, "_calculate_provider_families", unexpected)
+    monkeypatch.setattr(module, "build_replay_v2_as_of", unexpected)
+    monkeypatch.setattr(module, "_build_v1", unexpected)
+    monkeypatch.setattr(module, "synthesize_v3", unexpected)
+    reader = _Reader(rows)
+    report = run_h1_session(
+        reader=reader, session_open=opened, session_close=closed,
+        replay_run_id="preflight-reject",
+    )
+
+    assert reader.calls == [(opened, closed)]
+    assert report.execution_stage == "PREFLIGHT_REJECTED"
     assert report.data_status == "DATA_INCOMPLETE"
-    assert "COIN_INTERQUOTE_GAP" in report.data_reason_codes
+
+
+def test_h1_preflight_only_accepts_complete_coverage_without_running_quant(
+    monkeypatch,
+):
+    import quant.historical_replay_h1 as module
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("preflight-only entered replay")
+
+    monkeypatch.setattr(module, "OneSessionReplayClock", unexpected)
+    monkeypatch.setattr(module, "_calculate_provider_families", unexpected)
+    report = _run(
+        _complete_five_second_rows(),
+        enforce_preflight=True, preflight_only=True,
+    )
+
+    assert report.execution_stage == "PREFLIGHT_ONLY"
+    assert report.data_status == "DATA_COMPLETE"
+    assert report.data_reason_codes == ()
+    assert all(row.over_limit_gap_count == 0 for row in report.quote_coverage)
+    assert report.frame_count == 0
+
+
+def test_h1_complete_coverage_dispatches_into_replay(monkeypatch):
+    import quant.historical_replay_h1 as module
+
+    def entered(*_args, **_kwargs):
+        raise RuntimeError("CERTIFIED_COVERAGE_ENTERED_REPLAY")
+
+    monkeypatch.setattr(module, "OneSessionReplayClock", entered)
+    opened, closed = _session()
+    with pytest.raises(RuntimeError, match="CERTIFIED_COVERAGE_ENTERED_REPLAY"):
+        run_h1_session(
+            reader=_Reader(_complete_five_second_rows()),
+            session_open=opened, session_close=closed,
+            replay_run_id="certified-dispatch",
+        )
+
+
+def test_h1_rejected_preflight_digest_excludes_run_id_and_timings():
+    opened, closed = _session()
+    rows = _canonical(
+        _quote("COIN", opened),
+        _quote("QQQ", opened, bid=500.0),
+        _quote("QQQ", opened + timedelta(seconds=1), bid=500.1),
+        _quote("COIN", opened + timedelta(seconds=6), bid=100.1),
+    )
+    first_ticks = iter((0.0, 1.0, 2.0, 5.0))
+    second_ticks = iter((100.0, 110.0, 130.0, 160.0))
+    first = run_h1_session(
+        reader=_Reader(rows), session_open=opened, session_close=closed,
+        replay_run_id="preflight-a", monotonic_clock=lambda: next(first_ticks),
+    )
+    second = run_h1_session(
+        reader=_Reader(rows), session_open=opened, session_close=closed,
+        replay_run_id="preflight-b", monotonic_clock=lambda: next(second_ticks),
+    )
+
+    assert first.execution_stage == second.execution_stage == "PREFLIGHT_REJECTED"
+    assert first.dataset_digest == second.dataset_digest
+    assert first.configuration_digest == second.configuration_digest
+    assert first.session_digest == second.session_digest
+    assert first.replay_run_id != second.replay_run_id
+    assert first.timings != second.timings
+
+
+def test_h1_invalid_preflight_only_remains_rejected():
+    opened, closed = _session()
+    report = run_h1_session(
+        reader=_Reader((_quote("COIN", opened),)),
+        session_open=opened, session_close=closed,
+        replay_run_id="invalid-preflight-only", preflight_only=True,
+    )
+
+    assert report.execution_stage == "PREFLIGHT_REJECTED"
+    assert report.data_status == "DATA_INCOMPLETE"
+
+
+@pytest.mark.parametrize("preflight_only", [False, True])
+@pytest.mark.parametrize(("case", "message"), (
+    ("out_of_order", "canonical chronological order"),
+    ("duplicate", "strictly increasing"),
+    ("outside_session", "outside the replay session"),
+))
+def test_h1_preflight_preserves_clock_input_validation(
+    case, message, preflight_only,
+):
+    opened, closed = _session()
+    coin = _quote("COIN", opened)
+    qqq = _quote("QQQ", opened, bid=500.0)
+    rows = {
+        "out_of_order": (qqq, coin),
+        "duplicate": (coin, _quote("COIN", opened, bid=100.1)),
+        "outside_session": (
+            coin, qqq, _quote("COIN", closed, bid=100.1),
+        ),
+    }[case]
+
+    with pytest.raises(ValueError, match=message):
+        run_h1_session(
+            reader=_Reader(rows), session_open=opened, session_close=closed,
+            replay_run_id=f"invalid-{case}", preflight_only=preflight_only,
+        )
 
 
 def test_target_uses_first_accepted_quote_at_or_after_provider_endpoint():
@@ -346,7 +555,7 @@ def test_fractional_final_second_is_resolution_only_close_drain():
     assert report.quote_coverage[0].last_quote_lead_ns == 500_000_000
 
 
-def test_cli_accepts_session_argument_and_emits_json(monkeypatch, capsys):
+def test_cli_accepts_preflight_only_and_emits_json(monkeypatch, capsys):
     import quant.historical_replay_h1 as module
 
     monkeypatch.setattr(
@@ -358,19 +567,63 @@ def test_cli_accepts_session_argument_and_emits_json(monkeypatch, capsys):
     def run(**kwargs):
         observed.update(kwargs)
         return SimpleNamespace(
-            data_status="CERTIFIED", to_dict=lambda: {"status": "PASS"},
+            execution_stage="PREFLIGHT_ONLY", data_status="DATA_COMPLETE",
+            to_dict=lambda: {"status": "PASS"},
         )
 
     monkeypatch.setattr(module, "run_h1_session", run)
 
-    assert main(("2026-01-05", "--run-id", "cli-run")) == 0
+    assert main((
+        "2026-01-05", "--run-id", "cli-run", "--preflight-only",
+    )) == 0
     assert json.loads(capsys.readouterr().out) == {"status": "PASS"}
     assert observed["replay_run_id"] == "cli-run"
     assert observed["session_open"].astimezone(EASTERN).hour == 9
     assert observed["session_close"].astimezone(EASTERN).hour == 16
+    assert observed["preflight_only"] is True
 
 
 def test_cli_fails_closed_when_session_data_is_incomplete(monkeypatch, capsys):
+    import quant.historical_replay_h1 as module
+
+    opened, _closed = _session()
+    reader = _Reader(_canonical(
+        _quote("COIN", opened),
+        _quote("QQQ", opened, bid=500.0),
+        _quote("QQQ", opened + timedelta(seconds=1), bid=500.1),
+        _quote("COIN", opened + timedelta(seconds=6), bid=100.1),
+    ))
+    monkeypatch.setattr(
+        module.AlpacaHistoricalSipReader, "from_environment",
+        classmethod(lambda _cls: reader),
+    )
+
+    assert main(("2026-01-05",)) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["data_status"] == "DATA_INCOMPLETE"
+    assert payload["execution_stage"] == "PREFLIGHT_REJECTED"
+    assert "COIN_INTERQUOTE_GAP" in payload["data_reason_codes"]
+    coin = next(row for row in payload["quote_coverage"]
+                if row["symbol"] == "COIN")
+    assert coin["max_gap_ns"] == 6 * NANOSECONDS
+    assert coin["max_gap_start_ns"] == int(opened.timestamp()) * NANOSECONDS
+    assert coin["max_gap_end_ns"] == (
+        int(opened.timestamp()) + 6
+    ) * NANOSECONDS
+    assert coin["over_limit_gap_count"] == 1
+    assert reader.calls == [_session()]
+
+
+@pytest.mark.parametrize(("stage", "status", "expected"), (
+    ("PREFLIGHT_ONLY", "DATA_COMPLETE", 0),
+    ("REPLAY_COMPLETE", "CERTIFIED", 0),
+    ("PREFLIGHT_ONLY", "CERTIFIED", 2),
+    ("REPLAY_COMPLETE", "DATA_COMPLETE", 2),
+    ("PREFLIGHT_REJECTED", "DATA_INCOMPLETE", 2),
+))
+def test_cli_accepts_only_valid_stage_status_pairs(
+    monkeypatch, capsys, stage, status, expected,
+):
     import quant.historical_replay_h1 as module
 
     monkeypatch.setattr(
@@ -380,14 +633,16 @@ def test_cli_fails_closed_when_session_data_is_incomplete(monkeypatch, capsys):
     monkeypatch.setattr(
         module, "run_h1_session",
         lambda **_kwargs: SimpleNamespace(
-            data_status="DATA_INCOMPLETE",
-            to_dict=lambda: {"data_status": "DATA_INCOMPLETE"},
+            execution_stage=stage, data_status=status,
+            to_dict=lambda: {
+                "execution_stage": stage, "data_status": status,
+            },
         ),
     )
 
-    assert main(("2026-01-05",)) == 2
+    assert main(("2026-01-05",)) == expected
     assert json.loads(capsys.readouterr().out) == {
-        "data_status": "DATA_INCOMPLETE",
+        "execution_stage": stage, "data_status": status,
     }
 
 
