@@ -58,7 +58,7 @@ DATA_SCHEMA_VERSION = "alpaca-historical-sip-nbbo-v1"
 SOURCE = "ALPACA_SIP"
 SOURCE_SPEC_ROUND_LOTS = "alpaca-sip-quote-size-round-lots-v1"
 SOURCE_SPEC_SHARES = "alpaca-sip-quote-size-shares-v1"
-REPLAY_METHOD_VERSION = "alpaca-sip-logical-1s-rth-window-v1"
+REPLAY_METHOD_VERSION = "alpaca-sip-logical-1s-rth-window-v2"
 REPLAY_STATE_SCHEMA_VERSION = "ATOM-HISTORICAL-V2-ENVELOPE-1"
 EVIDENCE_ORIGIN = "HISTORICAL_REPLAY"
 TARGET_SPEC_ID = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
@@ -291,6 +291,8 @@ class AlpacaHistoricalSipReader:
             raise ValueError("Alpaca historical quote is malformed")
         bid, ask, bid_size, ask_size = map(float, raw_values)
         if not open_ns <= event_ns < close_ns:
+            return None
+        if bid <= 0 or ask <= 0 or ask < bid:
             return None
         source_spec = (SOURCE_SPEC_SHARES if event_ns >= _SIZE_SHARES_START_NS
                        else SOURCE_SPEC_ROUND_LOTS)
