@@ -25,6 +25,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      # exchange-calendars and all direct acceptance dependencies are pinned below.
       - name: Install pinned acceptance dependencies
         run: >-
           python -m pip install --disable-pip-version-check
