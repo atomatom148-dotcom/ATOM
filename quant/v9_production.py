@@ -51,6 +51,7 @@ from .v9_v4d_integration import ImmutableStateCache, OperationalMetrics
 
 TARGET_SPEC_ID = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
 V2_REFRESH_SECONDS = 3600.0
+V2_STATE_BUILD_EVIDENCE_LIMIT = 65_536
 
 FORMULA_VERSIONS = (
     ("q1_momentum", Q1_VERSION),
@@ -129,10 +130,15 @@ class PostgresV2StateBuilder:
                       AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                       AND op.commit_observed_at<=to_timestamp(%s)
                     ORDER BY f.horizon, f.cutoff_epoch, f.forecast_id
+                    LIMIT %s
                     """,
-                    (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, state_as_of),
+                    (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, state_as_of,
+                     V2_STATE_BUILD_EVIDENCE_LIMIT + 1),
                 )
                 directional_rows = tuple(cursor.fetchall())
+                self.last_rows_materialized = len(directional_rows)
+                if len(directional_rows) > V2_STATE_BUILD_EVIDENCE_LIMIT:
+                    raise RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED")
                 cursor.execute(
                     """
                     SELECT f.forecast_id, f.quant_id, f.formula_version,
@@ -154,11 +160,15 @@ class PostgresV2StateBuilder:
                       AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                       AND op.commit_observed_at<=to_timestamp(%s)
                     ORDER BY f.horizon, f.cutoff_epoch, f.forecast_id
+                    LIMIT %s
                     """,
-                    (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, state_as_of),
+                    (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, state_as_of,
+                     V2_STATE_BUILD_EVIDENCE_LIMIT + 1),
                 )
                 magnitude_rows = tuple(cursor.fetchall())
                 self.last_rows_materialized = len(directional_rows) + len(magnitude_rows)
+                if len(magnitude_rows) > V2_STATE_BUILD_EVIDENCE_LIMIT:
+                    raise RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED")
             finally:
                 close = getattr(cursor, "close", None)
                 if callable(close):
