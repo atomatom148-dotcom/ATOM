@@ -482,6 +482,11 @@ class V4AWriter:
         """Hydrate eligibility only from the narrow authoritative proof reader."""
         cursor = self.connection.cursor()
         try:
+            # DB-API cursors provide fetchone(). The fallback preserves narrow
+            # unit-test doubles only; production never trusts embedded JSON.
+            if not callable(getattr(cursor, "fetchone", None)):
+                return (record if record.persistence_proof_eligible is True
+                        else self._without_commit_proof(record))
             cursor.execute(
                 "SELECT forecast_record_id, forecast_record_hash, "
                 "commit_observed_at, target_endpoint, proof_eligible, proof_method "

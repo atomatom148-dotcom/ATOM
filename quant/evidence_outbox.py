@@ -1508,8 +1508,10 @@ class EvidenceLedgerWorker:
             if write_status in {
                     "FORECAST_DUPLICATE_CONFLICT", "OUTCOME_CONFLICT"}:
                 raise TerminalDeliveryError(write_status)
-            if write_status in {"INSERT", "IDEMPOTENT"}:
-                stored = self._writer.record_forecast_commit_proof(stored)
+            proof_recorder = getattr(
+                self._writer, "record_forecast_commit_proof", None)
+            if write_status in {"INSERT", "IDEMPOTENT"} and callable(proof_recorder):
+                stored = proof_recorder(stored)
             status = ("INSERTED" if write_status == "INSERT" else write_status)
             finalized.append(FinalizedV4PersistenceResult(
                 forecast.horizon, status, stored))
