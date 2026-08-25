@@ -115,6 +115,66 @@ def test_reader_uses_one_sip_request_per_page_and_preserves_provider_nanos():
     assert all(row.data_schema_version == DATA_SCHEMA_VERSION for row in rows)
 
 
+def test_reader_sampling_is_mathematically_equivalent_to_raw_clock():
+    opened, closed = _session()
+    coin_payloads = [
+        _payload("2026-01-05T14:30:00.200000000Z"),
+        _payload("2026-01-05T14:30:00.500000000Z", bid=101.0),
+        _payload("2026-01-05T14:30:01.200000000Z", bid=102.0),
+    ]
+    qqq_payloads = [
+        _payload("2026-01-05T14:30:00.100000000Z", bid=500.0),
+        _payload("2026-01-05T14:30:00.400000000Z", bid=501.0),
+        _payload("2026-01-05T14:30:00.800000000Z", bid=502.0),
+    ]
+    sampled = AlpacaHistoricalSipReader(
+        "key", "secret", opener=_Opener({
+            "quotes": {"COIN": coin_payloads, "QQQ": qqq_payloads},
+            "next_page_token": None,
+        }),
+    ).read_session(session_open=opened, session_close=closed)
+    raw = tuple(sorted((
+        _quote("COIN", opened, fraction=200_000_000, bid=100.0),
+        _quote("COIN", opened, fraction=500_000_000, bid=101.0),
+        _quote("COIN", opened + timedelta(seconds=1),
+               fraction=200_000_000, bid=102.0),
+        _quote("QQQ", opened, fraction=100_000_000, bid=500.0),
+        _quote("QQQ", opened, fraction=400_000_000, bid=501.0),
+        _quote("QQQ", opened, fraction=800_000_000, bid=502.0),
+    ), key=lambda row: (row.provider_event_ns,
+                        ("COIN", "QQQ").index(row.symbol))))
+
+    assert len(sampled) == 4
+    assert tuple(OneSessionReplayClock(
+        sampled, session_open=opened, session_close=closed,
+    ).frames()) == tuple(OneSessionReplayClock(
+        raw, session_open=opened, session_close=closed,
+    ).frames())
+
+
+def test_reader_memory_is_bounded_by_logical_seconds_not_raw_quote_count():
+    opened, closed = _session()
+    coin = [
+        _payload(f"2026-01-05T14:30:00.{index:09d}Z", bid=100.0 + index / 1e6)
+        for index in range(1, 1_001)
+    ]
+    qqq = [
+        _payload(f"2026-01-05T14:30:00.{index:09d}Z", bid=500.0 + index / 1e6)
+        for index in range(1, 1_002)
+    ]
+
+    sampled = AlpacaHistoricalSipReader(
+        "key", "secret", opener=_Opener({
+            "quotes": {"COIN": coin, "QQQ": qqq},
+            "next_page_token": None,
+        }),
+    ).read_session(session_open=opened, session_close=closed)
+
+    assert len(sampled) == 3
+    assert sum(row.symbol == "COIN" for row in sampled) == 1
+    assert sum(row.symbol == "QQQ" for row in sampled) == 2
+
+
 @pytest.mark.parametrize("change", [
     lambda row: {key: value for key, value in row.items() if key != "bs"},
     lambda row: {**row, "as": -1.0},
