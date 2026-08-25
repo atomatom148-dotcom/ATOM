@@ -865,7 +865,10 @@ class EvidenceLedgerWorker:
                 record = deserialize_forecast_record(
                     payload, expected_hash=str(expected_hash))
                 record = proof_reader.read_forecast_commit_proof(record)
-            except (ValueError, LookupError):
+            except Exception:
+                # The production migration is an explicit gate. Until it is
+                # approved, missing proof infrastructure must fail closed
+                # without preventing the read-only web service from starting.
                 self.metrics.increment(invalid_metric)
                 continue
             if record.persistence_proof_eligible is True:
