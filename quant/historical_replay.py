@@ -58,7 +58,7 @@ DATA_SCHEMA_VERSION = "alpaca-historical-sip-nbbo-v1"
 SOURCE = "ALPACA_SIP"
 SOURCE_SPEC_ROUND_LOTS = "alpaca-sip-quote-size-round-lots-v1"
 SOURCE_SPEC_SHARES = "alpaca-sip-quote-size-shares-v1"
-REPLAY_METHOD_VERSION = "alpaca-sip-logical-1s-rth-window-v2"
+REPLAY_METHOD_VERSION = "alpaca-sip-logical-1s-rth-window-v3"
 REPLAY_STATE_SCHEMA_VERSION = "ATOM-HISTORICAL-V2-ENVELOPE-1"
 EVIDENCE_ORIGIN = "HISTORICAL_REPLAY"
 TARGET_SPEC_ID = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
@@ -180,7 +180,7 @@ class HistoricalSipQuote:
 
 
 class AlpacaHistoricalSipReader:
-    """Read one bounded COIN+QQQ SIP session with provider pagination."""
+    """Read and deterministically sample one bounded COIN+QQQ SIP session."""
 
     def __init__(
         self, api_key: str, secret_key: str, *,
@@ -221,10 +221,16 @@ class AlpacaHistoricalSipReader:
             "sort": "asc",
             "limit": str(self._page_limit),
         }
-        rows: list[HistoricalSipQuote] = []
+        coin_by_cutoff: dict[int, HistoricalSipQuote] = {}
+        qqq_by_cutoff: dict[int, HistoricalSipQuote] = {}
+        qqq_predecessors: dict[int, HistoricalSipQuote] = {}
         page_token: str | None = None
         seen_tokens: set[str] = set()
-        last_event_by_symbol: dict[str, int] = {}
+        last_row_by_symbol: dict[str, HistoricalSipQuote] = {}
+        qqq_started = False
+        coin_rows: tuple[HistoricalSipQuote, ...] = ()
+        coin_index = 0
+        last_qqq: HistoricalSipQuote | None = None
         while True:
             query = dict(base_query)
             if page_token is not None:
@@ -244,14 +250,46 @@ class AlpacaHistoricalSipReader:
                     raise ValueError("Alpaca historical quote collection is malformed")
                 for item in items:
                     decoded = self._decode(symbol, item, open_ns, close_ns)
-                    if decoded is not None:
-                        previous = last_event_by_symbol.get(symbol)
-                        if (previous is not None and
-                                decoded.provider_event_ns < previous):
+                    if decoded is None:
+                        continue
+                    previous = last_row_by_symbol.get(symbol)
+                    if (previous is not None and
+                            decoded.provider_event_ns < previous.provider_event_ns):
+                        raise ValueError(
+                            "Alpaca historical quotes are out of order")
+                    if (previous is not None and
+                            decoded.provider_event_ns == previous.provider_event_ns):
+                        if decoded != previous:
+                            raise ValueError(
+                                "conflicting historical quote identity")
+                        continue
+                    last_row_by_symbol[symbol] = decoded
+                    cutoff_ns = open_ns + (
+                        (decoded.provider_event_ns - open_ns +
+                         _NANOSECONDS - 1) // _NANOSECONDS
+                    ) * _NANOSECONDS
+                    if symbol == "COIN":
+                        if qqq_started:
                             raise ValueError(
                                 "Alpaca historical quotes are out of order")
-                        last_event_by_symbol[symbol] = decoded.provider_event_ns
-                        rows.append(decoded)
+                        coin_by_cutoff[cutoff_ns] = decoded
+                        continue
+                    if not qqq_started:
+                        qqq_started = True
+                        coin_rows = tuple(coin_by_cutoff.values())
+                    while (coin_index < len(coin_rows) and
+                           coin_rows[coin_index].provider_event_ns <
+                           decoded.provider_event_ns):
+                        if last_qqq is not None:
+                            qqq_predecessors[last_qqq.provider_event_ns] = last_qqq
+                        coin_index += 1
+                    last_qqq = decoded
+                    qqq_by_cutoff[cutoff_ns] = decoded
+                    while (coin_index < len(coin_rows) and
+                           coin_rows[coin_index].provider_event_ns ==
+                           decoded.provider_event_ns):
+                        qqq_predecessors[decoded.provider_event_ns] = decoded
+                        coin_index += 1
             token = payload.get("next_page_token")
             if token is None:
                 break
@@ -260,21 +298,22 @@ class AlpacaHistoricalSipReader:
             seen_tokens.add(token)
             page_token = token
 
-        rows.sort(key=lambda row: (row.provider_event_ns, SYMBOLS.index(row.symbol)))
-        canonical: list[HistoricalSipQuote] = []
-        by_identity: dict[tuple[str, int], HistoricalSipQuote] = {}
-        for row in rows:
-            identity = row.symbol, row.provider_event_ns
-            existing = by_identity.get(identity)
-            if existing is not None:
-                if existing != row:
-                    raise ValueError("conflicting historical quote identity")
-                continue
-            by_identity[identity] = row
-            canonical.append(row)
-        if not any(row.symbol == "COIN" for row in canonical):
+        if not qqq_started:
+            coin_rows = tuple(coin_by_cutoff.values())
+        while coin_index < len(coin_rows):
+            if last_qqq is not None:
+                qqq_predecessors[last_qqq.provider_event_ns] = last_qqq
+            coin_index += 1
+        if not coin_rows:
             raise RuntimeError("REPLAY_DATA_UNAVAILABLE")
-        return tuple(canonical)
+        qqq_rows = {
+            row.provider_event_ns: row
+            for row in (*qqq_by_cutoff.values(), *qqq_predecessors.values())
+        }
+        return tuple(sorted(
+            (*coin_rows, *qqq_rows.values()),
+            key=lambda row: (row.provider_event_ns, SYMBOLS.index(row.symbol)),
+        ))
 
     @staticmethod
     def _decode(
