@@ -16,8 +16,6 @@ CREATE TABLE atom_v9_internal.legacy_evidence_publications (
     ),
     PRIMARY KEY (evidence_kind, record_id)
 );
-ALTER TABLE atom_v9_internal.legacy_evidence_publications
-OWNER TO atom_v9_proof_owner;
 REVOKE ALL ON atom_v9_internal.legacy_evidence_publications
 FROM PUBLIC, anon, authenticated, service_role, atom_v9_v4_runtime;
 GRANT SELECT, INSERT ON atom_v9_internal.legacy_evidence_publications
@@ -29,6 +27,9 @@ FOR EACH ROW EXECUTE FUNCTION atom_v9_internal.reject_commit_proof_mutation();
 CREATE TRIGGER legacy_evidence_publications_reject_truncate
 BEFORE TRUNCATE ON atom_v9_internal.legacy_evidence_publications
 FOR EACH STATEMENT EXECUTE FUNCTION atom_v9_internal.reject_commit_proof_mutation();
+
+-- Supabase-compatible ownership handoff for SECURITY DEFINER functions.
+GRANT CREATE ON SCHEMA atom_v9_internal TO atom_v9_proof_owner;
 
 CREATE FUNCTION atom_v9_internal.record_legacy_evidence_publication(
     p_kind text, p_id bigint
@@ -119,3 +120,5 @@ TO atom_v9_v4_runtime;
 GRANT EXECUTE ON FUNCTION
     atom_v9_internal.read_legacy_evidence_publication(text, bigint)
 TO atom_v9_v4_runtime;
+
+REVOKE CREATE ON SCHEMA atom_v9_internal FROM atom_v9_proof_owner;
