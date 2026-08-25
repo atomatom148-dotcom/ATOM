@@ -57,6 +57,9 @@ class FakeCursor:
     def fetchall(self):
         return self.rows
 
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
     def close(self):
         self.closed = True
 
@@ -245,17 +248,72 @@ class V4AContractTests(unittest.TestCase):
         self.assertEqual(outcome.reason_codes, ())
         self.assertEqual(outcome.previous_observation_at, previous)
 
-    def test_forecast_persistence_deadline_boundary(self):
+    def test_forecast_commit_observation_uses_strict_boundary(self):
         f = self.forecast()
-        on_time = dataclasses.replace(f, persisted_at=f.target_endpoint,
-                                      persistence_proof_eligible=True)
-        late = dataclasses.replace(f, persisted_at=f.target_endpoint + timedelta(microseconds=1),
-                                   persistence_proof_eligible=False,
-                                   persistence_reason="FORECAST_PERSISTED_AFTER_TARGET_ENDPOINT")
-        self.assertTrue(on_time.persistence_proof_eligible)
-        o = build_outcome(forecast=late, target_identity="t", endpoint_observation_at=late.target_endpoint,
-                          target_resolved_at=late.target_endpoint, actual_return_bps=0.0)
-        self.assertIn("FORECAST_PERSISTED_AFTER_TARGET_ENDPOINT", o.reason_codes)
+        before = V4AWriter._apply_commit_proof(f, (
+            f.forecast_record_id, f.forecast_record_hash,
+            f.target_endpoint - timedelta(microseconds=1), f.target_endpoint,
+            True, "POST_COMMIT_DB_OBSERVATION_V1",
+        ))
+        equal = V4AWriter._apply_commit_proof(f, (
+            f.forecast_record_id, f.forecast_record_hash,
+            f.target_endpoint, f.target_endpoint,
+            False, "POST_COMMIT_DB_OBSERVATION_V1",
+        ))
+        after = V4AWriter._apply_commit_proof(f, (
+            f.forecast_record_id, f.forecast_record_hash,
+            f.target_endpoint + timedelta(microseconds=1), f.target_endpoint,
+            False, "POST_COMMIT_DB_OBSERVATION_V1",
+        ))
+        self.assertTrue(before.persistence_proof_eligible)
+        self.assertFalse(equal.persistence_proof_eligible)
+        self.assertFalse(after.persistence_proof_eligible)
+        self.assertEqual(
+            equal.persistence_reason,
+            "FORECAST_COMMITTED_AT_OR_AFTER_TARGET_ENDPOINT",
+        )
+        o = build_outcome(
+            forecast=equal,
+            target_identity="t",
+            endpoint_observation_at=equal.target_endpoint,
+            target_resolved_at=equal.target_endpoint,
+            actual_return_bps=0.0,
+        )
+        self.assertIn(
+            "FORECAST_COMMITTED_AT_OR_AFTER_TARGET_ENDPOINT", o.reason_codes,
+        )
+
+    def test_persist_forecast_starts_fail_closed_until_db_observation(self):
+        f = self.forecast()
+        cursor = FakeCursor([])
+        stored = V4AWriter(FakeConnection(cursor)).persist_forecast(f, T0)
+        self.assertFalse(stored.persistence_proof_eligible)
+        self.assertIsNone(stored.persisted_at)
+        self.assertEqual(stored.persistence_reason, "FORECAST_COMMIT_PROOF_MISSING")
+        record_json = json.loads(cursor.last_insert_parameters[8])
+        self.assertFalse(record_json["persistence_proof_eligible"])
+        self.assertEqual(
+            record_json["persistence_reason"], "FORECAST_COMMIT_PROOF_MISSING",
+        )
+
+    def test_record_and_read_proof_use_only_scoped_database_functions(self):
+        f = self.forecast()
+        observed = f.target_endpoint - timedelta(microseconds=1)
+        row = (
+            f.forecast_record_id, f.forecast_record_hash, observed,
+            f.target_endpoint, True, "POST_COMMIT_DB_OBSERVATION_V1",
+        )
+        for method_name, sql_token in (
+            ("record_forecast_commit_proof", "record_forecast_commit_proof"),
+            ("read_forecast_commit_proof", "read_forecast_commit_proof"),
+        ):
+            cursor = FakeCursor([row])
+            connection = FakeConnection(cursor)
+            hydrated = getattr(V4AWriter(connection), method_name)(f)
+            self.assertTrue(hydrated.persistence_proof_eligible)
+            self.assertEqual(hydrated.persisted_at, observed)
+            self.assertIn(sql_token, cursor.statements[0][0])
+            self.assertEqual(connection.commits, 1)
 
     def test_overlap_boundary_order_and_digest(self):
         base = self.forecast()
@@ -534,3 +592,39 @@ class V4AMigrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class V4CommitObservationMigrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.sql = (Path(__file__).parents[1] / "migrations" /
+                   "014_add_v4_forecast_commit_observations.sql").read_text()
+        cls.upper = " ".join(cls.sql.upper().split())
+
+    def test_private_append_only_proof_store_and_no_backfill(self):
+        self.assertIn("CREATE SCHEMA ATOM_V9_INTERNAL", self.upper)
+        self.assertIn("CREATE TABLE ATOM_V9_INTERNAL.FORECAST_COMMIT_PROOFS", self.upper)
+        self.assertIn("BEFORE UPDATE OR DELETE", self.upper)
+        self.assertIn("BEFORE TRUNCATE", self.upper)
+        self.assertNotIn("UPDATE PUBLIC.ATOM_V9_V4_FORECASTS", self.upper)
+        self.assertNotIn("TRACK_COMMIT_TIMESTAMP", self.upper)
+        self.assertNotIn("ALTER SYSTEM", self.upper)
+
+    def test_separate_transaction_installation_fence_and_strict_boundary(self):
+        self.assertIn("V_XID = PG_CATALOG.PG_CURRENT_XACT_ID()", self.upper)
+        self.assertIn("V_XID <= V_NOT_BEFORE_XID", self.upper)
+        self.assertIn("(COMMIT_OBSERVED_AT < TARGET_ENDPOINT) STORED", self.upper)
+        self.assertIn("POST_COMMIT_DB_OBSERVATION_V1", self.upper)
+
+    def test_runtime_has_function_only_access(self):
+        self.assertIn(
+            "REVOKE ALL ON TABLE ATOM_V9_INTERNAL.FORECAST_COMMIT_PROOFS "
+            "FROM PUBLIC, ANON, AUTHENTICATED, SERVICE_ROLE, ATOM_V9_V4_RUNTIME",
+            self.upper,
+        )
+        self.assertIn(
+            "GRANT EXECUTE ON FUNCTION "
+            "ATOM_V9_INTERNAL.RECORD_FORECAST_COMMIT_PROOF(TEXT) "
+            "TO ATOM_V9_V4_RUNTIME",
+            self.upper,
+        )
+        self.assertIn("CREATE ROLE ATOM_V9_PROOF_OWNER WITH NOLOGIN NOINHERIT NOSUPERUSER", self.upper)

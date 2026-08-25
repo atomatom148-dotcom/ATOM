@@ -211,6 +211,8 @@ class V4DCoordinator:
                 try:
                     stored = self._writer.persist_forecast(forecast, self._wall_clock())
                     status = self._writer.last_write_status or "UNKNOWN"
+                    if status in {"INSERT", "IDEMPOTENT"}:
+                        stored = self._writer.record_forecast_commit_proof(stored)
                     error_type = None
                     self.metrics.increment("forecast_persistence.success")
                 except Exception as error:  # persistence is an explicitly isolated boundary
