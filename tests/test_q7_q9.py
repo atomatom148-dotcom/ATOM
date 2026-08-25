@@ -9,7 +9,12 @@ from quant.q7_relative_value import (
     TAU_SECONDS,
     calculate_relative_value,
 )
-from quant.q8_cross_asset import calculate_cross_asset
+from quant.q8_cross_asset import (
+    CrossAssetResult, FORMULA_VERSION as Q8_FORMULA_VERSION,
+    HORIZON_SECONDS as Q8_HORIZON_SECONDS,
+    LEAD_LAGS_SECONDS, LOOKBACK_SECONDS, MIN_SYNCHRONIZED_RETURNS,
+    QUANT_ID as Q8_QUANT_ID, _synchronize, calculate_cross_asset,
+)
 from quant.q9_factor import calculate_factor
 from quant.web import dashboard_data
 
@@ -28,6 +33,58 @@ def histories(count=31, *, spacing=30, q_offset=0, q_returns=None, coin_returns=
         MidpointObservation(float(i * spacing + q_offset), price) for i, price in enumerate(q_prices)
     )
     return coin, qqq
+
+
+def nested_cross_asset_reference(coin_history, qqq_history, *, cutoff_epoch):
+    """Frozen v1 equation using the original nested causal lag lookup."""
+
+    if not math.isfinite(cutoff_epoch):
+        return None
+    coin = coin_history.within(cutoff=cutoff_epoch, lookback=LOOKBACK_SECONDS)
+    qqq = tuple(item for item in qqq_history.observations
+                if item.event_epoch <= cutoff_epoch)
+    pairs = _synchronize(coin, qqq)
+    returns = tuple(
+        (current[0].event_epoch,
+         math.log(current[0].midpoint / previous[0].midpoint),
+         math.log(current[1].midpoint / previous[1].midpoint))
+        for previous, current in zip(pairs, pairs[1:])
+    )
+    if len(returns) < MIN_SYNCHRONIZED_RETURNS or not all(
+        math.isfinite(value) for item in returns for value in item
+    ):
+        return None
+    betas = []
+    for lag in LEAD_LAGS_SECONDS:
+        regression_pairs = []
+        for ending, coin_return, _ in returns:
+            lagged = next((
+                item for item in reversed(returns)
+                if item[0] <= ending - lag
+            ), None)
+            if lagged is not None:
+                regression_pairs.append((lagged[2], coin_return))
+        denominator = sum(x * x for x, _ in regression_pairs)
+        if denominator <= 0:
+            return None
+        beta = sum(x * y for x, y in regression_pairs) / denominator
+        if not math.isfinite(beta):
+            return None
+        betas.append(beta)
+    current_signal = returns[-1][2]
+    lead_signal = (sum(betas) / len(betas)) * current_signal
+    forecasts = tuple(
+        10_000.0 * lead_signal * min(seconds / 60.0, 1.0)
+        for seconds in Q8_HORIZON_SECONDS
+    )
+    if not all(math.isfinite(value) for value in (
+        current_signal, lead_signal, *forecasts,
+    )):
+        return None
+    return CrossAssetResult(
+        Q8_QUANT_ID, Q8_FORMULA_VERSION, cutoff_epoch, forecasts,
+        betas[0], betas[1], current_signal, lead_signal,
+    )
 
 
 class RelativeValueTests(unittest.TestCase):
@@ -85,6 +142,32 @@ class RelativeValueTests(unittest.TestCase):
 
 
 class CrossAssetTests(unittest.TestCase):
+    def test_linear_lag_lookup_is_exactly_equal_to_frozen_nested_reference(self):
+        epochs = [0.0]
+        for index in range(1, 700):
+            epochs.append(epochs[-1] + 1.0 + 0.2 * (index % 7))
+        qqq_prices = [100.0]
+        coin_prices = [200.0]
+        for index in range(1, len(epochs)):
+            qqq_return = 0.0002 + 0.00005 * math.sin(index / 7)
+            coin_return = 0.0001 + 1.3 * qqq_return + 0.00002 * math.cos(index / 11)
+            qqq_prices.append(qqq_prices[-1] * math.exp(qqq_return))
+            coin_prices.append(coin_prices[-1] * math.exp(coin_return))
+        coin = MidpointHistory(
+            MidpointObservation(epoch, price)
+            for epoch, price in zip(epochs, coin_prices)
+        )
+        qqq = MidpointHistory(
+            MidpointObservation(epoch - 0.2 * (index % 3), price)
+            for index, (epoch, price) in enumerate(zip(epochs, qqq_prices))
+        )
+        cutoff = epochs[-1]
+
+        self.assertEqual(
+            calculate_cross_asset(coin, qqq, cutoff_epoch=cutoff),
+            nested_cross_asset_reference(coin, qqq, cutoff_epoch=cutoff),
+        )
+
     def test_fixed_coefficients_sign_scaling_and_immutability(self):
         q_returns = [0.001 + i * 0.00001 for i in range(32)]
         # At 30-second spacing, y_t = 2*x_(t-30); both fixed lags remain estimable.

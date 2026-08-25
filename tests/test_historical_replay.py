@@ -144,7 +144,7 @@ def test_reader_sampling_is_mathematically_equivalent_to_raw_clock():
     ), key=lambda row: (row.provider_event_ns,
                         ("COIN", "QQQ").index(row.symbol))))
 
-    assert len(sampled) == 4
+    assert sampled == raw
     assert tuple(OneSessionReplayClock(
         sampled, session_open=opened, session_close=closed,
     ).frames()) == tuple(OneSessionReplayClock(
@@ -170,9 +170,42 @@ def test_reader_memory_is_bounded_by_logical_seconds_not_raw_quote_count():
         }),
     ).read_session(session_open=opened, session_close=closed)
 
-    assert len(sampled) == 3
-    assert sum(row.symbol == "COIN" for row in sampled) == 1
-    assert sum(row.symbol == "QQQ" for row in sampled) == 2
+    assert len(sampled) == 5
+    assert sum(row.symbol == "COIN" for row in sampled) == 2
+    assert sum(row.symbol == "QQQ" for row in sampled) == 3
+
+
+def test_reader_retains_raw_gap_boundaries_inside_each_logical_second():
+    opened, closed = _session()
+    payloads = (
+        _payload("2026-01-05T14:30:00.100000000Z"),
+        _payload("2026-01-05T14:30:05.010000000Z", bid=101.0),
+        _payload("2026-01-05T14:30:05.900000000Z", bid=102.0),
+    )
+    sampled = AlpacaHistoricalSipReader(
+        "key", "secret", opener=_Opener({
+            "quotes": {"COIN": payloads},
+            "next_page_token": None,
+        }),
+    ).read_session(session_open=opened, session_close=closed)
+    raw = (
+        _quote("COIN", opened, fraction=100_000_000),
+        _quote("COIN", opened + timedelta(seconds=5),
+               fraction=10_000_000, bid=101.0),
+        _quote("COIN", opened + timedelta(seconds=5),
+               fraction=900_000_000, bid=102.0),
+    )
+
+    assert sampled == raw
+    assert max(
+        following.provider_event_ns - previous.provider_event_ns
+        for previous, following in zip(sampled, sampled[1:])
+    ) <= 5_000_000_000
+    assert tuple(OneSessionReplayClock(
+        sampled, session_open=opened, session_close=closed,
+    ).frames()) == tuple(OneSessionReplayClock(
+        raw, session_open=opened, session_close=closed,
+    ).frames())
 
 
 @pytest.mark.parametrize("change", [
