@@ -770,7 +770,12 @@ def test_cli_batch_preflight_stops_at_first_qualifying_date_without_quants(
                 max_gap_touches_rth_end=False,
                 configured_max_gap_ns=5 * NANOSECONDS,
             ),),
-            to_dict=lambda: {"date": day, "passed": passed},
+            to_dict=lambda: {
+                "historical_session": day,
+                "data_reason_codes": [] if passed else ["COIN_INTERQUOTE_GAP"],
+                "quote_coverage": [{"symbol": "COIN", "max_gap_ns": (
+                    5 if passed else 6) * NANOSECONDS}],
+            },
         )
 
     monkeypatch.setattr(module, "run_h1_session", run)
@@ -782,23 +787,62 @@ def test_cli_batch_preflight_stops_at_first_qualifying_date_without_quants(
     first_output = capsys.readouterr().out
 
     assert [call["session_open"].date().isoformat() for call in calls] == [
-        "2026-01-05", "2026-01-06",
+        "2026-01-05",
     ]
     assert all(call["preflight_only"] is True for call in calls)
     assert json.loads(first_output.splitlines()[-1]) == {
-        "qualifying_date": "2026-01-06",
+        "qualifying_date": "2026-01-05",
+        "maximum_interior_gap_seconds": 6,
+        "result_source": "NEW_PREFLIGHT",
     }
-    assert json.loads((tmp_path / "2026-01-05.json").read_text()) == {
-        "date": "2026-01-05", "passed": False,
-    }
-    assert json.loads((tmp_path / "2026-01-06.json").read_text()) == {
-        "date": "2026-01-06", "passed": True,
-    }
+    assert json.loads((tmp_path / "2026-01-05.json").read_text())[
+        "historical_session"] == "2026-01-05"
+    assert not (tmp_path / "2026-01-06.json").exists()
     assert not (tmp_path / "2026-01-07.json").exists()
 
     calls.clear()
     assert main(args) == 0
-    assert capsys.readouterr().out == first_output
+    cached_selection = json.loads(capsys.readouterr().out)
+    assert cached_selection == {
+        "qualifying_date": "2026-01-05",
+        "maximum_interior_gap_seconds": 6,
+        "result_source": "CACHE",
+    }
+    assert calls == []
+
+
+@pytest.mark.parametrize(("maximum_gap_seconds", "selected"), (
+    (5, 5), (6, 6), (7, 7), (8, None),
+))
+def test_cli_batch_selects_strictest_cached_gap_or_fails_closed(
+    monkeypatch, capsys, tmp_path, maximum_gap_seconds, selected,
+):
+    import quant.historical_replay_h1 as module
+
+    day = "2026-01-05"
+    (tmp_path / f"{day}.json").write_text(json.dumps({
+        "historical_session": day,
+        "data_reason_codes": ["COIN_INTERQUOTE_GAP"],
+        "quote_coverage": [{
+            "symbol": "COIN",
+            "max_gap_ns": maximum_gap_seconds * NANOSECONDS,
+        }],
+    }))
+
+    def unexpected():
+        raise AssertionError("cached date was refetched")
+
+    monkeypatch.setattr(
+        module.AlpacaHistoricalSipReader, "from_environment",
+        classmethod(lambda _cls: unexpected()),
+    )
+    result = main((day, "--batch-preflight", "--output-dir", str(tmp_path)))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == (0 if selected is not None else 2)
+    assert payload["maximum_interior_gap_seconds"] == selected
+    if selected is not None:
+        assert payload["result_source"] == "CACHE"
 
 
 def test_cli_fails_closed_when_session_data_is_incomplete(monkeypatch, capsys):
