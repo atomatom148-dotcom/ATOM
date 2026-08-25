@@ -9,7 +9,8 @@ from quant.history import MidpointHistory, MidpointObservation
 from quant.live_market import LiveMarketState
 from quant.q10_options_vol import OptionObservation
 from quant.v9_production import (
-    FORMULA_VERSION_MAP, PostgresV2StateBuilder, build_live_v1,
+    FORMULA_VERSION_MAP, V2_STATE_BUILD_EVIDENCE_LIMIT,
+    PostgresV2StateBuilder, build_live_v1,
 )
 from quant.v9_v1_contract import HORIZONS, QUANT_IDS
 from quant.web import dashboard_data
@@ -258,6 +259,11 @@ def test_v2_batch_builder_uses_read_only_repeatable_read_and_closes_snapshot():
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
     )
     assert connection.value.fetches == 2
+    bounded = connection.value.statements[2:]
+    assert len(bounded) == 2
+    assert all("LIMIT %s" in sql for sql, _params in bounded)
+    assert all(params[-1] == V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+               for _sql, params in bounded)
     assert connection.rollbacks == 1
     assert connection.value.closed and connection.closed
 
@@ -324,3 +330,38 @@ def test_v2_builder_materializes_provider_time_and_rejects_unproven_rows(monkeyp
     assert len(targets) == 3
     assert {row.resolved_epoch for row in targets} == {NOW - 1}
     assert "f.source_as_of_epoch" in connection.cursor_value.statements[2][0]
+
+def test_v2_builder_fails_closed_before_quant_work_when_row_limit_is_exceeded():
+    class Cursor:
+        def __init__(self):
+            self.fetches = 0
+        def execute(self, _sql, _parameters):
+            pass
+        def fetchone(self):
+            return (NOW,)
+        def fetchall(self):
+            self.fetches += 1
+            return [()] * (V2_STATE_BUILD_EVIDENCE_LIMIT + 1)
+        def close(self):
+            pass
+
+    class Connection:
+        def __init__(self):
+            self.cursor_value = Cursor()
+            self.rollbacks = 0
+        def cursor(self):
+            return self.cursor_value
+        def rollback(self):
+            self.rollbacks += 1
+        def close(self):
+            pass
+
+    connection = Connection()
+    builder = PostgresV2StateBuilder(
+        "postgresql://unused", connect=lambda _url: connection,
+    )
+    with pytest.raises(RuntimeError, match="V2_EVIDENCE_ROW_LIMIT_EXCEEDED"):
+        builder.build()
+    assert builder.last_rows_materialized == V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+    assert connection.cursor_value.fetches == 1
+    assert connection.rollbacks == 0

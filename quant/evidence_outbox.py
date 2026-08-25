@@ -47,6 +47,7 @@ STATE_BUILD_SHUTDOWN_TIMEOUT_SECONDS = 20.0
 STATE_BUILD_SHUTDOWN_JOIN_GRACE_SECONDS = 0.25
 EVIDENCE_RUNTIME_LOCK_ID = int.from_bytes(b"ATOMV9EL", "big")
 EVIDENCE_RECOVERY_OUTCOME_LIMIT = 65_536
+V4_STATE_BUILD_EVIDENCE_LIMIT = 65_536
 EVIDENCE_RECOVERY_CYCLE_QUERY_CHUNK = 4_096
 EVIDENCE_LEGACY_WRITER_QUIESCENCE_SECONDS = 2.5
 _TERMINAL_FAILURE_REASONS = frozenset({
@@ -159,17 +160,27 @@ class PostgresV4BStateBuilder:
         try:
             cursor.execute(
                 f"""SELECT f.forecast_record_hash, f.record_json,
-                          o.outcome_record_hash, o.record_json
+                          o.outcome_record_hash, o.record_json,
+                          p.forecast_record_id, p.forecast_record_hash,
+                          p.commit_observed_at, p.target_endpoint,
+                          p.proof_eligible, p.proof_method
                    FROM public.atom_v9_v4_forecasts AS f
                    JOIN public.atom_v9_v4_outcomes AS o
                      USING (forecast_record_id)
+                   JOIN LATERAL atom_v9_internal.read_forecast_commit_proof(
+                       f.forecast_record_id
+                   ) AS p ON p.proof_eligible
                    WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
                      AND ({cohort_scope})
                    ORDER BY f.cutoff_at, f.forecast_record_id,
-                            o.created_at, o.outcome_record_id""",
-                (symbol, state_as_of, state_as_of, *cohort_params),
+                            o.created_at, o.outcome_record_id
+                   LIMIT %s""",
+                (symbol, state_as_of, state_as_of, *cohort_params,
+                 V4_STATE_BUILD_EVIDENCE_LIMIT + 1),
             )
             rows = tuple(cursor.fetchall())
+            if len(rows) > V4_STATE_BUILD_EVIDENCE_LIMIT:
+                raise RuntimeError("V4_STATE_EVIDENCE_ROW_LIMIT_EXCEEDED")
             commit = getattr(self._connection, "commit", None)
             if callable(commit):
                 commit()
@@ -183,9 +194,17 @@ class PostgresV4BStateBuilder:
             if callable(close):
                 close()
         evidence = tuple(
-            (deserialize_forecast_record(forecast_json, expected_hash=str(forecast_hash)),
-             deserialize_outcome_record(outcome_json, expected_hash=str(outcome_hash)))
-            for forecast_hash, forecast_json, outcome_hash, outcome_json in rows
+            (V4AWriter._apply_commit_proof(
+                deserialize_forecast_record(
+                    forecast_json, expected_hash=str(forecast_hash)),
+                (proof_id, proof_hash, proof_observed_at, proof_target_endpoint,
+                 proof_eligible, proof_method),
+             ),
+             deserialize_outcome_record(
+                 outcome_json, expected_hash=str(outcome_hash)))
+            for (forecast_hash, forecast_json, outcome_hash, outcome_json,
+                 proof_id, proof_hash, proof_observed_at, proof_target_endpoint,
+                 proof_eligible, proof_method) in rows
         )
         state = build_accuracy_state(
             symbol=symbol, state_as_of=state_as_of,
@@ -223,17 +242,27 @@ class PostgresV4CStateBuilder:
         try:
             cursor.execute(
                 f"""SELECT f.forecast_record_hash, f.record_json,
-                          o.outcome_record_hash, o.record_json
+                          o.outcome_record_hash, o.record_json,
+                          p.forecast_record_id, p.forecast_record_hash,
+                          p.commit_observed_at, p.target_endpoint,
+                          p.proof_eligible, p.proof_method
                    FROM public.atom_v9_v4_forecasts AS f
                    JOIN public.atom_v9_v4_outcomes AS o
                      USING (forecast_record_id)
+                   JOIN LATERAL atom_v9_internal.read_forecast_commit_proof(
+                       f.forecast_record_id
+                   ) AS p ON p.proof_eligible
                    WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
                      AND ({cohort_scope})
                    ORDER BY f.cutoff_at, f.forecast_record_id,
-                            o.created_at, o.outcome_record_id""",
-                (symbol, state_as_of, state_as_of, *cohort_params),
+                            o.created_at, o.outcome_record_id
+                   LIMIT %s""",
+                (symbol, state_as_of, state_as_of, *cohort_params,
+                 V4_STATE_BUILD_EVIDENCE_LIMIT + 1),
             )
             rows = tuple(cursor.fetchall())
+            if len(rows) > V4_STATE_BUILD_EVIDENCE_LIMIT:
+                raise RuntimeError("V4_STATE_EVIDENCE_ROW_LIMIT_EXCEEDED")
             commit = getattr(self._connection, "commit", None)
             if callable(commit):
                 commit()
@@ -247,9 +276,17 @@ class PostgresV4CStateBuilder:
             if callable(close):
                 close()
         evidence = tuple(
-            (deserialize_forecast_record(forecast_json, expected_hash=str(forecast_hash)),
-             deserialize_outcome_record(outcome_json, expected_hash=str(outcome_hash)))
-            for forecast_hash, forecast_json, outcome_hash, outcome_json in rows
+            (V4AWriter._apply_commit_proof(
+                deserialize_forecast_record(
+                    forecast_json, expected_hash=str(forecast_hash)),
+                (proof_id, proof_hash, proof_observed_at, proof_target_endpoint,
+                 proof_eligible, proof_method),
+             ),
+             deserialize_outcome_record(
+                 outcome_json, expected_hash=str(outcome_hash)))
+            for (forecast_hash, forecast_json, outcome_hash, outcome_json,
+                 proof_id, proof_hash, proof_observed_at, proof_target_endpoint,
+                 proof_eligible, proof_method) in rows
         )
         state = self._build_state(symbol, state_as_of, cohorts, evidence)
         return self._store.insert(state, self._clock())
