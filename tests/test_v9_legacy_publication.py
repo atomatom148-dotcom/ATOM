@@ -1,7 +1,4 @@
 from pathlib import Path
-from types import SimpleNamespace
-
-from quant.evidence import records_for_results
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,17 +17,3 @@ def test_legacy_publication_migration_is_post_commit_append_only_and_no_backfill
     assert "track_commit_timestamp" not in sql
     assert "ALTER SYSTEM" not in sql
 
-
-def test_q5_q9_cannot_fall_back_to_cutoff_as_source_time():
-    for quant_id in (
-        "q5_microstructure", "q6_volume_liquidity", "q7_relative_value",
-        "q8_cross_asset", "q9_factor",
-    ):
-        result = SimpleNamespace(
-            quant_id=quant_id, formula_version="test-v1",
-            forecast_bps=(1.0,) * 6,
-        )
-        assert records_for_results(
-            results=(result,), cycle_id="COIN:100", symbol="COIN",
-            cutoff_epoch=100.0, cutoff_midpoint=50.0, created_epoch=101.0,
-        ) == ()

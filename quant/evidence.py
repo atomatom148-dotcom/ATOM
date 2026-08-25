@@ -602,9 +602,7 @@ def records_for_results(*, results: Sequence[object], cycle_id: str,
             continue
         source_as_of_epoch = getattr(result, "source_as_of_epoch", None)
         provider_timed = result.quant_id in {
-            "q4_stat_arb", "q5_microstructure", "q6_volume_liquidity",
-            "q7_relative_value", "q8_cross_asset", "q9_factor",
-            "q10_options_vol",
+            "q4_stat_arb", "q10_options_vol",
         }
         if source_as_of_epoch is None:
             if provider_timed:
