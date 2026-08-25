@@ -100,13 +100,8 @@ class PostgresV2StateBuilder:
             try:
                 cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY", ())
                 cursor.execute(
-                    """
-                    SELECT max(o.resolved_epoch)
-                    FROM public.forecasts AS f
-                    JOIN public.forecast_outcomes AS o USING (forecast_id)
-                    WHERE f.data_schema_version=%s AND f.source_spec_version=%s
-                    """,
-                    (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION),
+                    "SELECT extract(epoch FROM pg_catalog.transaction_timestamp())",
+                    (),
                 )
                 row = cursor.fetchone()
                 state_as_of = None if row is None else row[0]
@@ -119,11 +114,20 @@ class PostgresV2StateBuilder:
                            f.cycle_id, f.symbol, f.horizon, f.cutoff_epoch,
                            f.maturity_epoch, f.forecast_bps, f.created_epoch,
                            f.data_schema_version, f.source_spec_version,
-                           f.source_as_of_epoch, o.outcome_bps, o.resolved_epoch
+                           f.source_as_of_epoch, o.outcome_bps, o.resolved_epoch,
+                           extract(epoch FROM fp.commit_observed_at),
+                           extract(epoch FROM op.commit_observed_at)
                     FROM public.forecasts AS f
                     JOIN public.forecast_outcomes AS o USING (forecast_id)
+                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
+                        'DIRECTIONAL_FORECAST', f.forecast_id
+                    ) AS fp ON true
+                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
+                        'DIRECTIONAL_OUTCOME', o.forecast_id
+                    ) AS op ON true
                     WHERE f.data_schema_version=%s AND f.source_spec_version=%s
-                      AND o.resolved_epoch<=%s
+                      AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
+                      AND op.commit_observed_at<=to_timestamp(%s)
                     ORDER BY f.horizon, f.cutoff_epoch, f.forecast_id
                     """,
                     (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, state_as_of),
@@ -135,11 +139,20 @@ class PostgresV2StateBuilder:
                            f.cycle_id, f.symbol, f.horizon, f.cutoff_epoch,
                            f.maturity_epoch, f.forecast_volatility_bps,
                            f.created_epoch, f.data_schema_version,
-                           f.source_spec_version, o.resolved_epoch
+                           f.source_spec_version, o.resolved_epoch,
+                           extract(epoch FROM fp.commit_observed_at),
+                           extract(epoch FROM op.commit_observed_at)
                     FROM public.volatility_forecasts AS f
                     JOIN public.volatility_forecast_outcomes AS o USING (forecast_id)
+                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
+                        'VOLATILITY_FORECAST', f.forecast_id
+                    ) AS fp ON true
+                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
+                        'VOLATILITY_OUTCOME', o.forecast_id
+                    ) AS op ON true
                     WHERE f.data_schema_version=%s AND f.source_spec_version=%s
-                      AND o.resolved_epoch<=%s
+                      AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
+                      AND op.commit_observed_at<=to_timestamp(%s)
                     ORDER BY f.horizon, f.cutoff_epoch, f.forecast_id
                     """,
                     (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, state_as_of),
@@ -165,8 +178,7 @@ class PostgresV2StateBuilder:
         for row in directional_rows:
             (record_id, quant_id, formula_version, cycle_id, symbol, horizon,
              cutoff, maturity, value, created, schema, source, source_as_of,
-             outcome,
-             resolved) = row
+             outcome, _resolved, forecast_available, outcome_available) = row
             if (horizon not in targets_by_horizon or
                     FORMULA_VERSION_MAP.get(str(quant_id)) != str(formula_version)):
                 continue
@@ -174,7 +186,7 @@ class PostgresV2StateBuilder:
             targets_by_horizon[str(horizon)].append(RawTarget(
                 int(record_id), str(cycle_id), str(symbol), TARGET_SPEC_ID,
                 str(schema), str(source), str(horizon), float(cutoff),
-                float(maturity), float(resolved), float(outcome),
+                float(maturity), float(outcome_available), float(outcome),
             ))
             if (str(quant_id) in {"q4_stat_arb", "q10_options_vol"} and
                     source_as_of is None):
@@ -184,11 +196,12 @@ class PostgresV2StateBuilder:
                 int(record_id), identity, str(symbol), str(quant_id),
                 str(formula_version), str(schema), str(source), str(horizon),
                 DIRECTIONAL_BPS, float(value), float(cutoff), source_epoch,
-                float(created), "FRESH",
+                float(forecast_available), "FRESH",
             ))
         for row in magnitude_rows:
             (record_id, quant_id, formula_version, cycle_id, symbol, horizon,
-             cutoff, maturity, value, created, schema, source, _resolved) = row
+             cutoff, maturity, value, created, schema, source, _resolved,
+             forecast_available, _outcome_available) = row
             if (horizon not in observations_by_horizon or
                     str(quant_id) != "q3_volatility" or
                     FORMULA_VERSION_MAP["q3_volatility"] != str(formula_version)):
@@ -198,7 +211,7 @@ class PostgresV2StateBuilder:
                 int(record_id), identity, str(symbol), str(quant_id),
                 str(formula_version), str(schema), str(source), str(horizon),
                 MAGNITUDE_BPS, float(value), float(cutoff), float(cutoff),
-                float(created), "FRESH",
+                float(forecast_available), "FRESH",
             ))
 
         family_versions = tuple(

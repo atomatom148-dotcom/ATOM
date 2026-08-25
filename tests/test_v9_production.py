@@ -267,13 +267,16 @@ def test_v2_builder_materializes_provider_time_and_rejects_unproven_rows(monkeyp
     directional = [
         (1, "q4_stat_arb", FORMULA_VERSION_MAP["q4_stat_arb"], "cycle", "COIN",
          "30S", cutoff, cutoff + 30, 1.0, cutoff + 1,
-         DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, cutoff - 2, 2.0, NOW),
+         DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, cutoff - 2, 2.0, NOW,
+         cutoff + 1, NOW),
         (2, "q10_options_vol", FORMULA_VERSION_MAP["q10_options_vol"], "cycle", "COIN",
          "30S", cutoff, cutoff + 30, 1.0, cutoff + 1,
-         DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None, 2.0, NOW),
+         DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None, 2.0, NOW,
+         cutoff + 1, NOW),
         (3, "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"], "cycle", "COIN",
          "30S", cutoff, cutoff + 30, 1.0, cutoff + 1,
-         DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None, 2.0, NOW),
+         DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None, 2.0, NOW,
+         cutoff + 1, NOW),
     ]
 
     class Cursor:
