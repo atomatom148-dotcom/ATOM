@@ -136,6 +136,23 @@ def test_h1_mathematical_digests_are_repeatable_and_exclude_timings_and_run_id()
     assert first.replay_run_id != second.replay_run_id
 
 
+def test_h1_rejects_certification_when_usable_quotes_have_over_five_second_gap():
+    opened, closed = _session()
+    rows = _canonical(
+        _quote("COIN", opened),
+        _quote("QQQ", opened, bid=500.0),
+        _quote("COIN", opened + timedelta(seconds=6), bid=100.1),
+        _quote("QQQ", opened + timedelta(seconds=6), bid=500.1),
+        _quote("COIN", closed - timedelta(seconds=1), bid=101.0),
+        _quote("QQQ", closed - timedelta(seconds=1), bid=501.0),
+    )
+
+    report = _run(rows)
+
+    assert report.data_status == "DATA_INCOMPLETE"
+    assert "COIN_INTERQUOTE_GAP" in report.data_reason_codes
+
+
 def test_target_uses_first_accepted_quote_at_or_after_provider_endpoint():
     opened, _closed = _session()
     rows = _canonical(

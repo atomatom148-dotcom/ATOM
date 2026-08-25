@@ -117,10 +117,9 @@ def test_reader_uses_one_sip_request_per_page_and_preserves_provider_nanos():
 
 @pytest.mark.parametrize("change", [
     lambda row: {key: value for key, value in row.items() if key != "bs"},
-    lambda row: {**row, "bp": 101.0, "ap": 100.0},
     lambda row: {**row, "as": -1.0},
 ])
-def test_reader_rejects_incomplete_or_invalid_top_of_book(change):
+def test_reader_rejects_incomplete_or_invalid_sizes(change):
     opened, closed = _session()
     valid = _payload("2026-01-05T14:30:00Z")
     opener = _Opener({
@@ -128,6 +127,53 @@ def test_reader_rejects_incomplete_or_invalid_top_of_book(change):
         "next_page_token": None,
     })
     with pytest.raises(ValueError):
+        AlpacaHistoricalSipReader(
+            "key", "secret", opener=opener,
+        ).read_session(session_open=opened, session_close=closed)
+
+
+@pytest.mark.parametrize("invalid", [
+    {"bp": 0.0, "ap": 100.0},
+    {"bp": 100.0, "ap": 0.0},
+    {"bp": -1.0, "ap": 100.0},
+    {"bp": 100.0, "ap": -1.0},
+    {"bp": 101.0, "ap": 100.0},
+])
+def test_reader_skips_unusable_provider_top_of_book(invalid):
+    opened, closed = _session()
+    first = _payload("2026-01-05T14:30:00Z")
+    bad = {**_payload("2026-01-05T14:30:00.500000000Z"), **invalid}
+    good = _payload("2026-01-05T14:30:01Z")
+    opener = _Opener({
+        "quotes": {
+            "COIN": [first, bad, good],
+            "QQQ": [_payload("2026-01-05T14:30:01Z", bid=500.0)],
+        },
+        "next_page_token": None,
+    })
+
+    rows = AlpacaHistoricalSipReader(
+        "key", "secret", opener=opener,
+    ).read_session(session_open=opened, session_close=closed)
+
+    assert [row.provider_event_ns for row in rows] == [
+        _ns(opened),
+        _ns(opened + timedelta(seconds=1)),
+        _ns(opened + timedelta(seconds=1)),
+    ]
+
+
+def test_reader_reports_data_unavailable_when_all_coin_prices_are_unusable():
+    opened, closed = _session()
+    opener = _Opener({
+        "quotes": {
+            "COIN": [_payload("2026-01-05T14:30:00Z", bid=0.0, ask=0.0)],
+            "QQQ": [_payload("2026-01-05T14:30:00Z", bid=500.0)],
+        },
+        "next_page_token": None,
+    })
+
+    with pytest.raises(RuntimeError, match="REPLAY_DATA_UNAVAILABLE"):
         AlpacaHistoricalSipReader(
             "key", "secret", opener=opener,
         ).read_session(session_open=opened, session_close=closed)
