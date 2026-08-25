@@ -186,6 +186,13 @@ def test_h1_rejects_certification_when_usable_quotes_have_over_five_second_gap()
     assert coin.max_gap_end_ns == (
         int(opened.timestamp()) + 6
     ) * NANOSECONDS
+    assert coin.max_gap_start_utc == "2026-01-05T14:30:00.000000000Z"
+    assert coin.max_gap_end_utc == "2026-01-05T14:30:06.000000000Z"
+    assert coin.max_gap_previous_quote_ns == coin.max_gap_start_ns
+    assert coin.max_gap_next_quote_ns == coin.max_gap_end_ns
+    assert coin.max_gap_touches_rth_start is True
+    assert coin.max_gap_touches_rth_end is False
+    assert coin.configured_max_gap_ns == 5 * NANOSECONDS
     assert coin.over_limit_gap_count == 1
     assert coin.p99_gap_ns == 5 * NANOSECONDS
     assert coin.first_quote_delay_ns == 0
@@ -230,6 +237,21 @@ def test_h1_preflight_gap_ties_keep_first_interval_and_count_all_violations():
         int(opened.timestamp()) + 6
     ) * NANOSECONDS
     assert coin.over_limit_gap_count == 2
+
+
+def test_h1_gap_boundary_classification_uses_exact_rth_boundaries():
+    import quant.historical_replay_h1 as module
+
+    opened, closed = _session()
+    coverage = module._quote_coverage(
+        symbol="COIN",
+        rows=(_quote("COIN", opened), _quote("COIN", closed)),
+        open_ns=int(opened.timestamp()) * NANOSECONDS,
+        close_ns=int(closed.timestamp()) * NANOSECONDS,
+    )
+
+    assert coverage.max_gap_touches_rth_start is True
+    assert coverage.max_gap_touches_rth_end is True
 
 
 def test_h1_preflight_rejection_never_enters_clock_or_quant(monkeypatch):
@@ -664,6 +686,65 @@ def test_cli_accepts_preflight_only_and_emits_json(monkeypatch, capsys):
     assert observed["session_open"].astimezone(EASTERN).hour == 9
     assert observed["session_close"].astimezone(EASTERN).hour == 16
     assert observed["preflight_only"] is True
+
+
+def test_cli_batch_preflight_stops_at_first_qualifying_date_without_quants(
+    monkeypatch, capsys, tmp_path,
+):
+    import quant.historical_replay_h1 as module
+
+    monkeypatch.setattr(
+        module.AlpacaHistoricalSipReader, "from_environment",
+        classmethod(lambda _cls: object()),
+    )
+    calls = []
+
+    def run(**kwargs):
+        calls.append(kwargs)
+        day = kwargs["session_open"].date().isoformat()
+        passed = day == "2026-01-06"
+        return SimpleNamespace(
+            historical_session=day,
+            execution_stage="PREFLIGHT_ONLY" if passed else "PREFLIGHT_REJECTED",
+            data_status="DATA_COMPLETE" if passed else "DATA_INCOMPLETE",
+            data_reason_codes=() if passed else ("COIN_INTERQUOTE_GAP",),
+            quote_coverage=() if passed else (SimpleNamespace(
+                symbol="COIN", max_gap_ns=6 * NANOSECONDS,
+                max_gap_start_utc="2026-01-05T15:00:00.000000000Z",
+                max_gap_end_utc="2026-01-05T15:00:06.000000000Z",
+                max_gap_touches_rth_start=False,
+                max_gap_touches_rth_end=False,
+                configured_max_gap_ns=5 * NANOSECONDS,
+            ),),
+            to_dict=lambda: {"date": day, "passed": passed},
+        )
+
+    monkeypatch.setattr(module, "run_h1_session", run)
+    args = (
+        "2026-01-05", "2026-01-06", "2026-01-07", "--batch-preflight",
+        "--output-dir", str(tmp_path),
+    )
+    assert main(args) == 0
+    first_output = capsys.readouterr().out
+
+    assert [call["session_open"].date().isoformat() for call in calls] == [
+        "2026-01-05", "2026-01-06",
+    ]
+    assert all(call["preflight_only"] is True for call in calls)
+    assert json.loads(first_output.splitlines()[-1]) == {
+        "qualifying_date": "2026-01-06",
+    }
+    assert json.loads((tmp_path / "2026-01-05.json").read_text()) == {
+        "date": "2026-01-05", "passed": False,
+    }
+    assert json.loads((tmp_path / "2026-01-06.json").read_text()) == {
+        "date": "2026-01-06", "passed": True,
+    }
+    assert not (tmp_path / "2026-01-07.json").exists()
+
+    calls.clear()
+    assert main(args) == 0
+    assert capsys.readouterr().out == first_output
 
 
 def test_cli_fails_closed_when_session_data_is_incomplete(monkeypatch, capsys):

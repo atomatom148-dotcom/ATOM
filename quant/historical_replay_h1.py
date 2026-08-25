@@ -14,6 +14,7 @@ from datetime import date, datetime, time as datetime_time, timezone
 import hashlib
 import json
 import math
+from pathlib import Path
 import time
 from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
@@ -48,7 +49,7 @@ from .v9_v3_synthesis import synthesize_v3
 from .v9_v4a_evidence import canonical_sha256
 
 
-H1_RUNNER_VERSION = "ATOM-TRUE-V9-H1-RUNNER-2"
+H1_RUNNER_VERSION = "ATOM-TRUE-V9-H1-RUNNER-3"
 _NANOSECONDS = 1_000_000_000
 _REFRESH_NS = 3_600 * _NANOSECONDS
 _COMPLETE_EDGE_NS = 5 * _NANOSECONDS
@@ -93,6 +94,13 @@ class QuoteCoverage:
     max_gap_ns: int | None
     max_gap_start_ns: int | None
     max_gap_end_ns: int | None
+    max_gap_start_utc: str | None
+    max_gap_end_utc: str | None
+    max_gap_previous_quote_ns: int | None
+    max_gap_next_quote_ns: int | None
+    max_gap_touches_rth_start: bool
+    max_gap_touches_rth_end: bool
+    configured_max_gap_ns: int
     over_limit_gap_count: int
 
 
@@ -230,6 +238,17 @@ def _utc(epoch: float) -> datetime:
     return datetime.fromtimestamp(epoch, timezone.utc)
 
 
+def _ns_utc(value: int | None) -> str | None:
+    if value is None:
+        return None
+    seconds, nanoseconds = divmod(value, _NANOSECONDS)
+    return (
+        datetime.fromtimestamp(seconds, timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        ) + f".{nanoseconds:09d}Z"
+    )
+
+
 def _elapsed(clock: Callable[[], float], started: float) -> float:
     value = clock() - started
     if not math.isfinite(value) or value < 0:
@@ -254,6 +273,8 @@ def _quote_coverage(
         for previous, current in zip(rows, rows[1:])
     )
     maximum = max(gaps, key=lambda item: item[2], default=None)
+    gap_start = None if maximum is None else maximum[0]
+    gap_end = None if maximum is None else maximum[1]
     return QuoteCoverage(
         symbol,
         len(rows),
@@ -263,8 +284,15 @@ def _quote_coverage(
         None if not rows else close_ns - rows[-1].provider_event_ns,
         _nearest_rank_p99(item[2] for item in gaps),
         None if maximum is None else maximum[2],
-        None if maximum is None else maximum[0],
-        None if maximum is None else maximum[1],
+        gap_start,
+        gap_end,
+        _ns_utc(gap_start),
+        _ns_utc(gap_end),
+        gap_start,
+        gap_end,
+        gap_start == open_ns,
+        gap_end == close_ns,
+        _COMPLETE_GAP_NS,
         sum(item[2] > _COMPLETE_GAP_NS for item in gaps),
     )
 
@@ -1005,25 +1033,100 @@ def _session(day: date) -> tuple[datetime, datetime]:
     return opened, datetime.combine(day, datetime_time(16, 0), tzinfo=_EASTERN)
 
 
+def _preflight_passed(report: H1ReplayReport) -> bool:
+    return (
+        report.execution_stage == "PREFLIGHT_ONLY" and
+        report.data_status == "DATA_COMPLETE"
+    )
+
+
+def _batch_summary(report: H1ReplayReport, result_file: Path) -> dict[str, object]:
+    rejected = tuple(
+        coverage for coverage in report.quote_coverage
+        if any(code.startswith(f"{coverage.symbol}_")
+               for code in report.data_reason_codes)
+    )
+    return {
+        "date": report.historical_session,
+        "status": "QUALIFYING" if _preflight_passed(report) else "REJECTED",
+        "reason_codes": report.data_reason_codes,
+        "rejected_symbols": tuple({
+            "symbol": row.symbol,
+            "maximum_gap_ns": row.max_gap_ns,
+            "previous_quote_utc": row.max_gap_start_utc,
+            "next_quote_utc": row.max_gap_end_utc,
+            "touches_rth_start": row.max_gap_touches_rth_start,
+            "touches_rth_end": row.max_gap_touches_rth_end,
+            "configured_maximum_gap_ns": row.configured_max_gap_ns,
+        } for row in rejected),
+        "result_file": str(result_file),
+    }
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run one read-only ATOM TRUE V9 H1 historical SIP session",
     )
-    parser.add_argument("session", help="complete RTH session date (YYYY-MM-DD)")
+    parser.add_argument(
+        "session", nargs="+", help="complete RTH session date(s) (YYYY-MM-DD)",
+    )
     parser.add_argument("--run-id", help="replay run identity")
     parser.add_argument(
         "--preflight-only", action="store_true",
         help="validate retained quote coverage without running V9",
     )
+    parser.add_argument(
+        "--batch-preflight", action="store_true",
+        help="scan dates in order, coverage-only, stopping at the first pass",
+    )
+    parser.add_argument(
+        "--output-dir", default="h1-preflight-results",
+        help="directory for full per-date JSON results in batch mode",
+    )
     arguments = parser.parse_args(None if argv is None else tuple(argv))
+    if len(arguments.session) > 1 and not arguments.batch_preflight:
+        parser.error("multiple dates require --batch-preflight")
+    if arguments.batch_preflight and arguments.run_id:
+        parser.error("--run-id is only valid for a single session")
     try:
-        day = date.fromisoformat(arguments.session)
+        days = tuple(date.fromisoformat(value) for value in arguments.session)
     except ValueError as error:
         parser.error(str(error))
+    reader = AlpacaHistoricalSipReader.from_environment()
+    if arguments.batch_preflight:
+        output_dir = Path(arguments.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for day in days:
+            opened, closed = _session(day)
+            report = run_h1_session(
+                reader=reader, session_open=opened, session_close=closed,
+                replay_run_id=f"h1-preflight-{day.isoformat()}",
+                preflight_only=True,
+            )
+            result_file = output_dir / f"{day.isoformat()}.json"
+            result_file.write_text(
+                json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":"))
+                + "\n", encoding="utf-8",
+            )
+            print(json.dumps(
+                _batch_summary(report, result_file),
+                sort_keys=True, separators=(",", ":"),
+            ))
+            if _preflight_passed(report):
+                print(json.dumps(
+                    {"qualifying_date": day.isoformat()},
+                    sort_keys=True, separators=(",", ":"),
+                ))
+                return 0
+        print(json.dumps(
+            {"qualifying_date": None}, sort_keys=True, separators=(",", ":"),
+        ))
+        return 2
+
+    day = days[0]
     opened, closed = _session(day)
     report = run_h1_session(
-        reader=AlpacaHistoricalSipReader.from_environment(),
-        session_open=opened, session_close=closed,
+        reader=reader, session_open=opened, session_close=closed,
         replay_run_id=arguments.run_id or f"h1-{day.isoformat()}",
         preflight_only=arguments.preflight_only,
     )
