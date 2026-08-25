@@ -158,9 +158,9 @@ class WebSurfaceTests(unittest.TestCase):
         request(app, "/")
 
         self.assertEqual(set(dict(metrics.snapshot().distributions)), {
-            "web_endpoint.health.duration_ms",
-            "web_endpoint.api_live.duration_ms",
-            "web_endpoint.dashboard.duration_ms",
+            "web_endpoint./health.duration_ms",
+            "web_endpoint./api/live.duration_ms",
+            "web_endpoint./.duration_ms",
         })
 
     def test_page_uses_non_overlapping_live_and_evidence_loops(self):
