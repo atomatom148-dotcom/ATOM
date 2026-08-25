@@ -65,6 +65,17 @@ PHASE_E_FAMILY_NAMES = {
 }
 PHASE_E_HORIZONS = ("30S", "1M", "5M", "15M", "30M", "1H")
 DASHBOARD_PHASE_E_TTL_SECONDS = 300.0
+_WEB_ENDPOINT_METRIC_PATHS = frozenset({
+    "/",
+    "/health",
+    "/api/g2-cross-asset",
+    "/api/v9-math",
+    "/api/performance",
+    "/api/phase-e",
+    "/api/live",
+    "/api/dashboard",
+})
+_WEB_ENDPOINT_NOT_FOUND_METRIC = "not_found"
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,11 +609,15 @@ def create_app(
         path = environ.get("PATH_INFO", "")
         request_started = monotonic_clock()
         original_start_response = start_response
+        endpoint_metric = (
+            path if path in _WEB_ENDPOINT_METRIC_PATHS
+            else _WEB_ENDPOINT_NOT_FOUND_METRIC
+        )
 
         def measured_start_response(status: str, headers: list[tuple[str, str]],
                                     exc_info: object = None) -> object:
             metrics.observe(
-                "web_endpoint." + str(path or "unknown") + ".duration_ms",
+                "web_endpoint." + endpoint_metric + ".duration_ms",
                 (monotonic_clock() - request_started) * 1000,
             )
             if exc_info is None:
