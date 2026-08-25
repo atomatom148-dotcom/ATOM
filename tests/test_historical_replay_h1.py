@@ -59,7 +59,11 @@ def _run(rows, *, run_id="h1-test", enforce_preflight=False,
         patch.object(module, "_coverage_reason_codes", return_value=())
         if not enforce_preflight else nullcontext()
     )
-    with context:
+    endpoint_context = (
+        patch.object(module, "_endpoint_reason_codes", return_value=())
+        if not enforce_preflight else nullcontext()
+    )
+    with context, endpoint_context:
         report = run_h1_session(
             reader=reader, session_open=opened, session_close=closed,
             replay_run_id=run_id, preflight_only=preflight_only,
@@ -278,6 +282,85 @@ def test_h1_preflight_only_accepts_complete_coverage_without_running_quant(
     assert report.data_reason_codes == ()
     assert all(row.over_limit_gap_count == 0 for row in report.quote_coverage)
     assert report.frame_count == 0
+
+
+def test_h1_preflight_rejects_missing_late_target_endpoint_before_replay(
+    monkeypatch,
+):
+    import quant.historical_replay_h1 as module
+
+    opened, closed = _session()
+    rows = [
+        _quote("COIN", opened + timedelta(seconds=offset), bid=100.0)
+        for offset in range(0, 23_361, 5)
+    ]
+    rows.extend(
+        _quote("COIN", opened + timedelta(seconds=offset), bid=100.1)
+        for offset in (*range(23_361, 23_392, 5), 23_395)
+    )
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("endpoint preflight entered replay")
+
+    monkeypatch.setattr(module, "OneSessionReplayClock", unexpected)
+    monkeypatch.setattr(module, "_calculate_provider_families", unexpected)
+    monkeypatch.setattr(module, "build_replay_v2_as_of", unexpected)
+    monkeypatch.setattr(module, "_build_v1", unexpected)
+    monkeypatch.setattr(module, "synthesize_v3", unexpected)
+    report = run_h1_session(
+        reader=_Reader(tuple(rows)), session_open=opened, session_close=closed,
+        replay_run_id="endpoint-preflight-reject",
+    )
+
+    assert report.execution_stage == "PREFLIGHT_REJECTED"
+    assert report.data_status == "DATA_INCOMPLETE"
+    assert report.data_reason_codes == ("30S_ENDPOINT_GAP",)
+    assert report.frame_count == 0
+    assert report.timings.quant_seconds == 0.0
+    assert report.timings.alignment_seconds == 0.0
+
+
+def test_h1_preflight_requires_complete_coin_but_qqq_remains_family_local():
+    coin_rows = tuple(
+        row for row in _complete_five_second_rows() if row.symbol == "COIN"
+    )
+
+    report = _run(
+        coin_rows, enforce_preflight=True, preflight_only=True,
+    )
+
+    assert report.execution_stage == "PREFLIGHT_ONLY"
+    assert report.data_status == "DATA_COMPLETE"
+    assert report.data_reason_codes == ()
+    assert report.quote_counts == (("COIN", 4_680), ("QQQ", 0))
+    qqq = next(row for row in report.quote_coverage if row.symbol == "QQQ")
+    assert qqq.count == 0
+    assert qqq.first_quote_ns is None
+
+
+def test_h1_reader_data_unavailable_becomes_structured_preflight_rejection():
+    opened, closed = _session()
+
+    class UnavailableReader:
+        def __init__(self):
+            self.calls = []
+
+        def read_session(self, *, session_open, session_close):
+            self.calls.append((session_open, session_close))
+            raise RuntimeError("REPLAY_DATA_UNAVAILABLE")
+
+    reader = UnavailableReader()
+    report = run_h1_session(
+        reader=reader, session_open=opened, session_close=closed,
+        replay_run_id="reader-data-unavailable", preflight_only=True,
+    )
+
+    assert reader.calls == [(opened, closed)]
+    assert report.execution_stage == "PREFLIGHT_REJECTED"
+    assert report.data_status == "DATA_INCOMPLETE"
+    assert report.quote_counts == (("COIN", 0), ("QQQ", 0))
+    assert "COIN_INSUFFICIENT_QUOTES" in report.data_reason_codes
+    assert not any(code.startswith("QQQ_") for code in report.data_reason_codes)
 
 
 def test_h1_complete_coverage_dispatches_into_replay(monkeypatch):

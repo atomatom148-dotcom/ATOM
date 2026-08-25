@@ -293,6 +293,8 @@ def _coverage_reason_codes(
 ) -> tuple[str, ...]:
     reasons = []
     for coverage in quote_coverage:
+        if coverage.symbol != "COIN":
+            continue
         if coverage.count < 2:
             reasons.append(f"{coverage.symbol}_INSUFFICIENT_QUOTES")
         if (coverage.first_quote_delay_ns is None or
@@ -304,6 +306,58 @@ def _coverage_reason_codes(
         if (coverage.max_gap_ns is None or
                 coverage.max_gap_ns > _COMPLETE_GAP_NS):
             reasons.append(f"{coverage.symbol}_INTERQUOTE_GAP")
+    return tuple(sorted(reasons))
+
+
+def _preflight_coin_times(
+    rows: tuple[HistoricalSipQuote, ...], *, open_ns: int, close_ns: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Reproduce forecast and close-drain timestamps without replay work."""
+
+    frame_times: list[int] = []
+    index = 0
+    latest_ns: int | None = None
+    last_frame_ns: int | None = None
+    cutoff_ns = open_ns
+    while cutoff_ns < close_ns:
+        while (index < len(rows) and
+               rows[index].provider_event_ns <= cutoff_ns):
+            latest_ns = rows[index].provider_event_ns
+            index += 1
+        if latest_ns is not None and latest_ns != last_frame_ns:
+            frame_times.append(latest_ns)
+            last_frame_ns = latest_ns
+        cutoff_ns += _NANOSECONDS
+
+    outcome_times = list(frame_times)
+    if (rows and
+            (not outcome_times or
+             rows[-1].provider_event_ns > outcome_times[-1]) and
+            rows[-1].provider_event_ns < close_ns):
+        outcome_times.append(rows[-1].provider_event_ns)
+    return tuple(frame_times), tuple(outcome_times)
+
+
+def _endpoint_reason_codes(
+    rows: tuple[HistoricalSipQuote, ...], *, open_ns: int, close_ns: int,
+) -> tuple[str, ...]:
+    frame_times, outcome_times = _preflight_coin_times(
+        rows, open_ns=open_ns, close_ns=close_ns,
+    )
+    reasons = []
+    for horizon in HORIZONS:
+        horizon_ns = HORIZON_SECONDS[horizon] * _NANOSECONDS
+        endpoint_index = 0
+        for forecast_ns in frame_times:
+            maturity_ns = forecast_ns + horizon_ns
+            if maturity_ns >= close_ns:
+                break
+            while (endpoint_index < len(outcome_times) and
+                   outcome_times[endpoint_index] < maturity_ns):
+                endpoint_index += 1
+            if endpoint_index >= len(outcome_times):
+                reasons.append(f"{horizon}_ENDPOINT_GAP")
+                break
     return tuple(sorted(reasons))
 
 
@@ -487,6 +541,7 @@ def _configuration_digest(
         "complete_max_interquote_gap_seconds": (
             _COMPLETE_GAP_NS / _NANOSECONDS
         ),
+        "preflight_target_endpoint_audit": "TIMESTAMP_ONLY_EXACT_SIX",
     })
 
 
@@ -513,9 +568,14 @@ def run_h1_session(
 
     total_started = monotonic_clock()
     started = monotonic_clock()
-    quotes = tuple(reader.read_session(
-        session_open=session_open, session_close=session_close,
-    ))
+    try:
+        quotes = tuple(reader.read_session(
+            session_open=session_open, session_close=session_close,
+        ))
+    except RuntimeError as error:
+        if error.args != ("REPLAY_DATA_UNAVAILABLE",):
+            raise
+        quotes = ()
     read_decode_seconds = _elapsed(monotonic_clock, started)
     if any(not isinstance(row, HistoricalSipQuote) for row in quotes):
         raise TypeError("reader returned a non-historical quote")
@@ -535,7 +595,13 @@ def run_h1_session(
         )
         for symbol, rows in by_symbol.items()
     )
-    data_reason_codes = _coverage_reason_codes(quote_coverage)
+    coverage_reasons = _coverage_reason_codes(quote_coverage)
+    endpoint_reasons = (() if coverage_reasons else _endpoint_reason_codes(
+        by_symbol["COIN"], open_ns=open_ns, close_ns=close_ns,
+    ))
+    data_reason_codes = tuple(sorted(set(
+        (*coverage_reasons, *endpoint_reasons)
+    )))
     data_status = "CERTIFIED" if not data_reason_codes else "DATA_INCOMPLETE"
     dataset_digest = canonical_sha256(tuple(
         (row.symbol, row.provider_event_ns, row.bid, row.ask,

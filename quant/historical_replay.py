@@ -58,7 +58,7 @@ DATA_SCHEMA_VERSION = "alpaca-historical-sip-nbbo-v1"
 SOURCE = "ALPACA_SIP"
 SOURCE_SPEC_ROUND_LOTS = "alpaca-sip-quote-size-round-lots-v1"
 SOURCE_SPEC_SHARES = "alpaca-sip-quote-size-shares-v1"
-REPLAY_METHOD_VERSION = "alpaca-sip-logical-1s-rth-window-v3"
+REPLAY_METHOD_VERSION = "alpaca-sip-logical-1s-rth-window-v4"
 REPLAY_STATE_SCHEMA_VERSION = "ATOM-HISTORICAL-V2-ENVELOPE-1"
 EVIDENCE_ORIGIN = "HISTORICAL_REPLAY"
 TARGET_SPEC_ID = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
@@ -221,8 +221,12 @@ class AlpacaHistoricalSipReader:
             "sort": "asc",
             "limit": str(self._page_limit),
         }
-        coin_by_cutoff: dict[int, HistoricalSipQuote] = {}
-        qqq_by_cutoff: dict[int, HistoricalSipQuote] = {}
+        coin_by_cutoff: dict[
+            int, tuple[HistoricalSipQuote, HistoricalSipQuote]
+        ] = {}
+        qqq_by_cutoff: dict[
+            int, tuple[HistoricalSipQuote, HistoricalSipQuote]
+        ] = {}
         qqq_predecessors: dict[int, HistoricalSipQuote] = {}
         page_token: str | None = None
         seen_tokens: set[str] = set()
@@ -272,11 +276,17 @@ class AlpacaHistoricalSipReader:
                         if qqq_started:
                             raise ValueError(
                                 "Alpaca historical quotes are out of order")
-                        coin_by_cutoff[cutoff_ns] = decoded
+                        retained = coin_by_cutoff.get(cutoff_ns)
+                        coin_by_cutoff[cutoff_ns] = (
+                            (decoded, decoded) if retained is None else
+                            (retained[0], decoded)
+                        )
                         continue
                     if not qqq_started:
                         qqq_started = True
-                        coin_rows = tuple(coin_by_cutoff.values())
+                        coin_rows = tuple(
+                            last for _first, last in coin_by_cutoff.values()
+                        )
                     while (coin_index < len(coin_rows) and
                            coin_rows[coin_index].provider_event_ns <
                            decoded.provider_event_ns):
@@ -284,7 +294,11 @@ class AlpacaHistoricalSipReader:
                             qqq_predecessors[last_qqq.provider_event_ns] = last_qqq
                         coin_index += 1
                     last_qqq = decoded
-                    qqq_by_cutoff[cutoff_ns] = decoded
+                    retained = qqq_by_cutoff.get(cutoff_ns)
+                    qqq_by_cutoff[cutoff_ns] = (
+                        (decoded, decoded) if retained is None else
+                        (retained[0], decoded)
+                    )
                     while (coin_index < len(coin_rows) and
                            coin_rows[coin_index].provider_event_ns ==
                            decoded.provider_event_ns):
@@ -299,19 +313,28 @@ class AlpacaHistoricalSipReader:
             page_token = token
 
         if not qqq_started:
-            coin_rows = tuple(coin_by_cutoff.values())
+            coin_rows = tuple(
+                last for _first, last in coin_by_cutoff.values()
+            )
         while coin_index < len(coin_rows):
             if last_qqq is not None:
                 qqq_predecessors[last_qqq.provider_event_ns] = last_qqq
             coin_index += 1
         if not coin_rows:
             raise RuntimeError("REPLAY_DATA_UNAVAILABLE")
+        retained_coin_rows = {
+            row.provider_event_ns: row
+            for first, last in coin_by_cutoff.values()
+            for row in (first, last)
+        }
         qqq_rows = {
             row.provider_event_ns: row
-            for row in (*qqq_by_cutoff.values(), *qqq_predecessors.values())
+            for boundary in qqq_by_cutoff.values()
+            for row in boundary
         }
+        qqq_rows.update(qqq_predecessors)
         return tuple(sorted(
-            (*coin_rows, *qqq_rows.values()),
+            (*retained_coin_rows.values(), *qqq_rows.values()),
             key=lambda row: (row.provider_event_ns, SYMBOLS.index(row.symbol)),
         ))
 
