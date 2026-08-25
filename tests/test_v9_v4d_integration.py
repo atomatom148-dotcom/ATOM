@@ -23,6 +23,7 @@ from quant.v9_v4d_integration import (
 )
 from quant.evidence_outbox import (
     EVIDENCE_RECOVERY_CYCLE_QUERY_CHUNK, EVIDENCE_RECOVERY_OUTCOME_LIMIT,
+    V4_STATE_BUILD_EVIDENCE_LIMIT,
     EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork, TerminalDeliveryError,
     PostgresV4BStateBuilder, PostgresV4CStateBuilder, PostgresV4StateBuilder,
     V4StateBuildWorker, V4StateCacheRefresher,
@@ -1437,12 +1438,16 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
             assert "o.created_at<=%s" in sql
             assert "f.record_json->>'cohort_id'=%s" in sql
             assert "f.record_json->>'cohort_hash'=%s" in sql
+            assert "read_forecast_commit_proof" in sql and "LIMIT %s" in sql
             self.params = params
         def fetchall(self):
             return ((forecast.forecast_record_hash,
                      json.dumps(_canonical(asdict(forecast))),
                      outcome.outcome_record_hash,
-                     json.dumps(_canonical(asdict(outcome)))),)
+                     json.dumps(_canonical(asdict(outcome))),
+                     forecast.forecast_record_id, forecast.forecast_record_hash,
+                     NOW, forecast.target_endpoint, True,
+                     "POST_COMMIT_DB_OBSERVATION_V1"),)
         def close(self): pass
     class Connection(_WorkerConnection):
         def __init__(self): self.cursor_value = Cursor()
@@ -1471,6 +1476,7 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
     assert connection.cursor_value.params == (
         "COIN", as_of, as_of,
         *(value for horizon in HORIZONS for value in (horizon, *cohorts[horizon])),
+        V4_STATE_BUILD_EVIDENCE_LIMIT + 1,
     )
     assert store.calls == [(state, NOW + timedelta(minutes=2))]
 
@@ -1496,10 +1502,14 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
             assert "o.created_at<=%s" in sql
             assert "f.record_json->>'cohort_id'=%s" in sql
             assert "f.record_json->>'cohort_hash'=%s" in sql
+            assert "read_forecast_commit_proof" in sql and "LIMIT %s" in sql
             self.params = params
         def fetchall(self):
             return ((forecast.forecast_record_hash, json.dumps(_canonical(asdict(forecast))),
-                     outcome.outcome_record_hash, json.dumps(_canonical(asdict(outcome)))),)
+                     outcome.outcome_record_hash, json.dumps(_canonical(asdict(outcome))),
+                     forecast.forecast_record_id, forecast.forecast_record_hash,
+                     NOW, forecast.target_endpoint, True,
+                     "POST_COMMIT_DB_OBSERVATION_V1"),)
         def close(self): pass
     class Connection(_WorkerConnection):
         def __init__(self): self.cursor_value = Cursor()
@@ -1536,6 +1546,7 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
     assert connection.cursor_value.params == (
         "COIN", as_of, as_of,
         *(value for horizon in HORIZONS for value in (horizon, *cohorts[horizon])),
+        V4_STATE_BUILD_EVIDENCE_LIMIT + 1,
     )
     assert state.horizons[0].range_status == "UNAVAILABLE"
     assert all(item.range_status == "UNAVAILABLE" for item in state.horizons)
