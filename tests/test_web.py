@@ -9,6 +9,7 @@ from unittest.mock import patch
 from quant.history import MidpointHistory, MidpointObservation
 from quant.evidence import PhaseECohortMetrics
 from quant.live_market import LiveMarketState
+from quant.v9_v4d_integration import OperationalMetrics
 from quant.web import (DashboardEvidenceCache, FAMILY_NAMES, HORIZON_LABELS,
                        PHASE_E_FAMILY_NAMES, create_app, dashboard_data,
                        dashboard_page)
@@ -129,6 +130,38 @@ class WebSurfaceTests(unittest.TestCase):
         response = request(create_app(evidence_store=Store()), "/favicon.ico")
         self.assertEqual(response["status"], "404 Not Found")
         self.assertEqual(response["body"], b"Not Found")
+
+    def test_unknown_paths_share_one_bounded_telemetry_distribution(self):
+        metrics = OperationalMetrics()
+        app = create_app(metrics=metrics, monotonic_clock=lambda: 1.0)
+
+        for index in range(1_000):
+            response = request(app, f"/missing-{index}")
+            self.assertEqual(response["status"], "404 Not Found")
+
+        distributions = dict(metrics.snapshot().distributions)
+        self.assertEqual(
+            tuple(distributions),
+            ("web_endpoint.not_found.duration_ms",),
+        )
+        self.assertEqual(
+            distributions["web_endpoint.not_found.duration_ms"].count,
+            1_000,
+        )
+
+    def test_known_paths_use_fixed_endpoint_metric_names(self):
+        metrics = OperationalMetrics()
+        app = create_app(metrics=metrics, monotonic_clock=lambda: 1.0)
+
+        request(app, "/health")
+        request(app, "/api/live")
+        request(app, "/")
+
+        self.assertEqual(set(dict(metrics.snapshot().distributions)), {
+            "web_endpoint.health.duration_ms",
+            "web_endpoint.api_live.duration_ms",
+            "web_endpoint.dashboard.duration_ms",
+        })
 
     def test_page_uses_non_overlapping_live_and_evidence_loops(self):
         page = request(create_app(), "/")["body"].decode()
