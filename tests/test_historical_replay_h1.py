@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import asdict
 from datetime import datetime, timedelta
 import json
 from types import SimpleNamespace
@@ -216,6 +217,59 @@ def test_h1_rejects_certification_when_usable_quotes_have_over_five_second_gap()
     assert report.qqq_fresh_frame_count == 0
     assert report.replay_factor is None
     assert report.projected_seconds == ()
+
+
+def test_h1_frozen_interquote_gap_boundary_and_cli_limit_match(
+    monkeypatch, capsys,
+):
+    import quant.historical_replay_h1 as module
+
+    opened, closed = _session()
+    open_ns = int(opened.timestamp()) * NANOSECONDS
+    close_ns = int(closed.timestamp()) * NANOSECONDS
+
+    for gap_ns, rejected in (
+        (3_719_000_000, False),
+        (5 * NANOSECONDS, False),
+        (5 * NANOSECONDS + 1, True),
+    ):
+        coverage = module._quote_coverage(
+            symbol="COIN",
+            rows=(
+                _quote("COIN", opened),
+                _quote("COIN", opened, fraction=gap_ns),
+            ),
+            open_ns=open_ns,
+            close_ns=close_ns,
+        )
+
+        assert coverage.max_gap_ns == gap_ns
+        assert coverage.configured_max_gap_ns == 5 * NANOSECONDS
+        assert coverage.over_limit_gap_count == int(rejected)
+        assert (
+            "COIN_INTERQUOTE_GAP" in module._coverage_reason_codes((coverage,))
+        ) is rejected
+        assert coverage.configured_max_gap_ns == module._COMPLETE_GAP_NS
+        assert coverage.configured_max_gap_ns / NANOSECONDS == 5
+        assert asdict(coverage)["configured_max_gap_ns"] == module._COMPLETE_GAP_NS
+
+    monkeypatch.setattr(
+        module.AlpacaHistoricalSipReader, "from_environment",
+        classmethod(lambda _cls: object()),
+    )
+    monkeypatch.setattr(
+        module, "run_h1_session", lambda **_kwargs: SimpleNamespace(
+            execution_stage="PREFLIGHT_REJECTED",
+            data_status="DATA_INCOMPLETE",
+            to_dict=lambda: {"quote_coverage": (asdict(coverage),)},
+        ),
+    )
+
+    assert main(("2026-01-05", "--preflight-only")) == 2
+    displayed = json.loads(capsys.readouterr().out)
+    assert displayed["quote_coverage"][0]["configured_max_gap_ns"] == (
+        module._COMPLETE_GAP_NS
+    )
 
 
 def test_h1_preflight_gap_ties_keep_first_interval_and_count_all_violations():
