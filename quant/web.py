@@ -99,17 +99,26 @@ class DashboardEvidenceCache:
     def refresh(self) -> DashboardEvidenceSnapshot:
         as_of_epoch = self._clock()
         try:
+            counts = self._store.counts()
+        except Exception:
+            with self._lock:
+                return self._snapshot
+        with self._lock:
+            current = self._snapshot
+            self._snapshot = DashboardEvidenceSnapshot(
+                counts, current.phase_e_cohorts, as_of_epoch, "AVAILABLE",
+            )
+        try:
             cohorts = tuple(self._store.phase_e_cohorts(as_of_epoch))
             volatility_reader = getattr(self._store, "volatility_phase_e_cohorts", None)
             if callable(volatility_reader):
                 cohorts += tuple(volatility_reader(as_of_epoch))
             candidate = DashboardEvidenceSnapshot(
-                self._store.counts(), cohorts, as_of_epoch, "AVAILABLE",
+                counts, cohorts, as_of_epoch, "AVAILABLE",
             )
         except Exception:
             with self._lock:
-                current = self._snapshot
-            return current
+                return self._snapshot
         with self._lock:
             self._snapshot = candidate
         return candidate
@@ -816,7 +825,6 @@ def main(*, simulator_connection_factory: Callable | None = None,
         database_url = os.environ["DATABASE_URL"]
         evidence_store = PostgresEvidenceStore(database_url)
         evidence_cache = DashboardEvidenceCache(evidence_store)
-        evidence_cache.start()
         from .v9_production import (
             ImmutableV2StateProvider, PostgresV2StateBuilder, ProductionV9Runtime,
         )
@@ -835,9 +843,15 @@ def main(*, simulator_connection_factory: Callable | None = None,
         from .v9_v4b_accuracy import AccuracyStateStore
         from .v9_v4c_predictive import V4CStateStore
         import psycopg
+        def runtime_connect(url: str):
+            return psycopg.connect(
+                url, connect_timeout=5, keepalives=1,
+                keepalives_idle=5, keepalives_interval=2,
+                keepalives_count=3,
+            )
         outbox = EvidenceOutbox(metrics=metrics)
-        ledger_connection = psycopg.connect(database_url)
-        state_connection = psycopg.connect(database_url)
+        ledger_connection = runtime_connect(database_url)
+        state_connection = runtime_connect(database_url)
         cache_refresher = V4StateCacheRefresher(
             compact_store=V4CStateStore(ledger_connection),
             accuracy_store=AccuracyStateStore(ledger_connection),
@@ -854,14 +868,14 @@ def main(*, simulator_connection_factory: Callable | None = None,
         )
         state_build_worker = V4StateBuildWorker(
             state_builder, state_scheduler, connection=state_connection,
-            connect=psycopg.connect, database_url=database_url, metrics=metrics)
+            connect=runtime_connect, database_url=database_url, metrics=metrics)
         state_build_worker.start()
         sim3 = _start_sim3(simulator_connection_factory, simulator_utc_clock)
         ledger_worker = EvidenceLedgerWorker(
             outbox, evidence_store=PostgresEvidenceStore(
                 database_url, connection=ledger_connection),
             connection=ledger_connection,
-            connect=psycopg.connect, database_url=database_url,
+            connect=runtime_connect, database_url=database_url,
             metrics=metrics, cache_refresher=cache_refresher,
             state_build_submit=state_build_worker.submit,
             simulation_submit=sim3.submit if sim3 is not None else None,
@@ -889,6 +903,7 @@ def main(*, simulator_connection_factory: Callable | None = None,
             shutdown_requested.wait(.05)
         if not state.runtime_handoff_ready():
             raise RuntimeError("evidence handoff observation unavailable")
+        evidence_cache.start()
         def readiness_check() -> bool:
             statuses = dict(metrics.snapshot().statuses)
             owner_status = statuses.get("evidence_runtime_owner_status")
@@ -899,12 +914,7 @@ def main(*, simulator_connection_factory: Callable | None = None,
                         "evidence_ledger_worker.last_terminal_failure"
                     ) not in {None, "NONE"}):
                 return False
-            if ledger_worker.is_runtime_owner():
-                return True
-            return (
-                owner_status in {"WAITING", "WAITING_FOR_LEGACY_WRITER"}
-                and state.runtime_handoff_ready()
-            )
+            return ledger_worker.is_runtime_owner()
 
         app = create_app(
             state=state, evidence_cache=evidence_cache, metrics=metrics,
