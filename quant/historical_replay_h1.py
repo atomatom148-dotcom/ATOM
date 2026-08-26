@@ -23,8 +23,8 @@ from zoneinfo import ZoneInfo
 
 from .historical_replay import (
     ALLOWED_FORMULA_VERSIONS, DATA_SCHEMA_VERSION, EVIDENCE_ORIGIN,
-    MAX_TARGET_RESOLUTION_DELAY_SECONDS, REPLAY_METHOD_VERSION, SOURCE,
-    TARGET_SPEC_ID, AlpacaHistoricalSipReader, HistoricalSipQuote,
+    REPLAY_METHOD_VERSION, SOURCE, TARGET_SPEC_ID, AlpacaHistoricalSipReader,
+    HistoricalSipQuote,
     HistoricalSipRetrievalProof, OneSessionReplayClock, ReplayFamilyResults,
     ReplayFrame, build_replay_v2_as_of,
 )
@@ -52,14 +52,11 @@ from .v9_v3_synthesis import synthesize_v3
 from .v9_v4a_evidence import canonical_sha256
 
 
-H1_RUNNER_VERSION = "ATOM-TRUE-V9-H1-RUNNER-5"
+H1_RUNNER_VERSION = "ATOM-TRUE-V9-H1-RUNNER-4"
 _NANOSECONDS = 1_000_000_000
 _REFRESH_NS = 3_600 * _NANOSECONDS
 _COMPLETE_EDGE_NS = 5 * _NANOSECONDS
 _COMPLETE_GAP_NS = 5 * _NANOSECONDS
-_MAX_TARGET_RESOLUTION_DELAY_NS = round(
-    MAX_TARGET_RESOLUTION_DELAY_SECONDS * _NANOSECONDS
-)
 _EASTERN = ZoneInfo("America/New_York")
 _Q10 = "q10_options_vol"
 _RESULT_NAMES = {
@@ -646,7 +643,7 @@ def _configuration_digest(
         "session_target_rule": "MATURITY_STRICTLY_BEFORE_RTH_CLOSE",
         "close_rule": "RESOLUTION_ONLY_NO_FORECAST",
         "complete_edge_seconds": _COMPLETE_EDGE_NS / _NANOSECONDS,
-        "maximum_interquote_gap_seconds": (
+        "diagnostic_max_interquote_gap_seconds": (
             maximum_gap_ns / _NANOSECONDS
         ),
         "preflight_target_endpoint_audit": "TIMESTAMP_ONLY_EXACT_SIX",
@@ -866,8 +863,6 @@ def run_h1_session(
                     raise RuntimeError("REPLAY_TARGET_TIMING_VIOLATION")
                 queue.popleft()
                 delay_ns = endpoint.provider_event_ns - maturity_ns
-                if delay_ns > _MAX_TARGET_RESOLUTION_DELAY_NS:
-                    continue
                 target_bps = 10_000.0 * math.log(
                     endpoint.midpoint / candidate.cutoff_midpoint
                 )

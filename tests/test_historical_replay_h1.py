@@ -195,6 +195,17 @@ def test_h1_mathematical_digests_are_repeatable_and_exclude_timings_and_run_id()
     assert first.replay_run_id != second.replay_run_id
 
 
+def test_h1_frozen_2026_06_15_configuration_digest_is_restored():
+    import quant.historical_replay_h1 as module
+
+    opened, closed = module._session(date(2026, 6, 15))
+
+    assert module._configuration_digest(
+        session_open_ns=module._ns(opened),
+        session_close_ns=module._ns(closed),
+    ) == "dcd7f3af8fba60047ff965a22fc9dbf5f05734f97913c502f3d972f21cf46385"
+
+
 def test_h1_valid_retrieval_proof_allows_gap_and_preserves_telemetry():
     opened, closed = _session()
     rows = [_quote("COIN", opened), _quote("QQQ", opened, bid=500.0)]
@@ -667,18 +678,12 @@ def test_target_uses_first_accepted_quote_at_or_after_provider_endpoint():
     assert sample.resolution_cutoff_ns >= sample.endpoint_observation_ns
 
 
-@pytest.mark.parametrize(
-    ("endpoint_fraction", "expected_resolved", "expected_delay"),
-    (
-        (0, 1, 5 * NANOSECONDS),
-        (1, 0, None),
-    ),
-)
-def test_h1_target_resolution_delay_is_bounded_at_five_seconds(
-    endpoint_fraction, expected_resolved, expected_delay,
+@pytest.mark.parametrize("endpoint_fraction", (200_000_000, 999_999_999))
+def test_h1_observed_sub_five_second_endpoint_delays_remain_eligible(
+    endpoint_fraction,
 ):
     opened, _closed = _session()
-    endpoint = opened + timedelta(seconds=35)
+    endpoint = opened + timedelta(seconds=34)
     rows = _canonical(
         _quote("COIN", opened, bid=100.0),
         _quote("QQQ", opened, bid=500.0),
@@ -688,8 +693,8 @@ def test_h1_target_resolution_delay_is_bounded_at_five_seconds(
 
     coverage = _resolution(_run(rows), "30S")
 
-    assert coverage.resolved == expected_resolved
-    assert coverage.max_endpoint_delay_ns == expected_delay
+    assert coverage.resolved == 1
+    assert coverage.max_endpoint_delay_ns == 4 * NANOSECONDS + endpoint_fraction
 
 
 def test_forecast_target_origin_is_selected_provider_time_not_logical_tick():
