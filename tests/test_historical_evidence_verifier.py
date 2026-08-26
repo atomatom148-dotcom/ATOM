@@ -9,6 +9,7 @@ from quant.historical_evidence_verifier import (
     FORECAST_COLUMNS,
     HORIZONS, MANIFEST_COLUMNS, QUANTS, HistoricalEvidenceVerifier,
 )
+from quant.v9_v1_contract import HORIZONS as H2A_HORIZONS, QUANT_IDS
 
 NOW = datetime(2026, 6, 15, 13, 30, tzinfo=timezone.utc)
 CLOCK = lambda: datetime(2026, 8, 26, tzinfo=timezone.utc)
@@ -123,6 +124,28 @@ def test_valid_receipt_is_deterministic_and_complete():
     assert db.cursors[1].name == "atom_h2b_forecasts"
     assert db.cursors[1].itersize == 17
     assert "CASE quant_id" in db.sql[1] and "CASE horizon" in db.sql[1]
+
+
+def test_sql_replays_h2a_forecast_emission_order_exactly():
+    """Guard H2-A's real quant-major/horizon-minor spool traversal."""
+    evidence = tuple(rows(frames=2))
+    receipt, db = verify(evidence, [manifest(evidence, frames=2)])
+
+    statement = db.sql[1]
+    cutoff_order = statement.index("ORDER BY cutoff_at")
+    quant_order = statement.index("CASE quant_id", cutoff_order)
+    horizon_order = statement.index("CASE horizon", quant_order)
+    assert receipt.verification_status == "VERIFIED"
+    assert QUANTS is QUANT_IDS and HORIZONS is H2A_HORIZONS
+    assert cutoff_order < quant_order < horizon_order
+    assert [statement.index(f"WHEN '{quant}'", quant_order)
+            for quant in QUANT_IDS] == sorted(
+                statement.index(f"WHEN '{quant}'", quant_order)
+                for quant in QUANT_IDS)
+    assert [statement.index(f"WHEN '{horizon}'", horizon_order)
+            for horizon in H2A_HORIZONS] == sorted(
+                statement.index(f"WHEN '{horizon}'", horizon_order)
+                for horizon in H2A_HORIZONS)
 
 
 @pytest.mark.parametrize("manifest_rows,reason", [
