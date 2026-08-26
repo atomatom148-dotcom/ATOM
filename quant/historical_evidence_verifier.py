@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import os
@@ -12,7 +12,7 @@ from typing import Callable
 from quant.historical_evidence import HistoricalForecastEvidence, HistoricalReplayManifest
 
 
-VERIFIER_VERSION = "H2-B-4"
+VERIFIER_VERSION = "H2-B-5"
 DEFAULT_FETCH_SIZE = 2_000
 QUANTS = tuple(f"q{i}_{name}" for i, name in enumerate((
     "momentum", "mean_reversion", "volatility", "stat_arb", "microstructure",
@@ -50,7 +50,7 @@ class VerificationReceipt:
     horizon_count: int
     unavailable_null_count: int
     exact_hash_match_count: int
-    one_ulp_legacy_match_count: int
+    signed_zero_legacy_match_count: int
     dataset_digest: str | None
     configuration_digest: str | None
     stored_content_hash_summary: str
@@ -100,7 +100,7 @@ class HistoricalEvidenceVerifier:
         reasons: set[str] = set()
         manifest = None
         manifest_count = frame_count = forecast_count = cutoff_count = unavailable = 0
-        exact_hash_matches = one_ulp_legacy_matches = 0
+        exact_hash_matches = signed_zero_legacy_matches = 0
         quants: set[str] = set()
         horizons: set[str] = set()
         artifact = hashlib.sha256()
@@ -197,6 +197,14 @@ class HistoricalEvidenceVerifier:
                             reasons.add("MISSING_LINEAGE_OR_VERSION")
                         if row.content_sha256 == stored_hash:
                             exact_hash_matches += 1
+                        elif (row.availability_status == "AVAILABLE" and
+                              row.expected_return_bps == 0.0 and
+                              replace(row, expected_return_bps=-row.expected_return_bps).content_sha256 == stored_hash):
+                            # PostgreSQL numeric persistence can discard the sign
+                            # bit of zero.  This is the sole legacy hash repair:
+                            # every other field and the opposite zero's exact
+                            # canonical hash must still match the stored digest.
+                            signed_zero_legacy_matches += 1
                         else:
                             reasons.add("FORECAST_HASH_MISMATCH")
                         artifact.update(stored_hash.encode("ascii"))
@@ -211,6 +219,8 @@ class HistoricalEvidenceVerifier:
                 cutoff_count += 1
                 if cutoff_slots != SLOTS:
                     reasons.add("MISSING_OR_INVALID_SLOTS")
+            if exact_hash_matches + signed_zero_legacy_matches != forecast_count:
+                reasons.add("FORECAST_HASH_MISMATCH")
             if manifest is not None:
                 if forecast_count != manifest.frame_count * len(SLOTS) or cutoff_count != manifest.frame_count:
                     reasons.add("FORECAST_COUNT_MISMATCH")
@@ -232,7 +242,7 @@ class HistoricalEvidenceVerifier:
             "VERIFIED" if not reasons else "REJECTED", tuple(sorted(reasons)),
             manifest_count, frame_count, forecast_count, cutoff_count,
             len(quants), len(horizons), unavailable,
-            exact_hash_matches, one_ulp_legacy_matches,
+            exact_hash_matches, signed_zero_legacy_matches,
             manifest.dataset_digest if manifest else None,
             manifest.configuration_digest if manifest else None, digest, VERIFIER_VERSION,
             self.clock().astimezone(timezone.utc).isoformat(),
