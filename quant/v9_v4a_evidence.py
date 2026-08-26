@@ -27,8 +27,10 @@ EVIDENCE_VERSION = "ATOM_TRUE_V9_V4A_1"
 REPLAY_METHOD_VERSION = "ATOM_TRUE_V9_V4_REPLAY_1"
 EVIDENCE_ORIGINS = frozenset(("PRODUCTION", "CAUSAL_REPLAY"))
 TARGET_TIMING_REASON = "TARGET_TIMING_UNVERIFIED"
-TARGET_TIMING_METHOD_VERSION = "ATOM_TRUE_V9_V4_TARGET_FIRST_AT_OR_AFTER_1"
-OVERLAP_METHOD_VERSION = "ATOM_TRUE_V9_V4_OVERLAP_1"
+TARGET_ENDPOINT_DELAY_REASON = "TARGET_ENDPOINT_DELAY_EXCEEDED"
+TARGET_TIMING_METHOD_VERSION = "ATOM_TRUE_V9_V4_TARGET_FIRST_AT_OR_AFTER_2"
+MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS = 5.0
+OVERLAP_METHOD_VERSION = "ATOM_TRUE_V9_V4_OVERLAP_2"
 COMMIT_PROOF_METHOD = "POST_COMMIT_DB_OBSERVATION_V1"
 COMMIT_PROOF_MISSING_REASON = "FORECAST_COMMIT_PROOF_MISSING"
 COMMIT_PROOF_LATE_REASON = "FORECAST_COMMITTED_AT_OR_AFTER_TARGET_ENDPOINT"
@@ -329,6 +331,8 @@ def build_outcome(*, forecast: ForecastRecord, target_identity: str,
         target_resolved_at >= endpoint_observation_at
     )
     reasons = [] if timing_verified else [TARGET_TIMING_REASON]
+    if delay > MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS:
+        reasons.append(TARGET_ENDPOINT_DELAY_REASON)
     if forecast.persistence_proof_eligible is not True:
         reasons.append(forecast.persistence_reason or COMMIT_PROOF_MISSING_REASON)
     elif forecast.persisted_at is None:
@@ -393,7 +397,26 @@ def select_non_overlapping(records: Iterable[tuple[ForecastRecord, OutcomeRecord
     outcome_unconflicted = [pair for pairs in outcome_groups.values()
                             if len({pair[1].outcome_record_hash for pair in pairs}) == 1
                             for pair in pairs]
-    eligible = [(f, o) for f, o in outcome_unconflicted if o.proof_eligible]
+    eligible = []
+    for forecast, outcome in outcome_unconflicted:
+        if (not isinstance(forecast.target_endpoint, datetime) or
+                forecast.target_endpoint.tzinfo is None or
+                not isinstance(outcome.endpoint_observation_at, datetime) or
+                outcome.endpoint_observation_at.tzinfo is None or
+                outcome.target_endpoint != forecast.target_endpoint):
+            continue
+        derived_delay = (
+            outcome.endpoint_observation_at - forecast.target_endpoint
+        ).total_seconds()
+        if (
+            outcome.proof_eligible
+            and isinstance(outcome.endpoint_observation_delay, (int, float))
+            and not isinstance(outcome.endpoint_observation_delay, bool)
+            and math.isfinite(outcome.endpoint_observation_delay)
+            and outcome.endpoint_observation_delay == derived_delay
+            and 0.0 <= derived_delay <= MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS
+        ):
+            eligible.append((forecast, outcome))
     groups: dict[tuple[object, ...], list[tuple[ForecastRecord, OutcomeRecord]]] = {}
     for pair in eligible:
         groups.setdefault(pair[0].logical_key, []).append(pair)

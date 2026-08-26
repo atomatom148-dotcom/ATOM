@@ -264,6 +264,11 @@ def test_v2_batch_builder_uses_read_only_repeatable_read_and_closes_snapshot():
     assert all("LIMIT %s" in sql for sql, _params in bounded)
     assert all(params[-1] == V2_STATE_BUILD_EVIDENCE_LIMIT + 1
                for _sql, params in bounded)
+    assert all("o.resolved_epoch <= f.maturity_epoch + %s" in sql
+               for sql, _params in bounded)
+    assert all("o.resolved_epoch >= f.maturity_epoch" in sql
+               for sql, _params in bounded)
+    assert all(params[2] == 5.0 for _sql, params in bounded)
     assert connection.rollbacks == 1
     assert connection.value.closed and connection.closed
 

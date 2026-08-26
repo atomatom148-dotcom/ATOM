@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import asdict, replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -88,17 +88,18 @@ def _run(rows, *, run_id="h1-test", enforce_preflight=False,
 def _dense_then_refresh():
     opened, _closed = _session()
     rows = []
-    for offset in range(71):
+    for offset in range(0, 301, 5):
         at = opened + timedelta(seconds=offset)
         rows.extend((
             _quote("COIN", at, bid=100.0 + offset / 100),
             _quote("QQQ", at, bid=500.0 + offset / 200),
         ))
-    at = opened + timedelta(hours=1)
-    rows.extend((
-        _quote("COIN", at, bid=101.0),
-        _quote("QQQ", at, bid=501.0),
-    ))
+    for offset in (900, 1_800, 3_600):
+        at = opened + timedelta(seconds=offset)
+        rows.extend((
+            _quote("COIN", at, bid=101.0 + offset / 100_000),
+            _quote("QQQ", at, bid=501.0 + offset / 200_000),
+        ))
     return _canonical(*rows)
 
 
@@ -129,8 +130,8 @@ def test_h1_runs_reader_clock_families_v2_v1_v3_and_outcomes_end_to_end():
 
     assert report.evidence_origin == "HISTORICAL_REPLAY"
     assert report.historical_session == "2026-01-05"
-    assert report.quote_counts == (("COIN", 72), ("QQQ", 72))
-    assert report.frame_count == 72
+    assert report.quote_counts == (("COIN", 64), ("QQQ", 64))
+    assert report.frame_count == 64
     assert report.persistence_writes == 0
     assert report.q10_status == "DATA_UNAVAILABLE"
     assert len(report.v3_coverage) == 6
@@ -194,7 +195,7 @@ def test_h1_mathematical_digests_are_repeatable_and_exclude_timings_and_run_id()
     assert first.replay_run_id != second.replay_run_id
 
 
-def test_h1_keeps_over_five_second_gap_as_diagnostic_only():
+def test_h1_rejects_an_interior_gap_over_five_seconds():
     opened, closed = _session()
     rows = [_quote("COIN", opened), _quote("QQQ", opened, bid=500.0)]
     rows.extend(
@@ -210,9 +211,9 @@ def test_h1_keeps_over_five_second_gap_as_diagnostic_only():
         _canonical(*rows), enforce_preflight=True, preflight_only=True,
     )
 
-    assert report.data_status == "DATA_COMPLETE"
-    assert report.execution_stage == "PREFLIGHT_ONLY"
-    assert "COIN_INTERQUOTE_GAP" not in report.data_reason_codes
+    assert report.data_status == "DATA_INCOMPLETE"
+    assert report.execution_stage == "PREFLIGHT_REJECTED"
+    assert "COIN_INTERQUOTE_GAP" in report.data_reason_codes
     coin = report.quote_coverage[0]
     assert coin.max_gap_ns == 6 * NANOSECONDS
     assert coin.max_gap_start_ns == int(opened.timestamp()) * NANOSECONDS
@@ -278,9 +279,9 @@ def test_h1_frozen_interquote_gap_boundary_and_cli_limit_match(
         assert coverage.max_gap_ns == gap_ns
         assert coverage.configured_max_gap_ns == 5 * NANOSECONDS
         assert coverage.over_limit_gap_count == int(rejected)
-        assert "COIN_INTERQUOTE_GAP" not in module._coverage_reason_codes(
+        assert ("COIN_INTERQUOTE_GAP" in module._coverage_reason_codes(
             (coverage,)
-        )
+        )) is rejected
         assert coverage.configured_max_gap_ns == module._COMPLETE_GAP_NS
         assert coverage.configured_max_gap_ns / NANOSECONDS == 5
         assert asdict(coverage)["configured_max_gap_ns"] == module._COMPLETE_GAP_NS
@@ -368,7 +369,7 @@ def test_h1_preflight_rejection_never_enters_clock_or_quant(monkeypatch):
     assert reader.calls == [(opened, closed)]
     assert report.execution_stage == "PREFLIGHT_REJECTED"
     assert report.data_status == "DATA_INCOMPLETE"
-    assert "COIN_INTERQUOTE_GAP" not in report.data_reason_codes
+    assert "COIN_INTERQUOTE_GAP" in report.data_reason_codes
 
 
 def test_h1_preflight_only_accepts_complete_coverage_without_running_quant(
@@ -628,6 +629,31 @@ def test_target_uses_first_accepted_quote_at_or_after_provider_endpoint():
     assert sample.resolution_cutoff_ns >= sample.endpoint_observation_ns
 
 
+@pytest.mark.parametrize(
+    ("endpoint_fraction", "expected_resolved", "expected_delay"),
+    (
+        (0, 1, 5 * NANOSECONDS),
+        (1, 0, None),
+    ),
+)
+def test_h1_target_resolution_delay_is_bounded_at_five_seconds(
+    endpoint_fraction, expected_resolved, expected_delay,
+):
+    opened, _closed = _session()
+    endpoint = opened + timedelta(seconds=35)
+    rows = _canonical(
+        _quote("COIN", opened, bid=100.0),
+        _quote("QQQ", opened, bid=500.0),
+        _quote("COIN", endpoint, fraction=endpoint_fraction, bid=101.0),
+        _quote("QQQ", endpoint, fraction=endpoint_fraction, bid=501.0),
+    )
+
+    coverage = _resolution(_run(rows), "30S")
+
+    assert coverage.resolved == expected_resolved
+    assert coverage.max_endpoint_delay_ns == expected_delay
+
+
 def test_forecast_target_origin_is_selected_provider_time_not_logical_tick():
     opened, _closed = _session()
     rows = _canonical(
@@ -652,11 +678,9 @@ def test_forecast_target_origin_is_selected_provider_time_not_logical_tick():
 
 
 def test_target_maturing_at_close_remains_unresolved():
-    opened, closed = _session()
+    _opened, closed = _session()
     late = closed - timedelta(seconds=30)
     rows = _canonical(
-        _quote("COIN", opened, bid=100.0),
-        _quote("QQQ", opened, bid=500.0),
         _quote("COIN", late, bid=101.0),
         _quote("QQQ", late, bid=501.0),
     )
@@ -664,10 +688,10 @@ def test_target_maturing_at_close_remains_unresolved():
     report = _run(rows)
     coverage = _resolution(report, "30S")
 
-    assert coverage.forecasts == 2
-    assert coverage.session_eligible == 1
+    assert coverage.forecasts == 1
+    assert coverage.session_eligible == 0
     assert coverage.session_unavailable == 1
-    assert coverage.resolved == 1
+    assert coverage.resolved == 0
     assert coverage.unresolved == 1
     assert all(sample.maturity_ns < report.session_close_ns
                for sample in report.resolution_samples)
@@ -723,7 +747,7 @@ def test_hourly_v2_refresh_is_open_anchored_and_contains_resolved_only():
 def test_refreshed_v2_is_not_captured_before_provider_cutoff_reaches_state():
     opened, _closed = _session()
     rows = []
-    for offset in range(71):
+    for offset in range(0, 301, 5):
         at = opened + timedelta(seconds=offset)
         rows.extend((
             _quote("COIN", at, bid=100.0 + offset / 100),
@@ -773,12 +797,10 @@ def test_sparse_frames_catch_up_every_hourly_refresh_anchor():
 
 
 def test_fractional_final_second_is_resolution_only_close_drain():
-    opened, closed = _session()
+    _opened, closed = _session()
     late = closed - timedelta(seconds=32)
     final_second = closed - timedelta(seconds=1)
     rows = _canonical(
-        _quote("COIN", opened, bid=100.0),
-        _quote("QQQ", opened, bid=500.0),
         _quote("COIN", late, bid=101.0),
         _quote("QQQ", late, bid=501.0),
         _quote("COIN", final_second, fraction=500_000_000, bid=102.0),
@@ -787,9 +809,9 @@ def test_fractional_final_second_is_resolution_only_close_drain():
     report = _run(rows)
     coverage = _resolution(report, "30S")
 
-    assert report.frame_count == 2
-    assert coverage.forecasts == 2
-    assert coverage.resolved == 2
+    assert report.frame_count == 1
+    assert coverage.forecasts == 1
+    assert coverage.resolved == 1
     assert coverage.unresolved == 0
     assert report.quote_coverage[0].last_quote_lead_ns == 500_000_000
 
@@ -841,10 +863,31 @@ def test_cli_batch_preflight_stops_at_first_qualifying_date_without_quants(
         closed = kwargs["session_close"]
         open_ns = int(opened.timestamp()) * NANOSECONDS
         close_ns = int(closed.timestamp()) * NANOSECONDS
+        retained = 9_360
         proof = HistoricalSipRetrievalProof(
             ("COIN", "QQQ"), "sip", open_ns, close_ns, 10_000,
-            1, (4,), 4, 4, 0, 0, (), None,
+            1, (retained,), retained, retained, 0, 0, (), None,
         )
+        coverage = [{
+            "symbol": symbol,
+            "count": retained // 2,
+            "first_quote_ns": open_ns,
+            "last_quote_ns": close_ns - 5 * NANOSECONDS,
+            "first_quote_delay_ns": 0,
+            "last_quote_lead_ns": 5 * NANOSECONDS,
+            "p99_gap_ns": 5 * NANOSECONDS,
+            "max_gap_ns": 5 * NANOSECONDS,
+            "max_gap_start_ns": open_ns,
+            "max_gap_end_ns": open_ns + 5 * NANOSECONDS,
+            "max_gap_start_utc": None,
+            "max_gap_end_utc": None,
+            "max_gap_previous_quote_ns": open_ns,
+            "max_gap_next_quote_ns": open_ns + 5 * NANOSECONDS,
+            "max_gap_touches_rth_start": True,
+            "max_gap_touches_rth_end": False,
+            "configured_max_gap_ns": 5 * NANOSECONDS,
+            "over_limit_gap_count": 0,
+        } for symbol in ("COIN", "QQQ")]
         serialized = {
             "runner_version": module.H1_RUNNER_VERSION,
             "historical_session": day,
@@ -860,13 +903,21 @@ def test_cli_batch_preflight_stops_at_first_qualifying_date_without_quants(
                 "DATA_COMPLETE" if passed else "DATA_INCOMPLETE"
             ),
             "data_reason_codes": [] if passed else ["COIN_OPEN_EDGE_GAP"],
-            "quote_counts": [["COIN", 2], ["QQQ", 2]],
-            "quote_coverage": [{
-                "symbol": "COIN",
-                "configured_max_gap_ns": 5 * NANOSECONDS,
-            }],
+            "dataset_digest": "d" * 64,
+            "quote_counts": [["COIN", retained // 2],
+                             ["QQQ", retained // 2]],
+            "quote_coverage": coverage,
             "retrieval_proof": asdict(proof),
         }
+        serialized["session_digest"] = module.canonical_sha256({
+            "dataset_digest": serialized["dataset_digest"],
+            "configuration_digest": serialized["configuration_digest"],
+            "execution_stage": serialized["execution_stage"],
+            "data_status": serialized["data_status"],
+            "data_reason_codes": serialized["data_reason_codes"],
+            "quote_coverage": serialized["quote_coverage"],
+            "retrieval_proof": serialized["retrieval_proof"],
+        })
         return SimpleNamespace(
             historical_session=day,
             execution_stage="PREFLIGHT_ONLY" if passed else "PREFLIGHT_REJECTED",
@@ -948,6 +999,62 @@ def test_cli_batch_legacy_gap_only_cache_fails_closed_without_refetch(
     }
 
 
+def test_cached_preflight_requires_exact_coverage_proof_and_digest_equivalence():
+    import quant.historical_replay_h1 as module
+
+    report = _run(
+        _complete_five_second_rows(), enforce_preflight=True,
+        preflight_only=True,
+    )
+    base = json.loads(json.dumps(report.to_dict()))
+    day = date.fromisoformat(report.historical_session)
+    assert module._qualifies_cached_result(
+        base, day=day, maximum_gap_seconds=5,
+    )
+
+    def redigest(payload):
+        payload["session_digest"] = module.canonical_sha256({
+            "dataset_digest": payload["dataset_digest"],
+            "configuration_digest": payload["configuration_digest"],
+            "execution_stage": payload["execution_stage"],
+            "data_status": payload["data_status"],
+            "data_reason_codes": payload["data_reason_codes"],
+            "quote_coverage": payload["quote_coverage"],
+            "retrieval_proof": payload["retrieval_proof"],
+        })
+        return payload
+
+    mutations = []
+    changed = json.loads(json.dumps(base))
+    changed["quote_counts"][0][1] -= 1
+    mutations.append(changed)
+    changed = json.loads(json.dumps(base))
+    changed["quote_coverage"][0]["max_gap_ns"] += 1
+    mutations.append(redigest(changed))
+    changed = json.loads(json.dumps(base))
+    changed["quote_coverage"][0]["over_limit_gap_count"] = 1
+    mutations.append(redigest(changed))
+    changed = json.loads(json.dumps(base))
+    changed["quote_coverage"][0]["first_quote_delay_ns"] = True
+    mutations.append(redigest(changed))
+    changed = json.loads(json.dumps(base))
+    changed["quote_coverage"][0]["first_quote_ns"] += 1
+    mutations.append(redigest(changed))
+    changed = json.loads(json.dumps(base))
+    changed["retrieval_proof"]["retained_row_count"] -= 1
+    mutations.append(redigest(changed))
+    changed = json.loads(json.dumps(base))
+    changed["dataset_digest"] = "G" * 64
+    mutations.append(redigest(changed))
+    changed = json.loads(json.dumps(base))
+    changed["session_digest"] = "0" * 64
+    mutations.append(changed)
+
+    assert all(not module._qualifies_cached_result(
+        payload, day=day, maximum_gap_seconds=5,
+    ) for payload in mutations)
+
+
 def test_cli_fails_closed_when_session_data_is_incomplete(monkeypatch, capsys):
     import quant.historical_replay_h1 as module
 
@@ -967,7 +1074,7 @@ def test_cli_fails_closed_when_session_data_is_incomplete(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["data_status"] == "DATA_INCOMPLETE"
     assert payload["execution_stage"] == "PREFLIGHT_REJECTED"
-    assert "COIN_INTERQUOTE_GAP" not in payload["data_reason_codes"]
+    assert "COIN_INTERQUOTE_GAP" in payload["data_reason_codes"]
     assert "COIN_CLOSE_EDGE_GAP" in payload["data_reason_codes"]
     coin = next(row for row in payload["quote_coverage"]
                 if row["symbol"] == "COIN")

@@ -49,6 +49,7 @@ EVIDENCE_RUNTIME_LOCK_ID = int.from_bytes(b"ATOMV9EL", "big")
 EVIDENCE_RECOVERY_OUTCOME_LIMIT = 65_536
 V4_STATE_BUILD_EVIDENCE_LIMIT = 65_536
 EVIDENCE_RECOVERY_CYCLE_QUERY_CHUNK = 4_096
+EVIDENCE_HANDOFF_CANDIDATE_CYCLE_LIMIT = 256
 EVIDENCE_LEGACY_WRITER_QUIESCENCE_SECONDS = 2.5
 _TERMINAL_FAILURE_REASONS = frozenset({
     "MALFORMED_EVIDENCE_ENVELOPE",
@@ -851,28 +852,33 @@ class EvidenceLedgerWorker:
         """Replace every dependency bound to the failed shared connection."""
 
         if self._connect is None or not self._database_url:
+            self.metrics.set_status("evidence_runtime_owner_status", "ERROR")
             raise RuntimeError("evidence ledger reconnect is not configured")
         self._owns_runtime = False
-        connection = self._connect(self._database_url)
         old = self._connection
         rebind_store = None
+        rollback_rebinds = []
+        connection = None
         try:
+            connection = self._connect(self._database_url)
             writer = V4AWriter(connection)
             rebind_store = getattr(self._store, "rebind_connection", None)
             if not callable(rebind_store):
                 raise RuntimeError("evidence store cannot rebind its connection")
+            rollback_rebinds.append(rebind_store)
             rebind_store(connection)
             if self._cache_refresher is not None:
-                self._cache_refresher.rebind_connection(connection)
+                rebind_cache = self._cache_refresher.rebind_connection
+                rollback_rebinds.append(rebind_cache)
+                rebind_cache(connection)
         except Exception:
-            try:
-                if callable(rebind_store):
-                    rebind_store(old)
-                if self._cache_refresher is not None:
-                    self._cache_refresher.rebind_connection(old)
-            except Exception:
-                pass
-            close = getattr(connection, "close", None)
+            self.metrics.set_status("evidence_runtime_owner_status", "ERROR")
+            for rollback_rebind in reversed(rollback_rebinds):
+                try:
+                    rollback_rebind(old)
+                except Exception:
+                    pass
+            close = getattr(connection, "close", None) if connection is not None else None
             if callable(close):
                 close()
             raise
@@ -1070,8 +1076,9 @@ class EvidenceLedgerWorker:
             self._cycle_key(forecast))
 
     def _try_acquire_runtime_ownership(self) -> bool:
-        cursor = self._connection.cursor()
+        cursor = None
         try:
+            cursor = self._connection.cursor()
             cursor.execute(
                 "SELECT pg_try_advisory_lock(%s)",
                 (EVIDENCE_RUNTIME_LOCK_ID,),
@@ -1083,17 +1090,28 @@ class EvidenceLedgerWorker:
         except Exception:
             rollback = getattr(self._connection, "rollback", None)
             if callable(rollback):
-                rollback()
+                try:
+                    rollback()
+                except Exception:
+                    pass
+            self.metrics.set_status("evidence_runtime_owner_status", "ERROR")
             raise
         finally:
-            self._close_cursor(cursor)
+            if cursor is not None:
+                try:
+                    self._close_cursor(cursor)
+                except Exception:
+                    self.metrics.set_status(
+                        "evidence_runtime_owner_status", "ERROR",
+                    )
+                    raise
         return bool(row and row[0] is True)
 
     def _load_handoff_anchor(self) -> MidpointObservation | None:
         cursor = self._connection.cursor()
         try:
             cursor.execute(
-                """WITH complete_cycle AS (
+                """WITH recent_cycles AS MATERIALIZED (
                        SELECT f.symbol, f.cutoff_at, f.cycle_id,
                               f.v3_model_version
                        FROM public.atom_v9_v4_forecasts AS f
@@ -1103,14 +1121,34 @@ class EvidenceLedgerWorker:
                        GROUP BY f.symbol, f.cutoff_at, f.cycle_id,
                                 f.v3_model_version
                        HAVING count(*)=%s
-                          AND bool_and(
-                              f.record_json->>'persistence_proof_eligible'='true')
                           AND array_agg(f.horizon ORDER BY CASE f.horizon
                                 WHEN '30S' THEN 0 WHEN '1M' THEN 1
                                 WHEN '5M' THEN 2 WHEN '15M' THEN 3
                                 WHEN '30M' THEN 4 WHEN '1H' THEN 5 ELSE 6 END
                               )=ARRAY[%s,%s,%s,%s,%s,%s]::text[]
                        ORDER BY f.cutoff_at DESC, f.cycle_id DESC
+                       LIMIT %s
+                   ),
+                   complete_cycle AS (
+                       SELECT c.symbol, c.cutoff_at, c.cycle_id,
+                              c.v3_model_version
+                       FROM recent_cycles AS c
+                       JOIN public.atom_v9_v4_forecasts AS f
+                         ON f.symbol=c.symbol AND f.cutoff_at=c.cutoff_at
+                        AND f.cycle_id=c.cycle_id
+                        AND f.v3_model_version=c.v3_model_version
+                       JOIN LATERAL
+                            atom_v9_internal.read_forecast_commit_proof(
+                                f.forecast_record_id
+                            ) AS p
+                         ON p.proof_eligible
+                        AND p.forecast_record_hash=f.forecast_record_hash
+                        AND p.target_endpoint=f.target_endpoint
+                        AND p.proof_method='POST_COMMIT_DB_OBSERVATION_V1'
+                       GROUP BY c.symbol, c.cutoff_at, c.cycle_id,
+                                c.v3_model_version
+                       HAVING count(*)=%s
+                       ORDER BY c.cutoff_at DESC, c.cycle_id DESC
                        LIMIT 1
                    )
                    SELECT f.forecast_record_hash, f.record_json
@@ -1124,7 +1162,10 @@ class EvidenceLedgerWorker:
                      WHEN '15M' THEN 3 WHEN '30M' THEN 4 WHEN '1H' THEN 5
                      ELSE 6 END
                    LIMIT 1""",
-                (*HORIZONS, len(HORIZONS), *HORIZONS),
+                (
+                    *HORIZONS, len(HORIZONS), *HORIZONS,
+                    EVIDENCE_HANDOFF_CANDIDATE_CYCLE_LIMIT, len(HORIZONS),
+                ),
             )
             rows = tuple(cursor.fetchall())
             commit = getattr(self._connection, "commit", None)
@@ -1410,6 +1451,7 @@ class EvidenceLedgerWorker:
             self._pending = self._merge_pending(self._pending, self._load_pending())
             self._submit_recovery_state_build()
         except Exception:
+            self.metrics.set_status("evidence_runtime_owner_status", "ERROR")
             self._release_runtime_ownership()
             raise
         self._handoff_anchor = anchor

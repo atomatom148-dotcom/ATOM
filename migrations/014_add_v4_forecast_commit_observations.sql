@@ -19,6 +19,10 @@ BEGIN
 END
 $$;
 
+-- Supabase's migration executor must temporarily be able to transfer the
+-- SECURITY DEFINER functions to the controlled NOLOGIN owner.
+GRANT atom_v9_proof_owner TO postgres;
+
 CREATE SCHEMA atom_v9_internal;
 REVOKE ALL ON SCHEMA atom_v9_internal
 FROM PUBLIC, anon, authenticated, service_role, atom_v9_v4_runtime;
@@ -232,3 +236,4 @@ ALTER FUNCTION atom_v9_internal.read_forecast_commit_proof(text)
 OWNER TO atom_v9_proof_owner;
 
 REVOKE CREATE ON SCHEMA atom_v9_internal FROM atom_v9_proof_owner;
+REVOKE atom_v9_proof_owner FROM postgres;

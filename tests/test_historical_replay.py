@@ -12,6 +12,7 @@ import pytest
 
 from quant.historical_replay import (
     ALLOWED_FORMULA_VERSIONS, DATA_SCHEMA_VERSION, REPLAY_METHOD_VERSION,
+    MAX_TARGET_RESOLUTION_DELAY_SECONDS,
     SOURCE_SPEC_ROUND_LOTS, SOURCE_SPEC_SHARES, AlpacaHistoricalSipReader,
     HistoricalSipQuote, OneSessionReplayClock, ReplayFrame, TARGET_SPEC_ID,
     build_replay_v2_as_of, calculate_replay_families,
@@ -686,6 +687,38 @@ def test_replay_v2_is_deterministic_and_accepts_exact_as_of_boundary():
 def test_replay_v2_rejects_future_target_before_dataset_construction():
     with pytest.raises(RuntimeError, match="REPLAY_LOOKAHEAD_VIOLATION"):
         _build(targets=(_target(resolved_epoch=STATE_AS_OF + 0.000001),))
+
+
+def test_replay_v2_accepts_only_bounded_endpoint_resolution_delay():
+    boundary_maturity = STATE_AS_OF - MAX_TARGET_RESOLUTION_DELAY_SECONDS
+    boundary = replace(
+        _target(),
+        cutoff_epoch=boundary_maturity - 30.0,
+        maturity_epoch=boundary_maturity,
+        resolved_epoch=STATE_AS_OF,
+    )
+    assert _build(targets=(boundary,)).v2_state is not None
+
+    just_late_maturity = boundary_maturity - 0.000001
+    just_late = replace(
+        boundary,
+        cutoff_epoch=just_late_maturity - 30.0,
+        maturity_epoch=just_late_maturity,
+    )
+    with pytest.raises(RuntimeError, match="REPLAY_TARGET_TIMING_VIOLATION"):
+        _build(targets=(just_late,))
+
+    delayed_state_as_of = STATE_AS_OF + 18_000.0
+    exact = int(delayed_state_as_of * 1_000_000_000)
+    delayed_frame = replace(
+        _frame(), clock_ns=exact, cutoff_ns=exact,
+        coin_source_as_of_ns=exact,
+    )
+    multi_hour_late = replace(
+        _target(), resolved_epoch=delayed_state_as_of,
+    )
+    with pytest.raises(RuntimeError, match="REPLAY_TARGET_TIMING_VIOLATION"):
+        _build(frame=delayed_frame, targets=(multi_hour_late,))
 
 
 @pytest.mark.parametrize("change", [

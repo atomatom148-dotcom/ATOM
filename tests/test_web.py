@@ -111,15 +111,41 @@ class WebSurfaceTests(unittest.TestCase):
         page = request(create_app(), "/")["body"].decode()
         self.assertIn(".market{grid-template-columns:repeat(2,minmax(0,1fr))}", page)
 
-    def test_health_only_reports_process_running(self):
+    @patch.dict("os.environ", {"RENDER_GIT_COMMIT": "a" * 40}, clear=False)
+    def test_health_reports_process_and_deployed_commit_without_readiness_work(self):
         class Store:
             def counts(self): raise AssertionError("health must not query evidence")
             def phase_e_cohorts(self, as_of):
                 raise AssertionError("health must not evaluate Phase E")
 
-        response = request(create_app(evidence_store=Store()), "/health")
+        response = request(create_app(
+            evidence_store=Store(),
+            readiness_check=lambda: (_ for _ in ()).throw(
+                AssertionError("health must not check readiness")),
+        ), "/health")
         self.assertEqual(response["status"], "200 OK")
-        self.assertEqual(json.loads(response["body"]), {"status": "running"})
+        self.assertEqual(json.loads(response["body"]), {
+            "status": "running", "commit": "a" * 40,
+        })
+
+    def test_ready_fails_closed_and_contains_callback_failures(self):
+        missing = request(create_app(), "/ready")
+        false = request(create_app(readiness_check=lambda: False), "/ready")
+        failed = request(create_app(
+            readiness_check=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        ), "/ready")
+        for response in (missing, false, failed):
+            self.assertEqual(response["status"], "503 Service Unavailable")
+            self.assertEqual(json.loads(response["body"]), {
+                "status": "not_ready",
+            })
+
+    def test_ready_requires_literal_true(self):
+        response = request(
+            create_app(readiness_check=lambda: True), "/ready",
+        )
+        self.assertEqual(response["status"], "200 OK")
+        self.assertEqual(json.loads(response["body"]), {"status": "ready"})
 
     def test_unknown_route_does_not_query_evidence(self):
         class Store:
@@ -154,11 +180,13 @@ class WebSurfaceTests(unittest.TestCase):
         app = create_app(metrics=metrics, monotonic_clock=lambda: 1.0)
 
         request(app, "/health")
+        request(app, "/ready")
         request(app, "/api/live")
         request(app, "/")
 
         self.assertEqual(set(dict(metrics.snapshot().distributions)), {
             "web_endpoint./health.duration_ms",
+            "web_endpoint./ready.duration_ms",
             "web_endpoint./api/live.duration_ms",
             "web_endpoint./.duration_ms",
         })
