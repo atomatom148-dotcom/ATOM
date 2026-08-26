@@ -2,6 +2,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 
 import pytest
 
@@ -118,6 +119,7 @@ def test_valid_receipt_is_deterministic_and_complete():
     assert receipt.reason_codes == ()
     assert (receipt.frame_count, receipt.forecast_count, receipt.quant_count,
             receipt.horizon_count, receipt.unavailable_null_count) == (1, 72, 12, 6, 72)
+    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (72, 0)
     assert receipt.verified_at == "2026-08-26T00:00:00+00:00"
     assert db.max_fetch == 17
     assert db.cursors[0].name is None
@@ -193,6 +195,90 @@ def test_invalid_null_pairing_missing_lineage_and_forecast_hash_reject():
     evidence = list(rows())
     evidence[0] = forecast(stored_hash="f" * 64)
     receipt, _ = verify(evidence, [manifest(evidence)])
+    assert "FORECAST_HASH_MISMATCH" in receipt.reason_codes
+
+
+def available_forecast(database_value, hashed_value, **changes):
+    original = HistoricalForecastEvidence(
+        RUN, NOW, QUANTS[1], "15M", hashed_value,
+        "AVAILABLE", None, "formula-1", "DIRECTIONAL_BPS", NOW, NOW,
+        "data-1", "source-1")
+    payload = asdict(original) | changes | {"expected_return_bps": database_value}
+    return tuple(payload[name] for name in FORECAST_COLUMNS[:-1]) + (original.content_sha256,)
+
+
+def replace_slot(evidence, replacement):
+    identity = (replacement[1], replacement[2], replacement[3])
+    return [replacement if (row[1], row[2], row[3]) == identity else row for row in evidence]
+
+
+def test_available_exact_hash_match_is_accepted_without_legacy_repair():
+    evidence = replace_slot(list(rows()), available_forecast(1.0, 1.0))
+
+    receipt, _ = verify(evidence)
+
+    assert receipt.verification_status == "VERIFIED"
+    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (72, 0)
+
+
+def test_confirmed_negative_direction_one_ulp_legacy_hash_is_accepted():
+    database_value = -8.52740738334745
+    hashed_value = math.nextafter(database_value, -math.inf)
+    assert hashed_value == -8.527407383347452
+    evidence = replace_slot(list(rows()), available_forecast(database_value, hashed_value))
+
+    receipt, _ = verify(evidence)
+
+    assert receipt.verification_status == "VERIFIED"
+    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (71, 1)
+
+
+def test_positive_direction_one_ulp_legacy_hash_is_accepted():
+    database_value = 1.0
+    hashed_value = math.nextafter(database_value, math.inf)
+    evidence = replace_slot(list(rows()), available_forecast(database_value, hashed_value))
+
+    receipt, _ = verify(evidence)
+
+    assert receipt.verification_status == "VERIFIED"
+    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (71, 1)
+
+
+def test_two_ulp_forecast_hash_mismatch_rejects():
+    database_value = 1.0
+    one_ulp = math.nextafter(database_value, math.inf)
+    hashed_value = math.nextafter(one_ulp, math.inf)
+    evidence = replace_slot(list(rows()), available_forecast(database_value, hashed_value))
+
+    receipt, _ = verify(evidence)
+
+    assert receipt.verification_status == "REJECTED"
+    assert "FORECAST_HASH_MISMATCH" in receipt.reason_codes
+
+
+@pytest.mark.parametrize("value", [math.inf, -math.inf, math.nan])
+def test_non_finite_available_forecast_rejects(value):
+    evidence = list(rows())
+    raw = list(evidence[0])
+    raw[4:7] = [value, "AVAILABLE", None]
+    evidence[0] = tuple(raw)
+
+    receipt, _ = verify(evidence, [manifest(evidence)])
+
+    assert receipt.verification_status == "REJECTED"
+    assert "INVALID_AVAILABILITY_NULL_PAIRING" in receipt.reason_codes
+
+
+def test_altered_non_numeric_field_cannot_use_one_ulp_compatibility():
+    database_value = 1.0
+    hashed_value = math.nextafter(database_value, math.inf)
+    replacement = available_forecast(
+        database_value, hashed_value, formula_version="altered-formula")
+    evidence = replace_slot(list(rows()), replacement)
+
+    receipt, _ = verify(evidence)
+
+    assert receipt.verification_status == "REJECTED"
     assert "FORECAST_HASH_MISMATCH" in receipt.reason_codes
 
 
