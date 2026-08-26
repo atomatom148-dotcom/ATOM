@@ -1,5 +1,5 @@
 from dataclasses import asdict, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
 
@@ -8,6 +8,8 @@ from quant.v9_efficacy import (
     COMMIT_PROOF_METHOD,
     EFFICACY_VERSION,
     METHOD,
+    V3_MODEL_VERSION,
+    V9_MODEL_VERSION,
     EfficacyObservation,
     build_chronological_efficacy_report,
 )
@@ -19,6 +21,10 @@ END = datetime(2026, 1, 20, tzinfo=UTC)
 
 def _hash(token):
     return canonical_sha256(token)
+
+
+def _items(payload):
+    return tuple(sorted(payload.items()))
 
 
 def observation(
@@ -37,10 +43,43 @@ def observation(
     cutoff = cutoff or START + timedelta(minutes=index)
     target = cutoff + timedelta(seconds=30)
     available = available or target
+    v9_record_id = f"v9-{index}"
+    v3_record_id = f"v3-{index}"
+    outcome_record_id = f"o-{index}"
+    target_identity = f"target-{index}"
+    v9_payload = {
+        "record_id": v9_record_id,
+        "model_version": V9_MODEL_VERSION,
+        "horizon": horizon,
+        "family": family,
+        "family_weight": weight,
+        "cutoff_at": cutoff,
+        "target_endpoint": target,
+        "target_identity": target_identity,
+        "expected_return_bps": v9,
+    }
+    v3_payload = {
+        "record_id": v3_record_id,
+        "model_version": V3_MODEL_VERSION,
+        "horizon": horizon,
+        "cutoff_at": cutoff,
+        "target_endpoint": target,
+        "target_identity": target_identity,
+        "expected_return_bps": v3,
+    }
+    outcome_payload = {
+        "record_id": outcome_record_id,
+        "forecast_record_id": v9_record_id,
+        "baseline_forecast_record_id": v3_record_id,
+        "target_identity": target_identity,
+        "target_endpoint": target,
+        "actual_return_bps": actual,
+        "target_timing_status": "VERIFIED",
+    }
     return EfficacyObservation(
-        forecast_record_id=f"v9-{index}",
-        forecast_record_hash=_hash(("v9", index)),
-        v9_model_version="ATOM_TRUE_V9_V4",
+        forecast_record_id=v9_record_id,
+        forecast_record_hash=canonical_sha256(v9_payload),
+        v9_model_version=V9_MODEL_VERSION,
         horizon=horizon,
         family=family,
         family_weight=weight,
@@ -48,20 +87,23 @@ def observation(
         target_endpoint=target,
         forecast_available_at=cutoff + timedelta(microseconds=1),
         forecast_proof_method=COMMIT_PROOF_METHOD,
-        v3_forecast_record_id=f"v3-{index}",
-        v3_forecast_record_hash=_hash(("v3", index)),
-        v3_model_version="ATOM_TRUE_V9_V3",
+        v3_forecast_record_id=v3_record_id,
+        v3_forecast_record_hash=canonical_sha256(v3_payload),
+        v3_model_version=V3_MODEL_VERSION,
         v3_forecast_available_at=cutoff + timedelta(microseconds=2),
         v3_forecast_proof_method=COMMIT_PROOF_METHOD,
-        outcome_record_id=f"o-{index}",
-        outcome_record_hash=_hash(("outcome", index)),
-        target_identity=f"target-{index}",
+        outcome_record_id=outcome_record_id,
+        outcome_record_hash=canonical_sha256(outcome_payload),
+        target_identity=target_identity,
         target_timing_status="VERIFIED",
         evidence_available_at=available,
         v9_bps=v9,
         v3_bps=v3,
         actual_bps=actual,
         proof_eligible=proof,
+        v9_forecast_payload=_items(v9_payload),
+        v3_forecast_payload=_items(v3_payload),
+        outcome_payload=_items(outcome_payload),
     )
 
 
@@ -96,6 +138,101 @@ def test_commit_after_cutoff_but_before_target_is_eligible():
         observations=(row,), holdout_start=START, evaluation_as_of=END,
     )
     assert report.holdout_n == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("v9_model_version", "ATOM_TRUE_V9_V4"),
+     ("v3_model_version", "ATOM-TRUE-V9-V3")),
+)
+def test_only_exact_frozen_model_versions_are_eligible(field, value):
+    report = build_chronological_efficacy_report(
+        observations=(replace(observation(1), **{field: value}),),
+        holdout_start=START,
+        evaluation_as_of=END,
+    )
+    assert report.holdout_n == 0
+    assert report.excluded_n == 1
+
+
+def test_hash_verified_payload_must_link_to_observation():
+    row = observation(1)
+    payload = dict(row.v9_forecast_payload)
+    payload["record_id"] = "different-record"
+    row = replace(
+        row,
+        forecast_record_hash=canonical_sha256(payload),
+        v9_forecast_payload=_items(payload),
+    )
+    report = build_chronological_efficacy_report(
+        observations=(row,), holdout_start=START, evaluation_as_of=END,
+    )
+    assert report.holdout_n == 0
+    assert report.excluded_n == 1
+
+
+def test_forecast_proof_before_cutoff_is_ineligible():
+    row = observation(1)
+    row = replace(row, forecast_available_at=row.cutoff_at - timedelta(microseconds=1))
+    report = build_chronological_efficacy_report(
+        observations=(row,), holdout_start=START, evaluation_as_of=END,
+    )
+    assert report.holdout_n == 0
+    assert report.excluded_n == 1
+
+
+def test_target_endpoint_must_equal_cutoff_plus_horizon():
+    row = observation(1)
+    endpoint = row.target_endpoint + timedelta(seconds=1)
+    v9_payload = dict(row.v9_forecast_payload)
+    v3_payload = dict(row.v3_forecast_payload)
+    outcome_payload = dict(row.outcome_payload)
+    for payload in (v9_payload, v3_payload, outcome_payload):
+        payload["target_endpoint"] = endpoint
+    row = replace(
+        row,
+        target_endpoint=endpoint,
+        forecast_record_hash=canonical_sha256(v9_payload),
+        v3_forecast_record_hash=canonical_sha256(v3_payload),
+        outcome_record_hash=canonical_sha256(outcome_payload),
+        v9_forecast_payload=_items(v9_payload),
+        v3_forecast_payload=_items(v3_payload),
+        outcome_payload=_items(outcome_payload),
+    )
+    report = build_chronological_efficacy_report(
+        observations=(row,), holdout_start=START, evaluation_as_of=END,
+    )
+    assert report.holdout_n == 0
+    assert report.excluded_n == 1
+
+
+def test_conflicting_logical_records_are_excluded_before_counts():
+    first = observation(1)
+    conflict = observation(2, cutoff=first.cutoff_at, v9=-1)
+    report = build_chronological_efficacy_report(
+        observations=(first, conflict), holdout_start=START,
+        evaluation_as_of=END,
+    )
+    assert report.holdout_n == 0
+    assert report.excluded_n == 2
+    assert report.slices == ()
+
+
+class _NaiveLikeTimezone(tzinfo):
+    def utcoffset(self, dt):
+        return None
+
+
+def test_datetime_with_tzinfo_but_no_offset_is_excluded():
+    row = observation(1)
+    malformed = row.cutoff_at.replace(tzinfo=_NaiveLikeTimezone())
+    report = build_chronological_efficacy_report(
+        observations=(replace(row, cutoff_at=malformed),),
+        holdout_start=START,
+        evaluation_as_of=END,
+    )
+    assert report.holdout_n == 0
+    assert report.excluded_n == 1
 
 
 def test_holdout_metrics_do_not_train_on_pre_holdout_values():
