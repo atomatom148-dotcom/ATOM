@@ -12,7 +12,7 @@ from typing import Callable
 from quant.historical_evidence import HistoricalForecastEvidence, HistoricalReplayManifest
 
 
-VERIFIER_VERSION = "H2-B-1"
+VERIFIER_VERSION = "H2-B-2"
 DEFAULT_FETCH_SIZE = 2_000
 QUANTS = tuple(f"q{i}_{name}" for i, name in enumerate((
     "momentum", "mean_reversion", "volatility", "stat_arb", "microstructure",
@@ -69,6 +69,13 @@ def _as_manifest(row: tuple[object, ...]) -> tuple[HistoricalReplayManifest, str
 def _as_forecast(row: tuple[object, ...]) -> tuple[HistoricalForecastEvidence, str]:
     values = dict(zip(FORECAST_COLUMNS, row, strict=True))
     stored_hash = str(values.pop("content_sha256"))
+    # H2-A hashed UTC datetimes. PostgreSQL decodes timestamptz values in the
+    # connection's TimeZone, so an equivalent instant can otherwise serialize
+    # with a different offset and fail the immutable per-row hash check.
+    for field in ("cutoff_at", "source_as_of", "available_at"):
+        value = values[field]
+        if isinstance(value, datetime) and value.tzinfo is not None:
+            values[field] = value.astimezone(timezone.utc)
     return HistoricalForecastEvidence(**values), stored_hash
 
 

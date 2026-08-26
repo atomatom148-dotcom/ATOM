@@ -1,6 +1,7 @@
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 
 import pytest
 
@@ -123,6 +124,37 @@ def test_valid_receipt_is_deterministic_and_complete():
     assert db.cursors[1].name == "atom_h2b_forecasts"
     assert db.cursors[1].itersize == 17
     assert "CASE quant_id" in db.sql[1] and "CASE horizon" in db.sql[1]
+
+
+def test_postgresql_timestamptz_offset_is_normalized_to_h2a_utc_payload():
+    evidence = tuple(rows())
+    database_timezone = timezone(-timedelta(hours=5))
+    decoded = []
+    for raw in evidence:
+        values = dict(zip(FORECAST_COLUMNS, raw, strict=True))
+        for field in ("cutoff_at", "source_as_of", "available_at"):
+            values[field] = values[field].astimezone(database_timezone)
+        decoded.append(tuple(values[field] for field in FORECAST_COLUMNS))
+
+    receipt, _ = verify(decoded, [manifest(evidence)])
+    first = HistoricalForecastEvidence(*evidence[0][:-1])
+    canonical_payload = json.dumps(
+        asdict(first), sort_keys=True, separators=(",", ":"), default=str,
+    )
+
+    assert decoded[0][1].isoformat() == "2026-06-15T08:30:00-05:00"
+    assert canonical_payload == (
+        '{"availability_status":"UNAVAILABLE","available_at":"2026-06-15 '
+        '13:30:00+00:00","cutoff_at":"2026-06-15 13:30:00+00:00",'
+        '"data_schema_version":"data-1","expected_return_bps":null,'
+        '"formula_version":"formula-1","horizon":"30S",'
+        '"numerical_type":"DIRECTIONAL_BPS","quant_id":"q1_momentum",'
+        '"replay_run_id":"h2a-2026-06-15-persistence-v3",'
+        '"source_as_of":"2026-06-15 13:30:00+00:00",'
+        '"source_schema_version":"source-1","unavailable_reason":"NO_INPUT"}'
+    )
+    assert receipt.verification_status == "VERIFIED"
+    assert "FORECAST_HASH_MISMATCH" not in receipt.reason_codes
 
 
 @pytest.mark.parametrize("manifest_rows,reason", [
