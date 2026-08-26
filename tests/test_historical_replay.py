@@ -12,7 +12,6 @@ import pytest
 
 from quant.historical_replay import (
     ALLOWED_FORMULA_VERSIONS, DATA_SCHEMA_VERSION, REPLAY_METHOD_VERSION,
-    MAX_TARGET_RESOLUTION_DELAY_SECONDS,
     SOURCE_SPEC_ROUND_LOTS, SOURCE_SPEC_SHARES, AlpacaHistoricalSipReader,
     HistoricalSipQuote, OneSessionReplayClock, ReplayFrame, TARGET_SPEC_ID,
     build_replay_v2_as_of, calculate_replay_families,
@@ -689,8 +688,8 @@ def test_replay_v2_rejects_future_target_before_dataset_construction():
         _build(targets=(_target(resolved_epoch=STATE_AS_OF + 0.000001),))
 
 
-def test_replay_v2_accepts_only_bounded_endpoint_resolution_delay():
-    boundary_maturity = STATE_AS_OF - MAX_TARGET_RESOLUTION_DELAY_SECONDS
+def test_replay_v2_endpoint_eligibility_has_no_delay_gate():
+    boundary_maturity = STATE_AS_OF - 5.0
     boundary = replace(
         _target(),
         cutoff_epoch=boundary_maturity - 30.0,
@@ -705,8 +704,7 @@ def test_replay_v2_accepts_only_bounded_endpoint_resolution_delay():
         cutoff_epoch=just_late_maturity - 30.0,
         maturity_epoch=just_late_maturity,
     )
-    with pytest.raises(RuntimeError, match="REPLAY_TARGET_TIMING_VIOLATION"):
-        _build(targets=(just_late,))
+    assert _build(targets=(just_late,)).v2_state is not None
 
     delayed_state_as_of = STATE_AS_OF + 18_000.0
     exact = int(delayed_state_as_of * 1_000_000_000)
@@ -717,8 +715,7 @@ def test_replay_v2_accepts_only_bounded_endpoint_resolution_delay():
     multi_hour_late = replace(
         _target(), resolved_epoch=delayed_state_as_of,
     )
-    with pytest.raises(RuntimeError, match="REPLAY_TARGET_TIMING_VIOLATION"):
-        _build(frame=delayed_frame, targets=(multi_hour_late,))
+    assert _build(frame=delayed_frame, targets=(multi_hour_late,)).v2_state is not None
 
 
 @pytest.mark.parametrize("change", [

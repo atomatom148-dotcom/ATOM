@@ -58,11 +58,10 @@ DATA_SCHEMA_VERSION = "alpaca-historical-sip-nbbo-v1"
 SOURCE = "ALPACA_SIP"
 SOURCE_SPEC_ROUND_LOTS = "alpaca-sip-quote-size-round-lots-v1"
 SOURCE_SPEC_SHARES = "alpaca-sip-quote-size-shares-v1"
-REPLAY_METHOD_VERSION = "alpaca-sip-logical-1s-rth-window-v5"
+REPLAY_METHOD_VERSION = "alpaca-sip-logical-1s-rth-window-v4"
 REPLAY_STATE_SCHEMA_VERSION = "ATOM-HISTORICAL-V2-ENVELOPE-1"
 EVIDENCE_ORIGIN = "HISTORICAL_REPLAY"
 TARGET_SPEC_ID = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
-MAX_TARGET_RESOLUTION_DELAY_SECONDS = 5.0
 ALLOWED_FORMULA_VERSIONS = {
     "q1_momentum": Q1_VERSION,
     "q2_mean_reversion": Q2_VERSION,
@@ -905,9 +904,6 @@ def build_replay_v2_as_of(
             row.horizon != horizon or
             row.maturity_epoch != row.cutoff_epoch + HORIZON_SECONDS[horizon] or
             row.resolved_epoch < row.maturity_epoch or
-            row.resolved_epoch > (
-                row.maturity_epoch + MAX_TARGET_RESOLUTION_DELAY_SECONDS
-            ) or
             not _same_rth_target_window(row.cutoff_epoch, row.maturity_epoch)
             for row in target_rows
         ):
@@ -1071,7 +1067,6 @@ __all__ = [
     "AlpacaHistoricalSipReader",
     "DATA_SCHEMA_VERSION", "EVIDENCE_ORIGIN", "HistoricalReplayV2State",
     "HistoricalSipQuote", "HistoricalSipRetrievalProof",
-    "MAX_TARGET_RESOLUTION_DELAY_SECONDS",
     "OneSessionReplayClock",
     "REPLAY_METHOD_VERSION", "ReplayFamilyResults", "ReplayFrame", "SOURCE",
     "REPLAY_STATE_SCHEMA_VERSION", "SOURCE_SPEC_ROUND_LOTS",
