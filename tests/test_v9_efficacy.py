@@ -182,7 +182,7 @@ def test_overlapping_targets_are_removed_before_statistics():
 
 def test_model_specific_effective_counts_drive_each_bound():
     rows = tuple(
-        observation(i, v9=1 if i % 2 else -1, v3=-1, actual=1)
+        observation(i, v9=1 if i <= 20 else -1, v3=-1, actual=1)
         for i in range(1, 40)
     )
     item = build_chronological_efficacy_report(
