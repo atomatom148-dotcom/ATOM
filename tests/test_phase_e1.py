@@ -97,8 +97,11 @@ class PhaseEStoreTests(unittest.TestCase):
         cursor = Cursor()
         store_with(cursor).phase_e_cohorts(123.5)
         sql = " ".join(cursor.executions[0][0].split())
-        self.assertIn("LEFT JOIN LATERAL", sql)
+        self.assertNotIn("JOIN LATERAL", sql)
+        self.assertIn("WITH forecast_proofs AS MATERIALIZED", sql)
+        self.assertIn("outcome_proofs AS MATERIALIZED", sql)
         self.assertIn("read_legacy_evidence_publications", sql)
+        self.assertIn("read_legacy_evidence_publications_for_records", sql)
         for statement, _parameters in cursor.executions:
             self.assertIn("o.resolved_epoch >= f.maturity_epoch", statement)
             self.assertIn(
@@ -125,15 +128,32 @@ class PhaseEStoreTests(unittest.TestCase):
             self.assertIn("read_legacy_evidence_publications", normalized)
             self.assertNotIn("read_legacy_evidence_publication(", normalized)
             self.assertEqual(
-                normalized.count("read_legacy_evidence_publications("), 2,
+                normalized.count("read_legacy_evidence_publications("), 1,
             )
-            self.assertEqual(normalized.count("65536"), 2)
-            self.assertLess(
-                normalized.index(
-                    "FROM atom_v9_internal.read_legacy_evidence_publications"
-                ),
-                normalized.index("FROM forecasts AS f"),
+            self.assertEqual(
+                normalized.count(
+                    "read_legacy_evidence_publications_for_records("
+                ), 1,
             )
+            self.assertEqual(normalized.count("65536"), 1)
+            self.assertIn("WITH forecast_proofs AS MATERIALIZED", normalized)
+            self.assertIn("outcome_proofs AS MATERIALIZED", normalized)
+            self.assertNotIn("JOIN LATERAL", normalized)
+            self.assertIn(
+                "ARRAY( SELECT ids.record_id FROM forecast_proofs AS ids )",
+                normalized,
+            )
+
+    def test_global_window_metadata_is_explicit_and_truncation_is_reported(self):
+        metrics = ((
+            "q1", "v1", "COIN", "30S", 1, 1, 1, 1.0,
+            0.0, 1.0, 0.0, 0.0, True,
+        ),)
+        resolved = (("q1", "v1", "COIN", "30S", 0, 1),)
+        value = store_with(Cursor(metrics, resolved)).phase_e_cohorts(100)[0]
+        self.assertEqual(value.evidence_window, "MOST_RECENT_GLOBAL")
+        self.assertEqual(value.evidence_window_limit, 65536)
+        self.assertTrue(value.evidence_window_truncated)
 
     def test_outcome_is_invisible_until_its_resolution_epoch(self):
         class PointInTimeCursor(Cursor):
@@ -254,7 +274,7 @@ class PhaseEStoreTests(unittest.TestCase):
         store_with(cursor).phase_e_cohorts(1.0)
         sql = re.sub(r"--[^\n]*|/\*.*?\*/", "", cursor.executions[0][0],
                      flags=re.DOTALL).upper()
-        self.assertTrue(sql.lstrip().startswith("SELECT"))
+        self.assertTrue(sql.lstrip().startswith("WITH"))
         for forbidden in ("INSERT", "UPDATE", "DELETE", "ALTER", "DROP", "CREATE", "TRUNCATE"):
             self.assertIsNone(re.search(rf"\b{forbidden}\b", sql))
         normalized = " ".join(sql.split())
@@ -432,6 +452,9 @@ class PhaseEApiTests(unittest.TestCase):
                 "resolved_count": 2, "coverage": 2 / 3, "rmse_bps": 5.5,
                 "directional_accuracy": 0.5, "mae_bps": 4.5,
                 "bias_bps": -1.25, "effective_n": 2, "eligible": False,
+                "evidence_window": "MOST_RECENT_GLOBAL",
+                "evidence_window_limit": 65536,
+                "evidence_window_truncated": False,
             }],
         })
 
