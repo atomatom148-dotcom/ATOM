@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
+import os
 
 import pytest
 
@@ -62,8 +63,8 @@ def manifest(forecast_rows, frames=1, **changes):
 
 
 class Cursor:
-    def __init__(self, db, name=None):
-        self.db, self.name, self.source, self.offset = db, name, (), 0
+    def __init__(self, db, name=None, binary=False):
+        self.db, self.name, self.binary, self.source, self.offset = db, name, binary, (), 0
         self.itersize = None
 
     def execute(self, sql, params=()):
@@ -94,8 +95,8 @@ class DB:
         self.interrupt, self.partial = interrupt, partial
         self.sql, self.max_fetch, self.cursors = [], 0, []
 
-    def cursor(self, name=None):
-        cursor = Cursor(self, name)
+    def cursor(self, name=None, binary=False):
+        cursor = Cursor(self, name, binary)
         self.cursors.append(cursor)
         return cursor
 
@@ -124,6 +125,7 @@ def test_valid_receipt_is_deterministic_and_complete():
     assert db.max_fetch == 17
     assert db.cursors[0].name is None
     assert db.cursors[1].name == "atom_h2b_forecasts"
+    assert db.cursors[1].binary is True
     assert db.cursors[1].itersize == 17
     assert "CASE quant_id" in db.sql[1] and "CASE horizon" in db.sql[1]
 
@@ -157,6 +159,27 @@ def test_postgresql_timestamptz_offset_is_normalized_to_h2a_utc_payload():
     )
     assert receipt.verification_status == "VERIFIED"
     assert "FORECAST_HASH_MISMATCH" not in receipt.reason_codes
+
+
+def test_postgresql_binary_float8_transport_preserves_exact_binary64():
+    """Exercise psycopg against PostgreSQL, not a transport mock."""
+    database_url = os.environ.get("POSTGRES_TEST_DATABASE_URL")
+    if not database_url:
+        pytest.skip("POSTGRES_TEST_DATABASE_URL is required for PostgreSQL integration")
+    import psycopg
+
+    original = -8.527407383347452
+    with psycopg.connect(database_url) as connection:
+        connection.execute("SET extra_float_digits TO 0")
+        with connection.cursor() as text_cursor:
+            text_cursor.execute("SELECT %s::float8", (original,))
+            text_value = text_cursor.fetchone()[0]
+        with connection.cursor(binary=True) as binary_cursor:
+            binary_cursor.execute("SELECT %s::float8", (original,))
+            binary_value = binary_cursor.fetchone()[0]
+
+    assert text_value.hex() != original.hex()
+    assert binary_value.hex() == original.hex()
 
 
 @pytest.mark.parametrize("manifest_rows,reason", [
@@ -221,7 +244,7 @@ def test_available_exact_hash_match_is_accepted_without_legacy_repair():
     assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (72, 0)
 
 
-def test_confirmed_negative_direction_one_ulp_legacy_hash_is_accepted():
+def test_negative_direction_one_ulp_hash_is_rejected():
     database_value = -8.52740738334745
     hashed_value = math.nextafter(database_value, -math.inf)
     assert hashed_value == -8.527407383347452
@@ -229,19 +252,21 @@ def test_confirmed_negative_direction_one_ulp_legacy_hash_is_accepted():
 
     receipt, _ = verify(evidence)
 
-    assert receipt.verification_status == "VERIFIED"
-    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (71, 1)
+    assert receipt.verification_status == "REJECTED"
+    assert "FORECAST_HASH_MISMATCH" in receipt.reason_codes
+    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (71, 0)
 
 
-def test_positive_direction_one_ulp_legacy_hash_is_accepted():
+def test_positive_direction_one_ulp_hash_is_rejected():
     database_value = 1.0
     hashed_value = math.nextafter(database_value, math.inf)
     evidence = replace_slot(list(rows()), available_forecast(database_value, hashed_value))
 
     receipt, _ = verify(evidence)
 
-    assert receipt.verification_status == "VERIFIED"
-    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (71, 1)
+    assert receipt.verification_status == "REJECTED"
+    assert "FORECAST_HASH_MISMATCH" in receipt.reason_codes
+    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (71, 0)
 
 
 def test_two_ulp_forecast_hash_mismatch_rejects():
@@ -269,7 +294,7 @@ def test_non_finite_available_forecast_rejects(value):
     assert "INVALID_AVAILABILITY_NULL_PAIRING" in receipt.reason_codes
 
 
-def test_altered_non_numeric_field_cannot_use_one_ulp_compatibility():
+def test_altered_non_numeric_field_with_adjacent_float_is_rejected():
     database_value = 1.0
     hashed_value = math.nextafter(database_value, math.inf)
     replacement = available_forecast(
@@ -330,6 +355,7 @@ def test_11229_by_72_verification_is_streamed_in_bounded_batches(monkeypatch):
     assert receipt.cutoff_count == 11_229
     assert db.max_fetch == 997
     assert db.cursors[1].itersize == 997
+    assert db.cursors[1].binary is True
 
 
 def test_artifact_and_expected_frame_count_mismatches_reject():
