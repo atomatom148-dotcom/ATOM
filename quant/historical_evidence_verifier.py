@@ -45,6 +45,7 @@ class VerificationReceipt:
     manifest_count: int
     frame_count: int
     forecast_count: int
+    cutoff_count: int
     quant_count: int
     horizon_count: int
     unavailable_null_count: int
@@ -89,18 +90,20 @@ class HistoricalEvidenceVerifier:
             raise ValueError("replay_run_id must contain 1..128 characters")
         reasons: set[str] = set()
         manifest = None
-        manifest_count = frame_count = forecast_count = unavailable = 0
+        manifest_count = frame_count = forecast_count = cutoff_count = unavailable = 0
         quants: set[str] = set()
         horizons: set[str] = set()
         artifact = hashlib.sha256()
-        cursor = self.connection.cursor()
+        manifest_cursor = self.connection.cursor()
+        forecast_cursor = None
         try:
-            cursor.execute(
+            manifest_cursor.execute(
                 "SELECT " + ",".join(MANIFEST_COLUMNS) +
                 " FROM public.atom_historical_replay_runs WHERE replay_run_id=%s",
                 (replay_run_id,),
             )
-            manifest_rows = cursor.fetchmany(2)
+            manifest_rows = manifest_cursor.fetchmany(2)
+            manifest_cursor.close()
             manifest_count = len(manifest_rows)
             if manifest_count != 1:
                 reasons.add("MISSING_MANIFEST" if manifest_count == 0 else "MULTIPLE_MANIFESTS")
@@ -128,18 +131,28 @@ class HistoricalEvidenceVerifier:
                 except Exception:
                     reasons.add("INVALID_MANIFEST")
 
-            cursor.execute(
+            # A named psycopg cursor is a PostgreSQL server-side portal.  Both
+            # itersize and explicit fetchmany calls cap client-side transfer;
+            # the 808,488-row result is never materialized by the client.
+            forecast_cursor = self.connection.cursor(name="atom_h2b_forecasts")
+            forecast_cursor.itersize = self.fetch_size
+            quant_order = "CASE quant_id " + " ".join(
+                f"WHEN '{quant}' THEN {index}" for index, quant in enumerate(QUANTS)
+            ) + " END"
+            horizon_order = "CASE horizon " + " ".join(
+                f"WHEN '{horizon}' THEN {index}" for index, horizon in enumerate(HORIZONS)
+            ) + " END"
+            forecast_cursor.execute(
                 "SELECT " + ",".join(FORECAST_COLUMNS) +
                 " FROM public.atom_historical_replay_forecasts WHERE replay_run_id=%s"
-                " ORDER BY cutoff_at,quant_id,horizon",
+                f" ORDER BY cutoff_at,{quant_order},{horizon_order}",
                 (replay_run_id,),
             )
             current_cutoff = None
             cutoff_slots: set[tuple[str, str]] = set()
-            cutoff_count = 0
             previous_identity = None
             while True:
-                batch = cursor.fetchmany(self.fetch_size)
+                batch = forecast_cursor.fetchmany(self.fetch_size)
                 if not batch:
                     break
                 for raw in batch:
@@ -191,15 +204,17 @@ class HistoricalEvidenceVerifier:
         except Exception:
             reasons.add("DATABASE_INTERRUPTION_OR_PARTIAL_RETRIEVAL")
         finally:
-            close = getattr(cursor, "close", None)
-            if callable(close):
-                close()
+            for cursor in (forecast_cursor, manifest_cursor):
+                close = getattr(cursor, "close", None)
+                if callable(close):
+                    close()
 
         digest = artifact.hexdigest()
         return VerificationReceipt(
             replay_run_id, str(manifest.historical_session) if manifest else None,
             "VERIFIED" if not reasons else "REJECTED", tuple(sorted(reasons)),
-            manifest_count, frame_count, forecast_count, len(quants), len(horizons), unavailable,
+            manifest_count, frame_count, forecast_count, cutoff_count,
+            len(quants), len(horizons), unavailable,
             manifest.dataset_digest if manifest else None,
             manifest.configuration_digest if manifest else None, digest, VERIFIER_VERSION,
             self.clock().astimezone(timezone.utc).isoformat(),

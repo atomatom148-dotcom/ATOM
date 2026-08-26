@@ -60,8 +60,9 @@ def manifest(forecast_rows, frames=1, **changes):
 
 
 class Cursor:
-    def __init__(self, db):
-        self.db, self.source, self.offset = db, (), 0
+    def __init__(self, db, name=None):
+        self.db, self.name, self.source, self.offset = db, name, (), 0
+        self.itersize = None
 
     def execute(self, sql, params=()):
         self.db.sql.append(sql)
@@ -89,9 +90,12 @@ class DB:
     def __init__(self, manifests, forecasts, *, interrupt=False, partial=0):
         self.manifests, self.forecasts = tuple(manifests), iter(forecasts)
         self.interrupt, self.partial = interrupt, partial
-        self.sql, self.max_fetch = [], 0
+        self.sql, self.max_fetch, self.cursors = [], 0, []
 
-    def cursor(self): return Cursor(self)
+    def cursor(self, name=None):
+        cursor = Cursor(self, name)
+        self.cursors.append(cursor)
+        return cursor
 
 
 def verify(forecasts, manifest_rows=None, **db_options):
@@ -115,6 +119,10 @@ def test_valid_receipt_is_deterministic_and_complete():
             receipt.horizon_count, receipt.unavailable_null_count) == (1, 72, 12, 6, 72)
     assert receipt.verified_at == "2026-08-26T00:00:00+00:00"
     assert db.max_fetch == 17
+    assert db.cursors[0].name is None
+    assert db.cursors[1].name == "atom_h2b_forecasts"
+    assert db.cursors[1].itersize == 17
+    assert "CASE quant_id" in db.sql[1] and "CASE horizon" in db.sql[1]
 
 
 @pytest.mark.parametrize("manifest_rows,reason", [
@@ -201,7 +209,9 @@ def test_11229_by_72_verification_is_streamed_in_bounded_batches(monkeypatch):
     receipt = HistoricalEvidenceVerifier(db, fetch_size=997, clock=CLOCK).verify(RUN)
     assert receipt.verification_status == "VERIFIED"
     assert receipt.frame_count == 11_229 and receipt.forecast_count == 808_488
+    assert receipt.cutoff_count == 11_229
     assert db.max_fetch == 997
+    assert db.cursors[1].itersize == 997
 
 
 def test_artifact_and_expected_frame_count_mismatches_reject():
