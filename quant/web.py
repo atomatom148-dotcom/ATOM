@@ -106,7 +106,8 @@ class DashboardEvidenceCache:
         with self._lock:
             current = self._snapshot
             self._snapshot = DashboardEvidenceSnapshot(
-                counts, current.phase_e_cohorts, as_of_epoch, "AVAILABLE",
+                counts, current.phase_e_cohorts,
+                current.as_of_epoch, current.status,
             )
         try:
             cohorts = tuple(self._store.phase_e_cohorts(as_of_epoch))
@@ -914,7 +915,12 @@ def main(*, simulator_connection_factory: Callable | None = None,
                         "evidence_ledger_worker.last_terminal_failure"
                     ) not in {None, "NONE"}):
                 return False
-            return ledger_worker.is_runtime_owner()
+            if ledger_worker.is_runtime_owner():
+                return True
+            return (
+                owner_status in {"WAITING", "WAITING_FOR_LEGACY_WRITER"}
+                and state.runtime_handoff_ready()
+            )
 
         app = create_app(
             state=state, evidence_cache=evidence_cache, metrics=metrics,

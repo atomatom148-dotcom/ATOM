@@ -1,3 +1,4 @@
+import inspect
 import json
 import subprocess
 import unittest
@@ -6,6 +7,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from quant import web as web_module
 from quant.history import MidpointHistory, MidpointObservation
 from quant.evidence import PhaseECohortMetrics
 from quant.live_market import LiveMarketState
@@ -146,6 +148,14 @@ class WebSurfaceTests(unittest.TestCase):
         )
         self.assertEqual(response["status"], "200 OK")
         self.assertEqual(json.loads(response["body"]), {"status": "ready"})
+
+    def test_main_preserves_handoff_ready_rolling_replacement_path(self):
+        source = inspect.getsource(web_module.main)
+        self.assertIn(
+            'owner_status in {"WAITING", "WAITING_FOR_LEGACY_WRITER"}',
+            source,
+        )
+        self.assertIn("and state.runtime_handoff_ready()", source)
 
     def test_unknown_route_does_not_query_evidence(self):
         class Store:
@@ -639,7 +649,40 @@ async function advance(milliseconds) {{
 
         self.assertEqual(snapshot.counts, (2_939_098, 2_887_635))
         self.assertEqual(snapshot.phase_e_cohorts, ())
-        self.assertEqual(snapshot.status, "AVAILABLE")
+        self.assertIsNone(snapshot.as_of_epoch)
+        self.assertEqual(snapshot.status, "UNAVAILABLE")
+
+    def test_failed_phase_e_refresh_does_not_retimestamp_stale_cohorts(self):
+        cohort = PhaseECohortMetrics(
+            "q1_momentum", "v1", "COIN", "30S", 1, 1, 1,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1, False,
+        )
+
+        class Store:
+            def __init__(self):
+                self.count_calls = 0
+                self.phase_calls = 0
+            def counts(self):
+                self.count_calls += 1
+                return (self.count_calls, self.count_calls)
+            def phase_e_cohorts(self, _as_of):
+                self.phase_calls += 1
+                if self.phase_calls > 1:
+                    raise RuntimeError("phase e unavailable")
+                return (cohort,)
+
+        refresh_times = iter((100.0, 200.0))
+        cache = DashboardEvidenceCache(
+            Store(), clock=lambda: next(refresh_times),
+        )
+        first = cache.refresh()
+        stale = cache.refresh()
+
+        self.assertEqual(first.as_of_epoch, 100.0)
+        self.assertEqual(stale.counts, (2, 2))
+        self.assertEqual(stale.phase_e_cohorts, (cohort,))
+        self.assertEqual(stale.as_of_epoch, 100.0)
+        self.assertEqual(stale.status, "AVAILABLE")
 
     def test_phase_e_endpoint_uses_same_snapshot_without_scanning(self):
         cohort = PhaseECohortMetrics(
