@@ -14,7 +14,9 @@ from datetime import date, datetime, time as datetime_time, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import subprocess
 import time
 from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
@@ -649,6 +651,7 @@ def run_h1_session(
     replay_run_id: str, monotonic_clock: Callable[[], float] = time.perf_counter,
     preflight_only: bool = False,
     maximum_interior_gap_seconds: int = 5,
+    forecast_evidence: list | None = None,
 ) -> H1ReplayReport:
     """Run one complete RTH session without any external write."""
 
@@ -967,6 +970,31 @@ def run_h1_session(
                 family_mutable[(quant_id, horizon)][0] += 1
                 if values is not None and values[index] is not None:
                     family_mutable[(quant_id, horizon)][1] += 1
+        if forecast_evidence is not None:
+            from .historical_evidence import HistoricalForecastEvidence
+            cutoff_at = _utc(_forecast_epoch(frame))
+            for quant_id in QUANT_IDS:
+                family_result = result_map[quant_id]
+                values = _result_values(quant_id, family_result)
+                source_at = _utc(_family_source_epoch(
+                    quant_id, family_result, frame,
+                ))
+                for index, horizon in enumerate(HORIZONS):
+                    value = None if values is None else values[index]
+                    reason = None if value is not None else (
+                        "REPLAY_Q10_DATA_UNAVAILABLE" if quant_id == _Q10
+                        else "MISSING_VALUE"
+                    )
+                    forecast_evidence.append(HistoricalForecastEvidence(
+                        replay_run_id, cutoff_at, quant_id, horizon,
+                        None if value is None else float(value),
+                        "AVAILABLE" if value is not None else "UNAVAILABLE",
+                        reason, _FORMULA_VERSIONS[quant_id],
+                        MAGNITUDE_BPS if quant_id == "q3_volatility"
+                        else DIRECTIONAL_BPS,
+                        source_at, cutoff_at, frame.data_schema_version,
+                        frame.source_spec_version,
+                    ))
 
         v1 = v3 = None
         by_horizon = {}
@@ -1244,11 +1272,20 @@ def main(argv: Iterable[str] | None = None) -> int:
         "--max-interior-gap-seconds", type=int, choices=(5,), default=5,
         help="frozen COIN RTH gap diagnostic (5 seconds)",
     )
+    parser.add_argument(
+        "--persist-certified", action="store_true",
+        help="atomically append a REPLAY_COMPLETE/CERTIFIED run",
+    )
+    parser.add_argument(
+        "--git-commit", help="commit that produced the replay (defaults to HEAD)",
+    )
     arguments = parser.parse_args(None if argv is None else tuple(argv))
     if len(arguments.session) > 1 and not arguments.batch_preflight:
         parser.error("multiple dates require --batch-preflight")
     if arguments.batch_preflight and arguments.run_id:
         parser.error("--run-id is only valid for a single session")
+    if arguments.persist_certified and (arguments.batch_preflight or arguments.preflight_only):
+        parser.error("--persist-certified requires a full single-session replay")
     try:
         days = tuple(date.fromisoformat(value) for value in arguments.session)
     except ValueError as error:
@@ -1308,12 +1345,33 @@ def main(argv: Iterable[str] | None = None) -> int:
     reader = AlpacaHistoricalSipReader.from_environment()
     day = days[0]
     opened, closed = _session(day)
+    evidence = [] if arguments.persist_certified else None
     report = run_h1_session(
         reader=reader, session_open=opened, session_close=closed,
         replay_run_id=arguments.run_id or f"h1-{day.isoformat()}",
         preflight_only=arguments.preflight_only,
         maximum_interior_gap_seconds=arguments.max_interior_gap_seconds,
+        forecast_evidence=evidence,
     )
+    if arguments.persist_certified:
+        if report.execution_stage != "REPLAY_COMPLETE" or report.data_status != "CERTIFIED":
+            print(json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":")))
+            return 2
+        database_url = os.environ.get("HISTORICAL_EVIDENCE_DATABASE_URL")
+        if not database_url:
+            parser.error("HISTORICAL_EVIDENCE_DATABASE_URL is required to persist")
+        import psycopg
+        from .historical_evidence import HistoricalEvidenceWriter, build_manifest
+        git_commit = arguments.git_commit or subprocess.run(
+            ("git", "rev-parse", "HEAD"), check=True, capture_output=True,
+            text=True,
+        ).stdout.strip()
+        manifest = build_manifest(report, tuple(evidence), git_commit=git_commit)
+        with psycopg.connect(database_url) as connection:
+            writes = HistoricalEvidenceWriter(connection).persist(
+                manifest, tuple(evidence),
+            )
+        report = replace(report, persistence_writes=writes)
     print(json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":")))
     passed = (
         (report.execution_stage == "PREFLIGHT_ONLY" and
