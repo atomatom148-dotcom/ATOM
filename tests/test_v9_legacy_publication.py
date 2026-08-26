@@ -24,6 +24,26 @@ def test_legacy_publication_migration_is_post_commit_append_only_and_no_backfill
 
 
 
+def test_bounded_publication_reader_is_indexed_capped_and_read_only():
+    sql = (
+        ROOT / "migrations" /
+        "017_bound_legacy_evidence_publication_reads.sql"
+    ).read_text()
+    assert "read_legacy_evidence_publications" in sql
+    assert "legacy_evidence_publications_kind_observed_id_idx" in sql
+    assert "p.commit_observed_at<=p_as_of" in sql
+    assert "LEAST(GREATEST(p_limit, 0), 65536)" in sql
+    assert "ROWS 65536" in sql
+    assert "SECURITY DEFINER" in sql
+    assert "SET search_path=pg_catalog" in sql
+    assert "OWNER TO atom_v9_proof_owner" in sql
+    assert "TO atom_v9_v4_runtime" in sql
+    assert "INSERT INTO atom_v9_internal.legacy_evidence_publications" not in sql
+    assert "UPDATE atom_v9_internal.legacy_evidence_publications" not in sql
+    assert "DELETE FROM atom_v9_internal.legacy_evidence_publications" not in sql
+
+
+
 def test_publication_proof_recorder_suppresses_only_unapplied_schema_errors():
     from quant.evidence import PostgresEvidenceStore
 
