@@ -8,13 +8,15 @@ weights, thresholds, evidence, or production decisions.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 from numbers import Real
 import re
 from typing import Iterable
 
-from quant.v9_v1_contract import HORIZONS
+from quant.v9_v1_contract import HORIZONS, HORIZON_SECONDS
+from quant.v9_v3_synthesis import MODEL_VERSION as V3_MODEL_VERSION
+from quant.v9_v4a_evidence import CONTRACT_VERSION as V9_MODEL_VERSION
 from quant.v9_v4a_evidence import canonical_sha256
 from quant.v9_v4b_accuracy import (
     effective_n, inverse_regularized_incomplete_beta,
@@ -57,6 +59,9 @@ class EfficacyObservation:
     v3_bps: float
     actual_bps: float
     proof_eligible: bool
+    v9_forecast_payload: tuple[tuple[str, object], ...]
+    v3_forecast_payload: tuple[tuple[str, object], ...]
+    outcome_payload: tuple[tuple[str, object], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +103,12 @@ class EfficacyReport:
 
 
 def _aware(value: object) -> bool:
-    return isinstance(value, datetime) and value.tzinfo is not None
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return False
+    try:
+        return value.utcoffset() is not None
+    except Exception:
+        return False
 
 
 def _finite_real(value: object) -> bool:
@@ -107,6 +117,31 @@ def _finite_real(value: object) -> bool:
 
 def _sha256(value: object) -> bool:
     return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+
+
+def _payload(value: object) -> dict[str, object] | None:
+    if not isinstance(value, tuple):
+        return None
+    try:
+        payload = dict(value)
+    except (TypeError, ValueError):
+        return None
+    if len(payload) != len(value) or not all(isinstance(key, str) for key in payload):
+        return None
+    return payload
+
+
+def _bound_payload(
+    value: object,
+    record_hash: str,
+    expected: dict[str, object],
+) -> bool:
+    payload = _payload(value)
+    return (
+        payload is not None
+        and canonical_sha256(payload) == record_hash
+        and all(payload.get(key) == item for key, item in expected.items())
+    )
 
 
 def _directional_win(predicted: float, actual: float) -> float | None:
@@ -134,6 +169,38 @@ def _valid(row: EfficacyObservation) -> bool:
         row.cutoff_at, row.target_endpoint, row.forecast_available_at,
         row.v3_forecast_available_at, row.evidence_available_at,
     )
+    if row.horizon not in HORIZON_SECONDS or not all(_aware(value) for value in timestamps):
+        return False
+    expected_endpoint = row.cutoff_at + timedelta(seconds=HORIZON_SECONDS[row.horizon])
+    v9_expected = {
+        "record_id": row.forecast_record_id,
+        "model_version": row.v9_model_version,
+        "horizon": row.horizon,
+        "family": row.family,
+        "family_weight": row.family_weight,
+        "cutoff_at": row.cutoff_at,
+        "target_endpoint": row.target_endpoint,
+        "target_identity": row.target_identity,
+        "expected_return_bps": row.v9_bps,
+    }
+    v3_expected = {
+        "record_id": row.v3_forecast_record_id,
+        "model_version": row.v3_model_version,
+        "horizon": row.horizon,
+        "cutoff_at": row.cutoff_at,
+        "target_endpoint": row.target_endpoint,
+        "target_identity": row.target_identity,
+        "expected_return_bps": row.v3_bps,
+    }
+    outcome_expected = {
+        "record_id": row.outcome_record_id,
+        "forecast_record_id": row.forecast_record_id,
+        "baseline_forecast_record_id": row.v3_forecast_record_id,
+        "target_identity": row.target_identity,
+        "target_endpoint": row.target_endpoint,
+        "actual_return_bps": row.actual_bps,
+        "target_timing_status": row.target_timing_status,
+    }
     return (
         row.proof_eligible is True
         and row.horizon in HORIZONS
@@ -142,16 +209,17 @@ def _valid(row: EfficacyObservation) -> bool:
         and bool(row.v3_forecast_record_id)
         and bool(row.outcome_record_id)
         and bool(row.target_identity)
-        and bool(row.v9_model_version)
-        and bool(row.v3_model_version)
+        and row.v9_model_version == V9_MODEL_VERSION
+        and row.v3_model_version == V3_MODEL_VERSION
         and _sha256(row.forecast_record_hash)
         and _sha256(row.v3_forecast_record_hash)
         and _sha256(row.outcome_record_hash)
         and row.forecast_proof_method == COMMIT_PROOF_METHOD
         and row.v3_forecast_proof_method == COMMIT_PROOF_METHOD
         and row.target_timing_status == VERIFIED_TARGET_TIMING
-        and all(_aware(value) for value in timestamps)
-        and row.cutoff_at < row.target_endpoint
+        and row.target_endpoint == expected_endpoint
+        and row.cutoff_at <= row.forecast_available_at
+        and row.cutoff_at <= row.v3_forecast_available_at
         and row.forecast_available_at < row.target_endpoint
         and row.v3_forecast_available_at < row.target_endpoint
         and row.target_endpoint <= row.evidence_available_at
@@ -159,6 +227,9 @@ def _valid(row: EfficacyObservation) -> bool:
             row.family_weight, row.v9_bps, row.v3_bps, row.actual_bps
         ))
         and 0 <= row.family_weight <= 1
+        and _bound_payload(row.v9_forecast_payload, row.forecast_record_hash, v9_expected)
+        and _bound_payload(row.v3_forecast_payload, row.v3_forecast_record_hash, v3_expected)
+        and _bound_payload(row.outcome_payload, row.outcome_record_hash, outcome_expected)
     )
 
 
@@ -178,6 +249,34 @@ def _non_overlapping(
         if not selected or row.cutoff_at >= selected[-1].target_endpoint:
             selected.append(row)
     return tuple(selected)
+
+
+def _without_conflicts(
+    rows: Iterable[EfficacyObservation],
+) -> tuple[EfficacyObservation, ...]:
+    groups: dict[tuple[datetime, str, str], list[EfficacyObservation]] = {}
+    for row in rows:
+        groups.setdefault((row.cutoff_at, row.horizon, row.family), []).append(row)
+    canonical: list[EfficacyObservation] = []
+    for group in groups.values():
+        signatures = {
+            (
+                row.forecast_record_hash, row.v3_forecast_record_hash,
+                row.outcome_record_hash, row.v9_bps, row.v3_bps,
+                row.actual_bps, row.target_identity,
+            )
+            for row in group
+        }
+        if len(signatures) != 1:
+            continue
+        canonical.append(min(group, key=lambda row: (
+            row.forecast_record_id, row.v3_forecast_record_id,
+            row.outcome_record_id,
+        )))
+    return tuple(sorted(canonical, key=lambda row: (
+        row.cutoff_at, HORIZONS.index(row.horizon), row.family,
+        row.forecast_record_id,
+    )))
 
 
 def _slice(
@@ -259,7 +358,8 @@ def build_chronological_efficacy_report(
     candidates = tuple(
         row for row in incoming if _known_as_of(row, evaluation_as_of)
     )
-    valid = tuple(row for row in candidates if _valid(row))
+    validated = tuple(row for row in candidates if _valid(row))
+    valid = _without_conflicts(validated)
     calibration = tuple(
         row for row in valid if row.evidence_available_at < holdout_start
     )
