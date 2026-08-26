@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import math
+from numbers import Real
+import re
 from typing import Iterable
 
 from quant.v9_v1_contract import HORIZONS
@@ -19,19 +21,37 @@ from quant.v9_v4b_accuracy import (
 )
 from quant.v9_v4c_predictive import hac, holm
 
-EFFICACY_VERSION = "ATOM_TRUE_V9_CHRONOLOGICAL_EFFICACY_1"
-METHOD = "PAIRED_DIRECTIONAL_HAC_HOLM_005_1"
+EFFICACY_VERSION = "ATOM_TRUE_V9_CHRONOLOGICAL_EFFICACY_2"
+METHOD = "PAIRED_NONOVERLAP_DIRECTIONAL_HAC_HOLM_005_2"
 SIGNIFICANCE_ALPHA = 0.05
+MIN_SIGNIFICANCE_RAW_N = 500
+MIN_SIGNIFICANCE_EFFECTIVE_N = 400.0
+COMMIT_PROOF_METHOD = "POST_COMMIT_DB_OBSERVATION_V1"
+VERIFIED_TARGET_TIMING = "VERIFIED"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True, slots=True)
 class EfficacyObservation:
     forecast_record_id: str
+    forecast_record_hash: str
+    v9_model_version: str
     horizon: str
     family: str
     family_weight: float
     cutoff_at: datetime
+    target_endpoint: datetime
     forecast_available_at: datetime
+    forecast_proof_method: str
+    v3_forecast_record_id: str
+    v3_forecast_record_hash: str
+    v3_model_version: str
+    v3_forecast_available_at: datetime
+    v3_forecast_proof_method: str
+    outcome_record_id: str
+    outcome_record_hash: str
+    target_identity: str
+    target_timing_status: str
     evidence_available_at: datetime
     v9_bps: float
     v3_bps: float
@@ -45,6 +65,8 @@ class EfficacySlice:
     family: str
     holdout_n: int
     directional_effective_n: float
+    v9_directional_effective_n: float
+    v3_directional_effective_n: float
     mean_family_weight: float | None
     v9_directional_accuracy: float | None
     v3_directional_accuracy: float | None
@@ -75,6 +97,18 @@ class EfficacyReport:
     slices: tuple[EfficacySlice, ...]
 
 
+def _aware(value: object) -> bool:
+    return isinstance(value, datetime) and value.tzinfo is not None
+
+
+def _finite_real(value: object) -> bool:
+    return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _sha256(value: object) -> bool:
+    return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+
+
 def _directional_win(predicted: float, actual: float) -> float | None:
     if actual == 0:
         return None
@@ -96,18 +130,54 @@ def _lower_95(wins: float, effective_count: float) -> float | None:
 
 
 def _valid(row: EfficacyObservation) -> bool:
+    timestamps = (
+        row.cutoff_at, row.target_endpoint, row.forecast_available_at,
+        row.v3_forecast_available_at, row.evidence_available_at,
+    )
     return (
-        row.proof_eligible
+        row.proof_eligible is True
         and row.horizon in HORIZONS
         and bool(row.family)
         and bool(row.forecast_record_id)
-        and row.forecast_available_at <= row.cutoff_at
-        and row.cutoff_at < row.evidence_available_at
-        and all(math.isfinite(value) for value in (
+        and bool(row.v3_forecast_record_id)
+        and bool(row.outcome_record_id)
+        and bool(row.target_identity)
+        and bool(row.v9_model_version)
+        and bool(row.v3_model_version)
+        and _sha256(row.forecast_record_hash)
+        and _sha256(row.v3_forecast_record_hash)
+        and _sha256(row.outcome_record_hash)
+        and row.forecast_proof_method == COMMIT_PROOF_METHOD
+        and row.v3_forecast_proof_method == COMMIT_PROOF_METHOD
+        and row.target_timing_status == VERIFIED_TARGET_TIMING
+        and all(_aware(value) for value in timestamps)
+        and row.cutoff_at < row.target_endpoint
+        and row.forecast_available_at < row.target_endpoint
+        and row.v3_forecast_available_at < row.target_endpoint
+        and row.target_endpoint <= row.evidence_available_at
+        and all(_finite_real(value) for value in (
             row.family_weight, row.v9_bps, row.v3_bps, row.actual_bps
         ))
-        and row.family_weight >= 0
+        and 0 <= row.family_weight <= 1
     )
+
+
+def _known_as_of(row: EfficacyObservation, evaluation_as_of: datetime) -> bool:
+    """Exclude aware future rows entirely; retain malformed rows as exclusions."""
+    if not _aware(row.cutoff_at) or not _aware(row.evidence_available_at):
+        return True
+    return row.cutoff_at <= evaluation_as_of and row.evidence_available_at <= evaluation_as_of
+
+
+def _non_overlapping(
+    rows: Iterable[EfficacyObservation],
+) -> tuple[EfficacyObservation, ...]:
+    ordered = sorted(rows, key=lambda row: (row.cutoff_at, row.forecast_record_id))
+    selected: list[EfficacyObservation] = []
+    for row in ordered:
+        if not selected or row.cutoff_at >= selected[-1].target_endpoint:
+            selected.append(row)
+    return tuple(selected)
 
 
 def _slice(
@@ -115,6 +185,7 @@ def _slice(
     family: str,
     rows: tuple[EfficacyObservation, ...],
 ) -> EfficacySlice:
+    rows = _non_overlapping(rows)
     scored = tuple(
         (row, _directional_win(row.v9_bps, row.actual_bps),
          _directional_win(row.v3_bps, row.actual_bps))
@@ -123,29 +194,43 @@ def _slice(
     scored = tuple(item for item in scored if item[1] is not None and item[2] is not None)
     if not scored:
         return EfficacySlice(
-            horizon, family, 0, 0.0, None, None, None, None,
+            horizon, family, 0, 0.0, 0.0, 0.0, None, None, None, None,
             None, None, "UNAVAILABLE", None, 1.0, None, None, False,
             ("NO_SCOREABLE_HOLDOUT",),
         )
     v9 = tuple(float(item[1]) for item in scored)
     v3 = tuple(float(item[2]) for item in scored)
     paired = tuple(a - b for a, b in zip(v9, v3, strict=True))
-    n_eff, effective_reasons = effective_n(paired)
+    paired_n_eff, paired_reasons = effective_n(paired)
+    v9_n_eff, v9_reasons = effective_n(v9)
+    v3_n_eff, v3_reasons = effective_n(v3)
     v9_accuracy = math.fsum(v9) / len(v9)
     v3_accuracy = math.fsum(v3) / len(v3)
     result = hac(paired)
-    reasons = tuple(sorted(set(effective_reasons + result.reason_codes)))
+    reasons = tuple(sorted(set(
+        paired_reasons + v9_reasons + v3_reasons + result.reason_codes
+    )))
+    sufficient = (
+        len(scored) >= MIN_SIGNIFICANCE_RAW_N
+        and paired_n_eff >= MIN_SIGNIFICANCE_EFFECTIVE_N
+        and v9_n_eff >= MIN_SIGNIFICANCE_EFFECTIVE_N
+        and v3_n_eff >= MIN_SIGNIFICANCE_EFFECTIVE_N
+    )
+    if not sufficient:
+        reasons = tuple(sorted(set(reasons + ("EFFICACY_EVIDENCE_INSUFFICIENT",))))
     return EfficacySlice(
         horizon=horizon,
         family=family,
         holdout_n=len(scored),
-        directional_effective_n=n_eff,
+        directional_effective_n=paired_n_eff,
+        v9_directional_effective_n=v9_n_eff,
+        v3_directional_effective_n=v3_n_eff,
         mean_family_weight=math.fsum(row.family_weight for row, _, _ in scored) / len(scored),
         v9_directional_accuracy=v9_accuracy,
         v3_directional_accuracy=v3_accuracy,
         paired_improvement=v9_accuracy - v3_accuracy,
-        v9_lower_95=_lower_95(v9_accuracy, n_eff),
-        v3_lower_95=_lower_95(v3_accuracy, n_eff),
+        v9_lower_95=_lower_95(v9_accuracy, v9_n_eff),
+        v3_lower_95=_lower_95(v3_accuracy, v3_n_eff),
         hac_status=result.status,
         hac_z=result.z,
         p_upper=result.p_upper,
@@ -165,13 +250,16 @@ def build_chronological_efficacy_report(
     """Evaluate a fixed chronological holdout without training on it."""
 
     if (
-        holdout_start.tzinfo is None
-        or evaluation_as_of.tzinfo is None
+        not _aware(holdout_start)
+        or not _aware(evaluation_as_of)
         or holdout_start >= evaluation_as_of
     ):
         raise ValueError("aware chronological boundaries with holdout_start < evaluation_as_of required")
     incoming = tuple(observations)
-    valid = tuple(row for row in incoming if _valid(row))
+    candidates = tuple(
+        row for row in incoming if _known_as_of(row, evaluation_as_of)
+    )
+    valid = tuple(row for row in candidates if _valid(row))
     calibration = tuple(
         row for row in valid if row.evidence_available_at < holdout_start
     )
@@ -186,7 +274,11 @@ def build_chronological_efficacy_report(
         _slice(
             horizon,
             family,
-            tuple(row for row in holdout if row.horizon == horizon and row.family == family),
+            tuple(sorted(
+                (row for row in holdout
+                 if row.horizon == horizon and row.family == family),
+                key=lambda row: (row.cutoff_at, row.forecast_record_id),
+            )),
         )
         for horizon, family in families
     )
@@ -200,6 +292,7 @@ def build_chronological_efficacy_report(
                 holm_threshold=by_index[index].threshold,
                 significant_improvement=(
                     item.hac_status == "AVAILABLE"
+                    and "EFFICACY_EVIDENCE_INSUFFICIENT" not in item.reason_codes
                     and item.paired_improvement is not None
                     and item.paired_improvement > 0
                     and by_index[index].passed
@@ -223,7 +316,7 @@ def build_chronological_efficacy_report(
         evaluation_as_of=evaluation_as_of,
         calibration_n=len(calibration),
         holdout_n=len(holdout),
-        excluded_n=len(incoming) - len(valid),
+        excluded_n=len(candidates) - len(valid),
         evidence_digest=digest,
         slices=slices,
     )
