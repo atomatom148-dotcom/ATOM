@@ -559,7 +559,9 @@ class LiveEvidenceTests(unittest.TestCase):
 
     def test_dashboard_only_populates_durable_counts(self):
         evidence = dashboard_data(evidence_counts=(17, 4))["evidence"]
-        self.assertEqual(evidence, {"Forecasts": 17, "Resolved": 4})
+        self.assertEqual(evidence, {
+            "Forecasts": 17, "Resolved": 4, "Status": "UNAVAILABLE",
+        })
 
 
 if __name__ == "__main__":

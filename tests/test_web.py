@@ -11,6 +11,8 @@ from quant import web as web_module
 from quant.history import MidpointHistory, MidpointObservation
 from quant.evidence import PhaseECohortMetrics
 from quant.live_market import LiveMarketState
+from quant.q10_options_vol import OptionObservation, OptionSurface
+from quant.v9_production import FORMULA_VERSION_MAP
 from quant.v9_v4d_integration import OperationalMetrics
 from quant.web import (DashboardEvidenceCache, FAMILY_NAMES, HORIZON_LABELS,
                        PHASE_E_FAMILY_NAMES, create_app, dashboard_data,
@@ -60,11 +62,22 @@ class WebSurfaceTests(unittest.TestCase):
             self.assertEqual(len(family["values"]), 6)
             self.assertEqual(family["values"], [None] * 6)
 
+    def test_display_horizons_match_the_frozen_evidence_contract(self):
+        self.assertEqual(HORIZON_LABELS, ("30S", "1M", "5M", "15M", "30M", "1H"))
+
     def test_unavailable_fields_are_null_and_not_fabricated(self):
         payload = dashboard_data()
         self.assertTrue(all(values == [None] * 6 for values in payload["final_numbers"].values()))
-        self.assertEqual(payload["options_data"], {"expiration": None, "calls": [], "puts": []})
-        self.assertTrue(all(value is None for value in payload["evidence"].values()))
+        self.assertEqual(payload["options_data"], {
+            "status": "UNAVAILABLE", "as_of_epoch": None,
+            "expiration": None, "calls": [], "puts": [],
+        })
+        self.assertEqual(payload["evidence"], {
+            "Forecasts": None, "Resolved": None, "Status": "UNAVAILABLE",
+        })
+        self.assertEqual(len(payload["phase_e_cohorts"]), 72)
+        self.assertTrue(all(row["effective_n"] is None
+                            for row in payload["phase_e_cohorts"]))
         self.assertTrue(all(value is None for family in payload["quant_families"] for value in family["values"]))
         self.assertIsNone(payload["market"]["data_age"])
         self.assertIsNone(payload["market"]["event_epoch"])
@@ -505,7 +518,8 @@ async function advance(milliseconds) {{
         )
         cohorts = tuple(
             PhaseECohortMetrics(
-                quant_id, "v1", "COIN", "1H" if index == 0 else "30S",
+                quant_id, FORMULA_VERSION_MAP[quant_id], "COIN",
+                "1H" if index == 0 else "30S",
                 21, 20, 19, 0.999123, 2.3456, 0.514, 1.2345,
                 None if index == 1 else -0.126, 20, index % 2 == 0,
             )
@@ -521,7 +535,8 @@ async function advance(milliseconds) {{
             def volatility_phase_e_cohorts(self, as_of):
                 self.phase_calls.append(as_of)
                 return (PhaseECohortMetrics(
-                    "q3_volatility", "v1", "COIN", "30S", 1, 1, 1,
+                    "q3_volatility", FORMULA_VERSION_MAP["q3_volatility"],
+                    "COIN", "30S", 1, 1, 1,
                     1.0, 0.0, None, None, None, 1, False,
                 ),)
 
@@ -533,12 +548,16 @@ async function advance(milliseconds) {{
         rows = payload["phase_e_cohorts"]
 
         self.assertEqual(store.phase_calls, [456.75, 456.75])
-        self.assertEqual(payload["evidence"], {"Forecasts": 123, "Resolved": 98})
-        self.assertEqual([row["family"] for row in rows], list(PHASE_E_FAMILY_NAMES.values()))
+        self.assertEqual(payload["evidence"], {
+            "Forecasts": 123, "Resolved": 98, "Status": "AVAILABLE",
+        })
+        populated = [row for row in rows if row["formula_version"] is not None]
+        self.assertEqual([row["family"] for row in populated],
+                         list(PHASE_E_FAMILY_NAMES.values()))
         self.assertIn("q3_volatility", [row["quant_id"] for row in rows])
-        self.assertEqual(rows[0]["directional_accuracy"], 0.514)
-        self.assertEqual(rows[0]["coverage"], 0.999123)
-        self.assertEqual(rows[0]["rmse_bps"], 2.3456)
+        self.assertEqual(populated[0]["directional_accuracy"], 0.514)
+        self.assertEqual(populated[0]["coverage"], 0.999123)
+        self.assertEqual(populated[0]["rmse_bps"], 2.3456)
 
         page_app = create_app(evidence_cache=cache, clock=lambda: 456.75)
         page = request(page_app, "/")["body"].decode()
@@ -553,13 +572,80 @@ async function advance(milliseconds) {{
         self.assertIn(">-0.13<", page)
         self.assertNotIn(">None<", page)
 
+    def test_phase_e_dashboard_exposes_all_72_slots_without_fake_zeroes(self):
+        observed = PhaseECohortMetrics(
+            "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"], "COIN", "30S",
+            21, 20, 19,
+            0.95, 2.5, 0.75, 1.5, -0.5, 20, True,
+        )
+        superseded = PhaseECohortMetrics(
+            "q1_momentum", "superseded-v0", "COIN", "30S", 999, 999, 999,
+            1.0, 0.0, 1.0, 0.0, 0.0, 999, True,
+        )
+        wrong_symbol = PhaseECohortMetrics(
+            "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"], "OTHER", "30S",
+            888, 888, 888, 1.0, 0.0, 1.0, 0.0, 0.0, 888, True,
+        )
+
+        payload = dashboard_data(
+            phase_e_cohorts=(superseded, wrong_symbol, observed),
+            evidence_status="AVAILABLE",
+        )
+        rows = payload["phase_e_cohorts"]
+
+        self.assertEqual(len(rows), 72)
+        self.assertEqual(
+            [(row["quant_id"], row["horizon"]) for row in rows],
+            [(quant_id, horizon)
+             for quant_id in PHASE_E_FAMILY_NAMES
+             for horizon in ("30S", "1M", "5M", "15M", "30M", "1H")],
+        )
+        self.assertEqual(rows[0]["effective_n"], 20)
+        missing = rows[1]
+        self.assertIsNone(missing["forecast_count"])
+        self.assertIsNone(missing["effective_n"])
+        self.assertIsNone(missing["eligible"])
+        self.assertIsNone(missing["directional_accuracy"])
+        self.assertEqual(payload["evidence"]["Status"], "AVAILABLE")
+        page = dashboard_page(payload).decode()
+        self.assertIn(">Momentum / 1M<", page)
+        self.assertNotIn(">null<", page)
+
+    def test_options_display_labels_stale_surface_and_formats_prices(self):
+        call = OptionObservation(
+            "COIN-CALL", 100.0, 185.0, 10_000.0, "2026-09-25",
+            15.899999999999999, 0.7303, 0.5515, 0.0102, -0.2, 0.1,
+            15.35, 16.45,
+        )
+        put = OptionObservation(
+            "COIN-PUT", 100.0, 185.0, 10_000.0, "2026-09-25",
+            13.05, 0.6403, -0.4523, 0.0116, -0.2149, 0.1,
+            11.65, 14.45,
+        )
+        surface = OptionSurface(100.0, "2026-09-25", (call,), (put,))
+        state = LiveMarketState(clock=lambda: 131.0)
+        self.assertTrue(state.accept_quote(bid=184.0, ask=186.0, event_epoch=100.0))
+        state.accept_option_surface(surface, midpoint=185.0)
+
+        payload = dashboard_data(snapshot=state.snapshot(), now_epoch=131.0,
+                                 calculate_missing=False)
+        page = dashboard_page(payload).decode()
+
+        self.assertEqual(payload["options_data"]["status"], "STALE")
+        self.assertEqual(payload["options_data"]["as_of_epoch"], 100.0)
+        self.assertIn(">STALE<", page)
+        self.assertIn(">15.90<", page)
+        self.assertNotIn("15.899999999999999", page)
+
     def test_dashboard_requests_only_read_the_background_cache(self):
         first = PhaseECohortMetrics(
-            "q1_momentum", "v1", "COIN", "30S", 1, 1, 1,
+            "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"],
+            "COIN", "30S", 1, 1, 1,
             1.0, 1.0, 1.0, 1.0, 1.0, 1, False,
         )
         refreshed = PhaseECohortMetrics(
-            "q1_momentum", "v1", "COIN", "30S", 2, 2, 2,
+            "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"],
+            "COIN", "30S", 2, 2, 2,
             1.0, 2.0, 1.0, 2.0, 1.0, 2, False,
         )
 
@@ -635,8 +721,12 @@ async function advance(milliseconds) {{
         empty_cache.refresh()
         empty_app = create_app(evidence_cache=empty_cache, clock=lambda: 100.0)
         empty = json.loads(request(empty_app, "/api/dashboard")["body"])
-        self.assertEqual(empty["phase_e_cohorts"], [])
-        self.assertEqual(empty["evidence"], {"Forecasts": 0, "Resolved": 0})
+        self.assertEqual(len(empty["phase_e_cohorts"]), 72)
+        self.assertTrue(all(row["effective_n"] is None
+                            for row in empty["phase_e_cohorts"]))
+        self.assertEqual(empty["evidence"], {
+            "Forecasts": 0, "Resolved": 0, "Status": "UNAVAILABLE",
+        })
 
     def test_background_cache_keeps_new_counts_when_phase_e_fails(self):
         class Store:
@@ -709,12 +799,15 @@ async function advance(milliseconds) {{
 
     def test_phase_e_horizons_have_fixed_display_order(self):
         cohorts = tuple(
-            PhaseECohortMetrics("q1_momentum", "v1", "COIN", horizon,
+            PhaseECohortMetrics(
+                                "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"],
+                                "COIN", horizon,
                                 1, 1, 1, 1.0, 1.0, 1.0, 1.0, 1.0, 1, False)
             for horizon in reversed(("30S", "1M", "5M", "15M", "30M", "1H"))
         )
         rows = dashboard_data(phase_e_cohorts=cohorts)["phase_e_cohorts"]
-        self.assertEqual([row["horizon"] for row in rows],
+        q1_rows = [row for row in rows if row["quant_id"] == "q1_momentum"]
+        self.assertEqual([row["horizon"] for row in q1_rows],
                          ["30S", "1M", "5M", "15M", "30M", "1H"])
 
 

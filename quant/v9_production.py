@@ -51,6 +51,7 @@ from .v9_v4d_integration import ImmutableStateCache, OperationalMetrics
 
 TARGET_SPEC_ID = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
 V2_REFRESH_SECONDS = 3600.0
+V2_FAILURE_RETRY_SECONDS = 60.0
 V2_STATE_BUILD_EVIDENCE_LIMIT = 65_536
 
 FORMULA_VERSIONS = (
@@ -314,13 +315,18 @@ class ImmutableV2StateProvider:
         with self._lock:
             return self._status
 
-    def start(self, *, interval_seconds: float = V2_REFRESH_SECONDS) -> threading.Thread:
+    def start(self, *, interval_seconds: float = V2_REFRESH_SECONDS,
+              stop_event: threading.Event | None = None) -> threading.Thread:
         interval = max(60.0, float(interval_seconds))
+        stop_event = stop_event or threading.Event()
 
         def worker() -> None:
-            while True:
-                self.refresh()
-                time.sleep(interval)
+            while not stop_event.is_set():
+                snapshot = self.refresh()
+                delay = (interval if snapshot.status == "AVAILABLE" else
+                         V2_FAILURE_RETRY_SECONDS)
+                if stop_event.wait(delay):
+                    return
 
         thread = threading.Thread(target=worker, name="atom-v9-v2-builder", daemon=True)
         thread.start()

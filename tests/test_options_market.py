@@ -225,7 +225,10 @@ class RuntimeTests(unittest.TestCase):
         item = parse_alpaca_option_snapshot(contract("DISPLAY"), snapshot(greeks={}), cutoff_epoch=CUTOFF)
         state.accept_option_observation(item)
         payload = dashboard_data(snapshot=state.snapshot())
-        self.assertEqual(payload["options_data"], {"expiration": None, "calls": [], "puts": []})
+        self.assertEqual(payload["options_data"], {
+            "status": "UNAVAILABLE", "as_of_epoch": None,
+            "expiration": None, "calls": [], "puts": [],
+        })
         self.assertEqual(payload["quant_families"][9]["values"], [None] * 6)
 
 

@@ -460,7 +460,9 @@ class PhaseEApiTests(unittest.TestCase):
 
     def test_dashboard_keeps_only_global_evidence_totals(self):
         evidence = dashboard_data(evidence_counts=(10, 8))["evidence"]
-        self.assertEqual(evidence, {"Forecasts": 10, "Resolved": 8})
+        self.assertEqual(evidence, {
+            "Forecasts": 10, "Resolved": 8, "Status": "UNAVAILABLE",
+        })
 
     def test_dashboard_does_not_poll_phase_e(self):
         page = request(create_app(), "/")["body"].decode()

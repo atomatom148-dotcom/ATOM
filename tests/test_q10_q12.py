@@ -68,7 +68,10 @@ class OptionsVolTests(unittest.TestCase):
         self.assertIsNone(calculate_options_vol())
         payload = dashboard_data()
         self.assertEqual(payload["quant_families"][9]["values"], [None] * 6)
-        self.assertEqual(payload["options_data"], {"expiration": None, "calls": [], "puts": []})
+        self.assertEqual(payload["options_data"], {
+            "status": "UNAVAILABLE", "as_of_epoch": None,
+            "expiration": None, "calls": [], "puts": [],
+        })
 
     def test_deterministic_means_asymmetries_and_equal_weighting(self):
         result = calculate_options_vol(self.surface(), cutoff_epoch=100)

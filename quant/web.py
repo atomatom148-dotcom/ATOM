@@ -26,11 +26,13 @@ from .live_market import (
 from .q1_momentum import calculate_momentum
 from .q2_mean_reversion import calculate_mean_reversion
 from .q3_volatility import calculate_volatility
+from .q10_options_vol import MAX_SURFACE_AGE_SECONDS
+from .v9_production import FORMULA_VERSION_MAP
 from .v9_telemetry import latest_v9_observation
 from .v9_v4d_integration import OperationalMetrics
 
 
-HORIZON_LABELS = ("30S", "1M", "5M", "15M", "30M", "60M")
+HORIZON_LABELS = ("30S", "1M", "5M", "15M", "30M", "1H")
 FAMILY_NAMES = (
     "Momentum",
     "Mean Reversion",
@@ -146,6 +148,7 @@ def dashboard_data(
     snapshot: LiveSnapshot | None = None, now_epoch: float | None = None,
     evidence_counts: tuple[int, int] | None = None,
     phase_e_cohorts: Iterable[object] = (),
+    evidence_status: str = "UNAVAILABLE",
     cross_asset_state: CrossAssetState | None = None,
     market_display: LatestMarketDisplay | None = None,
     v9_output: object | None = None,
@@ -159,6 +162,7 @@ def dashboard_data(
     history = history if history is not None else MidpointHistory()
     if cutoff_epoch is None:
         cutoff_epoch = history.latest.event_epoch if history.latest else 0.0
+    current_epoch = time.time() if now_epoch is None else now_epoch
 
     q1 = snapshot.momentum if snapshot and snapshot.momentum else (
         calculate_momentum(history, cutoff_epoch=cutoff_epoch)
@@ -229,20 +233,49 @@ def dashboard_data(
                 break
         return rows
 
+    surface_age = (current_epoch - surface.event_epoch
+                   if surface is not None else None)
+    options_status = (
+        "UNAVAILABLE" if surface_age is None or surface_age < 0 else
+        "LIVE" if surface_age <= MAX_SURFACE_AGE_SECONDS else "STALE"
+    )
     options_data = {
+        "status": options_status,
+        "as_of_epoch": surface.event_epoch if surface else None,
         "expiration": surface.expiration if surface else None,
         "calls": option_rows(surface.calls) if surface else [],
         "puts": option_rows(surface.puts) if surface else [],
     }
-    family_order = {quant_id: index for index, quant_id in enumerate(PHASE_E_FAMILY_NAMES)}
-    horizon_order = {horizon: index for index, horizon in enumerate(PHASE_E_HORIZONS)}
-    visible_cohorts = sorted(
-        (cohort for cohort in phase_e_cohorts if cohort.quant_id in PHASE_E_FAMILY_NAMES),
-        key=lambda cohort: (
-            family_order[cohort.quant_id], cohort.formula_version, cohort.symbol,
-            horizon_order.get(cohort.horizon, len(horizon_order)), cohort.horizon,
-        ),
-    )
+    canonical_cohorts: dict[tuple[str, str], dict[str, object]] = {}
+    for cohort in phase_e_cohorts:
+        if (cohort.quant_id not in PHASE_E_FAMILY_NAMES or
+                cohort.horizon not in PHASE_E_HORIZONS or
+                cohort.symbol != "COIN" or
+                cohort.formula_version != FORMULA_VERSION_MAP[cohort.quant_id]):
+            continue
+        canonical_cohorts.setdefault(
+            (cohort.quant_id, cohort.horizon),
+            dict(asdict(cohort), family=PHASE_E_FAMILY_NAMES[cohort.quant_id]),
+        )
+
+    visible_cohorts = []
+    for quant_id, family in PHASE_E_FAMILY_NAMES.items():
+        for horizon in PHASE_E_HORIZONS:
+            observed = canonical_cohorts.get((quant_id, horizon))
+            if observed is not None:
+                visible_cohorts.append(observed)
+                continue
+            visible_cohorts.append({
+                "quant_id": quant_id, "formula_version": None,
+                "symbol": "COIN", "horizon": horizon,
+                "forecast_count": None, "matured_count": None,
+                "resolved_count": None, "coverage": None,
+                "rmse_bps": None, "directional_accuracy": None,
+                "mae_bps": None, "bias_bps": None,
+                "effective_n": None, "eligible": None,
+                "evidence_window": None, "evidence_window_limit": None,
+                "evidence_window_truncated": None, "family": family,
+            })
     final_values = {metric: [None] * 6 for metric in ("BPS", "MOVE%", "RANGE")}
     results = getattr(v9_output, "final_numbers", ()) if v9_output is not None else ()
     if len(results) == 6:
@@ -281,7 +314,6 @@ def dashboard_data(
             tuple(item.horizon for item in v3_horizons) == PHASE_E_HORIZONS)
         else ["UNAVAILABLE"] * 6
     )
-    current_epoch = time.time() if now_epoch is None else now_epoch
     btc_event_epoch = (
         cross_asset_state.as_of_epoch - cross_asset_state.btc_age_seconds
         if (cross_asset_state is not None and
@@ -330,9 +362,9 @@ def dashboard_data(
         "evidence": {
             "Forecasts": evidence_counts[0] if evidence_counts else None,
             "Resolved": evidence_counts[1] if evidence_counts else None,
+            "Status": evidence_status,
         },
-        "phase_e_cohorts": [dict(asdict(cohort), family=PHASE_E_FAMILY_NAMES[cohort.quant_id])
-                            for cohort in visible_cohorts],
+        "phase_e_cohorts": visible_cohorts,
     }
 
 
@@ -402,7 +434,8 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     def phase_e_row(cohort: dict[str, object]) -> tuple[object, ...]:
         return (
             f"{cohort['family']} / {cohort['horizon']}", cohort["effective_n"],
-            "YES" if cohort["eligible"] else "NO",
+            ("" if cohort["eligible"] is None else
+             "YES" if cohort["eligible"] else "NO"),
             "" if cohort["directional_accuracy"] is None else f"{cohort['directional_accuracy'] * 100:.1f}%",
             _decimal_cell(cohort["rmse_bps"]), _decimal_cell(cohort["mae_bps"]),
             _decimal_cell(cohort["bias_bps"]),
@@ -420,10 +453,17 @@ def dashboard_page(data: dict[str, object]) -> bytes:
                      f"</tr></thead><tbody id=phase-e-body>{phase_e_body}</tbody></table></div>")
     option_columns = ("Symbol", "Strike", "Bid", "Ask", "Premium", "IV", "Delta",
                       "Gamma", "Theta", "Vega", "Spread")
+    def option_cell(field: str, value: object) -> str:
+        if field in {"Strike", "Bid", "Ask", "Premium", "Spread"}:
+            return _decimal_cell(value)
+        if field in {"IV", "Delta", "Gamma", "Theta", "Vega"}:
+            return "" if value is None else f"{float(value):.4f}"
+        return _cell(value)
+
     def option_table(side: str) -> str:
         body = "".join(
             "<tr>" + "".join(
-                f'<td data-dashboard-field="options_data.{side}.{row_index}.{field}">{_cell(row[field])}</td>'
+                f'<td data-dashboard-field="options_data.{side}.{row_index}.{field}">{option_cell(field, row[field])}</td>'
                 for field in option_columns
             ) + "</tr>"
             for row_index, row in enumerate(options[side])
@@ -442,7 +482,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
 <h2>FINAL NUMBERS</h2>{_table(horizons, final_numbers.items(), section='final_numbers', decimal=True)}
 <h2>V9 DIRECTIONAL ACCURACY</h2>{_table(PHASE_E_HORIZONS, accuracy_rows, section='v9_accuracy')}
 <h2>12 QUANT FAMILIES</h2>{_table(horizons, ((item['name'], item['values']) for item in families), section='quant_families', decimal=True)}
-<h2>OPTIONS DATA</h2><div>EXPIRATION: <span data-dashboard-field="options_data.expiration">{_cell(options['expiration'])}</span></div>{option_table('calls')}{option_table('puts')}
+<h2>OPTIONS DATA</h2><div>STATUS: <span data-dashboard-field="options_data.status">{_cell(options['status'])}</span></div><div>AS OF: <span data-dashboard-field="options_data.as_of_epoch">{_cycle_cell(options['as_of_epoch'])}</span></div><div>EXPIRATION: <span data-dashboard-field="options_data.expiration">{_cell(options['expiration'])}</span></div>{option_table('calls')}{option_table('puts')}
 <h2>EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in evidence.items()), section='evidence')}{phase_e_table}
 </main><script>
 (() => {{
@@ -510,7 +550,16 @@ def dashboard_page(data: dict[str, object]) -> bytes:
       values.forEach((value, index) => set(`v9_accuracy.${{name}}.${{index}}`, value)));
     data.quant_families.forEach(family => family.values.forEach((value, index) =>
       set(`quant_families.${{family.name}}.${{index}}`, value, decimal)));
+    set("options_data.status", data.options_data.status);
+    set("options_data.as_of_epoch", data.options_data.as_of_epoch, cycle);
     set("options_data.expiration", data.options_data.expiration);
+    const optionValue = (field, value) => {{
+      if (["Strike", "Bid", "Ask", "Premium", "Spread"].includes(field))
+        return decimal(value);
+      if (["IV", "Delta", "Gamma", "Theta", "Vega"].includes(field))
+        return value == null ? "" : Number(value).toFixed(4);
+      return text(value);
+    }};
     ["calls", "puts"].forEach(side => {{
       const body = document.getElementById(`options-${{side}}`);
       const fields = {json.dumps(list(option_columns))};
@@ -518,7 +567,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
         const row = document.createElement("tr");
         row.replaceChildren(...fields.map(field => {{
           const cell = document.createElement("td");
-          cell.textContent = text(contract[field]);
+          cell.textContent = optionValue(field, contract[field]);
           return cell;
         }}));
         return row;
@@ -531,8 +580,8 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     const phaseEBody = document.getElementById("phase-e-body");
     phaseEBody.replaceChildren(...data.phase_e_cohorts.map(cohort => {{
       const values = [
-        `${{cohort.family}} / ${{cohort.horizon}}`, String(cohort.effective_n),
-        cohort.eligible ? "YES" : "NO",
+        `${{cohort.family}} / ${{cohort.horizon}}`, text(cohort.effective_n),
+        cohort.eligible == null ? "" : cohort.eligible ? "YES" : "NO",
         cohort.directional_accuracy == null ? "" : (cohort.directional_accuracy * 100).toFixed(1) + "%",
         decimal(cohort.rmse_bps), decimal(cohort.mae_bps), decimal(cohort.bias_bps),
         cohort.coverage == null ? "" : (cohort.coverage * 100).toFixed(1) + "%"
@@ -758,6 +807,7 @@ def create_app(
         data = dashboard_data(
             history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
             now_epoch=as_of_epoch, evidence_counts=counts, phase_e_cohorts=cohorts,
+            evidence_status=cached.status,
             cross_asset_state=cross_asset_state, market_display=market_display,
             v9_output=v9_output,
             calculate_missing=False,
