@@ -10,16 +10,16 @@ import time
 from typing import Callable
 
 from quant.historical_evidence import HistoricalForecastEvidence, HistoricalReplayManifest
-from quant.v9_v1_contract import HORIZONS, QUANT_IDS
 
 
 VERIFIER_VERSION = "H2-B-2"
 DEFAULT_FETCH_SIZE = 2_000
-# H2-A appends each frame's forecasts in the V1 contract's quant-major,
-# horizon-minor order.  Use those exact source constants rather than a second
-# reconstruction of the ordering in H2-B.
-QUANTS = QUANT_IDS
-SLOTS = frozenset((quant, horizon) for quant in QUANT_IDS for horizon in HORIZONS)
+QUANTS = tuple(f"q{i}_{name}" for i, name in enumerate((
+    "momentum", "mean_reversion", "volatility", "stat_arb", "microstructure",
+    "volume_liquidity", "relative_value", "cross_asset", "factor",
+    "options_vol", "regime", "event_session"), 1))
+HORIZONS = ("30S", "1M", "5M", "15M", "30M", "1H")
+SLOTS = frozenset((quant, horizon) for quant in QUANTS for horizon in HORIZONS)
 
 MANIFEST_COLUMNS = (
     "replay_run_id", "historical_session", "execution_stage", "certification_status",
@@ -69,6 +69,13 @@ def _as_manifest(row: tuple[object, ...]) -> tuple[HistoricalReplayManifest, str
 def _as_forecast(row: tuple[object, ...]) -> tuple[HistoricalForecastEvidence, str]:
     values = dict(zip(FORECAST_COLUMNS, row, strict=True))
     stored_hash = str(values.pop("content_sha256"))
+    # H2-A hashed UTC datetimes. PostgreSQL decodes timestamptz values in the
+    # connection's TimeZone, so an equivalent instant can otherwise serialize
+    # with a different offset and fail the immutable per-row hash check.
+    for field in ("cutoff_at", "source_as_of", "available_at"):
+        value = values[field]
+        if isinstance(value, datetime) and value.tzinfo is not None:
+            values[field] = value.astimezone(timezone.utc)
     return HistoricalForecastEvidence(**values), stored_hash
 
 
