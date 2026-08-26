@@ -29,6 +29,7 @@ class HistoricalOutcomePostgresTests(unittest.TestCase):
             c.execute(Path("supabase/migrations/20260826042317_create_historical_replay_evidence.sql").read_text())
             # This is the exact proposed migration, not a test copy.
             c.execute(Path("supabase/migrations/20260826144639_create_historical_replay_outcomes.sql").read_text())
+            c.execute(Path("supabase/migrations/20260826160458_h2_c_outcome_integrity_repair.sql").read_text())
             c.execute("SET ROLE atom_historical_replay_writer")
             c.execute("""INSERT INTO public.atom_historical_replay_runs VALUES
               ('pg-h2c','2026-06-15','REPLAY_COMPLETE','CERTIFIED','abcdef0',
@@ -53,7 +54,7 @@ class HistoricalOutcomePostgresTests(unittest.TestCase):
             self.assertEqual(c.fetchone()[0], 0)
             c.execute("""INSERT INTO public.atom_historical_replay_outcomes
               SELECT 'pg-h2c', timestamp '2026-06-15 13:30:00+00' + n*interval '1 second', h,
-               NULL,'UNAVAILABLE','NO_TARGET',NULL,NULL,NULL,NULL,'data-v','source-v',repeat('f',64),now()
+               NULL,'UNAVAILABLE','NO_TARGET',NULL,NULL,NULL,NULL,'data-v','source-v','COIN_MIDPOINT_LOG_RETURN_BPS_1',repeat('a',64),repeat('f',64),now()
               FROM generate_series(0,11228) n CROSS JOIN
                (VALUES ('30S'),('1M'),('5M'),('15M'),('30M'),('1H')) horizons(h)""")
             c.execute("SELECT count(*) FROM public.atom_historical_replay_outcomes")
@@ -71,12 +72,37 @@ class HistoricalOutcomePostgresTests(unittest.TestCase):
                 c.execute("SET ROLE "+role)
                 c.execute("SAVEPOINT denied")
                 with self.assertRaises(psycopg.Error):
-                    c.execute("INSERT INTO public.atom_historical_replay_outcomes (replay_run_id,cutoff_at,horizon,availability_status,unavailable_reason,data_schema_version,source_schema_version,content_sha256,resolved_at) VALUES ('pg-h2c',now(),'30S','UNAVAILABLE','X','d','s',repeat('a',64),now())")
+                    c.execute("INSERT INTO public.atom_historical_replay_outcomes (replay_run_id,cutoff_at,horizon,availability_status,unavailable_reason,data_schema_version,source_schema_version,resolution_spec_version,outcome_source_dataset_digest,content_sha256,resolved_at) VALUES ('pg-h2c',now(),'30S','UNAVAILABLE','X','d','s','COIN_MIDPOINT_LOG_RETURN_BPS_1',repeat('a',64),repeat('a',64),now())")
                 c.execute("ROLLBACK TO denied")
                 c.execute("RESET ROLE")
             c.execute("SET ROLE atom_historical_score_reader")
             c.execute("SELECT count(*) FROM public.atom_historical_replay_outcomes")
             self.assertEqual(c.fetchone()[0], 67374)
+            c.execute("RESET ROLE")
+
+    def test_missing_or_invalid_outcome_lineage_is_rejected(self):
+        with self.db.cursor() as c:
+            c.execute("SET ROLE atom_historical_outcome_resolver")
+            statements = (
+                """INSERT INTO public.atom_historical_replay_outcomes
+                    (replay_run_id,cutoff_at,horizon,availability_status,
+                     unavailable_reason,data_schema_version,source_schema_version,
+                     content_sha256,resolved_at)
+                    VALUES ('pg-h2c','2026-06-15 13:30+00','30S','UNAVAILABLE',
+                     'X','d','s',repeat('a',64),now())""",
+                """INSERT INTO public.atom_historical_replay_outcomes
+                    (replay_run_id,cutoff_at,horizon,availability_status,
+                     unavailable_reason,data_schema_version,source_schema_version,
+                     resolution_spec_version,outcome_source_dataset_digest,
+                     content_sha256,resolved_at)
+                    VALUES ('pg-h2c','2026-06-15 13:30+00','30S','UNAVAILABLE',
+                     'X','d','s','CHANGED','bad',repeat('a',64),now())""",
+            )
+            for statement in statements:
+                c.execute("SAVEPOINT lineage")
+                with self.assertRaises(psycopg.Error):
+                    c.execute(statement)
+                c.execute("ROLLBACK TO lineage")
             c.execute("RESET ROLE")
 
     def test_nonfinite_values_are_rejected(self):
@@ -87,10 +113,10 @@ class HistoricalOutcomePostgresTests(unittest.TestCase):
                 statement="""INSERT INTO public.atom_historical_replay_outcomes
                   (replay_run_id,cutoff_at,horizon,actual_return_bps,availability_status,
                    cutoff_midpoint_at,cutoff_midpoint,target_midpoint_at,target_midpoint,
-                   data_schema_version,source_schema_version,content_sha256,resolved_at)
+                   data_schema_version,source_schema_version,resolution_spec_version,outcome_source_dataset_digest,content_sha256,resolved_at)
                   VALUES ('pg-h2c','2026-06-15 14:00+00','30S',%s,'AVAILABLE',
                    '2026-06-15 14:00+00',%s,'2026-06-15 14:00:30+00',%s,
-                   'd','s',repeat('a',64),now())"""
+                   'd','s','COIN_MIDPOINT_LOG_RETURN_BPS_1',repeat('a',64),repeat('a',64),now())"""
                 c.execute("SAVEPOINT finite")
                 with self.assertRaises(psycopg.Error): c.execute(statement, values)
                 c.execute("ROLLBACK TO finite")
@@ -100,7 +126,8 @@ class HistoricalOutcomePostgresTests(unittest.TestCase):
         from quant.historical_outcomes import HistoricalOutcome, HistoricalOutcomeResolver
         now = datetime(2026, 6, 16, tzinfo=timezone.utc)
         row = HistoricalOutcome("pg-h2c", now, "30S", None, "UNAVAILABLE",
-            "NO_TARGET", None, None, None, None, "data-v", "source-v", now)
+            "NO_TARGET", None, None, None, None, "data-v", "source-v",
+            "COIN_MIDPOINT_LOG_RETURN_BPS_1", "a"*64, now)
         with self.db.cursor() as c:
                 c.execute("SET ROLE atom_historical_outcome_resolver")
                 c.execute("SELECT count(*) FROM public.atom_historical_replay_outcomes")
