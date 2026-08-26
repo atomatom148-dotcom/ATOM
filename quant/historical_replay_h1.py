@@ -22,7 +22,8 @@ from zoneinfo import ZoneInfo
 from .historical_replay import (
     ALLOWED_FORMULA_VERSIONS, DATA_SCHEMA_VERSION, EVIDENCE_ORIGIN,
     REPLAY_METHOD_VERSION, SOURCE, TARGET_SPEC_ID, AlpacaHistoricalSipReader,
-    HistoricalSipQuote, OneSessionReplayClock, ReplayFamilyResults,
+    HistoricalSipQuote, HistoricalSipRetrievalProof, OneSessionReplayClock,
+    ReplayFamilyResults,
     ReplayFrame, build_replay_v2_as_of,
 )
 from .q1_momentum import calculate_momentum
@@ -49,7 +50,7 @@ from .v9_v3_synthesis import synthesize_v3
 from .v9_v4a_evidence import canonical_sha256
 
 
-H1_RUNNER_VERSION = "ATOM-TRUE-V9-H1-RUNNER-3"
+H1_RUNNER_VERSION = "ATOM-TRUE-V9-H1-RUNNER-4"
 _NANOSECONDS = 1_000_000_000
 _REFRESH_NS = 3_600 * _NANOSECONDS
 _COMPLETE_EDGE_NS = 5 * _NANOSECONDS
@@ -181,6 +182,7 @@ class H1ReplayReport:
     first_quote_ns: tuple[tuple[str, int | None], ...]
     last_quote_ns: tuple[tuple[str, int | None], ...]
     quote_coverage: tuple[QuoteCoverage, ...]
+    retrieval_proof: HistoricalSipRetrievalProof | None
     frame_count: int
     rth_seconds: int
     frame_coverage: float
@@ -332,10 +334,68 @@ def _coverage_reason_codes(
         if (coverage.last_quote_lead_ns is None or
                 coverage.last_quote_lead_ns > _COMPLETE_EDGE_NS):
             reasons.append(f"{coverage.symbol}_CLOSE_EDGE_GAP")
-        if (coverage.max_gap_ns is None or
-                coverage.max_gap_ns > maximum_gap_ns):
-            reasons.append(f"{coverage.symbol}_INTERQUOTE_GAP")
     return tuple(sorted(reasons))
+
+
+def _proof_value(proof: object, name: str) -> object:
+    if isinstance(proof, dict):
+        return proof.get(name)
+    return getattr(proof, name, None)
+
+
+def _retrieval_proof_valid(
+    proof: object, *, open_ns: int, close_ns: int, retained_count: int,
+) -> bool:
+    required = {
+        "requested_symbols", "feed", "request_start_ns", "request_end_ns",
+        "page_limit", "page_count", "page_raw_row_counts",
+        "raw_row_count", "retained_row_count", "bucket_sampled_row_count",
+        "rejected_row_count", "rejection_reason_counts",
+        "terminal_next_page_token",
+    }
+    if isinstance(proof, dict) and not required.issubset(proof):
+        return False
+    if not isinstance(proof, (dict, HistoricalSipRetrievalProof)):
+        return False
+    page_limit = _proof_value(proof, "page_limit")
+    page_count = _proof_value(proof, "page_count")
+    page_rows = _proof_value(proof, "page_raw_row_counts")
+    raw = _proof_value(proof, "raw_row_count")
+    retained = _proof_value(proof, "retained_row_count")
+    sampled = _proof_value(proof, "bucket_sampled_row_count")
+    rejected = _proof_value(proof, "rejected_row_count")
+    reasons = _proof_value(proof, "rejection_reason_counts")
+    integers = (page_limit, page_count, raw, retained, sampled, rejected)
+    if any(isinstance(value, bool) or not isinstance(value, int)
+           for value in integers):
+        return False
+    if (tuple(_proof_value(proof, "requested_symbols") or ()) !=
+            ("COIN", "QQQ") or _proof_value(proof, "feed") != "sip" or
+            _proof_value(proof, "request_start_ns") != open_ns or
+            _proof_value(proof, "request_end_ns") != close_ns or
+            not 1 <= page_limit <= 10_000 or page_count <= 0 or
+            not isinstance(page_rows, (list, tuple)) or
+            len(page_rows) != page_count or
+            any(isinstance(value, bool) or not isinstance(value, int) or
+                value < 0 for value in page_rows) or
+            raw != sum(page_rows) or retained != retained_count or
+            min(raw, retained, sampled, rejected) < 0 or
+            raw != retained + sampled + rejected or
+            _proof_value(proof, "terminal_next_page_token") is not None or
+            not isinstance(reasons, (list, tuple))):
+        return False
+    normalized_reasons = []
+    for row in reasons:
+        if (not isinstance(row, (list, tuple)) or len(row) != 2 or
+                not isinstance(row[0], str) or not row[0] or
+                isinstance(row[1], bool) or not isinstance(row[1], int) or
+                row[1] <= 0):
+            return False
+        normalized_reasons.append((row[0], row[1]))
+    return (
+        normalized_reasons == sorted(set(normalized_reasons)) and
+        rejected == sum(count for _reason, count in normalized_reasons)
+    )
 
 
 def _preflight_coin_times(
@@ -568,7 +628,7 @@ def _configuration_digest(
         "session_target_rule": "MATURITY_STRICTLY_BEFORE_RTH_CLOSE",
         "close_rule": "RESOLUTION_ONLY_NO_FORECAST",
         "complete_edge_seconds": _COMPLETE_EDGE_NS / _NANOSECONDS,
-        "complete_max_interquote_gap_seconds": (
+        "diagnostic_max_interquote_gap_seconds": (
             maximum_gap_ns / _NANOSECONDS
         ),
         "preflight_target_endpoint_audit": "TIMESTAMP_ONLY_EXACT_SIX",
@@ -589,8 +649,8 @@ def run_h1_session(
         raise TypeError("reader must provide read_session")
     if not isinstance(preflight_only, bool):
         raise TypeError("preflight_only must be bool")
-    if maximum_interior_gap_seconds not in (5, 6, 7):
-        raise ValueError("maximum_interior_gap_seconds must be 5, 6, or 7")
+    if maximum_interior_gap_seconds != 5:
+        raise ValueError("maximum_interior_gap_seconds is frozen at 5")
     maximum_gap_ns = maximum_interior_gap_seconds * _NANOSECONDS
     open_ns, close_ns = _ns(session_open), _ns(session_close)
     local_open = session_open.astimezone(_EASTERN)
@@ -611,6 +671,7 @@ def run_h1_session(
             raise
         quotes = ()
     read_decode_seconds = _elapsed(monotonic_clock, started)
+    retrieval_proof = getattr(reader, "last_retrieval_proof", None)
     if any(not isinstance(row, HistoricalSipQuote) for row in quotes):
         raise TypeError("reader returned a non-historical quote")
     _validate_quote_sequence(quotes, open_ns=open_ns, close_ns=close_ns)
@@ -630,14 +691,20 @@ def run_h1_session(
         )
         for symbol, rows in by_symbol.items()
     )
+    proof_reasons = (() if _retrieval_proof_valid(
+        retrieval_proof, open_ns=open_ns, close_ns=close_ns,
+        retained_count=len(quotes),
+    ) else (("RETRIEVAL_PROOF_MISSING",) if retrieval_proof is None else
+            ("RETRIEVAL_PROOF_INVALID",)))
     coverage_reasons = _coverage_reason_codes(
         quote_coverage, maximum_gap_ns=maximum_gap_ns,
     )
-    endpoint_reasons = (() if coverage_reasons else _endpoint_reason_codes(
+    endpoint_reasons = (() if (*proof_reasons, *coverage_reasons) else
+                        _endpoint_reason_codes(
         by_symbol["COIN"], open_ns=open_ns, close_ns=close_ns,
     ))
     data_reason_codes = tuple(sorted(set(
-        (*coverage_reasons, *endpoint_reasons)
+        (*proof_reasons, *coverage_reasons, *endpoint_reasons)
     )))
     data_status = "CERTIFIED" if not data_reason_codes else "DATA_INCOMPLETE"
     dataset_digest = canonical_sha256(tuple(
@@ -686,6 +753,7 @@ def run_h1_session(
             "data_status": report_data_status,
             "data_reason_codes": data_reason_codes,
             "quote_coverage": quote_coverage,
+            "retrieval_proof": retrieval_proof,
         })
         total_seconds = _elapsed(monotonic_clock, total_started)
         timings = ReplayTimings(
@@ -697,7 +765,7 @@ def run_h1_session(
             local_open.date().isoformat(), open_ns, close_ns,
             dataset_digest, config_digest, session_digest, execution_stage,
             report_data_status, data_reason_codes, quote_counts,
-            first_quote_ns, last_quote_ns, quote_coverage,
+            first_quote_ns, last_quote_ns, quote_coverage, retrieval_proof,
             0, int(rth_seconds), 0.0, 0, 0.0, 0, 0.0,
             family_coverage, v3_coverage, resolution_coverage, (), (),
             "DATA_UNAVAILABLE", 0, timings, None, (),
@@ -990,6 +1058,7 @@ def run_h1_session(
         "data_status": data_status,
         "data_reason_codes": data_reason_codes,
         "quote_coverage": quote_coverage,
+        "retrieval_proof": retrieval_proof,
         "qqq_attachment": (qqq_attached_frames, qqq_fresh_frames),
         "family_coverage": family_coverage,
         "v3_coverage": v3_coverage,
@@ -1026,7 +1095,7 @@ def run_h1_session(
         local_open.date().isoformat(), open_ns, close_ns,
         dataset_digest, config_digest, session_digest, "REPLAY_COMPLETE",
         data_status, data_reason_codes, quote_counts,
-        first_quote_ns, last_quote_ns, quote_coverage,
+        first_quote_ns, last_quote_ns, quote_coverage, retrieval_proof,
         frame_count, int(rth_seconds), frame_count / rth_seconds,
         qqq_attached_frames,
         0.0 if frame_count == 0 else qqq_attached_frames / frame_count,
@@ -1076,27 +1145,44 @@ def _batch_summary(report: H1ReplayReport, result_file: Path) -> dict[str, objec
 def _qualifies_cached_result(
     result: object, *, day: date, maximum_gap_seconds: int,
 ) -> bool:
-    """Fail-closed coverage check over a saved full preflight result."""
+    """Fail-closed proof check over a saved full preflight result."""
 
-    if not isinstance(result, dict):
+    opened, closed = _session(day)
+    open_ns, close_ns = _ns(opened), _ns(closed)
+    if (not isinstance(result, dict) or maximum_gap_seconds != 5 or
+            result.get("runner_version") != H1_RUNNER_VERSION or
+            result.get("historical_session") != day.isoformat() or
+            result.get("session_open_ns") != open_ns or
+            result.get("session_close_ns") != close_ns or
+            result.get("configuration_digest") != _configuration_digest(
+                session_open_ns=open_ns, session_close_ns=close_ns,
+            ) or result.get("execution_stage") != "PREFLIGHT_ONLY" or
+            result.get("data_status") != "DATA_COMPLETE" or
+            result.get("data_reason_codes") not in ([], ())):
         return False
-    if result.get("historical_session") != day.isoformat():
+    counts = result.get("quote_counts")
+    if (not isinstance(counts, (list, tuple)) or
+            tuple(row[0] for row in counts if isinstance(row, (list, tuple))
+                  and len(row) == 2) != ("COIN", "QQQ") or
+            any(not isinstance(row, (list, tuple)) or len(row) != 2 or
+                isinstance(row[1], bool) or not isinstance(row[1], int) or
+                row[1] < 0 for row in counts)):
         return False
-    reasons = result.get("data_reason_codes")
     coverage = result.get("quote_coverage")
-    if not isinstance(reasons, (list, tuple)) or not isinstance(
-            coverage, (list, tuple)):
-        return False
-    if any(reason != "COIN_INTERQUOTE_GAP" for reason in reasons):
+    if not isinstance(coverage, (list, tuple)):
         return False
     coin = next(
         (row for row in coverage
          if isinstance(row, dict) and row.get("symbol") == "COIN"), None,
     )
-    maximum = None if coin is None else coin.get("max_gap_ns")
     return (
-        isinstance(maximum, int) and not isinstance(maximum, bool) and
-        maximum <= maximum_gap_seconds * _NANOSECONDS
+        coin is not None and
+        coin.get("configured_max_gap_ns") == _COMPLETE_GAP_NS and
+        _retrieval_proof_valid(
+            result.get("retrieval_proof"), open_ns=open_ns,
+            close_ns=close_ns,
+            retained_count=sum(row[1] for row in counts),
+        )
     )
 
 
@@ -1142,8 +1228,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         help="directory for full per-date JSON results in batch mode",
     )
     parser.add_argument(
-        "--max-interior-gap-seconds", type=int, choices=(5, 6, 7), default=5,
-        help="maximum COIN RTH interior quote gap (default: 5)",
+        "--max-interior-gap-seconds", type=int, choices=(5,), default=5,
+        help="frozen COIN RTH gap diagnostic (5 seconds)",
     )
     arguments = parser.parse_args(None if argv is None else tuple(argv))
     if len(arguments.session) > 1 and not arguments.batch_preflight:
@@ -1163,20 +1249,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                 output_dir / f"{day.isoformat()}.json", day=day,
             )) is not None
         }
-        for threshold in (5, 6, 7):
-            for day in days:
-                result = cached_results.get(day)
-                if (result is not None and _qualifies_cached_result(
-                        result, day=day, maximum_gap_seconds=threshold)):
+        reader = None
+        for day in days:
+            result = cached_results.get(day)
+            if result is not None:
+                if _qualifies_cached_result(
+                        result, day=day, maximum_gap_seconds=5):
                     print(json.dumps(
-                        _selection(day, threshold, cached=True),
+                        _selection(day, 5, cached=True),
                         sort_keys=True, separators=(",", ":"),
                     ))
                     return 0
-
-        reader = None
-        for day in days:
-            if day in cached_results:
                 continue
             if reader is None:
                 reader = AlpacaHistoricalSipReader.from_environment()
@@ -1185,6 +1268,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 reader=reader, session_open=opened, session_close=closed,
                 replay_run_id=f"h1-preflight-{day.isoformat()}",
                 preflight_only=True,
+                maximum_interior_gap_seconds=5,
             )
             result_file = output_dir / f"{day.isoformat()}.json"
             result_file.write_text(
@@ -1195,16 +1279,12 @@ def main(argv: Iterable[str] | None = None) -> int:
                 _batch_summary(report, result_file),
                 sort_keys=True, separators=(",", ":"),
             ))
-            serialized = report.to_dict()
-            for threshold in (5, 6, 7):
-                if _qualifies_cached_result(
-                        serialized, day=day,
-                        maximum_gap_seconds=threshold):
-                    print(json.dumps(
-                        _selection(day, threshold, cached=False),
-                        sort_keys=True, separators=(",", ":"),
-                    ))
-                    return 0
+            if _preflight_passed(report):
+                print(json.dumps(
+                    _selection(day, 5, cached=False),
+                    sort_keys=True, separators=(",", ":"),
+                ))
+                return 0
         print(json.dumps(
             {"qualifying_date": None,
              "maximum_interior_gap_seconds": None},

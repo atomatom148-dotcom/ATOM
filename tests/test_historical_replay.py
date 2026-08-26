@@ -90,9 +90,8 @@ def test_reader_uses_one_sip_request_per_page_and_preserves_provider_nanos():
     }
     opener = _Opener(first, second)
 
-    rows = AlpacaHistoricalSipReader(
-        "key", "secret", opener=opener,
-    ).read_session(session_open=opened, session_close=closed)
+    reader = AlpacaHistoricalSipReader("key", "secret", opener=opener)
+    rows = reader.read_session(session_open=opened, session_close=closed)
 
     assert len(opener.calls) == 2
     first_query = parse_qs(urlparse(opener.calls[0][0].full_url).query)
@@ -113,6 +112,17 @@ def test_reader_uses_one_sip_request_per_page_and_preserves_provider_nanos():
     assert rows[-1].provider_event_ns == 1_767_623_401_123_456_790
     assert all(row.source_spec_version == SOURCE_SPEC_SHARES for row in rows)
     assert all(row.data_schema_version == DATA_SCHEMA_VERSION for row in rows)
+    proof = reader.last_retrieval_proof
+    assert proof is not None
+    assert proof.requested_symbols == ("COIN", "QQQ")
+    assert proof.feed == "sip"
+    assert proof.page_raw_row_counts == (1, 3)
+    assert proof.raw_row_count == 4
+    assert proof.retained_row_count == 3
+    assert proof.bucket_sampled_row_count == 0
+    assert proof.rejected_row_count == 1
+    assert proof.rejection_reason_counts == (("OUTSIDE_REQUEST_WINDOW", 1),)
+    assert proof.terminal_next_page_token is None
 
 
 def test_reader_sampling_is_mathematically_equivalent_to_raw_clock():
@@ -163,16 +173,22 @@ def test_reader_memory_is_bounded_by_logical_seconds_not_raw_quote_count():
         for index in range(1, 1_002)
     ]
 
-    sampled = AlpacaHistoricalSipReader(
+    reader = AlpacaHistoricalSipReader(
         "key", "secret", opener=_Opener({
             "quotes": {"COIN": coin, "QQQ": qqq},
             "next_page_token": None,
         }),
-    ).read_session(session_open=opened, session_close=closed)
+    )
+    sampled = reader.read_session(session_open=opened, session_close=closed)
 
     assert len(sampled) == 5
     assert sum(row.symbol == "COIN" for row in sampled) == 2
     assert sum(row.symbol == "QQQ" for row in sampled) == 3
+    proof = reader.last_retrieval_proof
+    assert proof.raw_row_count == 2_001
+    assert proof.retained_row_count == 5
+    assert proof.bucket_sampled_row_count == 1_996
+    assert proof.rejected_row_count == 0
 
 
 def test_reader_retains_raw_gap_boundaries_inside_each_logical_second():
@@ -256,7 +272,7 @@ def test_reader_skips_unusable_provider_top_of_book(invalid):
     ]
 
 
-def test_reader_reports_data_unavailable_when_all_coin_prices_are_unusable():
+def test_reader_accounts_for_all_unusable_coin_prices():
     opened, closed = _session()
     opener = _Opener({
         "quotes": {
@@ -266,13 +282,16 @@ def test_reader_reports_data_unavailable_when_all_coin_prices_are_unusable():
         "next_page_token": None,
     })
 
-    with pytest.raises(RuntimeError, match="REPLAY_DATA_UNAVAILABLE"):
-        AlpacaHistoricalSipReader(
-            "key", "secret", opener=opener,
-        ).read_session(session_open=opened, session_close=closed)
+    reader = AlpacaHistoricalSipReader("key", "secret", opener=opener)
+    rows = reader.read_session(session_open=opened, session_close=closed)
+
+    assert [row.symbol for row in rows] == ["QQQ"]
+    assert reader.last_retrieval_proof.rejection_reason_counts == (
+        ("INVALID_TOP_OF_BOOK", 1),
+    )
 
 
-def test_reader_rejects_conflicting_identity_and_missing_coin():
+def test_reader_rejects_conflicting_identity_and_accounts_for_missing_coin():
     opened, closed = _session()
     timestamp = "2026-01-05T14:30:00Z"
     conflict = _Opener({
@@ -289,9 +308,35 @@ def test_reader_rejects_conflicting_identity_and_missing_coin():
 
     missing = _Opener({"quotes": {"QQQ": [_payload(timestamp, bid=500.0)]},
                        "next_page_token": None})
-    with pytest.raises(RuntimeError, match="REPLAY_DATA_UNAVAILABLE"):
+    reader = AlpacaHistoricalSipReader("key", "secret", opener=missing)
+    rows = reader.read_session(session_open=opened, session_close=closed)
+    assert [row.symbol for row in rows] == ["QQQ"]
+    assert reader.last_retrieval_proof.raw_row_count == 1
+    assert reader.last_retrieval_proof.retained_row_count == 1
+
+
+@pytest.mark.parametrize("token", ["MISSING", "", 1])
+def test_reader_rejects_missing_empty_or_malformed_pagination_token(token):
+    opened, closed = _session()
+    payload = {"quotes": {"COIN": [_payload("2026-01-05T14:30:00Z")]}}
+    if token != "MISSING":
+        payload["next_page_token"] = token
+
+    with pytest.raises(ValueError, match="pagination"):
         AlpacaHistoricalSipReader(
-            "key", "secret", opener=missing,
+            "key", "secret", opener=_Opener(payload),
+        ).read_session(session_open=opened, session_close=closed)
+
+
+def test_reader_rejects_repeated_pagination_token():
+    opened, closed = _session()
+    page = {
+        "quotes": {"COIN": [_payload("2026-01-05T14:30:00Z")]},
+        "next_page_token": "repeat",
+    }
+    with pytest.raises(ValueError, match="pagination"):
+        AlpacaHistoricalSipReader(
+            "key", "secret", opener=_Opener(page, page),
         ).read_session(session_open=opened, session_close=closed)
 
 

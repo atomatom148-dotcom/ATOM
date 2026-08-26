@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 import json
 from types import SimpleNamespace
@@ -10,7 +10,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from quant.historical_replay import HistoricalSipQuote
+from quant.historical_replay import (
+    HistoricalSipQuote, HistoricalSipRetrievalProof,
+)
 from quant.historical_replay_h1 import main, run_h1_session
 from quant.v9_v1_contract import HORIZONS
 
@@ -41,12 +43,22 @@ def _canonical(*rows: HistoricalSipQuote) -> tuple[HistoricalSipQuote, ...]:
 
 
 class _Reader:
-    def __init__(self, rows):
+    def __init__(self, rows, *, with_proof=True):
         self.rows = tuple(rows)
         self.calls = []
+        self.with_proof = with_proof
+        self.last_retrieval_proof = None
 
     def read_session(self, *, session_open, session_close):
         self.calls.append((session_open, session_close))
+        if self.with_proof:
+            count = len(self.rows)
+            self.last_retrieval_proof = HistoricalSipRetrievalProof(
+                ("COIN", "QQQ"), "sip",
+                int(session_open.timestamp()) * NANOSECONDS,
+                int(session_close.timestamp()) * NANOSECONDS,
+                10_000, 1, (count,), count, count, 0, 0, (), None,
+            )
         return self.rows
 
 
@@ -164,7 +176,7 @@ def test_h1_mathematical_digests_are_repeatable_and_exclude_timings_and_run_id()
     assert first.replay_run_id != second.replay_run_id
 
 
-def test_h1_rejects_certification_when_usable_quotes_have_over_five_second_gap():
+def test_h1_keeps_over_five_second_gap_as_diagnostic_only():
     opened, closed = _session()
     rows = [_quote("COIN", opened), _quote("QQQ", opened, bid=500.0)]
     rows.extend(
@@ -176,11 +188,13 @@ def test_h1_rejects_certification_when_usable_quotes_have_over_five_second_gap()
         for offset in range(5, 23_400, 5)
     )
 
-    report = _run(_canonical(*rows), enforce_preflight=True)
+    report = _run(
+        _canonical(*rows), enforce_preflight=True, preflight_only=True,
+    )
 
-    assert report.data_status == "DATA_INCOMPLETE"
-    assert report.execution_stage == "PREFLIGHT_REJECTED"
-    assert "COIN_INTERQUOTE_GAP" in report.data_reason_codes
+    assert report.data_status == "DATA_COMPLETE"
+    assert report.execution_stage == "PREFLIGHT_ONLY"
+    assert "COIN_INTERQUOTE_GAP" not in report.data_reason_codes
     coin = report.quote_coverage[0]
     assert coin.max_gap_ns == 6 * NANOSECONDS
     assert coin.max_gap_start_ns == int(opened.timestamp()) * NANOSECONDS
@@ -246,9 +260,9 @@ def test_h1_frozen_interquote_gap_boundary_and_cli_limit_match(
         assert coverage.max_gap_ns == gap_ns
         assert coverage.configured_max_gap_ns == 5 * NANOSECONDS
         assert coverage.over_limit_gap_count == int(rejected)
-        assert (
-            "COIN_INTERQUOTE_GAP" in module._coverage_reason_codes((coverage,))
-        ) is rejected
+        assert "COIN_INTERQUOTE_GAP" not in module._coverage_reason_codes(
+            (coverage,)
+        )
         assert coverage.configured_max_gap_ns == module._COMPLETE_GAP_NS
         assert coverage.configured_max_gap_ns / NANOSECONDS == 5
         assert asdict(coverage)["configured_max_gap_ns"] == module._COMPLETE_GAP_NS
@@ -336,6 +350,7 @@ def test_h1_preflight_rejection_never_enters_clock_or_quant(monkeypatch):
     assert reader.calls == [(opened, closed)]
     assert report.execution_stage == "PREFLIGHT_REJECTED"
     assert report.data_status == "DATA_INCOMPLETE"
+    assert "COIN_INTERQUOTE_GAP" not in report.data_reason_codes
 
 
 def test_h1_preflight_only_accepts_complete_coverage_without_running_quant(
@@ -358,6 +373,52 @@ def test_h1_preflight_only_accepts_complete_coverage_without_running_quant(
     assert report.data_reason_codes == ()
     assert all(row.over_limit_gap_count == 0 for row in report.quote_coverage)
     assert report.frame_count == 0
+
+
+def test_h1_missing_retrieval_proof_fails_closed_before_replay(monkeypatch):
+    import quant.historical_replay_h1 as module
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("missing retrieval proof entered replay")
+
+    monkeypatch.setattr(module, "OneSessionReplayClock", unexpected)
+    opened, closed = _session()
+    report = run_h1_session(
+        reader=_Reader(_complete_five_second_rows(), with_proof=False),
+        session_open=opened, session_close=closed,
+        replay_run_id="missing-retrieval-proof", preflight_only=True,
+    )
+
+    assert report.execution_stage == "PREFLIGHT_REJECTED"
+    assert report.data_reason_codes == ("RETRIEVAL_PROOF_MISSING",)
+
+
+@pytest.mark.parametrize("change", (
+    {"requested_symbols": ("COIN",)},
+    {"feed": "iex"},
+    {"request_end_ns": 1},
+    {"retained_row_count": 0},
+    {"page_count": 2},
+    {"terminal_next_page_token": "unexpected"},
+))
+def test_h1_mismatched_retrieval_proof_fails_closed(change):
+    class InvalidProofReader(_Reader):
+        def read_session(self, **kwargs):
+            rows = super().read_session(**kwargs)
+            self.last_retrieval_proof = replace(
+                self.last_retrieval_proof, **change,
+            )
+            return rows
+
+    opened, closed = _session()
+    report = run_h1_session(
+        reader=InvalidProofReader(_complete_five_second_rows()),
+        session_open=opened, session_close=closed,
+        replay_run_id="invalid-retrieval-proof", preflight_only=True,
+    )
+
+    assert report.execution_stage == "PREFLIGHT_REJECTED"
+    assert report.data_reason_codes == ("RETRIEVAL_PROOF_INVALID",)
 
 
 def test_h1_preflight_rejects_missing_late_target_endpoint_before_replay(
@@ -436,6 +497,7 @@ def test_h1_reader_data_unavailable_becomes_structured_preflight_rejection():
     assert report.data_status == "DATA_INCOMPLETE"
     assert report.quote_counts == (("COIN", 0), ("QQQ", 0))
     assert "COIN_INSUFFICIENT_QUOTES" in report.data_reason_codes
+    assert "RETRIEVAL_PROOF_MISSING" in report.data_reason_codes
     assert not any(code.startswith("QQQ_") for code in report.data_reason_codes)
 
 
@@ -757,11 +819,41 @@ def test_cli_batch_preflight_stops_at_first_qualifying_date_without_quants(
         calls.append(kwargs)
         day = kwargs["session_open"].date().isoformat()
         passed = day == "2026-01-06"
+        opened = kwargs["session_open"]
+        closed = kwargs["session_close"]
+        open_ns = int(opened.timestamp()) * NANOSECONDS
+        close_ns = int(closed.timestamp()) * NANOSECONDS
+        proof = HistoricalSipRetrievalProof(
+            ("COIN", "QQQ"), "sip", open_ns, close_ns, 10_000,
+            1, (4,), 4, 4, 0, 0, (), None,
+        )
+        serialized = {
+            "runner_version": module.H1_RUNNER_VERSION,
+            "historical_session": day,
+            "session_open_ns": open_ns,
+            "session_close_ns": close_ns,
+            "configuration_digest": module._configuration_digest(
+                session_open_ns=open_ns, session_close_ns=close_ns,
+            ),
+            "execution_stage": (
+                "PREFLIGHT_ONLY" if passed else "PREFLIGHT_REJECTED"
+            ),
+            "data_status": (
+                "DATA_COMPLETE" if passed else "DATA_INCOMPLETE"
+            ),
+            "data_reason_codes": [] if passed else ["COIN_OPEN_EDGE_GAP"],
+            "quote_counts": [["COIN", 2], ["QQQ", 2]],
+            "quote_coverage": [{
+                "symbol": "COIN",
+                "configured_max_gap_ns": 5 * NANOSECONDS,
+            }],
+            "retrieval_proof": asdict(proof),
+        }
         return SimpleNamespace(
             historical_session=day,
             execution_stage="PREFLIGHT_ONLY" if passed else "PREFLIGHT_REJECTED",
             data_status="DATA_COMPLETE" if passed else "DATA_INCOMPLETE",
-            data_reason_codes=() if passed else ("COIN_INTERQUOTE_GAP",),
+            data_reason_codes=() if passed else ("COIN_OPEN_EDGE_GAP",),
             quote_coverage=() if passed else (SimpleNamespace(
                 symbol="COIN", max_gap_ns=6 * NANOSECONDS,
                 max_gap_start_utc="2026-01-05T15:00:00.000000000Z",
@@ -770,12 +862,7 @@ def test_cli_batch_preflight_stops_at_first_qualifying_date_without_quants(
                 max_gap_touches_rth_end=False,
                 configured_max_gap_ns=5 * NANOSECONDS,
             ),),
-            to_dict=lambda: {
-                "historical_session": day,
-                "data_reason_codes": [] if passed else ["COIN_INTERQUOTE_GAP"],
-                "quote_coverage": [{"symbol": "COIN", "max_gap_ns": (
-                    5 if passed else 6) * NANOSECONDS}],
-            },
+            to_dict=lambda: serialized,
         )
 
     monkeypatch.setattr(module, "run_h1_session", run)
@@ -787,35 +874,32 @@ def test_cli_batch_preflight_stops_at_first_qualifying_date_without_quants(
     first_output = capsys.readouterr().out
 
     assert [call["session_open"].date().isoformat() for call in calls] == [
-        "2026-01-05",
+        "2026-01-05", "2026-01-06",
     ]
     assert all(call["preflight_only"] is True for call in calls)
     assert json.loads(first_output.splitlines()[-1]) == {
-        "qualifying_date": "2026-01-05",
-        "maximum_interior_gap_seconds": 6,
+        "qualifying_date": "2026-01-06",
+        "maximum_interior_gap_seconds": 5,
         "result_source": "NEW_PREFLIGHT",
     }
     assert json.loads((tmp_path / "2026-01-05.json").read_text())[
         "historical_session"] == "2026-01-05"
-    assert not (tmp_path / "2026-01-06.json").exists()
+    assert (tmp_path / "2026-01-06.json").exists()
     assert not (tmp_path / "2026-01-07.json").exists()
 
     calls.clear()
     assert main(args) == 0
     cached_selection = json.loads(capsys.readouterr().out)
     assert cached_selection == {
-        "qualifying_date": "2026-01-05",
-        "maximum_interior_gap_seconds": 6,
+        "qualifying_date": "2026-01-06",
+        "maximum_interior_gap_seconds": 5,
         "result_source": "CACHE",
     }
     assert calls == []
 
 
-@pytest.mark.parametrize(("maximum_gap_seconds", "selected"), (
-    (5, 5), (6, 6), (7, 7), (8, None),
-))
-def test_cli_batch_selects_strictest_cached_gap_or_fails_closed(
-    monkeypatch, capsys, tmp_path, maximum_gap_seconds, selected,
+def test_cli_batch_legacy_gap_only_cache_fails_closed_without_refetch(
+    monkeypatch, capsys, tmp_path,
 ):
     import quant.historical_replay_h1 as module
 
@@ -825,7 +909,7 @@ def test_cli_batch_selects_strictest_cached_gap_or_fails_closed(
         "data_reason_codes": ["COIN_INTERQUOTE_GAP"],
         "quote_coverage": [{
             "symbol": "COIN",
-            "max_gap_ns": maximum_gap_seconds * NANOSECONDS,
+            "max_gap_ns": 5 * NANOSECONDS,
         }],
     }))
 
@@ -839,10 +923,11 @@ def test_cli_batch_selects_strictest_cached_gap_or_fails_closed(
     result = main((day, "--batch-preflight", "--output-dir", str(tmp_path)))
     payload = json.loads(capsys.readouterr().out)
 
-    assert result == (0 if selected is not None else 2)
-    assert payload["maximum_interior_gap_seconds"] == selected
-    if selected is not None:
-        assert payload["result_source"] == "CACHE"
+    assert result == 2
+    assert payload == {
+        "maximum_interior_gap_seconds": None,
+        "qualifying_date": None,
+    }
 
 
 def test_cli_fails_closed_when_session_data_is_incomplete(monkeypatch, capsys):
@@ -864,7 +949,8 @@ def test_cli_fails_closed_when_session_data_is_incomplete(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["data_status"] == "DATA_INCOMPLETE"
     assert payload["execution_stage"] == "PREFLIGHT_REJECTED"
-    assert "COIN_INTERQUOTE_GAP" in payload["data_reason_codes"]
+    assert "COIN_INTERQUOTE_GAP" not in payload["data_reason_codes"]
+    assert "COIN_CLOSE_EDGE_GAP" in payload["data_reason_codes"]
     coin = next(row for row in payload["quote_coverage"]
                 if row["symbol"] == "COIN")
     assert coin["max_gap_ns"] == 6 * NANOSECONDS

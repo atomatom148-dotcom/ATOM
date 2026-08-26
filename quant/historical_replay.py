@@ -179,6 +179,23 @@ class HistoricalSipQuote:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class HistoricalSipRetrievalProof:
+    requested_symbols: tuple[str, ...]
+    feed: str
+    request_start_ns: int
+    request_end_ns: int
+    page_limit: int
+    page_count: int
+    page_raw_row_counts: tuple[int, ...]
+    raw_row_count: int
+    retained_row_count: int
+    bucket_sampled_row_count: int
+    rejected_row_count: int
+    rejection_reason_counts: tuple[tuple[str, int], ...]
+    terminal_next_page_token: str | None
+
+
 class AlpacaHistoricalSipReader:
     """Read and deterministically sample one bounded COIN+QQQ SIP session."""
 
@@ -199,6 +216,11 @@ class AlpacaHistoricalSipReader:
         }
         self._opener = opener
         self._page_limit = page_limit
+        self._last_retrieval_proof: HistoricalSipRetrievalProof | None = None
+
+    @property
+    def last_retrieval_proof(self) -> HistoricalSipRetrievalProof | None:
+        return self._last_retrieval_proof
 
     @classmethod
     def from_environment(cls, *, opener: Callable = urlopen) -> "AlpacaHistoricalSipReader":
@@ -210,6 +232,7 @@ class AlpacaHistoricalSipReader:
     def read_session(
         self, *, session_open: datetime, session_close: datetime,
     ) -> tuple[HistoricalSipQuote, ...]:
+        self._last_retrieval_proof = None
         open_ns, close_ns = _session_bounds(session_open, session_close)
         base_query = {
             "symbols": ",".join(SYMBOLS),
@@ -235,6 +258,12 @@ class AlpacaHistoricalSipReader:
         coin_rows: tuple[HistoricalSipQuote, ...] = ()
         coin_index = 0
         last_qqq: HistoricalSipQuote | None = None
+        page_raw_row_counts: list[int] = []
+        valid_row_count = 0
+        rejection_counts = {
+            "INVALID_TOP_OF_BOOK": 0,
+            "OUTSIDE_REQUEST_WINDOW": 0,
+        }
         while True:
             query = dict(base_query)
             if page_token is not None:
@@ -248,14 +277,20 @@ class AlpacaHistoricalSipReader:
             if not isinstance(payload, dict) or not isinstance(payload.get("quotes"), dict):
                 raise ValueError("Alpaca historical quote response is malformed")
             quotes = payload["quotes"]
+            page_raw_row_count = 0
             for symbol in SYMBOLS:
                 items = quotes.get(symbol, ())
                 if not isinstance(items, (list, tuple)):
                     raise ValueError("Alpaca historical quote collection is malformed")
+                page_raw_row_count += len(items)
                 for item in items:
-                    decoded = self._decode(symbol, item, open_ns, close_ns)
+                    decoded, rejection_reason = self._decode(
+                        symbol, item, open_ns, close_ns,
+                    )
                     if decoded is None:
+                        rejection_counts[rejection_reason] += 1
                         continue
+                    valid_row_count += 1
                     previous = last_row_by_symbol.get(symbol)
                     if (previous is not None and
                             decoded.provider_event_ns < previous.provider_event_ns):
@@ -304,7 +339,10 @@ class AlpacaHistoricalSipReader:
                            decoded.provider_event_ns):
                         qqq_predecessors[decoded.provider_event_ns] = decoded
                         coin_index += 1
-            token = payload.get("next_page_token")
+            page_raw_row_counts.append(page_raw_row_count)
+            if "next_page_token" not in payload:
+                raise ValueError("Alpaca historical quote pagination is invalid")
+            token = payload["next_page_token"]
             if token is None:
                 break
             if not isinstance(token, str) or not token or token in seen_tokens:
@@ -320,8 +358,6 @@ class AlpacaHistoricalSipReader:
             if last_qqq is not None:
                 qqq_predecessors[last_qqq.provider_event_ns] = last_qqq
             coin_index += 1
-        if not coin_rows:
-            raise RuntimeError("REPLAY_DATA_UNAVAILABLE")
         retained_coin_rows = {
             row.provider_event_ns: row
             for first, last in coin_by_cutoff.values()
@@ -333,15 +369,35 @@ class AlpacaHistoricalSipReader:
             for row in boundary
         }
         qqq_rows.update(qqq_predecessors)
-        return tuple(sorted(
+        retained_rows = tuple(sorted(
             (*retained_coin_rows.values(), *qqq_rows.values()),
             key=lambda row: (row.provider_event_ns, SYMBOLS.index(row.symbol)),
         ))
+        raw_row_count = sum(page_raw_row_counts)
+        rejected_row_count = sum(rejection_counts.values())
+        bucket_sampled_row_count = valid_row_count - len(retained_rows)
+        if (bucket_sampled_row_count < 0 or
+                raw_row_count != (
+                    len(retained_rows) + bucket_sampled_row_count +
+                    rejected_row_count
+                )):
+            raise RuntimeError("REPLAY_ROW_ACCOUNTING_MISMATCH")
+        self._last_retrieval_proof = HistoricalSipRetrievalProof(
+            SYMBOLS, "sip", open_ns, close_ns, self._page_limit,
+            len(page_raw_row_counts), tuple(page_raw_row_counts),
+            raw_row_count, len(retained_rows), bucket_sampled_row_count,
+            rejected_row_count, tuple(
+                (reason, count) for reason, count in sorted(
+                    rejection_counts.items()
+                ) if count
+            ), None,
+        )
+        return retained_rows
 
     @staticmethod
     def _decode(
         symbol: str, payload: object, open_ns: int, close_ns: int,
-    ) -> HistoricalSipQuote | None:
+    ) -> tuple[HistoricalSipQuote | None, str | None]:
         if not isinstance(payload, dict):
             raise ValueError("Alpaca historical quote is malformed")
         try:
@@ -353,14 +409,17 @@ class AlpacaHistoricalSipReader:
             raise ValueError("Alpaca historical quote is malformed")
         bid, ask, bid_size, ask_size = map(float, raw_values)
         if not open_ns <= event_ns < close_ns:
-            return None
+            return None, "OUTSIDE_REQUEST_WINDOW"
         if bid <= 0 or ask <= 0 or ask < bid:
-            return None
+            return None, "INVALID_TOP_OF_BOOK"
         source_spec = (SOURCE_SPEC_SHARES if event_ns >= _SIZE_SHARES_START_NS
                        else SOURCE_SPEC_ROUND_LOTS)
-        return HistoricalSipQuote(
-            symbol, event_ns, bid, ask, bid_size, ask_size,
-            source_spec_version=source_spec,
+        return (
+            HistoricalSipQuote(
+                symbol, event_ns, bid, ask, bid_size, ask_size,
+                source_spec_version=source_spec,
+            ),
+            None,
         )
 
 
@@ -1007,7 +1066,8 @@ __all__ = [
     "ALLOWED_FORMULA_VERSIONS", "ALPACA_HISTORICAL_QUOTES_URL",
     "AlpacaHistoricalSipReader",
     "DATA_SCHEMA_VERSION", "EVIDENCE_ORIGIN", "HistoricalReplayV2State",
-    "HistoricalSipQuote", "OneSessionReplayClock",
+    "HistoricalSipQuote", "HistoricalSipRetrievalProof",
+    "OneSessionReplayClock",
     "REPLAY_METHOD_VERSION", "ReplayFamilyResults", "ReplayFrame", "SOURCE",
     "REPLAY_STATE_SCHEMA_VERSION", "SOURCE_SPEC_ROUND_LOTS",
     "SOURCE_SPEC_SHARES", "TARGET_SPEC_ID",
