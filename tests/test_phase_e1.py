@@ -66,10 +66,12 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertIn("NULL::double precision AS directional_accuracy", metric_sql)
         self.assertNotIn("outcome_bps", metric_sql)
         self.assertEqual(metric_parameters, (100.0,) * 14)
-        self.assertIn("read_legacy_evidence_publication", metric_sql)
+        self.assertIn("read_legacy_evidence_publications", metric_sql)
         self.assertIn("VOLATILITY_FORECAST", metric_sql)
         self.assertIn("VOLATILITY_OUTCOME", metric_sql)
-        self.assertIn("fp.commit_observed_at <= to_timestamp(%s)", metric_sql)
+        self.assertIn(
+            "'VOLATILITY_FORECAST', to_timestamp(%s), 65536", metric_sql,
+        )
         for statement, _parameters in cursor.executions:
             self.assertIn("o.resolved_epoch >= f.maturity_epoch", statement)
             self.assertIn(
@@ -96,7 +98,7 @@ class PhaseEStoreTests(unittest.TestCase):
         store_with(cursor).phase_e_cohorts(123.5)
         sql = " ".join(cursor.executions[0][0].split())
         self.assertIn("LEFT JOIN LATERAL", sql)
-        self.assertIn("read_legacy_evidence_publication", sql)
+        self.assertIn("read_legacy_evidence_publications", sql)
         for statement, _parameters in cursor.executions:
             self.assertIn("o.resolved_epoch >= f.maturity_epoch", statement)
             self.assertIn(
@@ -104,7 +106,9 @@ class PhaseEStoreTests(unittest.TestCase):
             )
         self.assertIn("DIRECTIONAL_FORECAST", sql)
         self.assertIn("DIRECTIONAL_OUTCOME", sql)
-        self.assertIn("fp.commit_observed_at <= to_timestamp(%s)", sql)
+        self.assertIn(
+            "'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536", sql,
+        )
         self.assertIn("GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon", sql)
         self.assertEqual(cursor.executions[0][1], (123.5,) * 16)
         self.assertEqual(sql.count("f.maturity_epoch <= %s"), 8)
@@ -112,6 +116,24 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertIn("NULLIF(count(*) FILTER", sql)
         self.assertIn("sqrt(avg(power(f.forecast_bps - o.outcome_bps, 2))", sql)
         self.assertIn("AND o.forecast_id IS NOT NULL", sql)
+
+    def test_queries_start_from_bounded_publication_sets(self):
+        cursor = Cursor()
+        store_with(cursor).phase_e_cohorts(123.5)
+        for statement, _parameters in cursor.executions:
+            normalized = " ".join(statement.split())
+            self.assertIn("read_legacy_evidence_publications", normalized)
+            self.assertNotIn("read_legacy_evidence_publication(", normalized)
+            self.assertEqual(
+                normalized.count("read_legacy_evidence_publications("), 2,
+            )
+            self.assertEqual(normalized.count("65536"), 2)
+            self.assertLess(
+                normalized.index(
+                    "FROM atom_v9_internal.read_legacy_evidence_publications"
+                ),
+                normalized.index("FROM forecasts AS f"),
+            )
 
     def test_outcome_is_invisible_until_its_resolution_epoch(self):
         class PointInTimeCursor(Cursor):
@@ -291,10 +313,12 @@ class PhaseEStoreTests(unittest.TestCase):
         normalized = " ".join(sql.split())
         self.assertEqual(parameters, (123.5, 123.5, 123.5, 123.5))
         self.assertIn("f.maturity_epoch <= %s", normalized)
-        self.assertIn("read_legacy_evidence_publication", normalized)
+        self.assertIn("read_legacy_evidence_publications", normalized)
         self.assertIn("DIRECTIONAL_FORECAST", normalized)
         self.assertIn("DIRECTIONAL_OUTCOME", normalized)
-        self.assertIn("fp.commit_observed_at <= to_timestamp(%s)", normalized)
+        self.assertIn(
+            "'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536", normalized,
+        )
         self.assertIn("o.resolved_epoch <= %s", normalized)
         self.assertIn("f.cutoff_epoch, f.forecast_id", normalized)
         self.assertRegex(normalized, r"ORDER BY .* f.cutoff_epoch, f.forecast_id")

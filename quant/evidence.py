@@ -392,23 +392,26 @@ class PostgresEvidenceStore:
                                FILTER (WHERE f.maturity_epoch <= %s
                                       AND o.forecast_id IS NOT NULL
                                       AND o.resolved_epoch <= %s) AS bias_bps
-                    FROM forecasts AS f
-                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        'DIRECTIONAL_FORECAST', f.forecast_id
-                    ) AS fp ON true
+                    FROM atom_v9_internal.read_legacy_evidence_publications(
+                        'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536
+                    ) AS fp
+                    JOIN LATERAL (
+                        SELECT *
+                        FROM forecasts AS f
+                        WHERE f.forecast_id=fp.record_id
+                    ) AS f ON true
                     LEFT JOIN LATERAL (
                         SELECT o.*
-                        FROM forecast_outcomes AS o
-                        JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                            'DIRECTIONAL_OUTCOME', o.forecast_id
-                        ) AS op ON true
+                        FROM atom_v9_internal.read_legacy_evidence_publications(
+                            'DIRECTIONAL_OUTCOME', to_timestamp(%s), 65536
+                        ) AS op
+                        JOIN forecast_outcomes AS o
+                          ON o.forecast_id=op.record_id
                         WHERE o.forecast_id=f.forecast_id
                           AND o.resolved_epoch >= f.maturity_epoch
                           AND o.resolved_epoch <= f.maturity_epoch + 5.0
-                          AND op.commit_observed_at<=to_timestamp(%s)
                     ) AS o ON true
-                    WHERE fp.commit_observed_at <= to_timestamp(%s)
-                      AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
+                    WHERE fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                     GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon
                     ORDER BY f.quant_id, f.formula_version, f.symbol,
                              CASE f.horizon
@@ -424,18 +427,21 @@ class PostgresEvidenceStore:
                     """
                     SELECT f.quant_id, f.formula_version, f.symbol, f.horizon,
                            f.cutoff_epoch, f.forecast_id
-                    FROM forecasts AS f
-                    JOIN forecast_outcomes AS o USING (forecast_id)
-                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        'DIRECTIONAL_FORECAST', f.forecast_id
-                    ) AS fp ON true
-                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        'DIRECTIONAL_OUTCOME', o.forecast_id
-                    ) AS op ON true
+                    FROM atom_v9_internal.read_legacy_evidence_publications(
+                        'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536
+                    ) AS fp
+                    JOIN LATERAL (
+                        SELECT *
+                        FROM forecasts AS f
+                        WHERE f.forecast_id=fp.record_id
+                    ) AS f ON true
+                    JOIN atom_v9_internal.read_legacy_evidence_publications(
+                        'DIRECTIONAL_OUTCOME', to_timestamp(%s), 65536
+                    ) AS op ON op.record_id=f.forecast_id
+                    JOIN forecast_outcomes AS o
+                      ON o.forecast_id=op.record_id
                     WHERE f.maturity_epoch <= %s
-                      AND fp.commit_observed_at <= to_timestamp(%s)
                       AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
-                      AND op.commit_observed_at <= to_timestamp(%s)
                       AND o.resolved_epoch >= f.maturity_epoch
                       AND o.resolved_epoch <= f.maturity_epoch + 5.0
                       AND o.resolved_epoch <= %s
@@ -522,23 +528,26 @@ class PostgresEvidenceStore:
                            ) FILTER (WHERE f.maturity_epoch <= %s
                                       AND o.forecast_id IS NOT NULL
                                       AND o.resolved_epoch <= %s) AS bias_bps
-                    FROM volatility_forecasts AS f
-                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        'VOLATILITY_FORECAST', f.forecast_id
-                    ) AS fp ON true
+                    FROM atom_v9_internal.read_legacy_evidence_publications(
+                        'VOLATILITY_FORECAST', to_timestamp(%s), 65536
+                    ) AS fp
+                    JOIN LATERAL (
+                        SELECT *
+                        FROM volatility_forecasts AS f
+                        WHERE f.forecast_id=fp.record_id
+                    ) AS f ON true
                     LEFT JOIN LATERAL (
                         SELECT o.*
-                        FROM volatility_forecast_outcomes AS o
-                        JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                            'VOLATILITY_OUTCOME', o.forecast_id
-                        ) AS op ON true
+                        FROM atom_v9_internal.read_legacy_evidence_publications(
+                            'VOLATILITY_OUTCOME', to_timestamp(%s), 65536
+                        ) AS op
+                        JOIN volatility_forecast_outcomes AS o
+                          ON o.forecast_id=op.record_id
                         WHERE o.forecast_id=f.forecast_id
                           AND o.resolved_epoch >= f.maturity_epoch
                           AND o.resolved_epoch <= f.maturity_epoch + 5.0
-                          AND op.commit_observed_at<=to_timestamp(%s)
                     ) AS o ON true
-                    WHERE fp.commit_observed_at <= to_timestamp(%s)
-                      AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
+                    WHERE fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                     GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon
                     ORDER BY f.quant_id, f.formula_version, f.symbol,
                              CASE f.horizon
@@ -554,18 +563,21 @@ class PostgresEvidenceStore:
                     """
                     SELECT f.quant_id, f.formula_version, f.symbol, f.horizon,
                            f.cutoff_epoch, f.forecast_id
-                    FROM volatility_forecasts AS f
-                    JOIN volatility_forecast_outcomes AS o USING (forecast_id)
-                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        'VOLATILITY_FORECAST', f.forecast_id
-                    ) AS fp ON true
-                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        'VOLATILITY_OUTCOME', o.forecast_id
-                    ) AS op ON true
+                    FROM atom_v9_internal.read_legacy_evidence_publications(
+                        'VOLATILITY_FORECAST', to_timestamp(%s), 65536
+                    ) AS fp
+                    JOIN LATERAL (
+                        SELECT *
+                        FROM volatility_forecasts AS f
+                        WHERE f.forecast_id=fp.record_id
+                    ) AS f ON true
+                    JOIN atom_v9_internal.read_legacy_evidence_publications(
+                        'VOLATILITY_OUTCOME', to_timestamp(%s), 65536
+                    ) AS op ON op.record_id=f.forecast_id
+                    JOIN volatility_forecast_outcomes AS o
+                      ON o.forecast_id=op.record_id
                     WHERE f.maturity_epoch <= %s
-                      AND fp.commit_observed_at <= to_timestamp(%s)
                       AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
-                      AND op.commit_observed_at <= to_timestamp(%s)
                       AND o.resolved_epoch >= f.maturity_epoch
                       AND o.resolved_epoch <= f.maturity_epoch + 5.0
                       AND o.resolved_epoch <= %s
