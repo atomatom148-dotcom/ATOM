@@ -68,6 +68,7 @@ DASHBOARD_PHASE_E_TTL_SECONDS = 300.0
 _WEB_ENDPOINT_METRIC_PATHS = frozenset({
     "/",
     "/health",
+    "/ready",
     "/api/g2-cross-asset",
     "/api/v9-math",
     "/api/performance",
@@ -578,6 +579,7 @@ def create_app(
     evidence_cache: DashboardEvidenceCache | None = None,
     metrics: OperationalMetrics | None = None,
     monotonic_clock: Callable[[], float] = time.perf_counter,
+    readiness_check: Callable[[], bool] | None = None,
 ) -> Callable:
     """Create the WSGI application, rendering current state on every request."""
 
@@ -626,9 +628,29 @@ def create_app(
 
         start_response = measured_start_response
         if path == "/health":
-            body = b'{"status":"running"}'
+            body = json.dumps({
+                "status": "running",
+                "commit": os.environ.get("RENDER_GIT_COMMIT"),
+            }, separators=(",", ":")).encode()
             start_response("200 OK", [("Content-Type", "application/json"),
                                       ("Content-Length", str(len(body)))])
+            return [body]
+        if path == "/ready":
+            try:
+                ready = (
+                    readiness_check is not None and
+                    readiness_check() is True
+                )
+            except Exception:
+                ready = False
+            body = json.dumps({
+                "status": "ready" if ready else "not_ready",
+            }, separators=(",", ":")).encode()
+            start_response(
+                "200 OK" if ready else "503 Service Unavailable",
+                [("Content-Type", "application/json"),
+                 ("Content-Length", str(len(body)))],
+            )
             return [body]
         if path == "/api/g2-cross-asset":
             value = state.publication().cross_asset_state if state is not None else None
@@ -867,8 +889,27 @@ def main(*, simulator_connection_factory: Callable | None = None,
             shutdown_requested.wait(.05)
         if not state.runtime_handoff_ready():
             raise RuntimeError("evidence handoff observation unavailable")
-        app = create_app(state=state, evidence_cache=evidence_cache,
-                         metrics=metrics)
+        def readiness_check() -> bool:
+            statuses = dict(metrics.snapshot().statuses)
+            owner_status = statuses.get("evidence_runtime_owner_status")
+            ingress_status = statuses.get("evidence_ingress_status")
+            if (owner_status == "ERROR" or
+                    ingress_status in {"BUFFER_FULL", "REPLAY_FAILED", "CLOSED"} or
+                    statuses.get(
+                        "evidence_ledger_worker.last_terminal_failure"
+                    ) not in {None, "NONE"}):
+                return False
+            if ledger_worker.is_runtime_owner():
+                return True
+            return (
+                owner_status in {"WAITING", "WAITING_FOR_LEGACY_WRITER"}
+                and state.runtime_handoff_ready()
+            )
+
+        app = create_app(
+            state=state, evidence_cache=evidence_cache, metrics=metrics,
+            readiness_check=readiness_check,
+        )
         with make_server(args.host, args.port, app) as server:
             Thread(
                 target=lambda: (shutdown_requested.wait(), server.shutdown()),

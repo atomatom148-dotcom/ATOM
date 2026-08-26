@@ -11,6 +11,7 @@ from quant.v9_v3_synthesis import (
 )
 from quant.v9_v4a_evidence import (
     CONTRACT_VERSION, EVIDENCE_VERSION, REPLAY_METHOD_VERSION,
+    MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS, TARGET_ENDPOINT_DELAY_REASON,
     DuplicateConflict, build_cohort, build_forecast, build_outcome,
     V4AWriter, canonical_sha256, canonical_target_identity,
     classify_duplicate, select_non_overlapping,
@@ -247,6 +248,76 @@ class V4AContractTests(unittest.TestCase):
         self.assertTrue(outcome.proof_eligible)
         self.assertEqual(outcome.reason_codes, ())
         self.assertEqual(outcome.previous_observation_at, previous)
+
+    def test_endpoint_observation_delay_is_bounded_at_five_seconds(self):
+        forecast = dataclasses.replace(
+            self.forecast(), persisted_at=T0,
+            persistence_proof_eligible=True,
+        )
+        previous = forecast.target_endpoint - timedelta(microseconds=1)
+
+        boundary = build_outcome(
+            forecast=forecast,
+            target_identity=canonical_target_identity(forecast),
+            previous_observation_at=previous,
+            endpoint_observation_at=(
+                forecast.target_endpoint + timedelta(
+                    seconds=MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS)),
+            target_resolved_at=(
+                forecast.target_endpoint + timedelta(
+                    seconds=MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS)),
+            actual_return_bps=2.5,
+        )
+        late = build_outcome(
+            forecast=forecast,
+            target_identity=canonical_target_identity(forecast),
+            previous_observation_at=previous,
+            endpoint_observation_at=(
+                forecast.target_endpoint + timedelta(
+                    seconds=MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS,
+                    microseconds=1)),
+            target_resolved_at=(
+                forecast.target_endpoint + timedelta(
+                    seconds=MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS,
+                    microseconds=1)),
+            actual_return_bps=2.5,
+        )
+
+        self.assertEqual(boundary.target_timing_status, "VERIFIED")
+        self.assertTrue(boundary.proof_eligible)
+        self.assertNotIn(TARGET_ENDPOINT_DELAY_REASON, boundary.reason_codes)
+        self.assertEqual(late.target_timing_status, "VERIFIED")
+        self.assertFalse(late.proof_eligible)
+        self.assertIn(TARGET_ENDPOINT_DELAY_REASON, late.reason_codes)
+
+    def test_overlap_revalidates_legacy_delay_claims(self):
+        forecast = dataclasses.replace(
+            self.forecast(), persisted_at=T0,
+            persistence_proof_eligible=True,
+        )
+        late = build_outcome(
+            forecast=forecast,
+            target_identity=canonical_target_identity(forecast),
+            previous_observation_at=forecast.target_endpoint - timedelta(seconds=1),
+            endpoint_observation_at=forecast.target_endpoint + timedelta(hours=17),
+            target_resolved_at=forecast.target_endpoint + timedelta(hours=17),
+            actual_return_bps=2.5,
+        )
+        forged_legacy = dataclasses.replace(
+            late, proof_eligible=True, reason_codes=(),
+        )
+
+        selection = select_non_overlapping(((forecast, forged_legacy),))
+        forged_delay = dataclasses.replace(
+            forged_legacy, endpoint_observation_delay=0.0,
+        )
+
+        self.assertEqual(selection.raw_resolved_n, 0)
+        self.assertEqual(selection.selected_ids, ())
+        self.assertEqual(
+            select_non_overlapping(((forecast, forged_delay),)).raw_resolved_n,
+            0,
+        )
 
     def test_forecast_commit_observation_uses_strict_boundary(self):
         f = self.forecast()
@@ -628,3 +699,53 @@ class V4CommitObservationMigrationTests(unittest.TestCase):
             self.upper,
         )
         self.assertIn("CREATE ROLE ATOM_V9_PROOF_OWNER WITH NOLOGIN NOINHERIT NOSUPERUSER", self.upper)
+
+    def test_supabase_owner_handoff_is_transactional_and_revoked(self):
+        self.assertEqual(
+            self.upper.count("GRANT ATOM_V9_PROOF_OWNER TO POSTGRES"), 1,
+        )
+        self.assertEqual(
+            self.upper.count("REVOKE ATOM_V9_PROOF_OWNER FROM POSTGRES"), 1,
+        )
+        self.assertLess(
+            self.upper.index("GRANT ATOM_V9_PROOF_OWNER TO POSTGRES"),
+            self.upper.index("OWNER TO ATOM_V9_PROOF_OWNER"),
+        )
+        self.assertGreater(
+            self.upper.index("REVOKE ATOM_V9_PROOF_OWNER FROM POSTGRES"),
+            self.upper.rindex("OWNER TO ATOM_V9_PROOF_OWNER"),
+        )
+
+
+class V4ProofAuthorizationMigrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.sql = (Path(__file__).parents[1] / "migrations" /
+                   "016_authorize_v4_proof_reader_and_harden_search_path.sql").read_text()
+        cls.upper = " ".join(cls.sql.upper().split())
+
+    def test_proof_owner_policy_and_role_guard_are_exact(self):
+        self.assertIn(
+            "CREATE POLICY ATOM_V9_V4_FORECASTS_PROOF_OWNER_SELECT "
+            "ON PUBLIC.ATOM_V9_V4_FORECASTS FOR SELECT "
+            "TO ATOM_V9_PROOF_OWNER USING (TRUE)",
+            self.upper,
+        )
+        for attribute in (
+            "NOT ROLCANLOGIN", "NOT ROLINHERIT", "NOT ROLSUPER",
+            "NOT ROLCREATEDB", "NOT ROLCREATEROLE", "NOT ROLREPLICATION",
+            "NOT ROLBYPASSRLS",
+        ):
+            self.assertIn(attribute, self.upper)
+        self.assertNotIn("ALTER ROLE", self.upper)
+
+    def test_legacy_trigger_search_path_is_hardened_without_evidence_dml(self):
+        self.assertIn(
+            "ALTER FUNCTION PUBLIC.REJECT_EVIDENCE_MUTATION() "
+            "SET SEARCH_PATH = PG_CATALOG",
+            self.upper,
+        )
+        for operation in ("UPDATE ", "DELETE FROM", "TRUNCATE ", "INSERT INTO"):
+            self.assertNotIn(operation, self.upper)
+        self.assertNotIn("GRANT ", self.upper)
+        self.assertNotIn("ATOM_V9_INTERNAL.", self.upper)

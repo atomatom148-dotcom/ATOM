@@ -38,6 +38,7 @@ def test_every_request_path_is_contained_from_historical_work_even_on_failure():
         for path in ("/health", "/", "/api/live", "/api/dashboard",
                      "/api/performance"):
             assert _request(app, path)["status"] == "200 OK"
+        assert _request(app, "/ready")["status"] == "503 Service Unavailable"
 
 
 def test_failed_family_is_excluded_without_retry_imputation_or_cycle_failure():

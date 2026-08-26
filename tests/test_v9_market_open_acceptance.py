@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import math
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Callable
@@ -48,8 +49,19 @@ def _scoreable_30s(output):
     return persisted.forecast
 
 
-def _validate_deployed_health(payload: dict) -> None:
+def _validate_deployed_health(
+    payload: dict, *, expected_commit: str | None = None,
+) -> None:
     assert payload.get("status") == "running"
+    commit = payload.get("commit")
+    assert isinstance(commit, str) and len(commit) == 40
+    assert all(character in "0123456789abcdef" for character in commit)
+    if expected_commit is not None:
+        assert commit == expected_commit
+
+
+def _validate_deployed_ready(payload: dict) -> None:
+    assert payload == {"status": "ready"}
 
 
 def _validate_deployed_live(payload: dict) -> None:
@@ -126,8 +138,6 @@ def _database_read(database_url: str, operation: Callable, *, deadline: float):
 
 
 def test_database_reads_force_read_only_and_bounded_timeouts(monkeypatch):
-    import psycopg
-
     cursor = SimpleNamespace()
 
     class CursorContext:
@@ -156,7 +166,12 @@ def test_database_reads_force_read_only_and_bounded_timeouts(monkeypatch):
         observed.update(database_url=database_url, **kwargs)
         return connection
 
-    monkeypatch.setattr(psycopg, "connect", connect)
+    fake_psycopg = SimpleNamespace(
+        connect=connect,
+        OperationalError=type("OperationalError", (Exception,), {}),
+        InterfaceError=type("InterfaceError", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
     assert _database_read(
         "postgresql://read-only-test",
         lambda value: value,
@@ -236,9 +251,20 @@ def _deployed_payload(
 
 
 def test_deployed_response_validation_requires_health_and_finite_30s():
-    _validate_deployed_health({"status":"running"})
+    _validate_deployed_health({"status": "running", "commit": "a" * 40})
+    _validate_deployed_ready({"status": "ready"})
     _validate_deployed_live(_deployed_payload())
-    with pytest.raises(AssertionError):_validate_deployed_health({"status":"stopped"})
+    with pytest.raises(AssertionError):
+        _validate_deployed_health({"status": "stopped", "commit": "a" * 40})
+    with pytest.raises(AssertionError):
+        _validate_deployed_health({"status": "running", "commit": None})
+    with pytest.raises(AssertionError):
+        _validate_deployed_health(
+            {"status": "running", "commit": "a" * 40},
+            expected_commit="b" * 40,
+        )
+    with pytest.raises(AssertionError):
+        _validate_deployed_ready({"status": "not_ready"})
     with pytest.raises(AssertionError):
         _validate_deployed_live(_deployed_payload(bps=[1.0]))
     with pytest.raises(AssertionError):
@@ -434,7 +460,11 @@ def test_market_open_database_backed_v1_through_website_and_verified_outcome():
     _skip_if_xnys_closed()
     database_url = os.environ["DATABASE_URL"]
     base_url = os.environ["ATOM_PRODUCTION_BASE_URL"]
-    _validate_deployed_health(_deployed_json(base_url, "/health"))
+    _validate_deployed_health(
+        _deployed_json(base_url, "/health"),
+        expected_commit=os.environ.get("GITHUB_SHA"),
+    )
+    _validate_deployed_ready(_deployed_json(base_url, "/ready"))
     initial = _deployed_json(base_url, "/api/live")
     baseline_cutoff = initial.get("v9", {}).get("forecast_cutoff")
     if (not isinstance(baseline_cutoff, (int, float)) or
@@ -509,5 +539,9 @@ def test_market_open_database_backed_v1_through_website_and_verified_outcome():
             database_url, deadline=time.monotonic() + 45),
     )
 
-    _validate_deployed_health(_deployed_json(base_url, "/health"))
+    _validate_deployed_health(
+        _deployed_json(base_url, "/health"),
+        expected_commit=os.environ.get("GITHUB_SHA"),
+    )
+    _validate_deployed_ready(_deployed_json(base_url, "/ready"))
     _validate_deployed_live(_deployed_json(base_url, "/api/live"))

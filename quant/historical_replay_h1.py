@@ -21,9 +21,9 @@ from zoneinfo import ZoneInfo
 
 from .historical_replay import (
     ALLOWED_FORMULA_VERSIONS, DATA_SCHEMA_VERSION, EVIDENCE_ORIGIN,
-    REPLAY_METHOD_VERSION, SOURCE, TARGET_SPEC_ID, AlpacaHistoricalSipReader,
-    HistoricalSipQuote, HistoricalSipRetrievalProof, OneSessionReplayClock,
-    ReplayFamilyResults,
+    MAX_TARGET_RESOLUTION_DELAY_SECONDS, REPLAY_METHOD_VERSION, SOURCE,
+    TARGET_SPEC_ID, AlpacaHistoricalSipReader, HistoricalSipQuote,
+    HistoricalSipRetrievalProof, OneSessionReplayClock, ReplayFamilyResults,
     ReplayFrame, build_replay_v2_as_of,
 )
 from .q1_momentum import calculate_momentum
@@ -50,11 +50,14 @@ from .v9_v3_synthesis import synthesize_v3
 from .v9_v4a_evidence import canonical_sha256
 
 
-H1_RUNNER_VERSION = "ATOM-TRUE-V9-H1-RUNNER-4"
+H1_RUNNER_VERSION = "ATOM-TRUE-V9-H1-RUNNER-5"
 _NANOSECONDS = 1_000_000_000
 _REFRESH_NS = 3_600 * _NANOSECONDS
 _COMPLETE_EDGE_NS = 5 * _NANOSECONDS
 _COMPLETE_GAP_NS = 5 * _NANOSECONDS
+_MAX_TARGET_RESOLUTION_DELAY_NS = round(
+    MAX_TARGET_RESOLUTION_DELAY_SECONDS * _NANOSECONDS
+)
 _EASTERN = ZoneInfo("America/New_York")
 _Q10 = "q10_options_vol"
 _RESULT_NAMES = {
@@ -335,6 +338,10 @@ def _coverage_reason_codes(
         if (coverage.last_quote_lead_ns is None or
                 coverage.last_quote_lead_ns > _COMPLETE_EDGE_NS):
             reasons.append(f"{coverage.symbol}_CLOSE_EDGE_GAP")
+        if (coverage.over_limit_gap_count > 0 or
+                coverage.max_gap_ns is None or
+                coverage.max_gap_ns > maximum_gap_ns):
+            reasons.append(f"{coverage.symbol}_INTERQUOTE_GAP")
     return tuple(sorted(reasons))
 
 
@@ -637,7 +644,7 @@ def _configuration_digest(
         "session_target_rule": "MATURITY_STRICTLY_BEFORE_RTH_CLOSE",
         "close_rule": "RESOLUTION_ONLY_NO_FORECAST",
         "complete_edge_seconds": _COMPLETE_EDGE_NS / _NANOSECONDS,
-        "diagnostic_max_interquote_gap_seconds": (
+        "maximum_interquote_gap_seconds": (
             maximum_gap_ns / _NANOSECONDS
         ),
         "preflight_target_endpoint_audit": "TIMESTAMP_ONLY_EXACT_SIX",
@@ -846,6 +853,9 @@ def run_h1_session(
                         endpoint.provider_event_ns <= visibility_ns):
                     raise RuntimeError("REPLAY_TARGET_TIMING_VIOLATION")
                 queue.popleft()
+                delay_ns = endpoint.provider_event_ns - maturity_ns
+                if delay_ns > _MAX_TARGET_RESOLUTION_DELAY_NS:
+                    continue
                 target_bps = 10_000.0 * math.log(
                     endpoint.midpoint / candidate.cutoff_midpoint
                 )
@@ -876,7 +886,6 @@ def run_h1_session(
                         )
                     )
                 resolution_mutable[horizon][1] += 1
-                delay_ns = endpoint.provider_event_ns - maturity_ns
                 resolution_delays[horizon].append(delay_ns)
                 sample = ResolutionSample(
                     candidate.cycle_id, horizon, maturity_ns,
@@ -1173,6 +1182,15 @@ def _qualifies_cached_result(
             result.get("data_status") != "DATA_COMPLETE" or
             result.get("data_reason_codes") not in ([], ())):
         return False
+    dataset_digest = result.get("dataset_digest")
+    session_digest = result.get("session_digest")
+    if (not isinstance(dataset_digest, str) or len(dataset_digest) != 64 or
+            any(character not in "0123456789abcdef"
+                for character in dataset_digest) or
+            not isinstance(session_digest, str) or len(session_digest) != 64 or
+            any(character not in "0123456789abcdef"
+                for character in session_digest)):
+        return False
     counts = result.get("quote_counts")
     if (not isinstance(counts, (list, tuple)) or
             tuple(row[0] for row in counts if isinstance(row, (list, tuple))
@@ -1184,13 +1202,54 @@ def _qualifies_cached_result(
     coverage = result.get("quote_coverage")
     if not isinstance(coverage, (list, tuple)):
         return False
-    coin = next(
-        (row for row in coverage
-         if isinstance(row, dict) and row.get("symbol") == "COIN"), None,
-    )
+    if (len(coverage) != 2 or
+            tuple(row.get("symbol") for row in coverage
+                  if isinstance(row, dict)) != ("COIN", "QQQ")):
+        return False
+    by_symbol = {row[0]: row[1] for row in counts}
+    if any(row.get("count") != by_symbol[row["symbol"]]
+           for row in coverage):
+        return False
+    coin = coverage[0]
+    expected_session_digest = canonical_sha256({
+        "dataset_digest": dataset_digest,
+        "configuration_digest": result.get("configuration_digest"),
+        "execution_stage": result.get("execution_stage"),
+        "data_status": result.get("data_status"),
+        "data_reason_codes": result.get("data_reason_codes"),
+        "quote_coverage": coverage,
+        "retrieval_proof": result.get("retrieval_proof"),
+    })
     return (
-        coin is not None and
+        session_digest == expected_session_digest and
+        coin.get("count", 0) >= 2 and
         coin.get("configured_max_gap_ns") == _COMPLETE_GAP_NS and
+        coin.get("over_limit_gap_count") == 0 and
+        isinstance(coin.get("max_gap_ns"), int) and
+        not isinstance(coin.get("max_gap_ns"), bool) and
+        0 <= coin["max_gap_ns"] <= _COMPLETE_GAP_NS and
+        isinstance(coin.get("p99_gap_ns"), int) and
+        not isinstance(coin.get("p99_gap_ns"), bool) and
+        0 <= coin["p99_gap_ns"] <= _COMPLETE_GAP_NS and
+        isinstance(coin.get("first_quote_delay_ns"), int) and
+        not isinstance(coin.get("first_quote_delay_ns"), bool) and
+        0 <= coin["first_quote_delay_ns"] <= _COMPLETE_EDGE_NS and
+        isinstance(coin.get("last_quote_lead_ns"), int) and
+        not isinstance(coin.get("last_quote_lead_ns"), bool) and
+        0 <= coin["last_quote_lead_ns"] <= _COMPLETE_EDGE_NS and
+        isinstance(coin.get("first_quote_ns"), int) and
+        not isinstance(coin.get("first_quote_ns"), bool) and
+        coin["first_quote_ns"] == open_ns + coin["first_quote_delay_ns"] and
+        isinstance(coin.get("last_quote_ns"), int) and
+        not isinstance(coin.get("last_quote_ns"), bool) and
+        coin["last_quote_ns"] == close_ns - coin["last_quote_lead_ns"] and
+        coin["count"] >= (
+            math.ceil(max(
+                0,
+                close_ns - open_ns - coin["first_quote_delay_ns"]
+                - coin["last_quote_lead_ns"],
+            ) / max(1, coin["max_gap_ns"])) + 1
+        ) and
         _retrieval_proof_valid(
             result.get("retrieval_proof"), open_ns=open_ns,
             close_ns=close_ns,
@@ -1242,7 +1301,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument(
         "--max-interior-gap-seconds", type=int, choices=(5,), default=5,
-        help="frozen COIN RTH gap diagnostic (5 seconds)",
+        help="frozen COIN RTH eligibility gap limit (5 seconds)",
     )
     arguments = parser.parse_args(None if argv is None else tuple(argv))
     if len(arguments.session) > 1 and not arguments.batch_preflight:

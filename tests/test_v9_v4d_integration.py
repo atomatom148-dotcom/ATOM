@@ -650,6 +650,49 @@ def test_runtime_ownership_uses_one_session_advisory_lock(monkeypatch):
     )]
 
 
+def test_runtime_ownership_lock_query_failure_sets_error_without_unlock(
+        monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+
+    class Cursor:
+        def __init__(self): self.calls = []
+        def execute(self, sql, params):
+            self.calls.append((sql, params))
+            raise RuntimeError("lock query unavailable")
+        def close(self): pass
+    cursor = Cursor()
+    class Connection(_WorkerConnection):
+        def cursor(self): return cursor
+
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=Connection())
+    released = []
+    worker._release_runtime_ownership = lambda: released.append(True)
+
+    with pytest.raises(RuntimeError, match="lock query unavailable"):
+        worker._acquire_runtime_ownership()
+    assert released == []
+    assert all("pg_advisory_unlock" not in sql for sql, _params in cursor.calls)
+    assert dict(worker.metrics.snapshot().statuses)[
+        "evidence_runtime_owner_status"] == "ERROR"
+
+
+def test_runtime_ownership_reconnect_failure_sets_error(monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(),
+        connection=_WorkerConnection(),
+        connect=lambda _url: (_ for _ in ()).throw(
+            RuntimeError("database unavailable")),
+        database_url="postgresql://runtime",
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        worker._reconnect()
+    assert dict(worker.metrics.snapshot().statuses)[
+        "evidence_runtime_owner_status"] == "ERROR"
+
+
 def test_cycle_lineage_lookup_chunks_below_postgres_bind_limit(monkeypatch):
     monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
 
@@ -677,13 +720,14 @@ def test_cycle_lineage_lookup_chunks_below_postgres_bind_limit(monkeypatch):
     assert all(len(params) < 65_535 for _sql, params in connection.calls)
 
 
-def test_handoff_anchor_requires_all_six_durable_forecasts_to_be_proof_eligible(
+def test_handoff_anchor_uses_authoritative_commit_proofs_not_stored_json(
         monkeypatch):
     monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
 
     class Cursor:
         sql = ""
-        def execute(self, sql, _params): self.sql = sql
+        params = ()
+        def execute(self, sql, params): self.sql, self.params = sql, params
         def fetchall(self): return ()
         def close(self): pass
     cursor = Cursor()
@@ -693,8 +737,82 @@ def test_handoff_anchor_requires_all_six_durable_forecasts_to_be_proof_eligible(
     worker = EvidenceLedgerWorker(
         EvidenceOutbox(), evidence_store=_RawStore(), connection=Connection())
     assert worker._load_handoff_anchor() is None
-    assert "bool_and" in cursor.sql
-    assert "persistence_proof_eligible" in cursor.sql
+    assert "read_forecast_commit_proof" in cursor.sql
+    assert "p.proof_eligible" in cursor.sql
+    assert "persistence_proof_eligible" not in cursor.sql
+    assert "recent_cycles AS MATERIALIZED" in cursor.sql
+    assert cursor.params[-2:] == (256, len(HORIZONS))
+
+
+def test_handoff_anchor_rehydrates_false_stored_json_from_authoritative_proof(
+        monkeypatch):
+    monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1,
+        capture_v2=lambda _captured: v2,
+        forecast_writer=None,
+        compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort",
+        cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecast = calculated.persistence[0].forecast
+    stored = replace(
+        forecast, persisted_at=None, persistence_proof_eligible=False,
+        persistence_reason="FORECAST_COMMIT_PROOF_MISSING",
+    )
+    row = (
+        stored.forecast_record_hash,
+        json.dumps(_canonical(asdict(stored)), sort_keys=True),
+    )
+
+    class Cursor:
+        def __init__(self, proof):
+            self.proof = proof
+            self.sql = ""
+            self.params = ()
+
+        def execute(self, sql, params):
+            self.sql, self.params = sql, params
+
+        def fetchall(self):
+            return (row,) if "complete_cycle AS" in self.sql else ()
+
+        def fetchone(self):
+            if "read_forecast_commit_proof" not in self.sql or not self.proof:
+                return None
+            return (
+                forecast.forecast_record_id,
+                forecast.forecast_record_hash,
+                NOW,
+                forecast.target_endpoint,
+                True,
+                "POST_COMMIT_DB_OBSERVATION_V1",
+            )
+
+        def close(self):
+            pass
+
+    class Connection(_WorkerConnection):
+        def __init__(self, proof):
+            self.proof = proof
+
+        def cursor(self):
+            return Cursor(self.proof)
+
+    proven = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(),
+        connection=Connection(True),
+    )
+    unproven = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(),
+        connection=Connection(False),
+    )
+
+    assert proven._load_handoff_anchor() == MidpointObservation(
+        forecast.cutoff_at.timestamp(), 100.0,
+    )
+    assert unproven._load_handoff_anchor() is None
 
 
 @pytest.mark.parametrize("database_url", (
@@ -759,6 +877,8 @@ def test_runtime_ingress_stays_closed_when_recovery_submission_fails(monkeypatch
         worker._acquire_runtime_ownership()
     assert released == [True]
     assert worker.is_runtime_owner() is False
+    assert dict(worker.metrics.snapshot().statuses)[
+        "evidence_runtime_owner_status"] == "ERROR"
 
 
 def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():

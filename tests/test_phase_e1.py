@@ -70,6 +70,11 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertIn("VOLATILITY_FORECAST", metric_sql)
         self.assertIn("VOLATILITY_OUTCOME", metric_sql)
         self.assertIn("fp.commit_observed_at <= to_timestamp(%s)", metric_sql)
+        for statement, _parameters in cursor.executions:
+            self.assertIn("o.resolved_epoch >= f.maturity_epoch", statement)
+            self.assertIn(
+                "o.resolved_epoch <= f.maturity_epoch + 5.0", statement,
+            )
 
     def test_result_is_frozen_and_exact_cohort_fields_are_preserved(self):
         cursor = Cursor((
@@ -92,6 +97,11 @@ class PhaseEStoreTests(unittest.TestCase):
         sql = " ".join(cursor.executions[0][0].split())
         self.assertIn("LEFT JOIN LATERAL", sql)
         self.assertIn("read_legacy_evidence_publication", sql)
+        for statement, _parameters in cursor.executions:
+            self.assertIn("o.resolved_epoch >= f.maturity_epoch", statement)
+            self.assertIn(
+                "o.resolved_epoch <= f.maturity_epoch + 5.0", statement,
+            )
         self.assertIn("DIRECTIONAL_FORECAST", sql)
         self.assertIn("DIRECTIONAL_OUTCOME", sql)
         self.assertIn("fp.commit_observed_at <= to_timestamp(%s)", sql)

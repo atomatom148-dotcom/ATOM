@@ -128,11 +128,13 @@ class PostgresV2StateBuilder:
                     ) AS op ON true
                     WHERE f.data_schema_version=%s AND f.source_spec_version=%s
                       AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
+                      AND o.resolved_epoch >= f.maturity_epoch
+                      AND o.resolved_epoch <= f.maturity_epoch + %s
                       AND op.commit_observed_at<=to_timestamp(%s)
                     ORDER BY f.horizon, f.cutoff_epoch, f.forecast_id
                     LIMIT %s
                     """,
-                    (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, state_as_of,
+                    (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, 5.0, state_as_of,
                      V2_STATE_BUILD_EVIDENCE_LIMIT + 1),
                 )
                 directional_rows = tuple(cursor.fetchall())
@@ -158,11 +160,13 @@ class PostgresV2StateBuilder:
                     ) AS op ON true
                     WHERE f.data_schema_version=%s AND f.source_spec_version=%s
                       AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
+                      AND o.resolved_epoch >= f.maturity_epoch
+                      AND o.resolved_epoch <= f.maturity_epoch + %s
                       AND op.commit_observed_at<=to_timestamp(%s)
                     ORDER BY f.horizon, f.cutoff_epoch, f.forecast_id
                     LIMIT %s
                     """,
-                    (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, state_as_of,
+                    (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, 5.0, state_as_of,
                      V2_STATE_BUILD_EVIDENCE_LIMIT + 1),
                 )
                 magnitude_rows = tuple(cursor.fetchall())

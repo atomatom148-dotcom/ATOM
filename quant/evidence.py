@@ -403,6 +403,8 @@ class PostgresEvidenceStore:
                             'DIRECTIONAL_OUTCOME', o.forecast_id
                         ) AS op ON true
                         WHERE o.forecast_id=f.forecast_id
+                          AND o.resolved_epoch >= f.maturity_epoch
+                          AND o.resolved_epoch <= f.maturity_epoch + 5.0
                           AND op.commit_observed_at<=to_timestamp(%s)
                     ) AS o ON true
                     WHERE fp.commit_observed_at <= to_timestamp(%s)
@@ -434,6 +436,8 @@ class PostgresEvidenceStore:
                       AND fp.commit_observed_at <= to_timestamp(%s)
                       AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                       AND op.commit_observed_at <= to_timestamp(%s)
+                      AND o.resolved_epoch >= f.maturity_epoch
+                      AND o.resolved_epoch <= f.maturity_epoch + 5.0
                       AND o.resolved_epoch <= %s
                     ORDER BY f.quant_id, f.formula_version, f.symbol,
                              CASE f.horizon
@@ -529,6 +533,8 @@ class PostgresEvidenceStore:
                             'VOLATILITY_OUTCOME', o.forecast_id
                         ) AS op ON true
                         WHERE o.forecast_id=f.forecast_id
+                          AND o.resolved_epoch >= f.maturity_epoch
+                          AND o.resolved_epoch <= f.maturity_epoch + 5.0
                           AND op.commit_observed_at<=to_timestamp(%s)
                     ) AS o ON true
                     WHERE fp.commit_observed_at <= to_timestamp(%s)
@@ -560,6 +566,8 @@ class PostgresEvidenceStore:
                       AND fp.commit_observed_at <= to_timestamp(%s)
                       AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                       AND op.commit_observed_at <= to_timestamp(%s)
+                      AND o.resolved_epoch >= f.maturity_epoch
+                      AND o.resolved_epoch <= f.maturity_epoch + 5.0
                       AND o.resolved_epoch <= %s
                     ORDER BY f.quant_id, f.formula_version, f.symbol,
                              CASE f.horizon
