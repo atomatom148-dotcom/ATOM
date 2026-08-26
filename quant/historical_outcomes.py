@@ -87,7 +87,8 @@ def frozen_actual_return_bps(cutoff_midpoint: float, target_midpoint: float) -> 
 
 
 def resolve_slots(replay_run_id: str, slots: Iterable[tuple[datetime, str]],
-                  quotes: Iterable[HistoricalSipQuote], *, data_schema_version: str,
+                  quotes: Iterable[HistoricalSipQuote], *, session_open: datetime,
+                  session_close: datetime, data_schema_version: str,
                   source_schema_version: str, resolved_at: datetime) -> Iterator[HistoricalOutcome]:
     coin = tuple(q for q in quotes if q.symbol == "COIN")
     times = tuple(q.provider_event_ns for q in coin)
@@ -102,14 +103,16 @@ def resolve_slots(replay_run_id: str, slots: Iterable[tuple[datetime, str]],
         cutoff = coin[ci] if ci >= 0 else None
         target = coin[ti] if ti < len(coin) else None
         previous = coin[ti - 1] if ti > 0 else None
-        if cutoff is None:
+        if not (_utc(session_open) <= cutoff_at < _utc(session_close)):
+            reason = "CUTOFF_OUTSIDE_SESSION"
+        elif maturity_ns >= round(_utc(session_close).timestamp() * 1_000_000_000):
+            reason = "TARGET_OUTSIDE_SESSION"
+        elif cutoff is None:
             reason = "CUTOFF_MIDPOINT_UNAVAILABLE"
         elif target is None:
             reason = "TARGET_MIDPOINT_UNAVAILABLE"
         elif previous is None or not (previous.provider_event_ns < maturity_ns <= target.provider_event_ns):
             reason = "STRICT_TARGET_BRACKET_UNAVAILABLE"
-        elif target.provider_event_ns > maturity_ns + 5_000_000_000:
-            reason = "TARGET_ENDPOINT_DELAY_EXCEEDED"
         common = dict(replay_run_id=replay_run_id, cutoff_at=cutoff_at, horizon=horizon,
                       data_schema_version=data_schema_version,
                       source_schema_version=source_schema_version,
@@ -149,9 +152,12 @@ class HistoricalOutcomeResolver:
             slots = cursor.fetchall()
             if len(slots) != receipt.frame_count * 6:
                 raise RuntimeError("H2C_SLOT_COUNT_MISMATCH")
-            cursor.execute("SELECT data_schema_version,source_schema_version FROM public.atom_historical_replay_runs WHERE replay_run_id=%s", (replay_run_id,))
+            cursor.execute("SELECT data_schema_version,source_schema_version,historical_session FROM public.atom_historical_replay_runs WHERE replay_run_id=%s", (replay_run_id,))
             versions = cursor.fetchone()
+            from .historical_replay_h1 import _session
+            session_open, session_close = _session(versions[2])
             rows = resolve_slots(replay_run_id, slots, quotes,
+                session_open=session_open, session_close=session_close,
                 data_schema_version=versions[0], source_schema_version=versions[1],
                 resolved_at=datetime.now(timezone.utc))
             inserted = 0
@@ -266,12 +272,21 @@ def score(connection, replay_run_id: str, *, fetch_size: int = DEFAULT_BATCH_SIZ
                           outcome_count, tuple(metrics), digest.hexdigest())
 
 
-def _connect():
-    database_url = os.environ.get("HISTORICAL_EVIDENCE_DATABASE_URL")
+def _connect(environment_variable: str, expected_role: str):
+    database_url = os.environ.get(environment_variable)
     if not database_url:
-        raise RuntimeError("HISTORICAL_EVIDENCE_DATABASE_URL is required")
+        raise RuntimeError(f"{environment_variable} is required")
     import psycopg
-    return psycopg.connect(database_url)
+    connection = psycopg.connect(database_url)
+    cursor = connection.cursor()
+    cursor.execute("SELECT current_user")
+    role = cursor.fetchone()[0]
+    cursor.close()
+    if role != expected_role:
+        connection.close()
+        raise RuntimeError(f"H2C_DATABASE_ROLE_MISMATCH:{expected_role}")
+    connection.commit()
+    return connection
 
 
 def main() -> int:
@@ -283,7 +298,12 @@ def main() -> int:
     scoring = commands.add_parser("score", help="read-only immutable scoring")
     scoring.add_argument("replay_run_id")
     args = parser.parse_args(); started = time.monotonic()
-    with _connect() as connection:
+    environment_variable, expected_role = (
+        ("HISTORICAL_SCORE_DATABASE_URL", "atom_historical_score_reader")
+        if args.command == "score" else
+        ("HISTORICAL_OUTCOME_DATABASE_URL", "atom_historical_outcome_resolver")
+    )
+    with _connect(environment_variable, expected_role) as connection:
         if args.command == "score":
             connection.read_only = True
             output = score(connection, args.replay_run_id).payload()

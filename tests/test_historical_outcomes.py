@@ -22,19 +22,34 @@ class OutcomeTests(unittest.TestCase):
     def test_strict_bracket_and_five_second_timing(self):
         rows = tuple(resolve_slots("run", [(BASE, "30S"), (BASE, "1M")],
             [quote(0,100), quote(29,101), quote(30,102), quote(66,103)],
+            session_open=BASE, session_close=BASE+timedelta(hours=6, minutes=30),
             data_schema_version=DATA_SCHEMA_VERSION,
             source_schema_version=SOURCE_SPEC_SHARES, resolved_at=BASE))
         self.assertEqual(rows[0].availability_status, "AVAILABLE")
         self.assertEqual(rows[0].target_midpoint_at, BASE+timedelta(seconds=30))
-        self.assertEqual(rows[1].unavailable_reason, "TARGET_ENDPOINT_DELAY_EXCEEDED")
+        self.assertEqual(rows[1].availability_status, "AVAILABLE")
+        self.assertEqual(rows[1].target_midpoint_at, BASE+timedelta(seconds=66))
 
     def test_every_slot_is_retained_when_target_is_unavailable(self):
         slots = [(BASE, h) for h in ("30S","1M","5M","15M","30M","1H")]
         rows = tuple(resolve_slots("run", slots, [quote(0,100)],
+            session_open=BASE, session_close=BASE+timedelta(hours=6, minutes=30),
             data_schema_version=DATA_SCHEMA_VERSION,
             source_schema_version=SOURCE_SPEC_SHARES, resolved_at=BASE))
         self.assertEqual(len(rows), 6)
         self.assertTrue(all(r.actual_return_bps is None and r.unavailable_reason for r in rows))
+
+    def test_session_boundary_and_full_one_hour_retrieval_window(self):
+        close = BASE + timedelta(hours=6, minutes=30)
+        slots = [(close-timedelta(hours=1, seconds=1), "1H"),
+                 (close-timedelta(hours=1), "1H")]
+        rows = tuple(resolve_slots("run", slots,
+            [quote(0,100), quote(6*3600+29*60+59,101)],
+            session_open=BASE, session_close=close,
+            data_schema_version=DATA_SCHEMA_VERSION,
+            source_schema_version=SOURCE_SPEC_SHARES, resolved_at=BASE))
+        self.assertEqual(rows[0].availability_status, "AVAILABLE")
+        self.assertEqual(rows[1].unavailable_reason, "TARGET_OUTSIDE_SESSION")
 
     def test_content_hash_excludes_resolution_clock_for_retry(self):
         kwargs = dict(replay_run_id="run",cutoff_at=BASE,horizon="30S",actual_return_bps=None,
@@ -57,6 +72,14 @@ class OutcomeTests(unittest.TestCase):
         for path in ("quant/historical_replay_h1.py", "quant/web.py"):
             from pathlib import Path
             self.assertNotIn("historical_outcomes", Path(path).read_text())
+
+    def test_commands_use_separate_role_specific_credentials(self):
+        from pathlib import Path
+        source = Path("quant/historical_outcomes.py").read_text()
+        self.assertIn("HISTORICAL_OUTCOME_DATABASE_URL", source)
+        self.assertIn("HISTORICAL_SCORE_DATABASE_URL", source)
+        self.assertNotIn("HISTORICAL_EVIDENCE_DATABASE_URL", source)
+        self.assertIn("SELECT current_user", source)
 
 class _Cursor:
     def __init__(self, connection, named=False):
@@ -94,3 +117,62 @@ class ScoringTests(unittest.TestCase):
         self.assertIsNone(q3.directional_accuracy)
     def test_scoring_receipt_is_deterministic_and_select_only(self):
         self.assertEqual(score(self._connection(),"run"),score(self._connection(),"run"))
+
+class _WriteCursor:
+    def __init__(self, answers, fail_insert=False): self.answers=list(answers); self.fail_insert=fail_insert; self.sql=[]
+    def execute(self, sql, params=()):
+        self.sql.append(sql)
+        if self.fail_insert and sql.startswith("INSERT INTO public.atom_historical_replay_outcomes"):
+            raise RuntimeError("injected batch failure")
+    def fetchone(self): return self.answers.pop(0)
+
+class ResolverContractTests(unittest.TestCase):
+    def make_outcome(self):
+        return HistoricalOutcome("run",BASE,"30S",None,"UNAVAILABLE","NO_TARGET",
+            None,None,None,None,"d","s",BASE)
+
+    def test_exact_retry_is_idempotent_and_conflict_fails_closed(self):
+        from quant.historical_outcomes import HistoricalOutcomeResolver
+        identical=_WriteCursor([(1,1)])
+        self.assertEqual(HistoricalOutcomeResolver._write(identical,"run",[self.make_outcome()]),0)
+        conflict=_WriteCursor([(1,0),(1,)])
+        with self.assertRaisesRegex(RuntimeError,"H2C_OUTCOME_CONFLICT"):
+            HistoricalOutcomeResolver._write(conflict,"run",[self.make_outcome()])
+        self.assertFalse(any(sql.startswith("INSERT") for sql in conflict.sql))
+
+    def test_unverified_replay_is_rejected_before_cursor_or_writes(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from quant.historical_outcomes import HistoricalOutcomeResolver
+        class Connection:
+            rollbacks=0
+            def rollback(self): self.rollbacks+=1
+            def cursor(self): raise AssertionError("cursor opened before verification")
+        connection=Connection()
+        with patch("quant.historical_outcomes.HistoricalEvidenceVerifier") as verifier:
+            verifier.return_value.verify.return_value=SimpleNamespace(
+                verification_status="REJECTED",reason_codes=("BAD",))
+            with self.assertRaisesRegex(RuntimeError,"H2C_UNVERIFIED_REPLAY"):
+                HistoricalOutcomeResolver(connection).resolve("run",())
+        self.assertEqual(connection.rollbacks,1)
+
+    def test_partial_batch_failure_rolls_back(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from quant.historical_outcomes import HistoricalOutcomeResolver
+        class Cursor(_WriteCursor):
+            def __init__(self): super().__init__([("d","s",BASE.date()),(1,0),(0,)],True)
+            def fetchall(self): return [(BASE,"30S")]
+            def close(self): pass
+        class Connection:
+            commits=rollbacks=0
+            def cursor(self): return Cursor()
+            def commit(self): self.commits+=1
+            def rollback(self): self.rollbacks+=1
+        connection=Connection()
+        with patch("quant.historical_outcomes.HistoricalEvidenceVerifier") as verifier:
+            verifier.return_value.verify.return_value=SimpleNamespace(
+                verification_status="VERIFIED",reason_codes=(),frame_count=1/6)
+            with self.assertRaisesRegex(RuntimeError,"injected batch failure"):
+                HistoricalOutcomeResolver(connection,batch_size=1).resolve("run",())
+        self.assertEqual((connection.commits,connection.rollbacks),(0,1))

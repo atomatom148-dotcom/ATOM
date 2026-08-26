@@ -38,16 +38,18 @@ CREATE TABLE public.atom_historical_replay_outcomes (
       OR (availability_status = 'UNAVAILABLE' AND actual_return_bps IS NULL
           AND unavailable_reason IS NOT NULL)),
   CHECK (actual_return_bps IS NULL OR actual_return_bps NOT IN
-         ('Infinity'::float8, '-Infinity'::float8)),
+         ('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8)),
+  CHECK (cutoff_midpoint IS NULL OR cutoff_midpoint NOT IN
+         ('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8)),
+  CHECK (target_midpoint IS NULL OR target_midpoint NOT IN
+         ('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8)),
   CHECK (cutoff_midpoint_at IS NULL OR cutoff_midpoint_at <= cutoff_at),
   CHECK (target_midpoint_at IS NULL OR target_midpoint_at >= cutoff_at + CASE horizon
     WHEN '30S' THEN interval '30 seconds' WHEN '1M' THEN interval '1 minute'
     WHEN '5M' THEN interval '5 minutes' WHEN '15M' THEN interval '15 minutes'
-    WHEN '30M' THEN interval '30 minutes' WHEN '1H' THEN interval '1 hour' END),
-  CHECK (target_midpoint_at IS NULL OR target_midpoint_at <= cutoff_at + CASE horizon
-    WHEN '30S' THEN interval '35 seconds' WHEN '1M' THEN interval '65 seconds'
-    WHEN '5M' THEN interval '305 seconds' WHEN '15M' THEN interval '905 seconds'
-    WHEN '30M' THEN interval '1805 seconds' WHEN '1H' THEN interval '3605 seconds' END)
+    WHEN '30M' THEN interval '30 minutes' WHEN '1H' THEN interval '1 hour' END)
+  -- H1 selects the first accepted quote at or after maturity. Interquote delay
+  -- is diagnostic telemetry, not an outcome-availability threshold.
 );
 
 CREATE TRIGGER atom_historical_outcomes_reject_update_delete
