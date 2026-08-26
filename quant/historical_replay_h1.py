@@ -156,6 +156,7 @@ class ReplayTimings:
     read_decode_seconds: float
     alignment_seconds: float
     quant_seconds: float
+    family_seconds: dict[str, float]
     resolution_seconds: float
     v2_seconds: float
     v1_seconds: float
@@ -462,7 +463,9 @@ def _forecast_epoch(frame: ReplayFrame) -> float:
     return frame.coin_source_as_of_ns / _NANOSECONDS
 
 
-def _calculate_provider_families(frame: ReplayFrame) -> ReplayFamilyResults:
+def _calculate_provider_families(
+    frame: ReplayFrame, family_seconds: dict[str, float],
+) -> ReplayFamilyResults:
     """Run the deployed equations at the selected provider timestamp."""
 
     forecast_cutoff = _forecast_epoch(frame)
@@ -477,35 +480,41 @@ def _calculate_provider_families(frame: ReplayFrame) -> ReplayFamilyResults:
         return (None if result is None else
                 replace(result, cutoff_epoch=forecast_cutoff))
 
+    def timed(quant_id: str, call: Callable[[], object | None]) -> object | None:
+        started = time.perf_counter()
+        result = call()
+        family_seconds[quant_id] += _elapsed(time.perf_counter, started)
+        return result
+
     return ReplayFamilyResults(
         forecast_cutoff,
-        stamp(calculate_momentum(
-            frame.coin_history, cutoff_epoch=calculation_cutoff)),
-        stamp(calculate_mean_reversion(
-            frame.coin_history, cutoff_epoch=calculation_cutoff)),
-        stamp(calculate_volatility(
-            frame.coin_history, cutoff_epoch=calculation_cutoff)),
-        stamp(calculate_stat_arb(
+        stamp(timed("q1_momentum", lambda: calculate_momentum(
+            frame.coin_history, cutoff_epoch=calculation_cutoff))),
+        stamp(timed("q2_mean_reversion", lambda: calculate_mean_reversion(
+            frame.coin_history, cutoff_epoch=calculation_cutoff))),
+        stamp(timed("q3_volatility", lambda: calculate_volatility(
+            frame.coin_history, cutoff_epoch=calculation_cutoff))),
+        stamp(timed("q4_stat_arb", lambda: calculate_stat_arb(
             frame.coin_history, frame.qqq_history,
-            cutoff_epoch=calculation_cutoff)),
-        stamp(calculate_microstructure(
-            frame.coin_quote_history, cutoff_epoch=calculation_cutoff)),
-        stamp(calculate_volume_liquidity(
-            frame.coin_quote_history, cutoff_epoch=calculation_cutoff)),
-        stamp(calculate_relative_value(
+            cutoff_epoch=calculation_cutoff))),
+        stamp(timed("q5_microstructure", lambda: calculate_microstructure(
+            frame.coin_quote_history, cutoff_epoch=calculation_cutoff))),
+        stamp(timed("q6_volume_liquidity", lambda: calculate_volume_liquidity(
+            frame.coin_quote_history, cutoff_epoch=calculation_cutoff))),
+        stamp(timed("q7_relative_value", lambda: calculate_relative_value(
             frame.coin_history, frame.qqq_history,
-            cutoff_epoch=calculation_cutoff)),
-        stamp(calculate_cross_asset(
+            cutoff_epoch=calculation_cutoff))),
+        stamp(timed("q8_cross_asset", lambda: calculate_cross_asset(
             frame.coin_history, frame.qqq_history,
-            cutoff_epoch=calculation_cutoff)),
-        stamp(calculate_factor(
+            cutoff_epoch=calculation_cutoff))),
+        stamp(timed("q9_factor", lambda: calculate_factor(
             frame.coin_history, frame.qqq_history,
-            cutoff_epoch=calculation_cutoff)),
+            cutoff_epoch=calculation_cutoff))),
         None,
-        stamp(calculate_regime(
-            frame.coin_history, cutoff_epoch=calculation_cutoff)),
-        stamp(calculate_event_session(
-            frame.coin_history, cutoff_epoch=calculation_cutoff)),
+        stamp(timed("q11_regime", lambda: calculate_regime(
+            frame.coin_history, cutoff_epoch=calculation_cutoff))),
+        stamp(timed("q12_event_session", lambda: calculate_event_session(
+            frame.coin_history, cutoff_epoch=calculation_cutoff))),
     )
 
 
@@ -757,7 +766,9 @@ def run_h1_session(
         })
         total_seconds = _elapsed(monotonic_clock, total_started)
         timings = ReplayTimings(
-            read_decode_seconds, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            read_decode_seconds, 0.0, 0.0,
+            {quant_id: 0.0 for quant_id in QUANT_IDS},
+            0.0, 0.0, 0.0, 0.0, 0.0,
             total_seconds,
         )
         return H1ReplayReport(
@@ -805,6 +816,7 @@ def run_h1_session(
     stream_digest.update(config_digest.encode("ascii"))
 
     alignment_seconds = quant_seconds = resolution_seconds = 0.0
+    family_seconds = {quant_id: 0.0 for quant_id in QUANT_IDS}
     v2_seconds = v1_seconds = v3_seconds = 0.0
     frame_count = qqq_attached_frames = qqq_fresh_frames = 0
     next_target_id = next_family_id = 1
@@ -946,7 +958,7 @@ def run_h1_session(
             current_v2 = pending_v2
 
         started = monotonic_clock()
-        results = _calculate_provider_families(frame)
+        results = _calculate_provider_families(frame, family_seconds)
         quant_seconds += _elapsed(monotonic_clock, started)
         result_map = _family_result_map(results)
         for quant_id in QUANT_IDS:
@@ -1068,6 +1080,7 @@ def run_h1_session(
     total_seconds = _elapsed(monotonic_clock, total_started)
     timings = ReplayTimings(
         read_decode_seconds, alignment_seconds, quant_seconds,
+        family_seconds,
         resolution_seconds, v2_seconds, v1_seconds, v3_seconds, 0.0,
         total_seconds,
     )

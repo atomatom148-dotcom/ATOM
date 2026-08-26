@@ -153,6 +153,21 @@ def test_h1_runs_reader_clock_families_v2_v1_v3_and_outcomes_end_to_end():
     assert report.configuration_digest
     assert report.session_digest
     assert report.timings.persistence_seconds == 0.0
+    assert tuple(report.timings.family_seconds) == (
+        "q1_momentum", "q2_mean_reversion", "q3_volatility",
+        "q4_stat_arb", "q5_microstructure", "q6_volume_liquidity",
+        "q7_relative_value", "q8_cross_asset", "q9_factor",
+        "q10_options_vol", "q11_regime", "q12_event_session",
+    )
+    assert all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        and value >= 0.0
+        for value in report.timings.family_seconds.values()
+    )
+    assert isinstance(report.to_dict()["timings"]["quant_seconds"], float)
+    assert report.to_dict()["timings"]["family_seconds"] == (
+        report.timings.family_seconds
+    )
     assert report.timings.total_seconds >= 0.0
     assert report.execution_stage == "REPLAY_COMPLETE"
     assert report.data_status == "DATA_INCOMPLETE"
@@ -170,6 +185,9 @@ def test_h1_mathematical_digests_are_repeatable_and_exclude_timings_and_run_id()
     assert first.configuration_digest == second.configuration_digest
     assert first.session_digest == second.session_digest
     assert first.family_coverage == second.family_coverage
+    assert tuple(row.quant_id for row in first.family_coverage) == tuple(
+        row.quant_id for row in second.family_coverage
+    )
     assert first.v3_coverage == second.v3_coverage
     assert first.resolution_coverage == second.resolution_coverage
     assert first.v2_refreshes == second.v2_refreshes
