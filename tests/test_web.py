@@ -626,6 +626,20 @@ async function advance(milliseconds) {{
         empty_app = create_app(evidence_cache=empty_cache, clock=lambda: 100.0)
         empty = json.loads(request(empty_app, "/api/dashboard")["body"])
         self.assertEqual(empty["phase_e_cohorts"], [])
+        self.assertEqual(empty["evidence"], {"Forecasts": 0, "Resolved": 0})
+
+    def test_background_cache_keeps_new_counts_when_phase_e_fails(self):
+        class Store:
+            def counts(self): return (2_939_098, 2_887_635)
+            def phase_e_cohorts(self, _as_of):
+                raise RuntimeError("phase e unavailable")
+
+        cache = DashboardEvidenceCache(Store(), clock=lambda: 100.0)
+        snapshot = cache.refresh()
+
+        self.assertEqual(snapshot.counts, (2_939_098, 2_887_635))
+        self.assertEqual(snapshot.phase_e_cohorts, ())
+        self.assertEqual(snapshot.status, "AVAILABLE")
 
     def test_phase_e_endpoint_uses_same_snapshot_without_scanning(self):
         cohort = PhaseECohortMetrics(
