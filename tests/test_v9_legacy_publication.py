@@ -48,6 +48,21 @@ def test_bounded_publication_reader_is_indexed_capped_and_read_only():
     assert "DELETE FROM atom_v9_internal.legacy_evidence_publications" not in sql
 
 
+def test_publication_cycle_lookup_has_one_targeted_read_index():
+    sql = (
+        ROOT / "migrations" /
+        "018_index_legacy_evidence_publication_cycles.sql"
+    ).read_text()
+    normalized = " ".join(sql.split())
+    assert "CREATE INDEX IF NOT EXISTS forecasts_cycle_id_forecast_id_idx" in normalized
+    assert "ON public.forecasts (cycle_id, forecast_id)" in normalized
+    assert "lock_timeout" in sql
+    assert "INSERT INTO" not in sql
+    assert "UPDATE " not in sql
+    assert "DELETE FROM" not in sql
+    assert "TRUNCATE " not in sql
+
+
 
 def test_publication_proof_recorder_suppresses_only_unapplied_schema_errors():
     from quant.evidence import PostgresEvidenceStore

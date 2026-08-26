@@ -464,7 +464,10 @@ class LiveMarketTests(unittest.TestCase):
         self.assertTrue(all(value is None for family in after["quant_families"][:3] for value in family["values"]))
         self.assertTrue(all(family["values"] == [None] * 6 for family in after["quant_families"][3:]))
         self.assertTrue(all(values == [None] * 6 for values in after["final_numbers"].values()))
-        self.assertEqual(after["options_data"], {"expiration": None, "calls": [], "puts": []})
+        self.assertEqual(after["options_data"], {
+            "status": "UNAVAILABLE", "as_of_epoch": None,
+            "expiration": None, "calls": [], "puts": [],
+        })
 
     def test_btc_remains_visible_while_evidence_owner_is_waiting(self):
         state = LiveMarketState(

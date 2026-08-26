@@ -10,6 +10,7 @@ from quant.live_market import LiveMarketState
 from quant.q10_options_vol import OptionObservation
 from quant.v9_production import (
     FORMULA_VERSION_MAP, V2_STATE_BUILD_EVIDENCE_LIMIT,
+    ImmutableV2StateProvider,
     PostgresV2StateBuilder, build_live_v1,
 )
 from quant.v9_v1_contract import HORIZONS, QUANT_IDS
@@ -212,6 +213,33 @@ def test_website_final_numbers_are_read_from_published_v4d_output():
     assert payload["final_numbers"]["BPS"] == [float(index) for index in range(6)]
     assert payload["final_numbers"]["MOVE%"] == [float(index) / 100 for index in range(6)]
     assert payload["final_numbers"]["RANGE"] == [None] * 6
+
+
+def test_v2_background_provider_retries_failed_build_after_one_minute():
+    class FailingBuilder:
+        last_rows_materialized = 0
+
+        def build(self):
+            raise RuntimeError("temporary database failure")
+
+    class StopAfterFirstWait:
+        def __init__(self):
+            self.seconds = []
+
+        def is_set(self):
+            return False
+
+        def wait(self, seconds):
+            self.seconds.append(seconds)
+            return True
+
+    stop = StopAfterFirstWait()
+    provider = ImmutableV2StateProvider(FailingBuilder())
+    thread = provider.start(interval_seconds=3600.0, stop_event=stop)
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert stop.seconds == [60.0]
 
 
 def test_v2_batch_builder_uses_read_only_repeatable_read_and_closes_snapshot():
