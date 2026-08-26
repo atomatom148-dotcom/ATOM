@@ -13,7 +13,10 @@ import time
 from typing import Iterable, Iterator
 
 from .historical_evidence_verifier import HistoricalEvidenceVerifier, QUANTS
-from .historical_replay import AlpacaHistoricalSipReader, HistoricalSipQuote
+from .historical_replay import (
+    AlpacaHistoricalSipReader, DATA_SCHEMA_VERSION, SYMBOLS, HistoricalSipQuote,
+    HistoricalSipRetrievalProof, OneSessionReplayClock,
+)
 from .v9_v1_contract import HORIZON_SECONDS
 
 OUTCOME_SCHEMA_VERSION = "H2-C-1"
@@ -47,11 +50,20 @@ class HistoricalOutcome:
     target_midpoint: float | None
     data_schema_version: str
     source_schema_version: str
+    resolution_spec_version: str
+    outcome_source_dataset_digest: str
     resolved_at: datetime
 
     def __post_init__(self) -> None:
         if self.horizon not in HORIZONS:
             raise ValueError("invalid outcome horizon")
+        if self.resolution_spec_version != RESOLUTION_SPEC_VERSION:
+            raise ValueError("invalid resolution spec version")
+        if (not isinstance(self.outcome_source_dataset_digest, str) or
+                len(self.outcome_source_dataset_digest) != 64 or
+                any(character not in "0123456789abcdef"
+                    for character in self.outcome_source_dataset_digest)):
+            raise ValueError("invalid outcome source dataset digest")
         if self.availability_status == "AVAILABLE":
             values = (self.actual_return_bps, self.cutoff_midpoint, self.target_midpoint)
             if (any(v is None or not math.isfinite(v) for v in values) or
@@ -86,29 +98,61 @@ def frozen_actual_return_bps(cutoff_midpoint: float, target_midpoint: float) -> 
     return 10_000.0 * math.log(target_midpoint / cutoff_midpoint)
 
 
+def _frame_cutoff_at(provider_event_ns: int) -> datetime:
+    # This is the exact conversion frozen H1 used when persisting its frame.
+    return datetime.fromtimestamp(provider_event_ns / 1_000_000_000, timezone.utc)
+
+
+def _accepted_coin_quotes(quotes: tuple[HistoricalSipQuote, ...], *,
+                          session_open: datetime,
+                          session_close: datetime) -> tuple[HistoricalSipQuote, ...]:
+    coin_by_ns = {row.provider_event_ns: row for row in quotes if row.symbol == "COIN"}
+    accepted = [coin_by_ns[frame.coin_source_as_of_ns] for frame in
+                OneSessionReplayClock(quotes, session_open=session_open,
+                                      session_close=session_close).frames()]
+    coin = tuple(row for row in quotes if row.symbol == "COIN")
+    close_ns = round(_utc(session_close).timestamp() * 1_000_000_000)
+    # Preserve H1's outcome-only 16:00 close drain of the last fractional-second quote.
+    if (coin and (not accepted or coin[-1].provider_event_ns >
+                  accepted[-1].provider_event_ns) and
+            coin[-1].provider_event_ns < close_ns):
+        accepted.append(coin[-1])
+    return tuple(accepted)
+
+
 def resolve_slots(replay_run_id: str, slots: Iterable[tuple[datetime, str]],
                   quotes: Iterable[HistoricalSipQuote], *, session_open: datetime,
                   session_close: datetime, data_schema_version: str,
-                  source_schema_version: str, resolved_at: datetime) -> Iterator[HistoricalOutcome]:
-    coin = tuple(q for q in quotes if q.symbol == "COIN")
-    times = tuple(q.provider_event_ns for q in coin)
-    from bisect import bisect_left, bisect_right
+                  source_schema_version: str, outcome_source_dataset_digest: str,
+                  resolved_at: datetime) -> Iterator[HistoricalOutcome]:
+    materialized = tuple(quotes)
+    accepted = _accepted_coin_quotes(materialized, session_open=session_open,
+                                     session_close=session_close)
+    # The drain quote is never a forecast frame. Determine frames independently.
+    frame_ns = tuple(frame.coin_source_as_of_ns for frame in OneSessionReplayClock(
+        materialized, session_open=session_open, session_close=session_close).frames())
+    by_cutoff: dict[datetime, HistoricalSipQuote] = {}
+    coin_by_ns = {row.provider_event_ns: row for row in materialized if row.symbol == "COIN"}
+    for ns in frame_ns:
+        key = _frame_cutoff_at(ns)
+        if key in by_cutoff:
+            raise RuntimeError("H2C_AMBIGUOUS_CUTOFF_MAPPING")
+        by_cutoff[key] = coin_by_ns[ns]
+    accepted_times = tuple(row.provider_event_ns for row in accepted)
+    from bisect import bisect_left
+    close_ns = round(_utc(session_close).timestamp() * 1_000_000_000)
     for cutoff_at, horizon in slots:
         cutoff_at = _utc(cutoff_at)
-        cutoff_ns = round(cutoff_at.timestamp() * 1_000_000_000)
-        maturity_ns = cutoff_ns + HORIZON_SECONDS[horizon] * 1_000_000_000
-        ci = bisect_right(times, cutoff_ns) - 1
-        ti = bisect_left(times, maturity_ns)
+        cutoff = by_cutoff.get(cutoff_at)
+        if cutoff is None:
+            raise RuntimeError("H2C_EXACT_CUTOFF_MAPPING_MISSING")
+        maturity_ns = cutoff.provider_event_ns + HORIZON_SECONDS[horizon] * 1_000_000_000
+        ti = bisect_left(accepted_times, maturity_ns)
+        target = accepted[ti] if ti < len(accepted) else None
+        previous = accepted[ti - 1] if ti > 0 else None
         reason = None
-        cutoff = coin[ci] if ci >= 0 else None
-        target = coin[ti] if ti < len(coin) else None
-        previous = coin[ti - 1] if ti > 0 else None
-        if not (_utc(session_open) <= cutoff_at < _utc(session_close)):
-            reason = "CUTOFF_OUTSIDE_SESSION"
-        elif maturity_ns >= round(_utc(session_close).timestamp() * 1_000_000_000):
+        if maturity_ns >= close_ns:
             reason = "TARGET_OUTSIDE_SESSION"
-        elif cutoff is None:
-            reason = "CUTOFF_MIDPOINT_UNAVAILABLE"
         elif target is None:
             reason = "TARGET_MIDPOINT_UNAVAILABLE"
         elif previous is None or not (previous.provider_event_ns < maturity_ns <= target.provider_event_ns):
@@ -116,20 +160,22 @@ def resolve_slots(replay_run_id: str, slots: Iterable[tuple[datetime, str]],
         common = dict(replay_run_id=replay_run_id, cutoff_at=cutoff_at, horizon=horizon,
                       data_schema_version=data_schema_version,
                       source_schema_version=source_schema_version,
+                      resolution_spec_version=RESOLUTION_SPEC_VERSION,
+                      outcome_source_dataset_digest=outcome_source_dataset_digest,
                       resolved_at=_utc(resolved_at))
         if reason:
             yield HistoricalOutcome(actual_return_bps=None, availability_status="UNAVAILABLE",
                 unavailable_reason=reason,
-                cutoff_midpoint_at=None if cutoff is None else datetime.fromtimestamp(cutoff.event_epoch, timezone.utc),
-                cutoff_midpoint=None if cutoff is None else cutoff.midpoint,
-                target_midpoint_at=None if target is None else datetime.fromtimestamp(target.event_epoch, timezone.utc),
+                cutoff_midpoint_at=_frame_cutoff_at(cutoff.provider_event_ns),
+                cutoff_midpoint=cutoff.midpoint,
+                target_midpoint_at=None if target is None else _frame_cutoff_at(target.provider_event_ns),
                 target_midpoint=None if target is None else target.midpoint, **common)
         else:
             yield HistoricalOutcome(actual_return_bps=frozen_actual_return_bps(cutoff.midpoint, target.midpoint),
                 availability_status="AVAILABLE", unavailable_reason=None,
-                cutoff_midpoint_at=datetime.fromtimestamp(cutoff.event_epoch, timezone.utc),
+                cutoff_midpoint_at=_frame_cutoff_at(cutoff.provider_event_ns),
                 cutoff_midpoint=cutoff.midpoint,
-                target_midpoint_at=datetime.fromtimestamp(target.event_epoch, timezone.utc),
+                target_midpoint_at=_frame_cutoff_at(target.provider_event_ns),
                 target_midpoint=target.midpoint, **common)
 
 
@@ -140,25 +186,63 @@ class HistoricalOutcomeResolver:
             raise ValueError("batch_size must be a positive integer")
         self.connection, self.batch_size = connection, batch_size
 
-    def resolve(self, replay_run_id: str, quotes: Iterable[HistoricalSipQuote], **expected) -> int:
+    def resolve(self, replay_run_id: str, quotes: Iterable[HistoricalSipQuote], *,
+                retrieval_proof: HistoricalSipRetrievalProof | None = None,
+                **expected) -> int:
+        # Materialize and authenticate the re-fetch before acquiring the advisory
+        # lock or attempting any outcome write.
+        materialized = tuple(quotes)
         receipt = HistoricalEvidenceVerifier(self.connection).verify(replay_run_id, **expected)
         if receipt.verification_status != "VERIFIED":
             self.connection.rollback()
             raise RuntimeError("H2C_UNVERIFIED_REPLAY:" + ",".join(receipt.reason_codes))
         cursor = self.connection.cursor()
         try:
+            cursor.execute("SELECT historical_session,dataset_digest,quote_counts,data_schema_version,source_schema_version FROM public.atom_historical_replay_runs WHERE replay_run_id=%s", (replay_run_id,))
+            manifest = cursor.fetchone()
+            if manifest is None:
+                raise RuntimeError("H2C_MANIFEST_MISSING")
+            historical_session, dataset_digest, quote_counts, data_version, source_version = manifest
+            from .historical_replay_h1 import (_retrieval_proof_valid, _session,
+                                                canonical_sha256)
+            session_open, session_close = _session(historical_session)
+            open_ns = round(session_open.timestamp() * 1_000_000_000)
+            close_ns = round(session_close.timestamp() * 1_000_000_000)
+            if not _retrieval_proof_valid(retrieval_proof, open_ns=open_ns,
+                                          close_ns=close_ns,
+                                          retained_count=len(materialized)):
+                raise RuntimeError("H2C_RETRIEVAL_PROOF_INVALID")
+            # Clock construction validates ordering, session bounds, symbols, and
+            # every quote's frozen schema lineage.
+            frame_count = sum(1 for _ in OneSessionReplayClock(
+                materialized, session_open=session_open,
+                session_close=session_close).frames())
+            actual_counts = {symbol: sum(row.symbol == symbol for row in materialized)
+                             for symbol in SYMBOLS}
+            if actual_counts != dict(quote_counts):
+                raise RuntimeError("H2C_QUOTE_COUNT_MISMATCH")
+            actual_digest = canonical_sha256(tuple(
+                (row.symbol, row.provider_event_ns, row.bid, row.ask,
+                 row.bid_size, row.ask_size, row.source,
+                 row.data_schema_version, row.source_spec_version)
+                for row in materialized))
+            if actual_digest != dataset_digest or actual_digest != receipt.dataset_digest:
+                raise RuntimeError("H2C_DATASET_DIGEST_MISMATCH")
+            if (frame_count != receipt.frame_count or data_version != DATA_SCHEMA_VERSION or
+                    any(row.data_schema_version != data_version or
+                        row.source_spec_version != source_version
+                        for row in materialized)):
+                raise RuntimeError("H2C_LINEAGE_MISMATCH")
+
             cursor.execute("SELECT pg_catalog.pg_advisory_xact_lock(hashtextextended(%s,1))", (replay_run_id,))
             cursor.execute("SELECT DISTINCT cutoff_at,horizon FROM public.atom_historical_replay_forecasts WHERE replay_run_id=%s ORDER BY cutoff_at,horizon", (replay_run_id,))
             slots = cursor.fetchall()
             if len(slots) != receipt.frame_count * 6:
                 raise RuntimeError("H2C_SLOT_COUNT_MISMATCH")
-            cursor.execute("SELECT data_schema_version,source_schema_version,historical_session FROM public.atom_historical_replay_runs WHERE replay_run_id=%s", (replay_run_id,))
-            versions = cursor.fetchone()
-            from .historical_replay_h1 import _session
-            session_open, session_close = _session(versions[2])
-            rows = resolve_slots(replay_run_id, slots, quotes,
+            rows = resolve_slots(replay_run_id, slots, materialized,
                 session_open=session_open, session_close=session_close,
-                data_schema_version=versions[0], source_schema_version=versions[1],
+                data_schema_version=data_version, source_schema_version=source_version,
+                outcome_source_dataset_digest=dataset_digest,
                 resolved_at=datetime.now(timezone.utc))
             inserted = 0
             batch = []
@@ -187,7 +271,7 @@ class HistoricalOutcomeResolver:
         cursor.execute("SELECT count(*) FROM jsonb_to_recordset(%s::jsonb) x(cutoff_at timestamptz,horizon text) JOIN public.atom_historical_replay_outcomes o ON o.replay_run_id=%s AND o.cutoff_at=x.cutoff_at AND o.horizon=x.horizon", (_canonical(expected), replay_run_id))
         if cursor.fetchone()[0]:
             raise RuntimeError("H2C_OUTCOME_CONFLICT")
-        cursor.execute("INSERT INTO public.atom_historical_replay_outcomes (replay_run_id,cutoff_at,horizon,actual_return_bps,availability_status,unavailable_reason,cutoff_midpoint_at,cutoff_midpoint,target_midpoint_at,target_midpoint,data_schema_version,source_schema_version,content_sha256,resolved_at) SELECT replay_run_id,cutoff_at,horizon,actual_return_bps,availability_status,unavailable_reason,cutoff_midpoint_at,cutoff_midpoint,target_midpoint_at,target_midpoint,data_schema_version,source_schema_version,content_sha256,resolved_at FROM jsonb_to_recordset(%s::jsonb) x(replay_run_id text,cutoff_at timestamptz,horizon text,actual_return_bps float8,availability_status text,unavailable_reason text,cutoff_midpoint_at timestamptz,cutoff_midpoint float8,target_midpoint_at timestamptz,target_midpoint float8,data_schema_version text,source_schema_version text,content_sha256 text,resolved_at timestamptz)", (_canonical(values),))
+        cursor.execute("INSERT INTO public.atom_historical_replay_outcomes (replay_run_id,cutoff_at,horizon,actual_return_bps,availability_status,unavailable_reason,cutoff_midpoint_at,cutoff_midpoint,target_midpoint_at,target_midpoint,data_schema_version,source_schema_version,resolution_spec_version,outcome_source_dataset_digest,content_sha256,resolved_at) SELECT replay_run_id,cutoff_at,horizon,actual_return_bps,availability_status,unavailable_reason,cutoff_midpoint_at,cutoff_midpoint,target_midpoint_at,target_midpoint,data_schema_version,source_schema_version,resolution_spec_version,outcome_source_dataset_digest,content_sha256,resolved_at FROM jsonb_to_recordset(%s::jsonb) x(replay_run_id text,cutoff_at timestamptz,horizon text,actual_return_bps float8,availability_status text,unavailable_reason text,cutoff_midpoint_at timestamptz,cutoff_midpoint float8,target_midpoint_at timestamptz,target_midpoint float8,data_schema_version text,source_schema_version text,resolution_spec_version text,outcome_source_dataset_digest text,content_sha256 text,resolved_at timestamptz)", (_canonical(values),))
         return len(rows)
 
 @dataclass(frozen=True, slots=True)
@@ -237,13 +321,13 @@ def score(connection, replay_run_id: str, *, fetch_size: int = DEFAULT_BATCH_SIZ
     cursor.close()
     stream = connection.cursor(name="atom_h2c_scoring", binary=True)
     stream.itersize = fetch_size
-    stream.execute("SELECT f.quant_id,f.horizon,f.expected_return_bps,f.availability_status,o.actual_return_bps,o.availability_status,o.content_sha256 FROM public.atom_historical_replay_forecasts f LEFT JOIN public.atom_historical_replay_outcomes o USING (replay_run_id,cutoff_at,horizon) WHERE f.replay_run_id=%s ORDER BY f.quant_id,f.horizon,f.cutoff_at", (replay_run_id,))
+    stream.execute("SELECT f.quant_id,f.horizon,f.expected_return_bps,f.availability_status,o.actual_return_bps,o.availability_status,o.content_sha256,o.resolution_spec_version,o.outcome_source_dataset_digest FROM public.atom_historical_replay_forecasts f LEFT JOIN public.atom_historical_replay_outcomes o USING (replay_run_id,cutoff_at,horizon) WHERE f.replay_run_id=%s ORDER BY f.quant_id,f.horizon,f.cutoff_at", (replay_run_id,))
     states = {(q, h): [0, 0, 0, 0, 0.0, 0.0, 0.0] for q in QUANTS for h in HORIZONS}
     digest = hashlib.sha256()
     while True:
         batch = stream.fetchmany(fetch_size)
         if not batch: break
-        for q, h, predicted, fs, actual, os_, outcome_hash in batch:
+        for q, h, predicted, fs, actual, os_, outcome_hash, resolution_version, source_digest in batch:
             state = states[(q, h)]
             if fs != "AVAILABLE": continue
             state[0] += 1
@@ -255,7 +339,7 @@ def score(connection, replay_run_id: str, *, fetch_size: int = DEFAULT_BATCH_SIZ
             if q != Q3:
                 if _sign(predicted) == _sign(actual): state[2] += 1
                 else: state[3] += 1
-            digest.update(f"{q}|{h}|{predicted.hex()}|{actual.hex()}|{outcome_hash}\n".encode())
+            digest.update(f"{q}|{h}|{predicted.hex()}|{actual.hex()}|{outcome_hash}|{resolution_version}|{source_digest}\n".encode())
     stream.close()
     metrics = []
     for q in QUANTS:
@@ -313,8 +397,10 @@ def main() -> int:
             if session is None: raise RuntimeError("H2C_MANIFEST_MISSING")
             from .historical_replay_h1 import _session
             session_open, session_close = _session(session[0])
-            quotes = AlpacaHistoricalSipReader.from_environment().read_session(session_open=session_open, session_close=session_close)
+            reader = AlpacaHistoricalSipReader.from_environment()
+            quotes = reader.read_session(session_open=session_open, session_close=session_close)
             inserted = HistoricalOutcomeResolver(connection).resolve(args.replay_run_id, quotes,
+                retrieval_proof=reader.last_retrieval_proof,
                 expected_dataset_digest=args.dataset_digest,
                 expected_configuration_digest=args.configuration_digest,
                 expected_frame_count=args.frame_count)

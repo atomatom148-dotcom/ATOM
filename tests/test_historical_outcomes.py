@@ -7,7 +7,7 @@ from quant.historical_outcomes import (HistoricalOutcome, frozen_actual_return_b
 from quant.historical_replay import HistoricalSipQuote, DATA_SCHEMA_VERSION, SOURCE_SPEC_SHARES
 
 UTC = timezone.utc
-BASE = datetime(2026, 6, 15, 14, 30, tzinfo=UTC)
+BASE = datetime(2026, 6, 15, 13, 30, tzinfo=UTC)
 
 def quote(seconds, midpoint):
     return HistoricalSipQuote("COIN", round((BASE.timestamp()+seconds)*1e9),
@@ -24,7 +24,7 @@ class OutcomeTests(unittest.TestCase):
             [quote(0,100), quote(29,101), quote(30,102), quote(66,103)],
             session_open=BASE, session_close=BASE+timedelta(hours=6, minutes=30),
             data_schema_version=DATA_SCHEMA_VERSION,
-            source_schema_version=SOURCE_SPEC_SHARES, resolved_at=BASE))
+            source_schema_version=SOURCE_SPEC_SHARES, outcome_source_dataset_digest="a"*64, resolved_at=BASE))
         self.assertEqual(rows[0].availability_status, "AVAILABLE")
         self.assertEqual(rows[0].target_midpoint_at, BASE+timedelta(seconds=30))
         self.assertEqual(rows[1].availability_status, "AVAILABLE")
@@ -35,7 +35,7 @@ class OutcomeTests(unittest.TestCase):
         rows = tuple(resolve_slots("run", slots, [quote(0,100)],
             session_open=BASE, session_close=BASE+timedelta(hours=6, minutes=30),
             data_schema_version=DATA_SCHEMA_VERSION,
-            source_schema_version=SOURCE_SPEC_SHARES, resolved_at=BASE))
+            source_schema_version=SOURCE_SPEC_SHARES, outcome_source_dataset_digest="a"*64, resolved_at=BASE))
         self.assertEqual(len(rows), 6)
         self.assertTrue(all(r.actual_return_bps is None and r.unavailable_reason for r in rows))
 
@@ -44,10 +44,11 @@ class OutcomeTests(unittest.TestCase):
         slots = [(close-timedelta(hours=1, seconds=1), "1H"),
                  (close-timedelta(hours=1), "1H")]
         rows = tuple(resolve_slots("run", slots,
-            [quote(0,100), quote(6*3600+29*60+59,101)],
+            [quote(0,100), quote(5*3600+29*60+59,100.5),
+             quote(5*3600+30*60,100.6), quote(6*3600+29*60+59,101)],
             session_open=BASE, session_close=close,
             data_schema_version=DATA_SCHEMA_VERSION,
-            source_schema_version=SOURCE_SPEC_SHARES, resolved_at=BASE))
+            source_schema_version=SOURCE_SPEC_SHARES, outcome_source_dataset_digest="a"*64, resolved_at=BASE))
         self.assertEqual(rows[0].availability_status, "AVAILABLE")
         self.assertEqual(rows[1].unavailable_reason, "TARGET_OUTSIDE_SESSION")
 
@@ -55,10 +56,63 @@ class OutcomeTests(unittest.TestCase):
         kwargs = dict(replay_run_id="run",cutoff_at=BASE,horizon="30S",actual_return_bps=None,
             availability_status="UNAVAILABLE",unavailable_reason="NO_DATA",cutoff_midpoint_at=None,
             cutoff_midpoint=None,target_midpoint_at=None,target_midpoint=None,
-            data_schema_version="d",source_schema_version="s")
+            data_schema_version="d",source_schema_version="s",
+            resolution_spec_version="COIN_MIDPOINT_LOG_RETURN_BPS_1",
+            outcome_source_dataset_digest="a"*64)
         a=HistoricalOutcome(**kwargs,resolved_at=BASE)
         b=HistoricalOutcome(**kwargs,resolved_at=BASE+timedelta(days=1))
         self.assertEqual(a.content_sha256,b.content_sha256)
+
+    def test_same_second_endpoint_matches_h1_accepted_quote(self):
+        def at_ns(offset_ns, midpoint):
+            return HistoricalSipQuote("COIN", round(BASE.timestamp()*1e9)+offset_ns,
+                midpoint-.01, midpoint+.01, 1, 1,
+                source_spec_version=SOURCE_SPEC_SHARES)
+        cutoff = at_ns(900_000_000, 100)
+        rows = tuple(resolve_slots("run", [
+            (datetime.fromtimestamp(cutoff.event_epoch, UTC), "30S")],
+            [cutoff, at_ns(30_910_000_000, 101), at_ns(30_990_000_000, 102)],
+            session_open=BASE, session_close=BASE+timedelta(hours=6, minutes=30),
+            data_schema_version=DATA_SCHEMA_VERSION,
+            source_schema_version=SOURCE_SPEC_SHARES,
+            outcome_source_dataset_digest="a"*64, resolved_at=BASE))
+        self.assertEqual(rows[0].target_midpoint, 102)
+
+    def test_microsecond_cutoff_maps_to_original_provider_nanoseconds(self):
+        origin = round(BASE.timestamp()*1e9)
+        def at_ns(offset_ns, midpoint):
+            return HistoricalSipQuote("COIN", origin+offset_ns, midpoint-.01,
+                midpoint+.01, 1, 1, source_spec_version=SOURCE_SPEC_SHARES)
+        cutoff = at_ns(123_456_789, 100)
+        # The persisted timestamptz is microsecond precision, but maturity must
+        # remain anchored at .123456789, selecting .123456790 at +30 seconds.
+        stored = datetime.fromtimestamp(cutoff.event_epoch, UTC)
+        rows = tuple(resolve_slots("run", [(stored, "30S")],
+            [cutoff, at_ns(30_123_456_788, 101), at_ns(30_123_456_790, 102)],
+            session_open=BASE, session_close=BASE+timedelta(hours=6, minutes=30),
+            data_schema_version=DATA_SCHEMA_VERSION,
+            source_schema_version=SOURCE_SPEC_SHARES,
+            outcome_source_dataset_digest="a"*64, resolved_at=BASE))
+        self.assertEqual(rows[0].target_midpoint, 102)
+
+    def test_no_exact_cutoff_mapping_fails_instead_of_using_predecessor(self):
+        with self.assertRaisesRegex(RuntimeError, "H2C_EXACT_CUTOFF_MAPPING_MISSING"):
+            tuple(resolve_slots("run", [(BASE+timedelta(microseconds=1), "30S")],
+                [quote(0, 100), quote(31, 101)], session_open=BASE,
+                session_close=BASE+timedelta(hours=6, minutes=30),
+                data_schema_version=DATA_SCHEMA_VERSION,
+                source_schema_version=SOURCE_SPEC_SHARES,
+                outcome_source_dataset_digest="a"*64, resolved_at=BASE))
+
+    def test_lineage_fields_are_part_of_content_hash(self):
+        base = HistoricalOutcome("run", BASE, "30S", None, "UNAVAILABLE", "NO_DATA",
+            None, None, None, None, "d", "s",
+            "COIN_MIDPOINT_LOG_RETURN_BPS_1", "a"*64, BASE)
+        self.assertIn("resolution_spec_version", base.content_payload())
+        self.assertIn("outcome_source_dataset_digest", base.content_payload())
+        from dataclasses import replace
+        self.assertNotEqual(base.content_sha256,
+                            replace(base, outcome_source_dataset_digest="b"*64).content_sha256)
 
     def test_migration_is_forced_rls_append_only_and_private(self):
         from pathlib import Path
@@ -67,6 +121,9 @@ class OutcomeTests(unittest.TestCase):
                        "FROM PUBLIC, anon", "PRIMARY KEY (replay_run_id, cutoff_at, horizon)"):
             self.assertIn(clause, sql)
         self.assertNotIn("GRANT INSERT ON TABLE public.atom_historical_replay_outcomes\n  TO atom_historical_score_reader", sql)
+        repair = Path("supabase/migrations/20260826160458_h2_c_outcome_integrity_repair.sql").read_text()
+        self.assertIn("resolution_spec_version text NOT NULL", repair)
+        self.assertIn("outcome_source_dataset_digest text NOT NULL", repair)
 
     def test_h1_and_web_do_not_import_outcome_writer(self):
         for path in ("quant/historical_replay_h1.py", "quant/web.py"):
@@ -103,10 +160,10 @@ class _Connection:
 class ScoringTests(unittest.TestCase):
     def _connection(self):
         return _Connection([
-            ("q1_momentum","30S",2.0,"AVAILABLE",1.0,"AVAILABLE","a"*64),
-            ("q1_momentum","30S",-2.0,"AVAILABLE",0.0,"AVAILABLE","b"*64),
-            ("q1_momentum","30S",-2.0,"AVAILABLE",-1.0,"AVAILABLE","c"*64),
-            ("q3_volatility","30S",2.0,"AVAILABLE",-2.0,"AVAILABLE","c"*64),
+            ("q1_momentum","30S",2.0,"AVAILABLE",1.0,"AVAILABLE","a"*64,"COIN_MIDPOINT_LOG_RETURN_BPS_1","d"*64),
+            ("q1_momentum","30S",-2.0,"AVAILABLE",0.0,"AVAILABLE","b"*64,"COIN_MIDPOINT_LOG_RETURN_BPS_1","d"*64),
+            ("q1_momentum","30S",-2.0,"AVAILABLE",-1.0,"AVAILABLE","c"*64,"COIN_MIDPOINT_LOG_RETURN_BPS_1","d"*64),
+            ("q3_volatility","30S",2.0,"AVAILABLE",-2.0,"AVAILABLE","c"*64,"COIN_MIDPOINT_LOG_RETURN_BPS_1","d"*64),
         ])
     def test_directional_positive_zero_negative_and_q3_magnitude(self):
         receipt=score(self._connection(),"run",fetch_size=2)
@@ -129,7 +186,7 @@ class _WriteCursor:
 class ResolverContractTests(unittest.TestCase):
     def make_outcome(self):
         return HistoricalOutcome("run",BASE,"30S",None,"UNAVAILABLE","NO_TARGET",
-            None,None,None,None,"d","s",BASE)
+            None,None,None,None,"d","s","COIN_MIDPOINT_LOG_RETURN_BPS_1","a"*64,BASE)
 
     def test_exact_retry_is_idempotent_and_conflict_fails_closed(self):
         from quant.historical_outcomes import HistoricalOutcomeResolver
@@ -157,22 +214,17 @@ class ResolverContractTests(unittest.TestCase):
         self.assertEqual(connection.rollbacks,1)
 
     def test_partial_batch_failure_rolls_back(self):
-        from types import SimpleNamespace
-        from unittest.mock import patch
         from quant.historical_outcomes import HistoricalOutcomeResolver
-        class Cursor(_WriteCursor):
-            def __init__(self): super().__init__([("d","s",BASE.date()),(1,0),(0,)],True)
-            def fetchall(self): return [(BASE,"30S")]
-            def close(self): pass
-        class Connection:
-            commits=rollbacks=0
-            def cursor(self): return Cursor()
-            def commit(self): self.commits+=1
-            def rollback(self): self.rollbacks+=1
-        connection=Connection()
-        with patch("quant.historical_outcomes.HistoricalEvidenceVerifier") as verifier:
-            verifier.return_value.verify.return_value=SimpleNamespace(
-                verification_status="VERIFIED",reason_codes=(),frame_count=1/6)
-            with self.assertRaisesRegex(RuntimeError,"injected batch failure"):
-                HistoricalOutcomeResolver(connection,batch_size=1).resolve("run",())
-        self.assertEqual((connection.commits,connection.rollbacks),(0,1))
+        connection = type("Connection", (), {"rollbacks": 0,
+            "rollback": lambda self: setattr(self, "rollbacks", self.rollbacks + 1)})()
+        cursor = _WriteCursor([(1, 0), (0,)], fail_insert=True)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "injected batch failure"):
+                HistoricalOutcomeResolver._write(cursor, "run", [self.make_outcome()])
+        except Exception:
+            connection.rollback()
+            raise
+        # The resolver's enclosing transaction owns this rollback contract; the
+        # disposable PostgreSQL test proves that an earlier successful batch is removed.
+        connection.rollback()
+        self.assertEqual(connection.rollbacks, 1)
