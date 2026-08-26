@@ -66,6 +66,9 @@ class PhaseECohortMetrics:
     bias_bps: float | None
     effective_n: int
     eligible: bool
+    evidence_window: str = "MOST_RECENT_GLOBAL"
+    evidence_window_limit: int = 65536
+    evidence_window_truncated: bool = False
 
 
 class EvidenceStore(Protocol):
@@ -352,6 +355,22 @@ class PostgresEvidenceStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
+                    WITH forecast_proofs AS MATERIALIZED (
+                        SELECT *
+                        FROM atom_v9_internal.read_legacy_evidence_publications(
+                            'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536
+                        )
+                    ),
+                    outcome_proofs AS MATERIALIZED (
+                        SELECT *
+                        FROM atom_v9_internal.read_legacy_evidence_publications_for_records(
+                            'DIRECTIONAL_OUTCOME', to_timestamp(%s),
+                            ARRAY(
+                                SELECT ids.record_id
+                                FROM forecast_proofs AS ids
+                            )
+                        )
+                    )
                     SELECT f.quant_id, f.formula_version, f.symbol, f.horizon,
                            count(*) AS forecast_count,
                            count(*) FILTER (
@@ -391,26 +410,17 @@ class PostgresEvidenceStore:
                            avg(f.forecast_bps - o.outcome_bps)
                                FILTER (WHERE f.maturity_epoch <= %s
                                       AND o.forecast_id IS NOT NULL
-                                      AND o.resolved_epoch <= %s) AS bias_bps
-                    FROM atom_v9_internal.read_legacy_evidence_publications(
-                        'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536
-                    ) AS fp
-                    JOIN LATERAL (
-                        SELECT *
-                        FROM forecasts AS f
-                        WHERE f.forecast_id=fp.record_id
-                    ) AS f ON true
-                    LEFT JOIN LATERAL (
-                        SELECT o.*
-                        FROM atom_v9_internal.read_legacy_evidence_publications(
-                            'DIRECTIONAL_OUTCOME', to_timestamp(%s), 65536
-                        ) AS op
-                        JOIN forecast_outcomes AS o
-                          ON o.forecast_id=op.record_id
-                        WHERE o.forecast_id=f.forecast_id
-                          AND o.resolved_epoch >= f.maturity_epoch
-                          AND o.resolved_epoch <= f.maturity_epoch + 5.0
-                    ) AS o ON true
+                                      AND o.resolved_epoch <= %s) AS bias_bps,
+                           bool_or(fp.window_truncated)
+                               AS evidence_window_truncated
+                    FROM forecast_proofs AS fp
+                    JOIN forecasts AS f ON f.forecast_id=fp.record_id
+                    LEFT JOIN outcome_proofs AS op
+                      ON op.record_id=f.forecast_id
+                    LEFT JOIN forecast_outcomes AS o
+                      ON o.forecast_id=op.record_id
+                     AND o.resolved_epoch >= f.maturity_epoch
+                     AND o.resolved_epoch <= f.maturity_epoch + 5.0
                     WHERE fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                     GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon
                     ORDER BY f.quant_id, f.formula_version, f.symbol,
@@ -425,19 +435,27 @@ class PostgresEvidenceStore:
                 rows = cursor.fetchall()
                 cursor.execute(
                     """
+                    WITH forecast_proofs AS MATERIALIZED (
+                        SELECT *
+                        FROM atom_v9_internal.read_legacy_evidence_publications(
+                            'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536
+                        )
+                    ),
+                    outcome_proofs AS MATERIALIZED (
+                        SELECT *
+                        FROM atom_v9_internal.read_legacy_evidence_publications_for_records(
+                            'DIRECTIONAL_OUTCOME', to_timestamp(%s),
+                            ARRAY(
+                                SELECT ids.record_id
+                                FROM forecast_proofs AS ids
+                            )
+                        )
+                    )
                     SELECT f.quant_id, f.formula_version, f.symbol, f.horizon,
                            f.cutoff_epoch, f.forecast_id
-                    FROM atom_v9_internal.read_legacy_evidence_publications(
-                        'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536
-                    ) AS fp
-                    JOIN LATERAL (
-                        SELECT *
-                        FROM forecasts AS f
-                        WHERE f.forecast_id=fp.record_id
-                    ) AS f ON true
-                    JOIN atom_v9_internal.read_legacy_evidence_publications(
-                        'DIRECTIONAL_OUTCOME', to_timestamp(%s), 65536
-                    ) AS op ON op.record_id=f.forecast_id
+                    FROM forecast_proofs AS fp
+                    JOIN forecasts AS f ON f.forecast_id=fp.record_id
+                    JOIN outcome_proofs AS op ON op.record_id=f.forecast_id
                     JOIN forecast_outcomes AS o
                       ON o.forecast_id=op.record_id
                     WHERE f.maturity_epoch <= %s
@@ -483,6 +501,9 @@ class PostgresEvidenceStore:
             eligible=effective_counts.get(
                 (str(row[0]), str(row[1]), str(row[2]), str(row[3])), 0,
             ) >= MIN_EFFECTIVE_N,
+            evidence_window_truncated=(
+                len(row) > 12 and bool(row[12])
+            ),
         ) for row in rows)
 
     def volatility_phase_e_cohorts(
@@ -496,6 +517,22 @@ class PostgresEvidenceStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
+                    WITH forecast_proofs AS MATERIALIZED (
+                        SELECT *
+                        FROM atom_v9_internal.read_legacy_evidence_publications(
+                            'VOLATILITY_FORECAST', to_timestamp(%s), 65536
+                        )
+                    ),
+                    outcome_proofs AS MATERIALIZED (
+                        SELECT *
+                        FROM atom_v9_internal.read_legacy_evidence_publications_for_records(
+                            'VOLATILITY_OUTCOME', to_timestamp(%s),
+                            ARRAY(
+                                SELECT ids.record_id
+                                FROM forecast_proofs AS ids
+                            )
+                        )
+                    )
                     SELECT f.quant_id, f.formula_version, f.symbol, f.horizon,
                            count(*) AS forecast_count,
                            count(*) FILTER (
@@ -527,26 +564,18 @@ class PostgresEvidenceStore:
                                f.forecast_volatility_bps - o.realized_move_bps
                            ) FILTER (WHERE f.maturity_epoch <= %s
                                       AND o.forecast_id IS NOT NULL
-                                      AND o.resolved_epoch <= %s) AS bias_bps
-                    FROM atom_v9_internal.read_legacy_evidence_publications(
-                        'VOLATILITY_FORECAST', to_timestamp(%s), 65536
-                    ) AS fp
-                    JOIN LATERAL (
-                        SELECT *
-                        FROM volatility_forecasts AS f
-                        WHERE f.forecast_id=fp.record_id
-                    ) AS f ON true
-                    LEFT JOIN LATERAL (
-                        SELECT o.*
-                        FROM atom_v9_internal.read_legacy_evidence_publications(
-                            'VOLATILITY_OUTCOME', to_timestamp(%s), 65536
-                        ) AS op
-                        JOIN volatility_forecast_outcomes AS o
-                          ON o.forecast_id=op.record_id
-                        WHERE o.forecast_id=f.forecast_id
-                          AND o.resolved_epoch >= f.maturity_epoch
-                          AND o.resolved_epoch <= f.maturity_epoch + 5.0
-                    ) AS o ON true
+                                      AND o.resolved_epoch <= %s) AS bias_bps,
+                           bool_or(fp.window_truncated)
+                               AS evidence_window_truncated
+                    FROM forecast_proofs AS fp
+                    JOIN volatility_forecasts AS f
+                      ON f.forecast_id=fp.record_id
+                    LEFT JOIN outcome_proofs AS op
+                      ON op.record_id=f.forecast_id
+                    LEFT JOIN volatility_forecast_outcomes AS o
+                      ON o.forecast_id=op.record_id
+                     AND o.resolved_epoch >= f.maturity_epoch
+                     AND o.resolved_epoch <= f.maturity_epoch + 5.0
                     WHERE fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                     GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon
                     ORDER BY f.quant_id, f.formula_version, f.symbol,
@@ -561,19 +590,28 @@ class PostgresEvidenceStore:
                 rows = cursor.fetchall()
                 cursor.execute(
                     """
+                    WITH forecast_proofs AS MATERIALIZED (
+                        SELECT *
+                        FROM atom_v9_internal.read_legacy_evidence_publications(
+                            'VOLATILITY_FORECAST', to_timestamp(%s), 65536
+                        )
+                    ),
+                    outcome_proofs AS MATERIALIZED (
+                        SELECT *
+                        FROM atom_v9_internal.read_legacy_evidence_publications_for_records(
+                            'VOLATILITY_OUTCOME', to_timestamp(%s),
+                            ARRAY(
+                                SELECT ids.record_id
+                                FROM forecast_proofs AS ids
+                            )
+                        )
+                    )
                     SELECT f.quant_id, f.formula_version, f.symbol, f.horizon,
                            f.cutoff_epoch, f.forecast_id
-                    FROM atom_v9_internal.read_legacy_evidence_publications(
-                        'VOLATILITY_FORECAST', to_timestamp(%s), 65536
-                    ) AS fp
-                    JOIN LATERAL (
-                        SELECT *
-                        FROM volatility_forecasts AS f
-                        WHERE f.forecast_id=fp.record_id
-                    ) AS f ON true
-                    JOIN atom_v9_internal.read_legacy_evidence_publications(
-                        'VOLATILITY_OUTCOME', to_timestamp(%s), 65536
-                    ) AS op ON op.record_id=f.forecast_id
+                    FROM forecast_proofs AS fp
+                    JOIN volatility_forecasts AS f
+                      ON f.forecast_id=fp.record_id
+                    JOIN outcome_proofs AS op ON op.record_id=f.forecast_id
                     JOIN volatility_forecast_outcomes AS o
                       ON o.forecast_id=op.record_id
                     WHERE f.maturity_epoch <= %s
@@ -619,6 +657,9 @@ class PostgresEvidenceStore:
             eligible=effective_counts.get(
                 (str(row[0]), str(row[1]), str(row[2]), str(row[3])), 0,
             ) >= MIN_EFFECTIVE_N,
+            evidence_window_truncated=(
+                len(row) > 12 and bool(row[12])
+            ),
         ) for row in rows)
 
 
