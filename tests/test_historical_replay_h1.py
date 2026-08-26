@@ -195,7 +195,7 @@ def test_h1_mathematical_digests_are_repeatable_and_exclude_timings_and_run_id()
     assert first.replay_run_id != second.replay_run_id
 
 
-def test_h1_rejects_an_interior_gap_over_five_seconds():
+def test_h1_valid_retrieval_proof_allows_gap_and_preserves_telemetry():
     opened, closed = _session()
     rows = [_quote("COIN", opened), _quote("QQQ", opened, bid=500.0)]
     rows.extend(
@@ -211,9 +211,9 @@ def test_h1_rejects_an_interior_gap_over_five_seconds():
         _canonical(*rows), enforce_preflight=True, preflight_only=True,
     )
 
-    assert report.data_status == "DATA_INCOMPLETE"
-    assert report.execution_stage == "PREFLIGHT_REJECTED"
-    assert "COIN_INTERQUOTE_GAP" in report.data_reason_codes
+    assert report.data_status == "DATA_COMPLETE"
+    assert report.execution_stage == "PREFLIGHT_ONLY"
+    assert report.data_reason_codes == ()
     coin = report.quote_coverage[0]
     assert coin.max_gap_ns == 6 * NANOSECONDS
     assert coin.max_gap_start_ns == int(opened.timestamp()) * NANOSECONDS
@@ -369,7 +369,8 @@ def test_h1_preflight_rejection_never_enters_clock_or_quant(monkeypatch):
     assert reader.calls == [(opened, closed)]
     assert report.execution_stage == "PREFLIGHT_REJECTED"
     assert report.data_status == "DATA_INCOMPLETE"
-    assert "COIN_INTERQUOTE_GAP" in report.data_reason_codes
+    assert "COIN_INTERQUOTE_GAP" not in report.data_reason_codes
+    assert "COIN_CLOSE_EDGE_GAP" in report.data_reason_codes
 
 
 def test_h1_preflight_only_accepts_complete_coverage_without_running_quant(
@@ -410,6 +411,43 @@ def test_h1_missing_retrieval_proof_fails_closed_before_replay(monkeypatch):
 
     assert report.execution_stage == "PREFLIGHT_REJECTED"
     assert report.data_reason_codes == ("RETRIEVAL_PROOF_MISSING",)
+
+
+@pytest.mark.parametrize("with_proof", (False, True))
+def test_h1_gap_does_not_override_missing_or_invalid_retrieval_proof(
+    with_proof,
+):
+    class GapProofReader(_Reader):
+        def read_session(self, **kwargs):
+            rows = super().read_session(**kwargs)
+            if with_proof:
+                self.last_retrieval_proof = replace(
+                    self.last_retrieval_proof, feed="iex",
+                )
+            return rows
+
+    opened, _closed = _session()
+    rows = list(_complete_five_second_rows())
+    rows = tuple(
+        row for row in rows
+        if not (row.symbol == "COIN" and
+                row.provider_event_ns == (
+                    int(opened.timestamp()) + 5
+                ) * NANOSECONDS)
+    )
+    report = run_h1_session(
+        reader=GapProofReader(rows, with_proof=with_proof),
+        session_open=opened, session_close=_session()[1],
+        replay_run_id="gap-invalid-proof", preflight_only=True,
+    )
+
+    assert report.execution_stage == "PREFLIGHT_REJECTED"
+    proof_reason = ("RETRIEVAL_PROOF_INVALID" if with_proof else
+                    "RETRIEVAL_PROOF_MISSING")
+    assert proof_reason in report.data_reason_codes
+    assert "COIN_INTERQUOTE_GAP" in report.data_reason_codes
+    assert report.quote_coverage[0].max_gap_ns == 10 * NANOSECONDS
+    assert report.quote_coverage[0].over_limit_gap_count == 1
 
 
 @pytest.mark.parametrize("change", (
@@ -1074,7 +1112,7 @@ def test_cli_fails_closed_when_session_data_is_incomplete(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["data_status"] == "DATA_INCOMPLETE"
     assert payload["execution_stage"] == "PREFLIGHT_REJECTED"
-    assert "COIN_INTERQUOTE_GAP" in payload["data_reason_codes"]
+    assert "COIN_INTERQUOTE_GAP" not in payload["data_reason_codes"]
     assert "COIN_CLOSE_EDGE_GAP" in payload["data_reason_codes"]
     coin = next(row for row in payload["quote_coverage"]
                 if row["symbol"] == "COIN")
