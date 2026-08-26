@@ -30,9 +30,14 @@ def test_bounded_publication_reader_is_indexed_capped_and_read_only():
         "017_bound_legacy_evidence_publication_reads.sql"
     ).read_text()
     assert "read_legacy_evidence_publications" in sql
+    assert "read_legacy_evidence_publications_for_records" in sql
     assert "legacy_evidence_publications_kind_observed_id_idx" in sql
     assert "p.commit_observed_at<=p_as_of" in sql
     assert "LEAST(GREATEST(p_limit, 0), 65536)" in sql
+    assert "window_truncated boolean" in sql
+    assert "LIMIT COALESCE(LEAST(GREATEST(p_limit, 0), 65536), 0) + 1" in sql
+    assert "cardinality(p_record_ids), 0) <= 65536" in sql
+    assert "p.record_id=ANY" in sql
     assert "ROWS 65536" in sql
     assert "SECURITY DEFINER" in sql
     assert "SET search_path=pg_catalog" in sql
