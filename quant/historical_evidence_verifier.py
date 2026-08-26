@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
-import math
 import os
 import time
 from typing import Callable
@@ -13,7 +12,7 @@ from typing import Callable
 from quant.historical_evidence import HistoricalForecastEvidence, HistoricalReplayManifest
 
 
-VERIFIER_VERSION = "H2-B-3"
+VERIFIER_VERSION = "H2-B-4"
 DEFAULT_FETCH_SIZE = 2_000
 QUANTS = tuple(f"q{i}_{name}" for i, name in enumerate((
     "momentum", "mean_reversion", "volatility", "stat_arb", "microstructure",
@@ -82,21 +81,6 @@ def _as_forecast(row: tuple[object, ...]) -> tuple[HistoricalForecastEvidence, s
     return HistoricalForecastEvidence(**values), stored_hash
 
 
-def _forecast_hash_match(row: HistoricalForecastEvidence, stored_hash: str) -> str | None:
-    """Classify an exact or uniquely adjacent H2-A binary64 hash match."""
-    if row.content_sha256 == stored_hash:
-        return "exact"
-    value = row.expected_return_bps
-    if row.availability_status != "AVAILABLE" or value is None or not math.isfinite(value):
-        return None
-    adjacent_matches = sum(
-        replace(row, expected_return_bps=math.nextafter(value, direction)).content_sha256
-        == stored_hash
-        for direction in (-math.inf, math.inf)
-    )
-    return "one_ulp_legacy" if adjacent_matches == 1 else None
-
-
 class HistoricalEvidenceVerifier:
     """Verify immutable H2-A rows using SELECT statements and ``fetchmany`` only."""
 
@@ -160,7 +144,12 @@ class HistoricalEvidenceVerifier:
             # A named psycopg cursor is a PostgreSQL server-side portal.  Both
             # itersize and explicit fetchmany calls cap client-side transfer;
             # the 808,488-row result is never materialized by the client.
-            forecast_cursor = self.connection.cursor(name="atom_h2b_forecasts")
+            # Binary result format is essential here: H2-A hashed the original
+            # IEEE-754 binary64 value, while PostgreSQL's text float8 rendering
+            # can be rounded according to extra_float_digits before psycopg
+            # parses it back into a Python float.
+            forecast_cursor = self.connection.cursor(
+                name="atom_h2b_forecasts", binary=True)
             forecast_cursor.itersize = self.fetch_size
             quant_order = "CASE quant_id " + " ".join(
                 f"WHEN '{quant}' THEN {index}" for index, quant in enumerate(QUANTS)
@@ -206,11 +195,8 @@ class HistoricalEvidenceVerifier:
                         if manifest is not None and (row.data_schema_version != manifest.data_schema_version or
                                                      row.source_schema_version != manifest.source_schema_version):
                             reasons.add("MISSING_LINEAGE_OR_VERSION")
-                        hash_match = _forecast_hash_match(row, stored_hash)
-                        if hash_match == "exact":
+                        if row.content_sha256 == stored_hash:
                             exact_hash_matches += 1
-                        elif hash_match == "one_ulp_legacy":
-                            one_ulp_legacy_matches += 1
                         else:
                             reasons.add("FORECAST_HASH_MISMATCH")
                         artifact.update(stored_hash.encode("ascii"))
