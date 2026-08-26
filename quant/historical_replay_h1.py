@@ -710,14 +710,23 @@ def run_h1_session(
         )
         for symbol, rows in by_symbol.items()
     )
-    proof_reasons = (() if _retrieval_proof_valid(
+    retrieval_proof_valid = _retrieval_proof_valid(
         retrieval_proof, open_ns=open_ns, close_ns=close_ns,
         retained_count=len(quotes),
-    ) else (("RETRIEVAL_PROOF_MISSING",) if retrieval_proof is None else
-            ("RETRIEVAL_PROOF_INVALID",)))
+    )
+    proof_reasons = (
+        () if retrieval_proof_valid else
+        (("RETRIEVAL_PROOF_MISSING",) if retrieval_proof is None else
+         ("RETRIEVAL_PROOF_INVALID",))
+    )
     coverage_reasons = _coverage_reason_codes(
         quote_coverage, maximum_gap_ns=maximum_gap_ns,
     )
+    if retrieval_proof_valid:
+        coverage_reasons = tuple(
+            reason for reason in coverage_reasons
+            if reason != "COIN_INTERQUOTE_GAP"
+        )
     endpoint_reasons = (() if (*proof_reasons, *coverage_reasons) else
                         _endpoint_reason_codes(
         by_symbol["COIN"], open_ns=open_ns, close_ns=close_ns,
