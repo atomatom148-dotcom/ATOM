@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 import math
 
@@ -49,7 +50,16 @@ def calculate_cross_asset(
     if not math.isfinite(cutoff_epoch):
         return None
     coin = coin_history.within(cutoff=cutoff_epoch, lookback=LOOKBACK_SECONDS)
-    qqq = tuple(item for item in qqq_history.observations if item.event_epoch <= cutoff_epoch)
+    qqq_observations = qqq_history.observations
+    qqq_start = bisect_left(
+        qqq_observations,
+        coin[0].event_epoch - MAX_QQQ_AGE_SECONDS if coin else cutoff_epoch,
+        key=lambda item: item.event_epoch,
+    )
+    qqq_end = bisect_right(
+        qqq_observations, cutoff_epoch, key=lambda item: item.event_epoch,
+    )
+    qqq = qqq_observations[qqq_start:qqq_end]
     pairs = _synchronize(coin, qqq)
     if not pairs or pairs[-1][0].event_epoch != cutoff_epoch:
         return None
