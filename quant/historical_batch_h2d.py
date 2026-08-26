@@ -70,7 +70,7 @@ def _run_json(command: list[str], stage: str) -> dict:
     return payload
 
 
-def _existing_run_ids(day: date) -> tuple[str, ...]:
+def _existing_manifests(day: date) -> tuple[dict[str, object], ...]:
     url = os.environ.get("HISTORICAL_EVIDENCE_DATABASE_URL")
     if not url:
         raise RuntimeError("HISTORICAL_EVIDENCE_DATABASE_URL is required")
@@ -79,9 +79,12 @@ def _existing_run_ids(day: date) -> tuple[str, ...]:
         connection.read_only = True
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT replay_run_id FROM public.atom_historical_replay_runs "
+                "SELECT replay_run_id,dataset_digest,configuration_digest,frame_count "
+                "FROM public.atom_historical_replay_runs "
                 "WHERE historical_session=%s ORDER BY replay_run_id", (day,))
-            return tuple(row[0] for row in cursor.fetchall())
+            return tuple({"replay_run_id": row[0], "dataset_digest": row[1],
+                          "configuration_digest": row[2], "frame_count": row[3]}
+                         for row in cursor.fetchall())
 
 
 def _digest(payload: object) -> str:
@@ -89,10 +92,9 @@ def _digest(payload: object) -> str:
                                      default=str).encode()).hexdigest()
 
 
-def execute(days: tuple[date, ...], *, dataset_digest: str,
-            configuration_digest: str, continue_on_failure: bool,
+def execute(days: tuple[date, ...], *, continue_on_failure: bool,
             run_json: Callable[[list[str], str], dict] = _run_json,
-            existing: Callable[[date], tuple[str, ...]] = _existing_run_ids) -> dict:
+            existing: Callable[[date], tuple[dict[str, object], ...]] = _existing_manifests) -> dict:
     receipt: dict[str, object] = {
         "orchestrator_version": H2D_VERSION,
         "requested_dates": [day.isoformat() for day in days],
@@ -112,31 +114,50 @@ def execute(days: tuple[date, ...], *, dataset_digest: str,
                 receipt["rejected"].append(day.isoformat())
                 receipt["sessions"].append(item)
                 continue
-            known = existing(day)
-            if len(known) > 1:
+            manifests = existing(day)
+            if len(manifests) > 1:
                 raise StageFailure("EXISTING", "CONFLICTING_SESSION_RUNS")
-            run_id = known[0] if known else f"h2d-{day.isoformat()}-{dataset_digest[:12]}-{configuration_digest[:12]}"
+            known = bool(manifests)
+            manifest = manifests[0] if known else None
+            run_id = str(manifest["replay_run_id"]) if manifest else f"h2d-{day.isoformat()}"
             item["replay_run_id"] = run_id
             receipt["replay_run_ids"].append(run_id)
             if not known:
                 started = time.monotonic()
                 h1 = run_json([py, "-m", "quant.historical_replay_h1", day.isoformat(),
-                    "--run-id", run_id, "--persist-certified"], "H1")
+                    "--run-id", run_id, "--max-interior-gap-seconds", "5",
+                    "--persist-certified"], "H1")
                 stages["h1_seconds"] = round(time.monotonic() - started, 6)
                 if h1.get("execution_stage") != "REPLAY_COMPLETE" or h1.get("data_status") != "CERTIFIED":
                     raise StageFailure("H1", "NOT_CERTIFIED", h1)
-                item["forecast_count"] = int(h1.get("frame_count", 0)) * 72
+                manifest = {key: h1.get(key) for key in
+                            ("dataset_digest", "configuration_digest", "frame_count")}
+            dataset_digest = manifest.get("dataset_digest")
+            configuration_digest = manifest.get("configuration_digest")
+            frame_count = manifest.get("frame_count")
+            if (not isinstance(dataset_digest, str) or not isinstance(configuration_digest, str)
+                    or isinstance(frame_count, bool) or not isinstance(frame_count, int)
+                    or frame_count < 1):
+                raise StageFailure("MANIFEST", "INVALID_SESSION_LINEAGE")
             started = time.monotonic()
             verified = run_json([py, "-m", "quant.historical_evidence_verifier", run_id,
-                "--dataset-digest", dataset_digest, "--configuration-digest", configuration_digest], "H2B")
+                "--dataset-digest", dataset_digest, "--configuration-digest", configuration_digest,
+                "--frame-count", str(frame_count)], "H2B")
             stages["h2b_seconds"] = round(time.monotonic() - started, 6)
-            if verified.get("verification_status") != "VERIFIED":
-                raise StageFailure("H2B", "NOT_VERIFIED", verified)
+            expected_forecasts = frame_count * 72
+            if (verified.get("verification_status") != "VERIFIED" or
+                    verified.get("manifest_count") != 1 or
+                    verified.get("frame_count") != frame_count or
+                    verified.get("forecast_count") != expected_forecasts or
+                    verified.get("quant_count") != 12 or
+                    verified.get("horizon_count") != 6 or
+                    verified.get("dataset_digest") != dataset_digest or
+                    verified.get("configuration_digest") != configuration_digest):
+                raise StageFailure("H2B", "VERIFIED_RECEIPT_MISMATCH", verified)
             item.update(forecast_count=verified.get("forecast_count"),
                         dataset_digest=verified.get("dataset_digest"),
                         configuration_digest=verified.get("configuration_digest"),
                         forecast_hash_summary=verified.get("stored_content_hash_summary"))
-            frame_count = verified["frame_count"]
             started = time.monotonic()
             outcome = run_json([py, "-m", "quant.historical_outcomes", "resolve-outcomes", run_id,
                 "--dataset-digest", dataset_digest, "--configuration-digest", configuration_digest,
@@ -145,6 +166,11 @@ def execute(days: tuple[date, ...], *, dataset_digest: str,
             started = time.monotonic()
             scoring = run_json([py, "-m", "quant.historical_outcomes", "score", run_id], "H2C_SCORE")
             stages["scoring_seconds"] = round(time.monotonic() - started, 6)
+            if (len(scoring.get("metrics", ())) != 72 or
+                    scoring.get("forecast_count") != expected_forecasts or
+                    scoring.get("dataset_digest") != dataset_digest or
+                    scoring.get("configuration_digest") != configuration_digest):
+                raise StageFailure("H2C_SCORE", "SCORING_RECEIPT_MISMATCH", scoring)
             state = "SKIPPED_VERIFIED" if known else "COMPLETED"
             item.update(state=state, outcome_count=scoring.get("outcome_count"),
                         metrics_count=len(scoring.get("metrics", ())),
@@ -181,8 +207,6 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--persist-certified", action="store_true",
                         help="required explicit authorization for append-only writes")
     parser.add_argument("--continue-on-failure", action="store_true")
-    parser.add_argument("--dataset-digest", required=True)
-    parser.add_argument("--configuration-digest", required=True)
     args = parser.parse_args(tuple(argv) if argv is not None else None)
     if not args.persist_certified:
         parser.error("--persist-certified is required")
@@ -191,9 +215,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                                maximum=args.max_sessions)
     except ValueError as error:
         parser.error(str(error))
-    output = execute(days, dataset_digest=args.dataset_digest,
-                     configuration_digest=args.configuration_digest,
-                     continue_on_failure=args.continue_on_failure)
+    output = execute(days, continue_on_failure=args.continue_on_failure)
     print(json.dumps(output, sort_keys=True, separators=(",", ":")))
     return 1 if output["overall_status"] == "FAILED" else 0
 
