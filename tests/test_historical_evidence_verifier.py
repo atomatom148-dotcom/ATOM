@@ -120,7 +120,7 @@ def test_valid_receipt_is_deterministic_and_complete():
     assert receipt.reason_codes == ()
     assert (receipt.frame_count, receipt.forecast_count, receipt.quant_count,
             receipt.horizon_count, receipt.unavailable_null_count) == (1, 72, 12, 6, 72)
-    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (72, 0)
+    assert (receipt.exact_hash_match_count, receipt.signed_zero_legacy_match_count) == (72, 0)
     assert receipt.verified_at == "2026-08-26T00:00:00+00:00"
     assert db.max_fetch == 17
     assert db.cursors[0].name is None
@@ -241,7 +241,23 @@ def test_available_exact_hash_match_is_accepted_without_legacy_repair():
     receipt, _ = verify(evidence)
 
     assert receipt.verification_status == "VERIFIED"
-    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (72, 0)
+    assert (receipt.exact_hash_match_count, receipt.signed_zero_legacy_match_count) == (72, 0)
+
+
+@pytest.mark.parametrize("database_value,hashed_value", [(0.0, -0.0), (-0.0, 0.0)])
+def test_opposite_signed_zero_hash_is_the_only_legacy_match(database_value, hashed_value):
+    assert math.copysign(1.0, database_value) != math.copysign(1.0, hashed_value)
+    evidence = replace_slot(
+        list(rows()), available_forecast(database_value, hashed_value))
+
+    receipt, _ = verify(evidence)
+
+    assert receipt.verification_status == "VERIFIED"
+    assert receipt.reason_codes == ()
+    assert (receipt.exact_hash_match_count,
+            receipt.signed_zero_legacy_match_count,
+            receipt.forecast_count) == (71, 1, 72)
+    assert receipt.exact_hash_match_count + receipt.signed_zero_legacy_match_count == receipt.forecast_count
 
 
 def test_negative_direction_one_ulp_hash_is_rejected():
@@ -254,7 +270,7 @@ def test_negative_direction_one_ulp_hash_is_rejected():
 
     assert receipt.verification_status == "REJECTED"
     assert "FORECAST_HASH_MISMATCH" in receipt.reason_codes
-    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (71, 0)
+    assert (receipt.exact_hash_match_count, receipt.signed_zero_legacy_match_count) == (71, 0)
 
 
 def test_positive_direction_one_ulp_hash_is_rejected():
@@ -266,7 +282,7 @@ def test_positive_direction_one_ulp_hash_is_rejected():
 
     assert receipt.verification_status == "REJECTED"
     assert "FORECAST_HASH_MISMATCH" in receipt.reason_codes
-    assert (receipt.exact_hash_match_count, receipt.one_ulp_legacy_match_count) == (71, 0)
+    assert (receipt.exact_hash_match_count, receipt.signed_zero_legacy_match_count) == (71, 0)
 
 
 def test_two_ulp_forecast_hash_mismatch_rejects():
@@ -305,6 +321,25 @@ def test_altered_non_numeric_field_with_adjacent_float_is_rejected():
 
     assert receipt.verification_status == "REJECTED"
     assert "FORECAST_HASH_MISMATCH" in receipt.reason_codes
+
+
+@pytest.mark.parametrize("field,value", [
+    ("formula_version", "altered-lineage"),
+    ("availability_status", "ALTERED"),
+    ("quant_id", QUANTS[2]),
+])
+def test_signed_zero_repair_rejects_altered_lineage_status_or_identity(field, value):
+    replacement = list(available_forecast(0.0, -0.0))
+    replacement[FORECAST_COLUMNS.index(field)] = value
+    evidence = list(rows())
+    target = next(index for index, row in enumerate(evidence)
+                  if (row[1], row[2], row[3]) == (NOW, QUANTS[1], "15M"))
+    evidence[target] = tuple(replacement)
+
+    receipt, _ = verify(evidence, [manifest(evidence)])
+
+    assert receipt.verification_status == "REJECTED"
+    assert receipt.signed_zero_legacy_match_count == 0
 
 
 @pytest.mark.parametrize("option", [{"interrupt": True}, {"partial": 17}])
