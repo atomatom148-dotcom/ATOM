@@ -44,6 +44,8 @@ def nested_cross_asset_reference(coin_history, qqq_history, *, cutoff_epoch):
     qqq = tuple(item for item in qqq_history.observations
                 if item.event_epoch <= cutoff_epoch)
     pairs = _synchronize(coin, qqq)
+    if not pairs or pairs[-1][0].event_epoch != cutoff_epoch:
+        return None
     returns = tuple(
         (current[0].event_epoch,
          math.log(current[0].midpoint / previous[0].midpoint),
@@ -145,7 +147,7 @@ class RelativeValueTests(unittest.TestCase):
 
 
 class CrossAssetTests(unittest.TestCase):
-    def test_linear_lag_lookup_is_exactly_equal_to_frozen_nested_reference(self):
+    def test_bounded_qqq_window_is_exactly_equal_to_prior_implementation(self):
         epochs = [0.0]
         for index in range(1, 700):
             epochs.append(epochs[-1] + 1.0 + 0.2 * (index % 7))
@@ -166,10 +168,26 @@ class CrossAssetTests(unittest.TestCase):
         )
         cutoff = epochs[-1]
 
-        self.assertEqual(
-            calculate_cross_asset(coin, qqq, cutoff_epoch=cutoff),
-            nested_cross_asset_reference(coin, qqq, cutoff_epoch=cutoff),
+        future_qqq = MidpointHistory(qqq.observations + (
+            MidpointObservation(cutoff + 1.0, qqq_prices[-1] * 1.01),
+        ))
+        cases = (
+            (coin, qqq, cutoff),
+            (coin, future_qqq, cutoff),
+            (coin, qqq, cutoff + 1.0),
+            (MidpointHistory(coin.observations[-20:]), qqq, cutoff),
         )
+        for case_coin, case_qqq, case_cutoff in cases:
+            with self.subTest(cutoff=case_cutoff, coin_count=case_coin.count,
+                              qqq_count=case_qqq.count):
+                self.assertEqual(
+                    calculate_cross_asset(
+                        case_coin, case_qqq, cutoff_epoch=case_cutoff,
+                    ),
+                    nested_cross_asset_reference(
+                        case_coin, case_qqq, cutoff_epoch=case_cutoff,
+                    ),
+                )
 
     def test_fixed_coefficients_sign_scaling_and_immutability(self):
         q_returns = [0.001 + i * 0.00001 for i in range(32)]
