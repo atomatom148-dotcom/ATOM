@@ -369,7 +369,10 @@ class LiveMarketState:
             else:
                 self._ndx_history = updated
             self._refresh_g2(event_epoch)
-            if not self._coin_cycle_pending and self._can_publish():
+            # BTC and NDX are independent display inputs.  Keep them visible
+            # while a replacement process waits for the evidence-writer lock;
+            # ownership gates COIN/evidence publication, not benchmark data.
+            if not self._coin_cycle_pending:
                 self._publication = replace(
                     self._publication, cross_asset_state=self._g2_state,
                 )

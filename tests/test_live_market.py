@@ -466,6 +466,24 @@ class LiveMarketTests(unittest.TestCase):
         self.assertTrue(all(values == [None] * 6 for values in after["final_numbers"].values()))
         self.assertEqual(after["options_data"], {"expiration": None, "calls": [], "puts": []})
 
+    def test_btc_remains_visible_while_evidence_owner_is_waiting(self):
+        state = LiveMarketState(
+            clock=lambda: 1001.0,
+            evidence_acceptance_ready=lambda: False,
+        )
+        self.assertTrue(state.accept_g2_price(
+            asset="BTC", price=60_000.0, event_epoch=1000.0,
+            max_age_seconds=MAX_BTC_AGE_SECONDS,
+        ))
+        state.metrics.set_status("btc_source_status", "LIVE")
+
+        payload = request_json(create_app(state=state, clock=lambda: 1002.0))
+
+        self.assertEqual(payload["market"]["btc"], 60_000.0)
+        self.assertEqual(payload["market"]["btc_display"], 60_000.0)
+        self.assertEqual(payload["market"]["btc_source_status"], "LIVE")
+        self.assertIsNone(payload["market"]["symbol"])
+
     def test_alpaca_event_timestamp_parser(self):
         self.assertEqual(parse_alpaca_timestamp("1970-01-01T00:00:01Z"), 1.0)
 
