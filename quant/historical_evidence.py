@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
-from typing import Iterable
+from pathlib import Path
+import tempfile
+from typing import Iterable, Iterator
 
 
 HISTORICAL_EVIDENCE_SCHEMA_VERSION = "H2-A-1"
@@ -93,6 +95,53 @@ class HistoricalReplayManifest:
         return _sha256(payload)
 
 
+class HistoricalEvidenceSpool:
+    """Disk-backed append-only collection that bounds full-session memory."""
+
+    def __init__(self, *, directory: str | None = None):
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="atom-h2a-", suffix=".jsonl",
+            dir=directory, delete=False,
+        )
+        self._handle = handle
+        self.path = Path(handle.name)
+        self._count = 0
+
+    def append(self, row: HistoricalForecastEvidence) -> None:
+        if self._handle.closed:
+            raise RuntimeError("historical evidence spool is closed")
+        self._handle.write(_canonical(row.payload()) + "\n")
+        self._count += 1
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __iter__(self) -> Iterator[HistoricalForecastEvidence]:
+        self._handle.flush()
+        with self.path.open(encoding="utf-8") as rows:
+            for encoded in rows:
+                payload = json.loads(encoded)
+                for field in ("cutoff_at", "source_as_of", "available_at"):
+                    payload[field] = datetime.fromisoformat(payload[field])
+                yield HistoricalForecastEvidence(**payload)
+
+    @property
+    def payload_bytes(self) -> int:
+        self._handle.flush()
+        return self.path.stat().st_size
+
+    def close(self) -> None:
+        if not self._handle.closed:
+            self._handle.close()
+        self.path.unlink(missing_ok=True)
+
+    def __enter__(self) -> HistoricalEvidenceSpool:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
 def artifact_sha256(rows: Iterable[HistoricalForecastEvidence]) -> str:
     digest = hashlib.sha256()
     for row in rows:
@@ -100,22 +149,29 @@ def artifact_sha256(rows: Iterable[HistoricalForecastEvidence]) -> str:
     return digest.hexdigest()
 
 
-def build_manifest(report, rows: tuple[HistoricalForecastEvidence, ...], *,
+def build_manifest(report, rows: Iterable[HistoricalForecastEvidence], *,
                    git_commit: str) -> HistoricalReplayManifest:
     if report.execution_stage != "REPLAY_COMPLETE" or report.data_status != "CERTIFIED":
         raise ValueError("only REPLAY_COMPLETE + CERTIFIED runs may persist")
-    available = sum(row.availability_status == "AVAILABLE" for row in rows)
-    unavailable = len(rows) - available
+    row_count = available = 0
+    source_versions: set[str] = set()
+    data_versions: set[str] = set()
+    artifact = hashlib.sha256()
+    for row in rows:
+        row_count += 1
+        available += row.availability_status == "AVAILABLE"
+        source_versions.add(row.source_schema_version)
+        data_versions.add(row.data_schema_version)
+        artifact.update(row.content_sha256.encode("ascii"))
+    unavailable = row_count - available
     timings = asdict(report.timings)
     family_timings = timings.pop("family_seconds")
-    source_versions = {row.source_schema_version for row in rows}
-    data_versions = {row.data_schema_version for row in rows}
-    if len(rows) != report.frame_count * 72 or len(source_versions) != 1 or len(data_versions) != 1:
+    if row_count != report.frame_count * 72 or len(source_versions) != 1 or len(data_versions) != 1:
         raise ValueError("historical evidence must contain exactly 72 lineage-consistent slots per frame")
     return HistoricalReplayManifest(
         report.replay_run_id, report.historical_session, report.execution_stage,
         report.data_status, git_commit, report.configuration_digest,
-        report.dataset_digest, report.session_digest, artifact_sha256(rows),
+        report.dataset_digest, report.session_digest, artifact.hexdigest(),
         report.frame_count, dict(report.quote_counts), available, unavailable,
         timings, family_timings, data_versions.pop(), source_versions.pop(),
         datetime.now(timezone.utc),
@@ -131,8 +187,18 @@ class HistoricalEvidenceWriter:
         self.connection = connection
         self.batch_size = batch_size
 
+    def _batches(self, forecasts: Iterable[HistoricalForecastEvidence]):
+        batch = []
+        for forecast in forecasts:
+            batch.append(forecast)
+            if len(batch) == self.batch_size:
+                yield tuple(batch)
+                batch.clear()
+        if batch:
+            yield tuple(batch)
+
     def persist(self, manifest: HistoricalReplayManifest,
-                forecasts: tuple[HistoricalForecastEvidence, ...]) -> int:
+                forecasts: Iterable[HistoricalForecastEvidence]) -> int:
         if manifest.execution_stage != "REPLAY_COMPLETE" or manifest.certification_status != "CERTIFIED":
             raise ValueError("only REPLAY_COMPLETE + CERTIFIED runs may persist")
         if artifact_sha256(forecasts) != manifest.artifact_sha256:
@@ -145,9 +211,9 @@ class HistoricalEvidenceWriter:
             if existing is not None:
                 if existing[0] != manifest.content_sha256:
                     raise RuntimeError("HISTORICAL_REPLAY_MANIFEST_CONFLICT")
-                matched = identical = 0
-                for offset in range(0, len(forecasts), self.batch_size):
-                    batch = forecasts[offset:offset + self.batch_size]
+                matched = identical = expected_count = 0
+                for batch in self._batches(forecasts):
+                    expected_count += len(batch)
                     expected = [{"cutoff_at": row.cutoff_at,
                                  "quant_id": row.quant_id,
                                  "horizon": row.horizon,
@@ -157,18 +223,19 @@ class HistoricalEvidenceWriter:
                     counts = cursor.fetchone()
                     matched += counts[0]
                     identical += counts[1]
-                if (matched, identical) != (len(forecasts), len(forecasts)):
+                if (matched, identical) != (expected_count, expected_count):
                     raise RuntimeError("HISTORICAL_REPLAY_FORECAST_CONFLICT")
                 self.connection.commit()
                 return 0
             payload = manifest.payload() | {"content_sha256": manifest.content_sha256}
             cursor.execute("INSERT INTO public.atom_historical_replay_runs (replay_run_id,historical_session,execution_stage,certification_status,git_commit,configuration_digest,dataset_digest,session_digest,artifact_sha256,frame_count,quote_counts,available_observation_count,unavailable_observation_count,stage_timings,family_timings,data_schema_version,source_schema_version,created_at,content_sha256) SELECT replay_run_id,historical_session,execution_stage,certification_status,git_commit,configuration_digest,dataset_digest,session_digest,artifact_sha256,frame_count,quote_counts,available_observation_count,unavailable_observation_count,stage_timings,family_timings,data_schema_version,source_schema_version,created_at,content_sha256 FROM jsonb_to_record(%s::jsonb) AS x(replay_run_id text,historical_session date,execution_stage text,certification_status text,git_commit text,configuration_digest text,dataset_digest text,session_digest text,artifact_sha256 text,frame_count bigint,quote_counts jsonb,available_observation_count bigint,unavailable_observation_count bigint,stage_timings jsonb,family_timings jsonb,data_schema_version text,source_schema_version text,created_at timestamptz,content_sha256 text)", (_canonical(payload),))
-            for offset in range(0, len(forecasts), self.batch_size):
-                batch = forecasts[offset:offset + self.batch_size]
+            inserted = 0
+            for batch in self._batches(forecasts):
                 values = [row.payload() | {"content_sha256": row.content_sha256} for row in batch]
                 cursor.execute("INSERT INTO public.atom_historical_replay_forecasts (replay_run_id,cutoff_at,quant_id,horizon,expected_return_bps,availability_status,unavailable_reason,formula_version,numerical_type,source_as_of,available_at,data_schema_version,source_schema_version,content_sha256) SELECT replay_run_id,cutoff_at,quant_id,horizon,expected_return_bps,availability_status,unavailable_reason,formula_version,numerical_type,source_as_of,available_at,data_schema_version,source_schema_version,content_sha256 FROM jsonb_to_recordset(%s::jsonb) AS x(replay_run_id text,cutoff_at timestamptz,quant_id text,horizon text,expected_return_bps double precision,availability_status text,unavailable_reason text,formula_version text,numerical_type text,source_as_of timestamptz,available_at timestamptz,data_schema_version text,source_schema_version text,content_sha256 text)", (_canonical(values),))
+                inserted += len(batch)
             self.connection.commit()
-            return 1 + len(forecasts)
+            return 1 + inserted
         except Exception:
             self.connection.rollback()
             raise

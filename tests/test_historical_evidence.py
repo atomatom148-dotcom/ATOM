@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from quant.historical_evidence import (
-    HistoricalEvidenceWriter, HistoricalForecastEvidence, build_manifest,
+    HistoricalEvidenceSpool, HistoricalEvidenceWriter,
+    HistoricalForecastEvidence, build_manifest,
 )
 from quant.historical_replay_h1 import ReplayTimings
 
@@ -89,6 +90,33 @@ def test_certified_run_is_accepted_in_bounded_batches_and_keeps_all_72_slots():
     assert manifest.unavailable_observation_count == 72
     assert all(row.expected_return_bps is None for row in rows)
     assert connection.commits == 1 and connection.rollbacks == 0
+
+
+def test_disk_spool_is_reiterable_and_removes_its_private_temporary_file():
+    rows = _rows()
+    with HistoricalEvidenceSpool() as spool:
+        assert spool.path.stat().st_mode & 0o777 == 0o600
+        for row in rows:
+            spool.append(row)
+        path = spool.path
+        assert len(spool) == 72 and spool.payload_bytes > 0
+        assert tuple(spool) == rows
+        assert tuple(spool) == rows
+    assert not path.exists()
+
+
+def test_disk_spool_persists_in_bounded_batches_without_materializing_session():
+    with HistoricalEvidenceSpool() as spool:
+        for row in _rows():
+            spool.append(row)
+        manifest = build_manifest(_report(), spool, git_commit="93e63bf")
+        connection = Connection()
+        assert HistoricalEvidenceWriter(connection, batch_size=25).persist(
+            manifest, spool,
+        ) == 73
+        inserts = [sql for sql, _ in connection.statements
+                   if "INSERT INTO public.atom_historical_replay_forecasts" in sql]
+        assert len(inserts) == 3
 
 
 def test_exact_retry_is_idempotent():

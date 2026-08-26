@@ -1345,33 +1345,39 @@ def main(argv: Iterable[str] | None = None) -> int:
     reader = AlpacaHistoricalSipReader.from_environment()
     day = days[0]
     opened, closed = _session(day)
-    evidence = [] if arguments.persist_certified else None
-    report = run_h1_session(
-        reader=reader, session_open=opened, session_close=closed,
-        replay_run_id=arguments.run_id or f"h1-{day.isoformat()}",
-        preflight_only=arguments.preflight_only,
-        maximum_interior_gap_seconds=arguments.max_interior_gap_seconds,
-        forecast_evidence=evidence,
-    )
     if arguments.persist_certified:
-        if report.execution_stage != "REPLAY_COMPLETE" or report.data_status != "CERTIFIED":
-            print(json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":")))
-            return 2
-        database_url = os.environ.get("HISTORICAL_EVIDENCE_DATABASE_URL")
-        if not database_url:
-            parser.error("HISTORICAL_EVIDENCE_DATABASE_URL is required to persist")
-        import psycopg
-        from .historical_evidence import HistoricalEvidenceWriter, build_manifest
-        git_commit = arguments.git_commit or subprocess.run(
-            ("git", "rev-parse", "HEAD"), check=True, capture_output=True,
-            text=True,
-        ).stdout.strip()
-        manifest = build_manifest(report, tuple(evidence), git_commit=git_commit)
-        with psycopg.connect(database_url) as connection:
-            writes = HistoricalEvidenceWriter(connection).persist(
-                manifest, tuple(evidence),
-            )
-        report = replace(report, persistence_writes=writes)
+        from .historical_evidence import HistoricalEvidenceSpool
+        evidence_context = HistoricalEvidenceSpool()
+    else:
+        from contextlib import nullcontext
+        evidence_context = nullcontext(None)
+    with evidence_context as evidence:
+        report = run_h1_session(
+            reader=reader, session_open=opened, session_close=closed,
+            replay_run_id=arguments.run_id or f"h1-{day.isoformat()}",
+            preflight_only=arguments.preflight_only,
+            maximum_interior_gap_seconds=arguments.max_interior_gap_seconds,
+            forecast_evidence=evidence,
+        )
+        if arguments.persist_certified:
+            if report.execution_stage != "REPLAY_COMPLETE" or report.data_status != "CERTIFIED":
+                print(json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":")))
+                return 2
+            database_url = os.environ.get("HISTORICAL_EVIDENCE_DATABASE_URL")
+            if not database_url:
+                parser.error("HISTORICAL_EVIDENCE_DATABASE_URL is required to persist")
+            import psycopg
+            from .historical_evidence import HistoricalEvidenceWriter, build_manifest
+            git_commit = arguments.git_commit or subprocess.run(
+                ("git", "rev-parse", "HEAD"), check=True, capture_output=True,
+                text=True,
+            ).stdout.strip()
+            manifest = build_manifest(report, evidence, git_commit=git_commit)
+            with psycopg.connect(database_url) as connection:
+                writes = HistoricalEvidenceWriter(connection).persist(
+                    manifest, evidence,
+                )
+            report = replace(report, persistence_writes=writes)
     print(json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":")))
     passed = (
         (report.execution_stage == "PREFLIGHT_ONLY" and
