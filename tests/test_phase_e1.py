@@ -61,7 +61,7 @@ class PhaseEStoreTests(unittest.TestCase):
             ),
         ))
         metric_sql, metric_parameters = cursor.executions[0]
-        self.assertIn("FROM volatility_forecasts AS f", metric_sql)
+        self.assertIn("JOIN volatility_forecasts AS f", metric_sql)
         self.assertIn("o.realized_move_bps", metric_sql)
         self.assertIn("NULL::double precision AS directional_accuracy", metric_sql)
         self.assertNotIn("outcome_bps", metric_sql)
@@ -345,7 +345,7 @@ class PhaseEStoreTests(unittest.TestCase):
         for statement, _ in cursor.executions:
             command = re.sub(r"--[^\n]*|/\*.*?\*/", "", statement,
                              flags=re.DOTALL).strip().upper()
-            self.assertTrue(command.startswith("SELECT"))
+            self.assertTrue(command.startswith(("SELECT", "WITH")))
             for forbidden in ("INSERT", "UPDATE", "DELETE", "ALTER", "DROP",
                               "CREATE", "TRUNCATE"):
                 self.assertIsNone(re.search(rf"\b{forbidden}\b", command))
