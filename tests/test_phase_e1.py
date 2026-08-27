@@ -98,11 +98,17 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertIn(
             "'VOLATILITY_FORECAST', to_timestamp(%s), 65536", metric_sql,
         )
-        for statement, _parameters in cursor.executions:
-            self.assertIn("o.resolved_epoch >= f.maturity_epoch", statement)
-            self.assertIn(
-                "o.resolved_epoch <= f.maturity_epoch + 5.0", statement,
-            )
+        self.assertIn(
+            "o.resolved_epoch >= f.maturity_epoch", cursor.executions[0][0],
+        )
+        self.assertIn(
+            "o.resolved_epoch <= f.maturity_epoch + 5.0",
+            cursor.executions[0][0],
+        )
+        self.assertIn(
+            "read_legacy_effective_observations",
+            cursor.executions[1][0],
+        )
 
     def test_result_is_frozen_and_exact_cohort_fields_are_preserved(self):
         cursor = Cursor((
@@ -128,11 +134,17 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertIn("outcome_proofs AS MATERIALIZED", sql)
         self.assertIn("read_legacy_evidence_publications", sql)
         self.assertIn("read_legacy_evidence_publications_for_records", sql)
-        for statement, _parameters in cursor.executions:
-            self.assertIn("o.resolved_epoch >= f.maturity_epoch", statement)
-            self.assertIn(
-                "o.resolved_epoch <= f.maturity_epoch + 5.0", statement,
-            )
+        self.assertIn(
+            "o.resolved_epoch >= f.maturity_epoch", cursor.executions[0][0],
+        )
+        self.assertIn(
+            "o.resolved_epoch <= f.maturity_epoch + 5.0",
+            cursor.executions[0][0],
+        )
+        self.assertIn(
+            "read_legacy_effective_observations",
+            cursor.executions[1][0],
+        )
         self.assertIn("DIRECTIONAL_FORECAST", sql)
         self.assertIn("DIRECTIONAL_OUTCOME", sql)
         self.assertIn(
@@ -146,29 +158,29 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertIn("sqrt(avg(power(f.forecast_bps - o.outcome_bps, 2))", sql)
         self.assertIn("AND o.forecast_id IS NOT NULL", sql)
 
-    def test_queries_start_from_bounded_publication_sets(self):
-        cursor = Cursor()
+    def test_metric_window_and_effective_sample_are_both_bounded(self):
+        metrics = ((
+            "q1", "v1", "COIN", "1H", 1, 1, 1, 1.0,
+            0.0, 1.0, 0.0, 0.0,
+        ),)
+        cursor = Cursor(metrics)
         store_with(cursor).phase_e_cohorts(123.5)
-        for statement, _parameters in cursor.executions:
-            normalized = " ".join(statement.split())
-            self.assertIn("read_legacy_evidence_publications", normalized)
-            self.assertNotIn("read_legacy_evidence_publication(", normalized)
-            self.assertEqual(
-                normalized.count("read_legacy_evidence_publications("), 1,
-            )
-            self.assertEqual(
-                normalized.count(
-                    "read_legacy_evidence_publications_for_records("
-                ), 1,
-            )
-            self.assertEqual(normalized.count("65536"), 1)
-            self.assertIn("WITH forecast_proofs AS MATERIALIZED", normalized)
-            self.assertIn("outcome_proofs AS MATERIALIZED", normalized)
-            self.assertNotIn("JOIN LATERAL", normalized)
-            self.assertIn(
-                "ARRAY( SELECT ids.record_id FROM forecast_proofs AS ids )",
-                normalized,
-            )
+
+        metric_sql = " ".join(cursor.executions[0][0].split())
+        effective_sql = " ".join(cursor.executions[1][0].split())
+        self.assertIn("read_legacy_evidence_publications", metric_sql)
+        self.assertIn("read_legacy_evidence_publications_for_records", metric_sql)
+        self.assertEqual(metric_sql.count("65536"), 1)
+        self.assertIn("read_legacy_effective_observations", effective_sql)
+        self.assertIn("'DIRECTIONAL_FORECAST'", effective_sql)
+        self.assertIn("%s::jsonb, 64", effective_sql)
+        self.assertNotIn("read_legacy_evidence_publications(", effective_sql)
+        self.assertEqual(cursor.executions[1][0].count("JOIN "), 0)
+        self.assertEqual(cursor.executions[1][1][0], 123.5)
+        self.assertEqual(json.loads(cursor.executions[1][1][1]), [{
+            "formula_version": "v1", "horizon": "1H",
+            "quant_id": "q1", "symbol": "COIN",
+        }])
 
     def test_global_window_metadata_is_explicit_and_truncation_is_reported(self):
         metrics = ((
