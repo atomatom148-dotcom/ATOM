@@ -1049,15 +1049,18 @@ def test_cli_batch_legacy_gap_only_cache_fails_closed_without_refetch(
 
 @pytest.mark.parametrize("output_dir", ("/tmp/atom-results", "../atom-results"))
 def test_cli_batch_preflight_rejects_output_paths_outside_working_directory(
-    monkeypatch, tmp_path, output_dir,
+    monkeypatch, capsys, tmp_path, output_dir,
 ):
     monkeypatch.chdir(tmp_path)
 
-    with pytest.raises(SystemExit, match="--output-dir"):
+    with pytest.raises(SystemExit):
         main(("2026-01-05", "--batch-preflight", "--output-dir", output_dir))
+    assert "--output-dir" in capsys.readouterr().err
 
 
-def test_cli_batch_preflight_rejects_symlink_escape(monkeypatch, tmp_path):
+def test_cli_batch_preflight_rejects_symlink_escape(
+    monkeypatch, capsys, tmp_path,
+):
     root = tmp_path / "root"
     outside = tmp_path / "outside"
     root.mkdir()
@@ -1065,8 +1068,9 @@ def test_cli_batch_preflight_rejects_symlink_escape(monkeypatch, tmp_path):
     (root / "results").symlink_to(outside, target_is_directory=True)
     monkeypatch.chdir(root)
 
-    with pytest.raises(SystemExit, match="current working directory"):
+    with pytest.raises(SystemExit):
         main(("2026-01-05", "--batch-preflight", "--output-dir", "results"))
+    assert "current working directory" in capsys.readouterr().err
 
 
 def test_cached_preflight_requires_exact_coverage_proof_and_digest_equivalence():
