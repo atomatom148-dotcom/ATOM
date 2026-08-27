@@ -41,6 +41,21 @@ README.md
 python tests/test_phase_a_contracts.py
 ```
 
+## Sonar analysis
+
+Sonar analysis is configured only for this project in
+`sonar-project.properties`. The scanner reads the server URL and authentication
+token from `SONAR_HOST_URL` and `SONAR_TOKEN`; these secrets must remain in the
+environment and must not be committed to the repository.
+
+Generate the configured coverage report and run the scanner from the repository
+root:
+
+```
+python -m pytest --cov=quant --cov-report=xml
+sonar-scanner
+```
+
 ## Live Q1-Q3 runtime
 
 Install `requirements.txt`, apply `migrations/001_live_q1_q2_evidence.sql`, and
