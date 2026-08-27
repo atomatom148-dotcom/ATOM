@@ -17,6 +17,10 @@ from quant.v9_production import (
 NOW = V2_CERTIFIED_RECOVERY_STATE_AS_OF + 86_400.0
 
 
+class QueryCanceled(Exception):
+    pass
+
+
 def _candidate(**overrides):
     values = {
         "state_id": V2_CERTIFIED_RECOVERY_STATE_ID,
@@ -115,7 +119,16 @@ def test_v2_builder_rejects_invalid_or_future_explicit_cutoff(invalid):
         builder.build(state_as_of=invalid)
 
 
-def test_v2_provider_bootstraps_exact_witness_after_not_found_and_overflow():
+@pytest.mark.parametrize(
+    "primary_error",
+    [
+        RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED"),
+        QueryCanceled("statement timeout"),
+    ],
+)
+def test_v2_provider_bootstraps_exact_witness_after_bounded_current_failure(
+    primary_error,
+):
     candidate = _candidate()
 
     class Builder:
@@ -128,7 +141,7 @@ def test_v2_provider_bootstraps_exact_witness_after_not_found_and_overflow():
             self.calls.append(kwargs)
             if not kwargs:
                 self.last_rows_materialized = V2_STATE_BUILD_EVIDENCE_LIMIT + 1
-                raise RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED")
+                raise primary_error
             assert kwargs == {
                 "state_as_of": V2_CERTIFIED_RECOVERY_STATE_AS_OF,
             }
@@ -249,14 +262,21 @@ def test_v2_provider_does_not_recover_for_non_overflow_build_failure():
     assert builder.calls == [{}]
 
 
-def test_retained_overflow_uses_normal_refresh_interval():
+@pytest.mark.parametrize(
+    "primary_error",
+    [
+        RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED"),
+        QueryCanceled("statement timeout"),
+    ],
+)
+def test_retained_bounded_failure_uses_normal_refresh_interval(primary_error):
     prior = _candidate(state_as_of=V2_CERTIFIED_RECOVERY_STATE_AS_OF - 1.0)
 
     class Builder:
         last_rows_materialized = V2_STATE_BUILD_EVIDENCE_LIMIT + 1
 
         def build(self):
-            raise RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED")
+            raise primary_error
 
     class Store:
         def latest(self, *, requested_cutoff):
