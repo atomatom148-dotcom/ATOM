@@ -177,11 +177,12 @@ def test_insert_is_atomic_content_addressed_and_uses_short_lived_connection():
     assert connector.calls == [DATABASE_URL]
     assert (connection.commits, connection.rollbacks) == (1, 0)
     assert connection.closed and connection.cursor_value.closed
-    assert connection.cursor_value.calls[:2] == [
+    assert connection.cursor_value.calls[:3] == [
         ("SET LOCAL statement_timeout = '15s'", ()),
         ("SET LOCAL lock_timeout = '2s'", ()),
+        ("SET LOCAL extra_float_digits = 3", ()),
     ]
-    insert_sql, parameters = connection.cursor_value.calls[3]
+    insert_sql, parameters = connection.cursor_value.calls[4]
     assert "INSERT INTO public.atom_v9_v2_states" in insert_sql
     assert "ON CONFLICT DO NOTHING RETURNING state_id" in insert_sql
     assert parameters[:12] == (
@@ -200,7 +201,7 @@ def test_insert_conflict_reread_is_validated_before_idempotency():
     assert PostgresV2StateStore(
         DATABASE_URL, connect=Connector(connection),
     ).insert(state) == IDEMPOTENT
-    assert "WHERE state_id = %s OR state_hash = %s" in connection.cursor_value.calls[4][0]
+    assert "WHERE state_id = %s OR state_hash = %s" in connection.cursor_value.calls[5][0]
 
     conflicting = Connection([
         _role(), [], [_row(state, replacements={1: "f" * 64})],
@@ -237,11 +238,12 @@ def test_latest_is_exact_bounded_causal_lookup_without_ttl():
     ).latest(requested_cutoff=9_999_999_999.0)
 
     assert result == (state, FOUND)
-    assert connection.cursor_value.calls[:2] == [
+    assert connection.cursor_value.calls[:3] == [
         ("SET LOCAL statement_timeout = '15s'", ()),
         ("SET LOCAL lock_timeout = '2s'", ()),
+        ("SET LOCAL extra_float_digits = 3", ()),
     ]
-    sql, parameters = connection.cursor_value.calls[3]
+    sql, parameters = connection.cursor_value.calls[4]
     assert "state_schema_version = %s" in sql
     assert "state_version = %s" in sql
     assert "model_family = %s" in sql
