@@ -220,6 +220,8 @@ class WebSurfaceTests(unittest.TestCase):
 
         self.assertIn('fetch("/api/live", {', page)
         self.assertIn('signal: controller.signal', page)
+        self.assertIn(
+            "setTimeout(() => controller.abort(), 15000)", page)
         self.assertIn('fetch("/api/dashboard", {cache: "no-store"})', page)
         self.assertIn("setTimeout(refreshLive, 250)", page)
         self.assertIn("setTimeout(refreshEvidence, 30000)", page)
