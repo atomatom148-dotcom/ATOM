@@ -159,6 +159,12 @@ def _float_token(value: float) -> str:
     return (0.0 if value == 0.0 else value).hex()
 
 
+def _same_float(left: float, right: float) -> bool:
+    """Compare finite binary64 values under the canonical signed-zero policy."""
+
+    return _float_token(left) == _float_token(right)
+
+
 def _canonical(value: object, *, excluded: frozenset[str] = frozenset()) -> object:
     if isinstance(value, float):
         return {"$float64": _float_token(value)}
@@ -380,7 +386,7 @@ def _validate_horizon_state(
             not _canonical_reason_tuple(value.reason_codes) or
             not _canonical_reason_tuple(value.covariance_reason_codes)):
         raise ValueError("invalid horizon identity, status, or reasons")
-    if (value.gamma != 0.0 or
+    if (not _same_float(value.gamma, 0.0) or
             value.scale_conditioning_status != "PENDING_CAUSAL_V3_REPLAY" or
             value.range_preparation_status != "PENDING_V3_REPLAY" or
             value.range_score_count != 0 or value.range_quantile is not None):
@@ -432,13 +438,13 @@ def _validate_horizon_state(
             if (
                 calibration.status != "UNAVAILABLE"
                 or calibration.reason_codes != ("NO_EVIDENCE",)
-                or calibration.calibration_intercept != 0.0
-                or calibration.calibration_slope != 1.0
+                or not _same_float(calibration.calibration_intercept, 0.0)
+                or not _same_float(calibration.calibration_slope, 1.0)
                 or calibration.calibration_parameter_covariance_2x2 !=
                 ((0.0, 0.0), (0.0, 0.0))
-                or calibration.effective_n != 0.0
-                or calibration.residual_variance != 0.0
-                or calibration.residual_standard_deviation != 0.0
+                or not _same_float(calibration.effective_n, 0.0)
+                or not _same_float(calibration.residual_variance, 0.0)
+                or not _same_float(calibration.residual_standard_deviation, 0.0)
             ):
                 raise ValueError(
                     "no-evidence directional calibration is not canonical")

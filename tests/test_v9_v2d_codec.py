@@ -22,6 +22,7 @@ from quant.v9_v2d_evidence_state import (
     V2EvidenceState,
     _canonical,
     _digest,
+    _same_float,
     build_v2d_evidence_state,
     deserialize_v2_evidence_state,
     serialize_v2_evidence_state,
@@ -89,6 +90,12 @@ def _wire(state: V2EvidenceState) -> str:
 
 
 class V2EvidenceStateCodecTests(unittest.TestCase):
+    def test_exact_float_comparison_preserves_frozen_binary64_policy(self):
+        self.assertTrue(_same_float(0.0, -0.0))
+        self.assertTrue(_same_float(1.0, 1.0))
+        self.assertFalse(_same_float(0.0, math.nextafter(0.0, 1.0)))
+        self.assertFalse(_same_float(1.0, math.nextafter(1.0, 2.0)))
+
     def test_round_trip_rehydrates_every_nested_type_and_tuple(self):
         state = _state()
         encoded = serialize_v2_evidence_state(state)
