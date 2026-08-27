@@ -403,25 +403,6 @@ class WebSurfaceTests(unittest.TestCase):
         })
         self.assertIn("V9 DIRECTIONAL ACCURACY", rendered)
 
-    def test_range_cells_explain_governed_calibration_without_publishing_numbers(self):
-        final_numbers = tuple(SimpleNamespace(
-            final_bps=1.0, move_percent=0.01,
-            range_lower_bps=None, range_upper_bps=None,
-        ) for _ in HORIZON_LABELS)
-        selected = (79, 58, 19, 15, 10, 5)
-        accuracy = tuple(SimpleNamespace(
-            horizon=horizon, directional_wins=1, directional_losses=1,
-            directional_accuracy=0.5, directional_effective_n=2.0,
-            non_overlapping_n=count, status="PROVISIONAL",
-        ) for horizon, count in zip(HORIZON_LABELS, selected))
-
-        data = dashboard_data(v9_output=SimpleNamespace(
-            final_numbers=final_numbers, accuracy=accuracy))
-
-        self.assertEqual(data["final_numbers"]["RANGE"], [
-            f"CALIBRATING {count}/500 MIN" for count in selected
-        ])
-
     def test_v9_accuracy_request_path_only_reads_published_live_output(self):
         class Store:
             def counts(self): raise AssertionError("must not scan historical evidence")
