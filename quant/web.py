@@ -306,7 +306,7 @@ def dashboard_data(
         if item is not None
     }
     if len(results) == len(PHASE_E_HORIZONS):
-        for index, (horizon, final) in enumerate(zip(PHASE_E_HORIZONS, results)):
+        for index, horizon in enumerate(PHASE_E_HORIZONS):
             if final_values["RANGE"][index] is not None:
                 continue
             accuracy_item = accuracy_by_horizon.get(horizon)
