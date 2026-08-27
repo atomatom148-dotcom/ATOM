@@ -67,7 +67,6 @@ PHASE_E_FAMILY_NAMES = {
 }
 PHASE_E_HORIZONS = ("30S", "1M", "5M", "15M", "30M", "1H")
 DASHBOARD_PHASE_E_TTL_SECONDS = 300.0
-RANGE_MINIMUM_SELECTED_OBSERVATIONS = 500
 _WEB_ENDPOINT_METRIC_PATHS = frozenset({
     "/",
     "/health",
@@ -305,18 +304,6 @@ def dashboard_data(
         (getattr(v9_output, "accuracy", ()) if v9_output is not None else ())
         if item is not None
     }
-    if len(results) == len(PHASE_E_HORIZONS):
-        for index, horizon in enumerate(PHASE_E_HORIZONS):
-            if final_values["RANGE"][index] is not None:
-                continue
-            accuracy_item = accuracy_by_horizon.get(horizon)
-            selected_n = getattr(accuracy_item, "non_overlapping_n", None)
-            if (isinstance(selected_n, int) and not isinstance(selected_n, bool) and
-                    0 <= selected_n < RANGE_MINIMUM_SELECTED_OBSERVATIONS):
-                final_values["RANGE"][index] = (
-                    f"CALIBRATING {selected_n}/"
-                    f"{RANGE_MINIMUM_SELECTED_OBSERVATIONS} MIN"
-                )
     v9_accuracy = []
     for horizon in PHASE_E_HORIZONS:
         item = accuracy_by_horizon.get(horizon)
