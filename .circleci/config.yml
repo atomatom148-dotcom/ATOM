@@ -1,0 +1,26 @@
+version: 2.1
+
+jobs:
+  test:
+    docker:
+      - image: cimg/python:3.12-node
+      - image: cimg/postgres:16.4
+        environment:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+    environment:
+      H2C_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      PYTHONPATH: .
+    steps:
+      - checkout
+      - run:
+          name: Install Python dependencies
+          command: python -m pip install -r requirements.txt pytest
+      - run:
+          name: Run ATOM test suite
+          command: python -m pytest -q
+
+workflows:
+  atom-ci:
+    jobs:
+      - test

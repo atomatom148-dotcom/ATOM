@@ -53,6 +53,12 @@ class HistoricalOutcomePostgresTests(unittest.TestCase):
             c.execute("SELECT count(*) FROM public.atom_historical_replay_forecasts")
             self.assertEqual(c.fetchone()[0], 0)
             c.execute("""INSERT INTO public.atom_historical_replay_outcomes
+              (replay_run_id, cutoff_at, horizon, actual_return_bps,
+               availability_status, unavailable_reason, cutoff_midpoint_at,
+               cutoff_midpoint, target_midpoint_at, target_midpoint,
+               data_schema_version, source_schema_version,
+               resolution_spec_version, outcome_source_dataset_digest,
+               content_sha256, resolved_at)
               SELECT 'pg-h2c', timestamp '2026-06-15 13:30:00+00' + n*interval '1 second', h,
                NULL,'UNAVAILABLE','NO_TARGET',NULL,NULL,NULL,NULL,'data-v','source-v','COIN_MIDPOINT_LOG_RETURN_BPS_1',repeat('a',64),repeat('f',64),now()
               FROM generate_series(0,11228) n CROSS JOIN
