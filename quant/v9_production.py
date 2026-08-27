@@ -38,7 +38,11 @@ from .v9_v2a_dataset import (
 )
 from .v9_v2b_calibration import build_v2b_calibration
 from .v9_v2c_covariance import build_v2c_covariance
-from .v9_v2d_evidence_state import V2EvidenceState, build_v2d_evidence_state
+from .v9_v2d_evidence_state import (
+    STATE_VERSION as V2_STATE_VERSION,
+    V2EvidenceState,
+    build_v2d_evidence_state,
+)
 from .v9_v4a_evidence import (
     V4AWriter, build_cohort, canonical_sha256, canonical_target_identity,
     deserialize_forecast_record,
@@ -53,6 +57,14 @@ TARGET_SPEC_ID = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
 V2_REFRESH_SECONDS = 3600.0
 V2_FAILURE_RETRY_SECONDS = 60.0
 V2_STATE_BUILD_EVIDENCE_LIMIT = 65_536
+
+# Earliest complete six-horizon production V2D witness from the durable V4
+# ledger. The exact content hash makes this a fail-closed recovery checkpoint.
+V2_CERTIFIED_RECOVERY_STATE_AS_OF = float.fromhex("0x1.aa3b44f821ed1p+30")
+V2_CERTIFIED_RECOVERY_STATE_HASH = (
+    "6354b28bd611c9a2bf5c0e714a4be6cfd21d6364f6dd4b8b81dded9a6a3cb378"
+)
+V2_CERTIFIED_RECOVERY_STATE_ID = "v9v2:" + V2_CERTIFIED_RECOVERY_STATE_HASH
 
 FORMULA_VERSIONS = (
     ("q1_momentum", Q1_VERSION),
@@ -80,6 +92,33 @@ class V2RefreshSnapshot:
     duration_ms: float | None = None
     rows_materialized: int = 0
     error_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class V2RecoveryWitness:
+    state_id: str
+    state_hash: str
+    state_as_of: float
+    state_version: str
+
+    def verify(self, state: V2EvidenceState) -> None:
+        if (
+            state.state_id != self.state_id
+            or state.state_hash != self.state_hash
+            or state.state_as_of != self.state_as_of
+            or state.state_version != self.state_version
+            or state.creation_status != "VALID"
+            or state.top_level_status not in ("MATURE", "PROVISIONAL")
+        ):
+            raise RuntimeError("V2_CERTIFIED_RECOVERY_MISMATCH")
+
+
+CERTIFIED_V2_RECOVERY_WITNESS = V2RecoveryWitness(
+    state_id=V2_CERTIFIED_RECOVERY_STATE_ID,
+    state_hash=V2_CERTIFIED_RECOVERY_STATE_HASH,
+    state_as_of=V2_CERTIFIED_RECOVERY_STATE_AS_OF,
+    state_version=V2_STATE_VERSION,
+)
 
 
 class V2StateStore(Protocol):
@@ -113,7 +152,8 @@ class PostgresV2StateBuilder:
         self._connect = connect
         self.last_rows_materialized = 0
 
-    def build(self) -> V2EvidenceState:
+    def build(self, *, state_as_of: float | None = None) -> V2EvidenceState:
+        requested_state_as_of = state_as_of
         self.last_rows_materialized = 0
         connection = self._connect(self._database_url)
         try:
@@ -125,10 +165,22 @@ class PostgresV2StateBuilder:
                     (),
                 )
                 row = cursor.fetchone()
-                state_as_of = None if row is None else row[0]
-                if state_as_of is None or not math.isfinite(float(state_as_of)):
+                snapshot_as_of = None if row is None else row[0]
+                if (snapshot_as_of is None or
+                        not math.isfinite(float(snapshot_as_of))):
                     raise RuntimeError("V2_RESOLVED_EVIDENCE_UNAVAILABLE")
-                state_as_of = float(state_as_of)
+                snapshot_as_of = float(snapshot_as_of)
+                if requested_state_as_of is None:
+                    state_as_of = snapshot_as_of
+                else:
+                    if (isinstance(requested_state_as_of, bool) or
+                            not isinstance(requested_state_as_of, (int, float)) or
+                            not math.isfinite(float(requested_state_as_of)) or
+                            float(requested_state_as_of) <= 0.0):
+                        raise RuntimeError("V2_CERTIFIED_RECOVERY_AS_OF_INVALID")
+                    state_as_of = float(requested_state_as_of)
+                    if state_as_of > snapshot_as_of:
+                        raise RuntimeError("V2_CERTIFIED_RECOVERY_AS_OF_INVALID")
                 cursor.execute(
                     """
                     SELECT f.forecast_id, f.quant_id, f.formula_version,
@@ -282,18 +334,35 @@ class PostgresV2StateBuilder:
         return state
 
 
+def build_certified_v2_recovery_state(
+    builder: PostgresV2StateBuilder,
+    witness: V2RecoveryWitness = CERTIFIED_V2_RECOVERY_WITNESS,
+) -> V2EvidenceState:
+    """Rebuild and verify one content-addressed production recovery witness."""
+
+    state = builder.build(state_as_of=witness.state_as_of)
+    witness.verify(state)
+    return state
+
+
 class ImmutableV2StateProvider:
     """Atomically publish complete frozen V2 states built outside request paths."""
 
     def __init__(self, builder: PostgresV2StateBuilder, *,
                  store: V2StateStore | None = None,
                  metrics: OperationalMetrics | None = None,
+                 recovery_witness: V2RecoveryWitness | None =
+                 CERTIFIED_V2_RECOVERY_WITNESS,
                  utc_clock: Callable[[], datetime] =
                  lambda: datetime.now(timezone.utc)):
         if not callable(utc_clock):
             raise TypeError("utc_clock must be callable")
+        if (recovery_witness is not None and
+                not isinstance(recovery_witness, V2RecoveryWitness)):
+            raise TypeError("recovery_witness must be a V2RecoveryWitness")
         self._builder = builder
         self._store = store
+        self._recovery_witness = recovery_witness
         self._utc_clock = utc_clock
         self._lock = threading.Lock()
         self._state: V2EvidenceState | None = None
@@ -349,13 +418,34 @@ class ImmutableV2StateProvider:
         started = time.perf_counter()
         with self._lock:
             needs_restore = self._state is None
+        restore_snapshot = None
         if needs_restore and self._store is not None:
             # Startup restoration is retried here so a transient database
             # failure cannot strand the service behind a permanent raw-build
             # overflow until its next process restart.
-            self.restore(self._utc_clock())
+            restore_snapshot = self.restore(self._utc_clock())
+        used_recovery = False
         try:
-            candidate = self._builder.build()
+            try:
+                candidate = self._builder.build()
+            except Exception as primary_error:
+                with self._lock:
+                    retained = self._state
+                can_recover = (
+                    retained is None
+                    and self._store is not None
+                    and self._recovery_witness is not None
+                    and restore_snapshot is not None
+                    and restore_snapshot.error_code == "NOT_FOUND"
+                    and _v2_error_code(primary_error) ==
+                    "V2_EVIDENCE_ROW_LIMIT_EXCEEDED"
+                )
+                if not can_recover:
+                    raise
+                used_recovery = True
+                candidate = build_certified_v2_recovery_state(
+                    self._builder, self._recovery_witness,
+                )
             with self._lock:
                 retained = self._state
             if retained is not None:
@@ -383,6 +473,12 @@ class ImmutableV2StateProvider:
             self.metrics.observe("v2_background_rows_materialized",
                                  float(self._builder.last_rows_materialized))
             self.metrics.increment("v2_background_refresh_failures_total")
+            if used_recovery:
+                self.metrics.increment("v2_certified_recovery_failures_total")
+                self.metrics.set_status(
+                    "v2_certified_recovery_status",
+                    snapshot.error_code or "FAILED",
+                )
             self.metrics.set_status("v2_background_status", status)
             self.metrics.set_status("v2_background_error_code",
                                     snapshot.error_code or "FAILED")
@@ -398,6 +494,9 @@ class ImmutableV2StateProvider:
                              float(self._builder.last_rows_materialized))
         self.metrics.set_status("v2_background_status", "AVAILABLE")
         self.metrics.set_status("v2_background_error_code", "NONE")
+        if used_recovery:
+            self.metrics.increment("v2_certified_recovery_success_total")
+            self.metrics.set_status("v2_certified_recovery_status", "AVAILABLE")
         with self._lock:
             self._state = candidate
             self._status = snapshot
@@ -425,8 +524,15 @@ class ImmutableV2StateProvider:
         def worker() -> None:
             while not stop_event.is_set():
                 snapshot = self.refresh()
-                delay = (interval if snapshot.status == "AVAILABLE" else
-                         V2_FAILURE_RETRY_SECONDS)
+                retained_overflow = (
+                    snapshot.status == "STALE"
+                    and snapshot.error_code == "V2_EVIDENCE_ROW_LIMIT_EXCEEDED"
+                )
+                delay = (
+                    interval
+                    if snapshot.status == "AVAILABLE" or retained_overflow
+                    else V2_FAILURE_RETRY_SECONDS
+                )
                 if stop_event.wait(delay):
                     return
 
