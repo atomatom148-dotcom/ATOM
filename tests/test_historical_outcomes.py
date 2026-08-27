@@ -143,8 +143,19 @@ class _Cursor:
         self.connection=connection; self.named=named; self.rows=[]; self.index=0; self.itersize=0
     def execute(self, sql, params=()):
         self.connection.statements.append(sql)
-        if self.named:
-            self.rows=list(self.connection.join_rows)
+        if sql.startswith("SELECT f.quant_id"):
+            after = None if len(params) == 2 else params[1:4]
+            if after is None:
+                self.connection.page_position = 0
+            elif self.connection.page_position:
+                previous = self.connection.join_rows[
+                    self.connection.page_position - 1]
+                assert (previous[0], previous[1], previous[9]) == after
+            start = self.connection.page_position
+            self.rows = self.connection.join_rows[start:start + params[-1]]
+            self.connection.page_position += len(self.rows)
+            self.connection.max_page_rows = max(self.connection.max_page_rows,
+                                                len(self.rows))
         elif sql == "SET LOCAL statement_timeout = '30min'": self.rows=[]
         elif "dataset_digest" in sql: self.rows=[("dataset","configuration")]
         elif "count(*) FROM public.atom_historical_replay_forecasts" in sql: self.rows=[(len(self.connection.join_rows),)]
@@ -156,8 +167,16 @@ class _Cursor:
     def close(self): pass
 
 class _Connection:
-    def __init__(self, rows): self.join_rows=rows; self.statements=[]
-    def cursor(self, name=None, binary=False): return _Cursor(self, name is not None)
+    def __init__(self, rows):
+        self.join_rows = [row if len(row) == 10 else row +
+                          (BASE + timedelta(microseconds=index),)
+                          for index, row in enumerate(rows)]
+        self.join_rows.sort(key=lambda row: (row[0], row[1], row[9]))
+        self.statements=[]; self.max_page_rows=0; self.cursor_names=[]
+        self.page_position=0
+    def cursor(self, name=None, binary=False):
+        self.cursor_names.append(name)
+        return _Cursor(self, name is not None)
 
 class ScoringTests(unittest.TestCase):
     def _connection(self):
@@ -187,6 +206,36 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(metric.resolved_count, 752_040)
         self.assertEqual(connection.statements[0],
                          "SET LOCAL statement_timeout = '30min'")
+        page_statements = [sql for sql in connection.statements
+                           if sql.startswith("SELECT f.quant_id")]
+        self.assertEqual(len(page_statements), 378)
+        self.assertLessEqual(connection.max_page_rows, 2_000)
+        self.assertTrue(all("LIMIT %s" in sql and "OFFSET" not in sql
+                            for sql in page_statements))
+        self.assertTrue(all("(f.quant_id,f.horizon,f.cutoff_at)>" in sql
+                            for sql in page_statements[1:]))
+        self.assertEqual(len(receipt.metrics), 72)
+
+    def test_keyset_ties_are_complete_deterministic_and_match_single_page(self):
+        base = ("q1_momentum", "30S", 2.0, "AVAILABLE", 1.0, "AVAILABLE",
+                "a"*64, "COIN_MIDPOINT_LOG_RETURN_BPS_1", "d"*64)
+        # Identical quant and horizon values force cutoff_at to disambiguate every
+        # boundary; adjacent quant/horizon changes cover the rest of the key.
+        rows = [base + (BASE + timedelta(microseconds=i),) for i in range(7)]
+        rows += [("q1_momentum", "1M", 2.0, "AVAILABLE", 1.0,
+                  "AVAILABLE", "b"*64, "COIN_MIDPOINT_LOG_RETURN_BPS_1",
+                  "d"*64, BASE)]
+        paged = score(_Connection(rows), "run", fetch_size=3)
+        previous = score(_Connection(rows), "run", fetch_size=100)
+        self.assertEqual(paged, previous)
+        metric = next(m for m in paged.metrics
+                      if (m.quant_id, m.horizon) == ("q1_momentum", "30S"))
+        self.assertEqual(metric.resolved_count, 7)
+
+    def test_scoring_uses_ordinary_cursor_for_each_bounded_statement(self):
+        connection = self._connection()
+        score(connection, "run", fetch_size=2)
+        self.assertFalse(any(connection.cursor_names))
 
 class _WriteCursor:
     def __init__(self, answers, fail_insert=False): self.answers=list(answers); self.fail_insert=fail_insert; self.sql=[]

@@ -309,7 +309,9 @@ def _sign(value: float) -> int:
 
 
 def score(connection, replay_run_id: str, *, fetch_size: int = DEFAULT_BATCH_SIZE) -> ScoringReceipt:
-    """Stream the immutable join read-only and return a stable receipt."""
+    """Page through the immutable join read-only and return a stable receipt."""
+    if fetch_size <= 0:
+        raise ValueError("fetch_size must be positive")
     cursor = connection.cursor()
     # Scoring is the sole long-running read on this role. Override any shorter
     # role/connection default for this transaction only; retain a finite bound.
@@ -323,15 +325,19 @@ def score(connection, replay_run_id: str, *, fetch_size: int = DEFAULT_BATCH_SIZ
     cursor.execute("SELECT count(*) FROM public.atom_historical_replay_outcomes WHERE replay_run_id=%s", (replay_run_id,))
     outcome_count = cursor.fetchone()[0]
     cursor.close()
-    stream = connection.cursor(name="atom_h2c_scoring", binary=True)
-    stream.itersize = fetch_size
-    stream.execute("SELECT f.quant_id,f.horizon,f.expected_return_bps,f.availability_status,o.actual_return_bps,o.availability_status,o.content_sha256,o.resolution_spec_version,o.outcome_source_dataset_digest FROM public.atom_historical_replay_forecasts f LEFT JOIN public.atom_historical_replay_outcomes o USING (replay_run_id,cutoff_at,horizon) WHERE f.replay_run_id=%s ORDER BY f.quant_id,f.horizon,f.cutoff_at", (replay_run_id,))
     states = {(q, h): [0, 0, 0, 0, 0.0, 0.0, 0.0] for q in QUANTS for h in HORIZONS}
     digest = hashlib.sha256()
+    page_after = None
     while True:
+        stream = connection.cursor(binary=True)
+        keyset = "" if page_after is None else " AND (f.quant_id,f.horizon,f.cutoff_at)>(%s,%s,%s)"
+        params = ((replay_run_id, fetch_size) if page_after is None else
+                  (replay_run_id, *page_after, fetch_size))
+        stream.execute("SELECT f.quant_id,f.horizon,f.expected_return_bps,f.availability_status,o.actual_return_bps,o.availability_status,o.content_sha256,o.resolution_spec_version,o.outcome_source_dataset_digest,f.cutoff_at FROM public.atom_historical_replay_forecasts f LEFT JOIN public.atom_historical_replay_outcomes o USING (replay_run_id,cutoff_at,horizon) WHERE f.replay_run_id=%s" + keyset + " ORDER BY f.quant_id,f.horizon,f.cutoff_at LIMIT %s", params)
         batch = stream.fetchmany(fetch_size)
+        stream.close()
         if not batch: break
-        for q, h, predicted, fs, actual, os_, outcome_hash, resolution_version, source_digest in batch:
+        for q, h, predicted, fs, actual, os_, outcome_hash, resolution_version, source_digest, cutoff_at in batch:
             state = states[(q, h)]
             if fs != "AVAILABLE": continue
             state[0] += 1
@@ -344,7 +350,7 @@ def score(connection, replay_run_id: str, *, fetch_size: int = DEFAULT_BATCH_SIZ
                 if _sign(predicted) == _sign(actual): state[2] += 1
                 else: state[3] += 1
             digest.update(f"{q}|{h}|{predicted.hex()}|{actual.hex()}|{outcome_hash}|{resolution_version}|{source_digest}\n".encode())
-    stream.close()
+        page_after = (batch[-1][0], batch[-1][1], batch[-1][9])
     metrics = []
     for q in QUANTS:
         for h in HORIZONS:
