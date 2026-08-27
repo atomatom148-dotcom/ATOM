@@ -71,6 +71,20 @@ class PhaseECohortMetrics:
     evidence_window_truncated: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class HistoricalReplaySummary:
+    """Bounded manifest-only totals for certified historical replay evidence."""
+
+    certified_sessions: int
+    cutoff_count: int
+    available_slot_count: int
+    unavailable_slot_count: int
+    latest_session: str | None
+    family_count: int = 12
+    horizon_count: int = 6
+    slots_per_cutoff: int = 72
+
+
 class EvidenceStore(Protocol):
     """The deliberately small API has no mutation or deletion operations."""
 
@@ -83,6 +97,8 @@ class EvidenceStore(Protocol):
     ) -> None: ...
 
     def counts(self) -> tuple[int, int]: ...
+
+    def historical_replay_summary(self) -> HistoricalReplaySummary: ...
 
     def phase_e_cohorts(
         self, as_of_epoch: float,
@@ -343,6 +359,28 @@ class PostgresEvidenceStore:
                 )
                 forecasts, resolved = cursor.fetchone()
         return int(forecasts), int(resolved)
+
+    def historical_replay_summary(self) -> HistoricalReplaySummary:
+        """Read only the certified run manifests; never scan replay forecasts."""
+
+        with self._connect(self._database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT count(*), COALESCE(sum(frame_count), 0),
+                           COALESCE(sum(available_observation_count), 0),
+                           COALESCE(sum(unavailable_observation_count), 0),
+                           max(historical_session)::text
+                    FROM public.atom_historical_replay_runs
+                    WHERE execution_stage = 'REPLAY_COMPLETE'
+                      AND certification_status = 'CERTIFIED'
+                    """,
+                    (),
+                )
+                sessions, cutoffs, available, unavailable, latest = cursor.fetchone()
+        return HistoricalReplaySummary(
+            int(sessions), int(cutoffs), int(available), int(unavailable), latest,
+        )
 
     def phase_e_cohorts(
         self, as_of_epoch: float,
@@ -728,7 +766,8 @@ def records_for_volatility(*, result: object | None, cycle_id: str,
 
 
 __all__ = [
-    "DATA_SCHEMA_VERSION", "EvidenceStore", "ForecastRecord", "MIN_EFFECTIVE_N",
-    "PhaseECohortMetrics", "PostgresEvidenceStore", "SOURCE_SPEC_VERSION",
+    "DATA_SCHEMA_VERSION", "EvidenceStore", "ForecastRecord",
+    "HistoricalReplaySummary", "MIN_EFFECTIVE_N", "PhaseECohortMetrics",
+    "PostgresEvidenceStore", "SOURCE_SPEC_VERSION",
     "VolatilityForecastRecord", "records_for_results", "records_for_volatility",
 ]
