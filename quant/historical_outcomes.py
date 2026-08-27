@@ -22,6 +22,7 @@ from .v9_v1_contract import HORIZON_SECONDS
 OUTCOME_SCHEMA_VERSION = "H2-C-1"
 RESOLUTION_SPEC_VERSION = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
 DEFAULT_BATCH_SIZE = 2_000
+SCORING_STATEMENT_TIMEOUT = "30min"
 HORIZONS = tuple(HORIZON_SECONDS)
 Q3 = "q3_volatility"
 
@@ -308,8 +309,11 @@ def _sign(value: float) -> int:
 
 
 def score(connection, replay_run_id: str, *, fetch_size: int = DEFAULT_BATCH_SIZE) -> ScoringReceipt:
-    """Stream the immutable join; issue SELECT only and return a stable receipt."""
+    """Stream the immutable join read-only and return a stable receipt."""
     cursor = connection.cursor()
+    # Scoring is the sole long-running read on this role. Override any shorter
+    # role/connection default for this transaction only; retain a finite bound.
+    cursor.execute(f"SET LOCAL statement_timeout = '{SCORING_STATEMENT_TIMEOUT}'")
     cursor.execute("SELECT dataset_digest,configuration_digest FROM public.atom_historical_replay_runs WHERE replay_run_id=%s", (replay_run_id,))
     manifest = cursor.fetchone()
     if manifest is None:
