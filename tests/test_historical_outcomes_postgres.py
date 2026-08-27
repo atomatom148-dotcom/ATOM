@@ -25,11 +25,12 @@ class HistoricalOutcomePostgresTests(unittest.TestCase):
             c.execute("SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace='public'::regnamespace AND relkind IN ('r','p')")
             if c.fetchone()[0]:
                 raise RuntimeError("H2C_TEST_DATABASE_URL must identify an empty disposable database")
-            c.execute("CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN; CREATE ROLE service_role NOLOGIN; CREATE ROLE h2c_public_test NOLOGIN")
+            c.execute("CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN; CREATE ROLE service_role NOLOGIN; CREATE ROLE h2c_public_test NOLOGIN; CREATE ROLE atom_v9_v4_runtime NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS")
             c.execute(Path("supabase/migrations/20260826042317_create_historical_replay_evidence.sql").read_text())
             # This is the exact proposed migration, not a test copy.
             c.execute(Path("supabase/migrations/20260826144639_create_historical_replay_outcomes.sql").read_text())
             c.execute(Path("supabase/migrations/20260826160458_h2_c_outcome_integrity_repair.sql").read_text())
+            c.execute(Path("supabase/migrations/20260827120905_authorize_historical_summary_runtime.sql").read_text())
             c.execute("SET ROLE atom_historical_replay_writer")
             c.execute("""INSERT INTO public.atom_historical_replay_runs VALUES
               ('pg-h2c','2026-06-15','REPLAY_COMPLETE','CERTIFIED','abcdef0',
@@ -85,6 +86,85 @@ class HistoricalOutcomePostgresTests(unittest.TestCase):
             c.execute("SELECT count(*) FROM public.atom_historical_replay_outcomes")
             self.assertEqual(c.fetchone()[0], 67374)
             c.execute("RESET ROLE")
+
+    def test_runtime_reads_only_latest_certified_session_manifests(self):
+        from quant.evidence import HistoricalReplaySummary, PostgresEvidenceStore
+
+        with self.db.cursor() as c:
+            c.execute(
+                """SELECT table_name, privilege_type
+                   FROM information_schema.role_table_grants
+                   WHERE grantee = 'atom_v9_v4_runtime'
+                     AND table_schema = 'public'
+                     AND table_name LIKE 'atom_historical_replay_%'
+                   ORDER BY table_name, privilege_type"""
+            )
+            self.assertEqual(
+                c.fetchall(),
+                [("atom_historical_replay_runs", "SELECT")],
+            )
+            c.execute("SET ROLE atom_historical_replay_writer")
+            c.execute(
+                """INSERT INTO public.atom_historical_replay_runs VALUES
+                  ('pg-h2c-rerun','2026-06-15','REPLAY_COMPLETE','CERTIFIED',
+                   'abcdef1',repeat('1',64),repeat('2',64),repeat('3',64),
+                   repeat('4',64),2,'{}'::jsonb,72,72,'{}'::jsonb,
+                   '{}'::jsonb,'data-v','source-v',
+                   now() + interval '1 day',repeat('5',64))"""
+            )
+            c.execute("RESET ROLE")
+            c.execute("SET ROLE atom_v9_v4_runtime")
+            try:
+                c.execute(
+                    "SELECT count(*) FROM public.atom_historical_replay_runs"
+                )
+                self.assertEqual(c.fetchone()[0], 2)
+                for table in (
+                    "atom_historical_replay_forecasts",
+                    "atom_historical_replay_outcomes",
+                ):
+                    c.execute("SAVEPOINT denied_read")
+                    with self.assertRaises(psycopg.Error):
+                        c.execute(f"SELECT count(*) FROM public.{table}")
+                    c.execute("ROLLBACK TO denied_read")
+                for statement in (
+                    """INSERT INTO public.atom_historical_replay_runs
+                       SELECT 'denied-run', historical_session, execution_stage,
+                              certification_status, git_commit,
+                              configuration_digest, dataset_digest,
+                              session_digest, artifact_sha256, frame_count,
+                              quote_counts, available_observation_count,
+                              unavailable_observation_count, stage_timings,
+                              family_timings, data_schema_version,
+                              source_schema_version, created_at, content_sha256
+                       FROM public.atom_historical_replay_runs LIMIT 1""",
+                    """UPDATE public.atom_historical_replay_runs
+                       SET created_at = created_at WHERE false""",
+                    "DELETE FROM public.atom_historical_replay_runs WHERE false",
+                    "TRUNCATE public.atom_historical_replay_runs",
+                ):
+                    c.execute("SAVEPOINT denied_write")
+                    with self.assertRaises(psycopg.Error):
+                        c.execute(statement)
+                    c.execute("ROLLBACK TO denied_write")
+
+                class BorrowedConnection:
+                    def __enter__(_self):
+                        return self.db
+
+                    def __exit__(_self, *_args):
+                        return False
+
+                store = PostgresEvidenceStore(URL)
+                store._connect = lambda _url: BorrowedConnection()
+                self.assertEqual(
+                    store.historical_replay_summary(),
+                    HistoricalReplaySummary(
+                        1, 2, 72, 72, "2026-06-15",
+                    ),
+                )
+            finally:
+                c.execute("RESET ROLE")
 
     def test_missing_or_invalid_outcome_lineage_is_rejected(self):
         with self.db.cursor() as c:
