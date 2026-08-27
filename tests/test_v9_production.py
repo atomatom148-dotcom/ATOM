@@ -9,7 +9,7 @@ from quant.history import MidpointHistory, MidpointObservation
 from quant.live_market import LiveMarketState
 from quant.q10_options_vol import OptionObservation
 from quant.v9_production import (
-    FORMULA_VERSION_MAP, V2_STATE_BUILD_EVIDENCE_LIMIT,
+    FORMULA_VERSION_MAP, V2_STATE_BUILD_EVIDENCE_PAGE_SIZE,
     ImmutableV2StateProvider,
     PostgresV2StateBuilder, build_live_v1,
 )
@@ -19,6 +19,10 @@ from quant.web import dashboard_data
 
 
 NOW = 1_800_000_000.0
+
+
+class QueryCanceled(Exception):
+    pass
 
 
 def _live_snapshot():
@@ -251,10 +255,10 @@ def test_v2_provider_restores_then_retains_last_good_state_on_overflow():
     )
 
     class OverflowingBuilder:
-        last_rows_materialized = V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+        last_rows_materialized = V2_STATE_BUILD_EVIDENCE_PAGE_SIZE + 1
 
         def build(self):
-            raise RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED")
+            raise QueryCanceled("statement timeout")
 
     class Store:
         def latest(self, *, requested_cutoff):
@@ -272,16 +276,16 @@ def test_v2_provider_restores_then_retains_last_good_state_on_overflow():
     assert failed.status == "STALE"
     assert failed.state_id == prior.state_id
     assert failed.state_as_of == prior.state_as_of
-    assert failed.error_type == "RuntimeError"
-    assert failed.error_code == "V2_EVIDENCE_ROW_LIMIT_EXCEEDED"
-    assert failed.rows_materialized == V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+    assert failed.error_type == "QueryCanceled"
+    assert failed.error_code == "QueryCanceled"
+    assert failed.rows_materialized == V2_STATE_BUILD_EVIDENCE_PAGE_SIZE + 1
     assert provider.capture(datetime.fromtimestamp(NOW, timezone.utc)) is prior
     telemetry = provider.metrics.snapshot()
     assert ("v2_state_restore_success_total", 1) in telemetry.counters
     assert ("v2_background_refresh_failures_total", 1) in telemetry.counters
     assert ("v2_background_status", "STALE") in telemetry.statuses
     assert (
-        "v2_background_error_code", "V2_EVIDENCE_ROW_LIMIT_EXCEEDED"
+        "v2_background_error_code", "QueryCanceled"
     ) in telemetry.statuses
 
 
@@ -293,10 +297,10 @@ def test_v2_provider_retries_restore_before_overflowing_rebuild():
     )
 
     class OverflowingBuilder:
-        last_rows_materialized = V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+        last_rows_materialized = V2_STATE_BUILD_EVIDENCE_PAGE_SIZE + 1
 
         def build(self):
-            raise RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED")
+            raise QueryCanceled("statement timeout")
 
     class Store:
         def __init__(self):
@@ -326,7 +330,7 @@ def test_v2_provider_retries_restore_before_overflowing_rebuild():
     assert initial.status == "UNAVAILABLE"
     assert retried.status == "STALE"
     assert retried.state_id == prior.state_id
-    assert retried.error_code == "V2_EVIDENCE_ROW_LIMIT_EXCEEDED"
+    assert retried.error_code == "QueryCanceled"
     assert store.latest_calls == 2
     assert provider.capture(cutoff) is prior
 
@@ -463,13 +467,14 @@ def test_v2_batch_builder_uses_read_only_repeatable_read_and_closes_snapshot():
     bounded = connection.value.statements[2:]
     assert len(bounded) == 2
     assert all("LIMIT %s" in sql for sql, _params in bounded)
-    assert all(params[-1] == V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+    assert all(params[-1] == V2_STATE_BUILD_EVIDENCE_PAGE_SIZE
                for _sql, params in bounded)
+    assert all("OFFSET" not in sql for sql, _params in bounded)
     assert all("o.resolved_epoch <= f.maturity_epoch + %s" in sql
                for sql, _params in bounded)
     assert all("o.resolved_epoch >= f.maturity_epoch" in sql
                for sql, _params in bounded)
-    assert all(params[2] == 5.0 for _sql, params in bounded)
+    assert all(params[4] == 5.0 for _sql, params in bounded)
     assert connection.rollbacks == 1
     assert connection.value.closed and connection.closed
 
@@ -537,7 +542,7 @@ def test_v2_builder_materializes_provider_time_and_rejects_unproven_rows(monkeyp
     assert {row.resolved_epoch for row in targets} == {NOW - 1}
     assert "f.source_as_of_epoch" in connection.cursor_value.statements[2][0]
 
-def test_v2_builder_fails_closed_before_quant_work_when_row_limit_is_exceeded():
+def test_v2_builder_fails_closed_if_keyset_does_not_advance():
     class Cursor:
         def __init__(self):
             self.fetches = 0
@@ -547,7 +552,7 @@ def test_v2_builder_fails_closed_before_quant_work_when_row_limit_is_exceeded():
             return (NOW,)
         def fetchall(self):
             self.fetches += 1
-            return [()] * (V2_STATE_BUILD_EVIDENCE_LIMIT + 1)
+            return [(1, None, None, None, None, "30S", 1.0)] * V2_STATE_BUILD_EVIDENCE_PAGE_SIZE
         def close(self):
             pass
 
@@ -566,8 +571,67 @@ def test_v2_builder_fails_closed_before_quant_work_when_row_limit_is_exceeded():
     builder = PostgresV2StateBuilder(
         "postgresql://unused", connect=lambda _url: connection,
     )
-    with pytest.raises(RuntimeError, match="V2_EVIDENCE_ROW_LIMIT_EXCEEDED"):
+    with pytest.raises(RuntimeError, match="V2_EVIDENCE_PAGINATION_STALLED"):
         builder.build()
-    assert builder.last_rows_materialized == V2_STATE_BUILD_EVIDENCE_LIMIT + 1
-    assert connection.cursor_value.fetches == 1
+    assert builder.last_rows_materialized == V2_STATE_BUILD_EVIDENCE_PAGE_SIZE * 2
+    assert connection.cursor_value.fetches == 2
     assert connection.rollbacks == 0
+
+
+@pytest.mark.parametrize("row_count", (65_536, 65_537, 200_000))
+def test_v2_builder_keyset_pages_admit_all_qualified_rows(monkeypatch, row_count):
+    class Cursor:
+        def __init__(self):
+            self.parameters = ()
+            self.volatility = False
+            self.keys = []
+        def execute(self, sql, parameters):
+            self.parameters = parameters
+            self.volatility = "volatility_forecasts" in sql
+            assert "OFFSET" not in sql
+        def fetchone(self): return (NOW,)
+        def fetchall(self):
+            if self.volatility:
+                return []
+            after = -1 if len(self.parameters) == 7 else int(self.parameters[-3])
+            first = after + 1
+            stop = min(first + V2_STATE_BUILD_EVIDENCE_PAGE_SIZE, row_count)
+            rows = [
+                (index, "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"],
+                 f"cycle-{index}", "COIN", "30S", float(index),
+                 float(index + 30), 1.0, float(index), DATA_SCHEMA_VERSION,
+                 SOURCE_SPEC_VERSION, None, 2.0, float(index + 30),
+                 float(index), float(index + 30))
+                for index in range(first, stop)
+            ]
+            if rows:
+                self.keys.append((rows[-1][5], rows[-1][6], rows[-1][0]))
+            return rows
+        def close(self): pass
+
+    class Connection:
+        def __init__(self): self.value = Cursor()
+        def cursor(self): return self.value
+        def rollback(self): pass
+        def close(self): pass
+
+    captured = 0
+    def dataset(**kwargs):
+        nonlocal captured
+        captured += len(tuple(kwargs["observations"]))
+        return SimpleNamespace(horizon=kwargs["horizon"])
+    monkeypatch.setattr("quant.v9_production.build_v2a_dataset", dataset)
+    monkeypatch.setattr("quant.v9_production.build_v2b_calibration", lambda _datasets: object())
+    monkeypatch.setattr("quant.v9_production.build_v2c_covariance", lambda *_args: object())
+    monkeypatch.setattr("quant.v9_production.build_v2d_evidence_state", lambda **_kwargs:
+        SimpleNamespace(creation_status="VALID", top_level_status="PROVISIONAL"))
+    connection = Connection()
+    builder = PostgresV2StateBuilder("postgresql://unused", connect=lambda _url: connection)
+
+    builder.build()
+
+    assert captured == row_count
+    assert builder.last_rows_materialized == row_count
+    assert connection.value.keys[0][2] == V2_STATE_BUILD_EVIDENCE_PAGE_SIZE - 1
+    assert connection.value.keys[-1][2] == row_count - 1
+    assert connection.value.keys == sorted(set(connection.value.keys))

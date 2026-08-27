@@ -56,9 +56,8 @@ from .v9_v4d_integration import ImmutableStateCache, OperationalMetrics
 TARGET_SPEC_ID = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
 V2_REFRESH_SECONDS = 3600.0
 V2_FAILURE_RETRY_SECONDS = 60.0
-V2_STATE_BUILD_EVIDENCE_LIMIT = 65_536
+V2_STATE_BUILD_EVIDENCE_PAGE_SIZE = 4_096
 _V2_CERTIFIED_RECOVERY_TRIGGER_CODES = frozenset((
-    "V2_EVIDENCE_ROW_LIMIT_EXCEEDED",
     "QueryCanceled",
 ))
 
@@ -185,70 +184,79 @@ class PostgresV2StateBuilder:
                     state_as_of = float(requested_state_as_of)
                     if state_as_of > snapshot_as_of:
                         raise RuntimeError("V2_CERTIFIED_RECOVERY_AS_OF_INVALID")
-                cursor.execute(
-                    """
+                def read_pages(*, volatility: bool) -> tuple[tuple, ...]:
+                    """Read a stable snapshot without OFFSET or a history ceiling."""
+
+                    table = ("volatility_forecasts" if volatility else "forecasts")
+                    outcome_table = ("volatility_forecast_outcomes" if volatility
+                                     else "forecast_outcomes")
+                    value = ("f.forecast_volatility_bps" if volatility
+                             else "f.forecast_bps")
+                    numerical_columns = (
+                        "o.resolved_epoch, " if volatility else
+                        "f.source_as_of_epoch, o.outcome_bps, o.resolved_epoch, "
+                    )
+                    publication_kinds = (
+                        ("VOLATILITY_FORECAST", "VOLATILITY_OUTCOME") if volatility
+                        else ("DIRECTIONAL_FORECAST", "DIRECTIONAL_OUTCOME")
+                    )
+                    result: list[tuple] = []
+                    key: tuple[object, object, object] | None = None
+                    while True:
+                        key_predicate = ""
+                        parameters: list[object] = [
+                            publication_kinds[0], publication_kinds[1],
+                            DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, 5.0,
+                            state_as_of,
+                        ]
+                        if key is not None:
+                            key_predicate = (
+                                "AND (f.horizon, f.cutoff_epoch, f.forecast_id) "
+                                "> (%s, %s, %s)"
+                            )
+                            parameters.extend(key)
+                        parameters.append(V2_STATE_BUILD_EVIDENCE_PAGE_SIZE)
+                        cursor.execute(
+                            f"""
                     SELECT f.forecast_id, f.quant_id, f.formula_version,
                            f.cycle_id, f.symbol, f.horizon, f.cutoff_epoch,
-                           f.maturity_epoch, f.forecast_bps, f.created_epoch,
+                           f.maturity_epoch, {value}, f.created_epoch,
                            f.data_schema_version, f.source_spec_version,
-                           f.source_as_of_epoch, o.outcome_bps, o.resolved_epoch,
+                           {numerical_columns}
                            extract(epoch FROM fp.commit_observed_at),
                            extract(epoch FROM op.commit_observed_at)
-                    FROM public.forecasts AS f
-                    JOIN public.forecast_outcomes AS o USING (forecast_id)
+                    FROM public.{table} AS f
+                    JOIN public.{outcome_table} AS o USING (forecast_id)
                     JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        'DIRECTIONAL_FORECAST', f.forecast_id
+                        %s, f.forecast_id
                     ) AS fp ON true
                     JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        'DIRECTIONAL_OUTCOME', o.forecast_id
+                        %s, o.forecast_id
                     ) AS op ON true
                     WHERE f.data_schema_version=%s AND f.source_spec_version=%s
                       AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
                       AND o.resolved_epoch >= f.maturity_epoch
                       AND o.resolved_epoch <= f.maturity_epoch + %s
                       AND op.commit_observed_at<=to_timestamp(%s)
+                      {key_predicate}
                     ORDER BY f.horizon, f.cutoff_epoch, f.forecast_id
                     LIMIT %s
                     """,
-                    (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, 5.0, state_as_of,
-                     V2_STATE_BUILD_EVIDENCE_LIMIT + 1),
-                )
-                directional_rows = tuple(cursor.fetchall())
-                self.last_rows_materialized = len(directional_rows)
-                if len(directional_rows) > V2_STATE_BUILD_EVIDENCE_LIMIT:
-                    raise RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED")
-                cursor.execute(
-                    """
-                    SELECT f.forecast_id, f.quant_id, f.formula_version,
-                           f.cycle_id, f.symbol, f.horizon, f.cutoff_epoch,
-                           f.maturity_epoch, f.forecast_volatility_bps,
-                           f.created_epoch, f.data_schema_version,
-                           f.source_spec_version, o.resolved_epoch,
-                           extract(epoch FROM fp.commit_observed_at),
-                           extract(epoch FROM op.commit_observed_at)
-                    FROM public.volatility_forecasts AS f
-                    JOIN public.volatility_forecast_outcomes AS o USING (forecast_id)
-                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        'VOLATILITY_FORECAST', f.forecast_id
-                    ) AS fp ON true
-                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        'VOLATILITY_OUTCOME', o.forecast_id
-                    ) AS op ON true
-                    WHERE f.data_schema_version=%s AND f.source_spec_version=%s
-                      AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
-                      AND o.resolved_epoch >= f.maturity_epoch
-                      AND o.resolved_epoch <= f.maturity_epoch + %s
-                      AND op.commit_observed_at<=to_timestamp(%s)
-                    ORDER BY f.horizon, f.cutoff_epoch, f.forecast_id
-                    LIMIT %s
-                    """,
-                    (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, 5.0, state_as_of,
-                     V2_STATE_BUILD_EVIDENCE_LIMIT + 1),
-                )
-                magnitude_rows = tuple(cursor.fetchall())
-                self.last_rows_materialized = len(directional_rows) + len(magnitude_rows)
-                if len(magnitude_rows) > V2_STATE_BUILD_EVIDENCE_LIMIT:
-                    raise RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED")
+                            tuple(parameters),
+                        )
+                        page = tuple(cursor.fetchall())
+                        result.extend(page)
+                        self.last_rows_materialized += len(page)
+                        if len(page) < V2_STATE_BUILD_EVIDENCE_PAGE_SIZE:
+                            return tuple(result)
+                        last = page[-1]
+                        next_key = (last[5], last[6], last[0])
+                        if key is not None and next_key <= key:
+                            raise RuntimeError("V2_EVIDENCE_PAGINATION_STALLED")
+                        key = next_key
+
+                directional_rows = read_pages(volatility=False)
+                magnitude_rows = read_pages(volatility=True)
             finally:
                 close = getattr(cursor, "close", None)
                 if callable(close):
