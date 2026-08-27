@@ -92,16 +92,39 @@ class HistoricalOutcomePostgresTests(unittest.TestCase):
 
         with self.db.cursor() as c:
             c.execute(
-                """SELECT table_name, privilege_type
-                   FROM information_schema.role_table_grants
-                   WHERE grantee = 'atom_v9_v4_runtime'
-                     AND table_schema = 'public'
-                     AND table_name LIKE 'atom_historical_replay_%'
-                   ORDER BY table_name, privilege_type"""
+                """SELECT
+                   has_table_privilege(
+                       'atom_v9_v4_runtime',
+                       'public.atom_historical_replay_runs', 'SELECT'
+                   ),
+                   has_table_privilege(
+                       'atom_v9_v4_runtime',
+                       'public.atom_historical_replay_runs', 'INSERT'
+                   ),
+                   has_table_privilege(
+                       'atom_v9_v4_runtime',
+                       'public.atom_historical_replay_runs', 'UPDATE'
+                   ),
+                   has_table_privilege(
+                       'atom_v9_v4_runtime',
+                       'public.atom_historical_replay_runs', 'DELETE'
+                   ),
+                   has_table_privilege(
+                       'atom_v9_v4_runtime',
+                       'public.atom_historical_replay_runs', 'TRUNCATE'
+                   ),
+                   has_table_privilege(
+                       'atom_v9_v4_runtime',
+                       'public.atom_historical_replay_forecasts', 'SELECT'
+                   ),
+                   has_table_privilege(
+                       'atom_v9_v4_runtime',
+                       'public.atom_historical_replay_outcomes', 'SELECT'
+                   )"""
             )
             self.assertEqual(
-                c.fetchall(),
-                [("atom_historical_replay_runs", "SELECT")],
+                c.fetchone(),
+                (True, False, False, False, False, False, False),
             )
             c.execute("SET ROLE atom_historical_replay_writer")
             c.execute(
