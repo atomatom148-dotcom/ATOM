@@ -142,8 +142,10 @@ class _Cursor:
     def __init__(self, connection, named=False):
         self.connection=connection; self.named=named; self.rows=[]; self.index=0; self.itersize=0
     def execute(self, sql, params=()):
+        self.connection.statements.append(sql)
         if self.named:
             self.rows=list(self.connection.join_rows)
+        elif sql == "SET LOCAL statement_timeout = '30min'": self.rows=[]
         elif "dataset_digest" in sql: self.rows=[("dataset","configuration")]
         elif "count(*) FROM public.atom_historical_replay_forecasts" in sql: self.rows=[(len(self.connection.join_rows),)]
         elif "count(*) FROM public.atom_historical_replay_outcomes" in sql: self.rows=[(3,)]
@@ -174,6 +176,17 @@ class ScoringTests(unittest.TestCase):
         self.assertIsNone(q3.directional_accuracy)
     def test_scoring_receipt_is_deterministic_and_select_only(self):
         self.assertEqual(score(self._connection(),"run"),score(self._connection(),"run"))
+
+    def test_large_stream_uses_bounded_transaction_local_timeout(self):
+        row = ("q1_momentum", "30S", 2.0, "AVAILABLE", 1.0, "AVAILABLE",
+               "a"*64, "COIN_MIDPOINT_LOG_RETURN_BPS_1", "d"*64)
+        connection = _Connection([row] * 752_040)
+        receipt = score(connection, "run", fetch_size=2_000)
+        metric = next(m for m in receipt.metrics
+                      if (m.quant_id, m.horizon) == ("q1_momentum", "30S"))
+        self.assertEqual(metric.resolved_count, 752_040)
+        self.assertEqual(connection.statements[0],
+                         "SET LOCAL statement_timeout = '30min'")
 
 class _WriteCursor:
     def __init__(self, answers, fail_insert=False): self.answers=list(answers); self.fail_insert=fail_insert; self.sql=[]
