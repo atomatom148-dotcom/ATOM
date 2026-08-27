@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from quant import web as web_module
 from quant.history import MidpointHistory, MidpointObservation
-from quant.evidence import PhaseECohortMetrics
+from quant.evidence import HistoricalReplaySummary, PhaseECohortMetrics
 from quant.live_market import LiveMarketState
 from quant.q10_options_vol import OptionObservation, OptionSurface
 from quant.v9_production import FORMULA_VERSION_MAP
@@ -796,6 +796,57 @@ async function advance(milliseconds) {{
 
         self.assertEqual(store.calls, [100.0])
         self.assertEqual(json.loads(response["body"])["as_of_epoch"], 100.0)
+
+    def test_historical_replay_summary_is_cached_displayed_and_read_only(self):
+        summary = HistoricalReplaySummary(
+            7, 82_786, 5_463_876, 496_716, "2026-08-25",
+        )
+
+        class Store:
+            def __init__(self):
+                self.summary_calls = 0
+
+            def counts(self):
+                return (0, 0)
+
+            def phase_e_cohorts(self, _as_of):
+                return ()
+
+            def historical_replay_summary(self):
+                self.summary_calls += 1
+                return summary
+
+        store = Store()
+        cache = DashboardEvidenceCache(store, clock=lambda: 100.0)
+        cache.refresh()
+        app = create_app(evidence_cache=cache, clock=lambda: 101.0)
+
+        dashboard = json.loads(request(app, "/api/dashboard")["body"])
+        endpoint = request(app, "/api/historical-replay")
+        page = request(app, "/")["body"].decode()
+
+        self.assertEqual(store.summary_calls, 1)
+        self.assertEqual(endpoint["status"], "200 OK")
+        self.assertEqual(json.loads(endpoint["body"]), {
+            "certified_sessions": 7,
+            "cutoff_count": 82_786,
+            "available_slot_count": 5_463_876,
+            "unavailable_slot_count": 496_716,
+            "latest_session": "2026-08-25",
+            "family_count": 12,
+            "horizon_count": 6,
+            "slots_per_cutoff": 72,
+        })
+        self.assertEqual(dashboard["historical_replay"]["Slots / Cutoff"], 72)
+        self.assertEqual(
+            dashboard["historical_replay"]["Available Slots"], 5_463_876,
+        )
+        self.assertIn("HISTORICAL REPLAY EVIDENCE", page)
+        self.assertIn(">2026-08-25<", page)
+
+    def test_historical_replay_endpoint_fails_closed_without_cached_summary(self):
+        response = request(create_app(), "/api/historical-replay")
+        self.assertEqual(response["status"], "503 Service Unavailable")
 
     def test_phase_e_horizons_have_fixed_display_order(self):
         cohorts = tuple(

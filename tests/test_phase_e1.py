@@ -3,7 +3,10 @@ import math
 import re
 import unittest
 
-from quant.evidence import MIN_EFFECTIVE_N, PhaseECohortMetrics, PostgresEvidenceStore
+from quant.evidence import (
+    HistoricalReplaySummary, MIN_EFFECTIVE_N, PhaseECohortMetrics,
+    PostgresEvidenceStore,
+)
 from quant.web import DashboardEvidenceCache, create_app, dashboard_data
 from tests.test_web import request
 
@@ -25,6 +28,7 @@ class Cursor:
         self.rows = (self.effective_rows if "f.cutoff_epoch, f.forecast_id" in statement
                      else self.metric_rows)
     def fetchall(self): return self.rows
+    def fetchone(self): return self.rows[0]
 
 
 class Connection:
@@ -42,6 +46,20 @@ def store_with(cursor):
 
 
 class PhaseEStoreTests(unittest.TestCase):
+    def test_historical_summary_reads_only_bounded_certified_run_manifests(self):
+        cursor = Cursor(rows=((
+            7, 82_786, 5_463_876, 496_716, "2026-08-25",
+        ),))
+
+        summary = store_with(cursor).historical_replay_summary()
+
+        self.assertEqual(summary, HistoricalReplaySummary(
+            7, 82_786, 5_463_876, 496_716, "2026-08-25",
+        ))
+        self.assertIn("atom_historical_replay_runs", cursor.statement)
+        self.assertNotIn("atom_historical_replay_forecasts", cursor.statement)
+        self.assertEqual(cursor.parameters, ())
+
     def test_volatility_cohorts_use_move_size_metrics_without_direction(self):
         metrics = ((
             "q3_volatility", "realized-volatility-v1", "COIN", "30S",
