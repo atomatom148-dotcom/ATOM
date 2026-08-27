@@ -22,6 +22,11 @@ from quant.v9_v2d_evidence_state import (
     build_v2d_evidence_state,
     serialize_v2_evidence_state,
 )
+from quant.v9_v2_build_receipt import (
+    RECEIPT_SCHEMA_VERSION,
+    V2BuildReceipt,
+    seal_receipt,
+)
 from quant.v9_v2_state_store import (
     FOUND,
     IDEMPOTENT,
@@ -81,6 +86,32 @@ def _state(*, state_as_of: float = 10_000.0, coefficient: float | None = None):
         calibrations=(calibration,),
         covariances=(covariance,),
     )
+
+
+def _receipt(state, **changes):
+    value = V2BuildReceipt(
+        receipt_schema_version=RECEIPT_SCHEMA_VERSION,
+        state_id=state.state_id,
+        state_as_of=state.state_as_of,
+        stored_forecast_rows=4,
+        resolved_evidence_rows=4,
+        source_rows_read=4,
+        eligible_rows=4,
+        admitted_rows=4,
+        rejected_rows=0,
+        pages_read=1,
+        page_size=4_096,
+        first_source_identity="directional:30S:q1_momentum:first",
+        last_source_identity="directional:30S:q1_momentum:last",
+        per_horizon_admitted_counts=(("30S", 4),),
+        per_family_horizon_admitted_counts=(("30S", "q1_momentum", 4),),
+        per_family_horizon_effective_n=(("30S", "q1_momentum", 4.0),),
+        build_elapsed_seconds=1.0,
+        peak_rss_bytes=1_024,
+        evidence_manifest_hash="b" * 64,
+        receipt_sha256="",
+    )
+    return seal_receipt(replace(value, **changes))
 
 
 class Cursor:
@@ -367,3 +398,77 @@ def test_connection_is_closed_even_when_cursor_cleanup_fails():
 
     assert connection.cursor_value.closed
     assert connection.closed
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"state_id": "v9v2:" + "f" * 64},
+        {"state_as_of": 9_999.0},
+    ),
+)
+def test_insert_with_receipt_rejects_identity_mismatch_before_connecting(changes):
+    state = _state()
+    connector = Connector()
+
+    with pytest.raises(V2StateInvalidError, match="does not identify"):
+        PostgresV2StateStore(
+            DATABASE_URL,
+            connect=connector,
+        ).insert_with_receipt(state, _receipt(state, **changes))
+
+    assert connector.calls == []
+
+
+@pytest.mark.parametrize(
+    ("receipt_rows", "state_rows", "expected"),
+    (
+        ([("receipt",)], [("state",)], INSERTED),
+        ([], [], IDEMPOTENT),
+    ),
+)
+def test_insert_with_receipt_commits_only_matching_atomic_outcomes(
+    receipt_rows,
+    state_rows,
+    expected,
+):
+    state = _state()
+    connection = Connection([_role(), receipt_rows, state_rows])
+
+    result = PostgresV2StateStore(
+        DATABASE_URL,
+        connect=Connector(connection),
+    ).insert_with_receipt(state, _receipt(state))
+
+    assert result == expected
+    assert (connection.commits, connection.rollbacks) == (1, 0)
+    assert any(
+        "atom_v9_v2_build_receipts" in sql
+        for sql, _ in connection.cursor_value.calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("receipt_inserted", "state_inserted"),
+    (
+        (True, False),
+        (False, True),
+    ),
+)
+def test_insert_with_receipt_rolls_back_split_append(
+    receipt_inserted,
+    state_inserted,
+):
+    state = _state()
+    receipt_rows = [("receipt",)] if receipt_inserted else []
+    state_rows = [(state.state_id,)] if state_inserted else []
+    connection = Connection([_role(), receipt_rows, state_rows])
+
+    with pytest.raises(V2StateConflictError, match="append conflict"):
+        PostgresV2StateStore(
+            DATABASE_URL,
+            connect=Connector(connection),
+        ).insert_with_receipt(state, _receipt(state))
+
+    assert (connection.commits, connection.rollbacks) == (0, 1)
+    assert connection.closed and connection.cursor_value.closed
