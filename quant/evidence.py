@@ -367,13 +367,23 @@ class PostgresEvidenceStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
+                    WITH latest_certified_sessions AS (
+                        SELECT DISTINCT ON (historical_session)
+                               historical_session,
+                               frame_count,
+                               available_observation_count,
+                               unavailable_observation_count
+                        FROM public.atom_historical_replay_runs
+                        WHERE execution_stage = 'REPLAY_COMPLETE'
+                          AND certification_status = 'CERTIFIED'
+                        ORDER BY historical_session, created_at DESC,
+                                 replay_run_id DESC
+                    )
                     SELECT count(*), COALESCE(sum(frame_count), 0),
                            COALESCE(sum(available_observation_count), 0),
                            COALESCE(sum(unavailable_observation_count), 0),
                            max(historical_session)::text
-                    FROM public.atom_historical_replay_runs
-                    WHERE execution_stage = 'REPLAY_COMPLETE'
-                      AND certification_status = 'CERTIFIED'
+                    FROM latest_certified_sessions
                     """,
                     (),
                 )
