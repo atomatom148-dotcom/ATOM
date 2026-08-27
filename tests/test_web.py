@@ -610,6 +610,9 @@ async function advance(milliseconds) {{
         page = dashboard_page(payload).decode()
         self.assertIn(">Momentum / 1M<", page)
         self.assertNotIn(">null<", page)
+        self.assertIn(">—</td>", page)
+        self.assertIn('cohort.effective_n == null ? "—"', page)
+        self.assertIn('cohort.coverage == null ? "—"', page)
 
     def test_options_display_labels_stale_surface_and_formats_prices(self):
         call = OptionObservation(
