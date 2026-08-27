@@ -56,8 +56,16 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertEqual(summary, HistoricalReplaySummary(
             7, 82_786, 5_463_876, 496_716, "2026-08-25",
         ))
-        self.assertIn("atom_historical_replay_runs", cursor.statement)
-        self.assertNotIn("atom_historical_replay_forecasts", cursor.statement)
+        sql = " ".join(cursor.statement.split())
+        self.assertIn("atom_historical_replay_runs", sql)
+        self.assertIn("WITH latest_certified_sessions AS", sql)
+        self.assertIn("SELECT DISTINCT ON (historical_session)", sql)
+        self.assertIn(
+            "ORDER BY historical_session, created_at DESC, replay_run_id DESC",
+            sql,
+        )
+        self.assertIn("FROM latest_certified_sessions", sql)
+        self.assertNotIn("atom_historical_replay_forecasts", sql)
         self.assertEqual(cursor.parameters, ())
 
     def test_volatility_cohorts_use_move_size_metrics_without_direction(self):
