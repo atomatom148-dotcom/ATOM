@@ -57,6 +57,10 @@ TARGET_SPEC_ID = "COIN_MIDPOINT_LOG_RETURN_BPS_1"
 V2_REFRESH_SECONDS = 3600.0
 V2_FAILURE_RETRY_SECONDS = 60.0
 V2_STATE_BUILD_EVIDENCE_LIMIT = 65_536
+_V2_CERTIFIED_RECOVERY_TRIGGER_CODES = frozenset((
+    "V2_EVIDENCE_ROW_LIMIT_EXCEEDED",
+    "QueryCanceled",
+))
 
 # Earliest complete six-horizon production V2D witness from the durable V4
 # ledger. The exact content hash makes this a fail-closed recovery checkpoint.
@@ -437,8 +441,8 @@ class ImmutableV2StateProvider:
                     and self._recovery_witness is not None
                     and restore_snapshot is not None
                     and restore_snapshot.error_code == "NOT_FOUND"
-                    and _v2_error_code(primary_error) ==
-                    "V2_EVIDENCE_ROW_LIMIT_EXCEEDED"
+                    and _v2_error_code(primary_error)
+                    in _V2_CERTIFIED_RECOVERY_TRIGGER_CODES
                 )
                 if not can_recover:
                     raise
@@ -524,13 +528,14 @@ class ImmutableV2StateProvider:
         def worker() -> None:
             while not stop_event.is_set():
                 snapshot = self.refresh()
-                retained_overflow = (
+                retained_bounded_failure = (
                     snapshot.status == "STALE"
-                    and snapshot.error_code == "V2_EVIDENCE_ROW_LIMIT_EXCEEDED"
+                    and snapshot.error_code
+                    in _V2_CERTIFIED_RECOVERY_TRIGGER_CODES
                 )
                 delay = (
                     interval
-                    if snapshot.status == "AVAILABLE" or retained_overflow
+                    if snapshot.status == "AVAILABLE" or retained_bounded_failure
                     else V2_FAILURE_RETRY_SECONDS
                 )
                 if stop_event.wait(delay):
