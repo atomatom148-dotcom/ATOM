@@ -13,6 +13,7 @@ from quant.v9_production import (
     ImmutableV2StateProvider,
     PostgresV2StateBuilder, build_live_v1,
 )
+from quant.v9_v2_state_store import V2StateRoleError
 from quant.v9_v1_contract import HORIZONS, QUANT_IDS
 from quant.web import dashboard_data
 
@@ -240,6 +241,178 @@ def test_v2_background_provider_retries_failed_build_after_one_minute():
 
     assert not thread.is_alive()
     assert stop.seconds == [60.0]
+
+
+def test_v2_provider_restores_then_retains_last_good_state_on_overflow():
+    prior = SimpleNamespace(
+        state_id="v9v2:" + "b" * 64,
+        state_as_of=NOW - 10,
+        creation_status="VALID",
+    )
+
+    class OverflowingBuilder:
+        last_rows_materialized = V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+
+        def build(self):
+            raise RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED")
+
+    class Store:
+        def latest(self, *, requested_cutoff):
+            assert requested_cutoff == NOW
+            return prior, "AVAILABLE"
+
+        def insert(self, _state):
+            raise AssertionError("overflow must not persist a partial state")
+
+    provider = ImmutableV2StateProvider(OverflowingBuilder(), store=Store())
+    restored = provider.restore(datetime.fromtimestamp(NOW, timezone.utc))
+    failed = provider.refresh()
+
+    assert restored.status == "AVAILABLE"
+    assert failed.status == "STALE"
+    assert failed.state_id == prior.state_id
+    assert failed.state_as_of == prior.state_as_of
+    assert failed.error_type == "RuntimeError"
+    assert failed.error_code == "V2_EVIDENCE_ROW_LIMIT_EXCEEDED"
+    assert failed.rows_materialized == V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+    assert provider.capture(datetime.fromtimestamp(NOW, timezone.utc)) is prior
+    telemetry = provider.metrics.snapshot()
+    assert ("v2_state_restore_success_total", 1) in telemetry.counters
+    assert ("v2_background_refresh_failures_total", 1) in telemetry.counters
+    assert ("v2_background_status", "STALE") in telemetry.statuses
+    assert (
+        "v2_background_error_code", "V2_EVIDENCE_ROW_LIMIT_EXCEEDED"
+    ) in telemetry.statuses
+
+
+def test_v2_provider_retries_restore_before_overflowing_rebuild():
+    prior = SimpleNamespace(
+        state_id="v9v2:" + "d" * 64,
+        state_as_of=NOW - 10,
+        creation_status="VALID",
+    )
+
+    class OverflowingBuilder:
+        last_rows_materialized = V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+
+        def build(self):
+            raise RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED")
+
+    class Store:
+        def __init__(self):
+            self.latest_calls = 0
+
+        def latest(self, *, requested_cutoff):
+            assert requested_cutoff == NOW
+            self.latest_calls += 1
+            if self.latest_calls == 1:
+                raise RuntimeError("temporary database failure")
+            return prior, "FOUND"
+
+        def insert(self, _state):
+            raise AssertionError("overflow must not persist a partial state")
+
+    store = Store()
+    cutoff = datetime.fromtimestamp(NOW, timezone.utc)
+    provider = ImmutableV2StateProvider(
+        OverflowingBuilder(),
+        store=store,
+        utc_clock=lambda: cutoff,
+    )
+
+    initial = provider.restore(cutoff)
+    retried = provider.refresh()
+
+    assert initial.status == "UNAVAILABLE"
+    assert retried.status == "STALE"
+    assert retried.state_id == prior.state_id
+    assert retried.error_code == "V2_EVIDENCE_ROW_LIMIT_EXCEEDED"
+    assert store.latest_calls == 2
+    assert provider.capture(cutoff) is prior
+
+
+def test_v2_restore_telemetry_uses_stable_store_reason_code():
+    class Builder:
+        last_rows_materialized = 0
+
+    class Store:
+        def latest(self, *, requested_cutoff):
+            assert requested_cutoff == NOW
+            raise V2StateRoleError("database role does not match V2 runtime")
+
+    cutoff = datetime.fromtimestamp(NOW, timezone.utc)
+    provider = ImmutableV2StateProvider(Builder(), store=Store())
+
+    snapshot = provider.restore(cutoff)
+
+    assert snapshot.status == "UNAVAILABLE"
+    assert snapshot.error_type == "V2StateRoleError"
+    assert snapshot.error_code == "V2_STATE_ROLE_MISMATCH"
+
+
+def test_v2_provider_rejects_candidate_older_than_restored_state():
+    prior = SimpleNamespace(
+        state_id="v9v2:" + "e" * 64,
+        state_as_of=NOW - 10,
+        creation_status="VALID",
+    )
+    candidate = SimpleNamespace(
+        state_id="v9v2:" + "f" * 64,
+        state_as_of=NOW - 20,
+        creation_status="VALID",
+    )
+
+    class Builder:
+        last_rows_materialized = 12
+
+        def build(self):
+            return candidate
+
+    class Store:
+        def latest(self, *, requested_cutoff):
+            assert requested_cutoff == NOW
+            return prior, "FOUND"
+
+        def insert(self, _state):
+            raise AssertionError("regressive candidate must not be persisted")
+
+    cutoff = datetime.fromtimestamp(NOW, timezone.utc)
+    provider = ImmutableV2StateProvider(Builder(), store=Store())
+    provider.restore(cutoff)
+
+    snapshot = provider.refresh()
+
+    assert snapshot.status == "STALE"
+    assert snapshot.state_id == prior.state_id
+    assert snapshot.error_code == "V2_STATE_AS_OF_REGRESSION"
+    assert provider.capture(cutoff) is prior
+
+
+def test_v2_provider_does_not_publish_when_durable_insert_fails():
+    candidate = SimpleNamespace(
+        state_id="v9v2:" + "c" * 64,
+        state_as_of=NOW - 1,
+        creation_status="VALID",
+    )
+
+    class Builder:
+        last_rows_materialized = 12
+
+        def build(self):
+            return candidate
+
+    class Store:
+        def insert(self, state):
+            assert state is candidate
+            raise RuntimeError("V2_STATE_PERSISTENCE_FAILED")
+
+    provider = ImmutableV2StateProvider(Builder(), store=Store())
+    snapshot = provider.refresh()
+
+    assert snapshot.status == "UNAVAILABLE"
+    assert snapshot.error_code == "V2_STATE_PERSISTENCE_FAILED"
+    with pytest.raises(RuntimeError, match="V2_STATE_UNAVAILABLE"):
+        provider.capture(datetime.fromtimestamp(NOW, timezone.utc))
 
 
 def test_v2_batch_builder_uses_read_only_repeatable_read_and_closes_snapshot():

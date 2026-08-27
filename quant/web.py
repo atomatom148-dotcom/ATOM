@@ -927,6 +927,35 @@ def _restore_shutdown_handlers(previous: dict[int, object]) -> None:
         signal.signal(signal_number, handler)
 
 
+def _start_v2(
+    database_url: str,
+    metrics: OperationalMetrics,
+    *,
+    builder_factory: Callable | None = None,
+    store_factory: Callable | None = None,
+    provider_factory: Callable | None = None,
+    utc_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+):
+    """Restore durable V2 state before starting its offline refresh worker."""
+
+    if builder_factory is None or provider_factory is None:
+        from .v9_production import ImmutableV2StateProvider, PostgresV2StateBuilder
+        builder_factory = builder_factory or PostgresV2StateBuilder
+        provider_factory = provider_factory or ImmutableV2StateProvider
+    if store_factory is None:
+        from .v9_v2_state_store import PostgresV2StateStore
+        store_factory = PostgresV2StateStore
+    provider = provider_factory(
+        builder_factory(database_url),
+        store=store_factory(database_url),
+        metrics=metrics,
+        utc_clock=utc_clock,
+    )
+    provider.restore(utc_clock())
+    provider.start()
+    return provider
+
+
 def main(*, simulator_connection_factory: Callable | None = None,
          simulator_utc_clock: Callable[[], datetime] =
          lambda: datetime.now(timezone.utc)) -> None:
@@ -944,14 +973,9 @@ def main(*, simulator_connection_factory: Callable | None = None,
         database_url = os.environ["DATABASE_URL"]
         evidence_store = PostgresEvidenceStore(database_url)
         evidence_cache = DashboardEvidenceCache(evidence_store)
-        from .v9_production import (
-            ImmutableV2StateProvider, PostgresV2StateBuilder, ProductionV9Runtime,
-        )
+        from .v9_production import ProductionV9Runtime
         metrics = OperationalMetrics()
-        v2_provider = ImmutableV2StateProvider(
-            PostgresV2StateBuilder(database_url), metrics=metrics,
-        )
-        v2_provider.start()
+        v2_provider = _start_v2(database_url, metrics)
         v9_runtime = ProductionV9Runtime(database_url, v2_provider, metrics=metrics)
         from .evidence_outbox import (
             EvidenceLedgerWorker, EvidenceOutbox, PostgresV4BStateBuilder,
