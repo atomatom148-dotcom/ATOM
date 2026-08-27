@@ -327,30 +327,39 @@ def score(connection, replay_run_id: str, *, fetch_size: int = DEFAULT_BATCH_SIZ
     cursor.close()
     states = {(q, h): [0, 0, 0, 0, 0.0, 0.0, 0.0] for q in QUANTS for h in HORIZONS}
     digest = hashlib.sha256()
-    page_after = None
-    while True:
-        stream = connection.cursor(binary=True)
-        keyset = "" if page_after is None else " AND (f.quant_id,f.horizon,f.cutoff_at)>(%s,%s,%s)"
-        params = ((replay_run_id, fetch_size) if page_after is None else
-                  (replay_run_id, *page_after, fetch_size))
-        stream.execute("SELECT f.quant_id,f.horizon,f.expected_return_bps,f.availability_status,o.actual_return_bps,o.availability_status,o.content_sha256,o.resolution_spec_version,o.outcome_source_dataset_digest,f.cutoff_at FROM public.atom_historical_replay_forecasts f LEFT JOIN public.atom_historical_replay_outcomes o USING (replay_run_id,cutoff_at,horizon) WHERE f.replay_run_id=%s" + keyset + " ORDER BY f.quant_id,f.horizon,f.cutoff_at LIMIT %s", params)
-        batch = stream.fetchmany(fetch_size)
-        stream.close()
-        if not batch: break
-        for q, h, predicted, fs, actual, os_, outcome_hash, resolution_version, source_digest, cutoff_at in batch:
-            state = states[(q, h)]
-            if fs != "AVAILABLE": continue
-            state[0] += 1
-            if os_ != "AVAILABLE" or actual is None: continue
-            state[1] += 1
-            target = abs(actual) if q == Q3 else actual
-            error = predicted - target
-            state[4] += error * error; state[5] += abs(error); state[6] += error
-            if q != Q3:
-                if _sign(predicted) == _sign(actual): state[2] += 1
-                else: state[3] += 1
-            digest.update(f"{q}|{h}|{predicted.hex()}|{actual.hex()}|{outcome_hash}|{resolution_version}|{source_digest}\n".encode())
-        page_after = (batch[-1][0], batch[-1][1], batch[-1][9])
+    # Preserve the former ORDER BY quant_id,horizon,cutoff_at byte order while
+    # making each bounded query follow the forecast primary key
+    # (replay_run_id,cutoff_at,quant_id,horizon).  A separate cutoff stream for
+    # each identity keeps every metric's floating-point addition order and the
+    # receipt digest exactly unchanged; it also lets LIMIT stop the index scan.
+    for quant_id, horizon in sorted(states):
+        page_after = None
+        while True:
+            stream = connection.cursor(binary=True)
+            keyset = ("" if page_after is None else
+                      " AND (f.cutoff_at,f.quant_id,f.horizon)>(%s,%s,%s)")
+            params = ((replay_run_id, quant_id, horizon, fetch_size)
+                      if page_after is None else
+                      (replay_run_id, quant_id, horizon, page_after,
+                       quant_id, horizon, fetch_size))
+            stream.execute("SELECT f.quant_id,f.horizon,f.expected_return_bps,f.availability_status,o.actual_return_bps,o.availability_status,o.content_sha256,o.resolution_spec_version,o.outcome_source_dataset_digest,f.cutoff_at FROM public.atom_historical_replay_forecasts f LEFT JOIN public.atom_historical_replay_outcomes o USING (replay_run_id,cutoff_at,horizon) WHERE f.replay_run_id=%s AND f.quant_id=%s AND f.horizon=%s" + keyset + " ORDER BY f.cutoff_at,f.quant_id,f.horizon LIMIT %s", params)
+            batch = stream.fetchmany(fetch_size)
+            stream.close()
+            if not batch: break
+            for q, h, predicted, fs, actual, os_, outcome_hash, resolution_version, source_digest, cutoff_at in batch:
+                state = states[(q, h)]
+                if fs != "AVAILABLE": continue
+                state[0] += 1
+                if os_ != "AVAILABLE" or actual is None: continue
+                state[1] += 1
+                target = abs(actual) if q == Q3 else actual
+                error = predicted - target
+                state[4] += error * error; state[5] += abs(error); state[6] += error
+                if q != Q3:
+                    if _sign(predicted) == _sign(actual): state[2] += 1
+                    else: state[3] += 1
+                digest.update(f"{q}|{h}|{predicted.hex()}|{actual.hex()}|{outcome_hash}|{resolution_version}|{source_digest}\n".encode())
+            page_after = batch[-1][9]
     metrics = []
     for q in QUANTS:
         for h in HORIZONS:
