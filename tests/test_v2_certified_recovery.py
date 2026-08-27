@@ -10,7 +10,7 @@ from quant.v9_production import (
     V2_CERTIFIED_RECOVERY_STATE_AS_OF,
     V2_CERTIFIED_RECOVERY_STATE_HASH,
     V2_CERTIFIED_RECOVERY_STATE_ID,
-    V2_STATE_BUILD_EVIDENCE_LIMIT,
+    V2_STATE_BUILD_EVIDENCE_PAGE_SIZE,
 )
 
 
@@ -78,7 +78,7 @@ def test_v2_builder_uses_exact_explicit_cutoff_for_both_evidence_queries():
     evidence_queries = connection.cursor_value.statements[2:]
     assert len(evidence_queries) == 2
     assert all(
-        parameters[3] == V2_CERTIFIED_RECOVERY_STATE_AS_OF
+        parameters[5] == V2_CERTIFIED_RECOVERY_STATE_AS_OF
         for _sql, parameters in evidence_queries
     )
     assert connection.rollbacks == 1
@@ -119,16 +119,8 @@ def test_v2_builder_rejects_invalid_or_future_explicit_cutoff(invalid):
         builder.build(state_as_of=invalid)
 
 
-@pytest.mark.parametrize(
-    "primary_error",
-    [
-        RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED"),
-        QueryCanceled("statement timeout"),
-    ],
-)
-def test_v2_provider_bootstraps_exact_witness_after_bounded_current_failure(
-    primary_error,
-):
+def test_v2_provider_bootstraps_exact_witness_after_bounded_current_failure():
+    primary_error = QueryCanceled("statement timeout")
     candidate = _candidate()
 
     class Builder:
@@ -140,7 +132,7 @@ def test_v2_provider_bootstraps_exact_witness_after_bounded_current_failure(
         def build(self, **kwargs):
             self.calls.append(kwargs)
             if not kwargs:
-                self.last_rows_materialized = V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+                self.last_rows_materialized = V2_STATE_BUILD_EVIDENCE_PAGE_SIZE + 1
                 raise primary_error
             assert kwargs == {
                 "state_as_of": V2_CERTIFIED_RECOVERY_STATE_AS_OF,
@@ -200,11 +192,11 @@ def test_v2_provider_rejects_any_certified_witness_mismatch(field, value):
     candidate = _candidate(**{field: value})
 
     class Builder:
-        last_rows_materialized = V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+        last_rows_materialized = V2_STATE_BUILD_EVIDENCE_PAGE_SIZE + 1
 
         def build(self, **kwargs):
             if not kwargs:
-                raise RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED")
+                raise QueryCanceled("statement timeout")
             return candidate
 
     class Store:
@@ -262,18 +254,12 @@ def test_v2_provider_does_not_recover_for_non_overflow_build_failure():
     assert builder.calls == [{}]
 
 
-@pytest.mark.parametrize(
-    "primary_error",
-    [
-        RuntimeError("V2_EVIDENCE_ROW_LIMIT_EXCEEDED"),
-        QueryCanceled("statement timeout"),
-    ],
-)
-def test_retained_bounded_failure_uses_normal_refresh_interval(primary_error):
+def test_retained_bounded_failure_uses_normal_refresh_interval():
+    primary_error = QueryCanceled("statement timeout")
     prior = _candidate(state_as_of=V2_CERTIFIED_RECOVERY_STATE_AS_OF - 1.0)
 
     class Builder:
-        last_rows_materialized = V2_STATE_BUILD_EVIDENCE_LIMIT + 1
+        last_rows_materialized = V2_STATE_BUILD_EVIDENCE_PAGE_SIZE + 1
 
         def build(self):
             raise primary_error
