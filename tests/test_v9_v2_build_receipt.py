@@ -67,3 +67,27 @@ def test_required_keyset_page_totals_have_no_hidden_ceiling(rows, pages):
     assert len(set(observed)) == rows
     assert observed[-1] == rows
     assert (rows + page_size - 1) // page_size == pages
+
+
+def test_sealed_receipt_cannot_be_resealed():
+    with pytest.raises(ValueError, match="already sealed"):
+        seal_receipt(seal_receipt(_receipt()))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"state_as_of": float("inf")},
+        {"build_elapsed_seconds": float("nan")},
+    ),
+)
+def test_nonfinite_receipt_values_fail_closed(changes):
+    with pytest.raises(ValueError, match="non-finite"):
+        seal_receipt(_receipt(**changes))
+
+
+def test_tampered_sealed_receipt_cannot_be_serialized():
+    receipt = seal_receipt(_receipt())
+    tampered = replace(receipt, admitted_rows=receipt.admitted_rows - 1)
+    with pytest.raises(ValueError, match="hash mismatch"):
+        serialize_v2_build_receipt(tampered)
