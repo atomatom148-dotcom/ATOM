@@ -978,9 +978,11 @@ def test_cli_batch_preflight_stops_at_first_qualifying_date_without_quants(
         )
 
     monkeypatch.setattr(module, "run_h1_session", run)
+    monkeypatch.chdir(tmp_path)
+    results_dir = tmp_path / "results"
     args = (
         "2026-01-05", "2026-01-06", "2026-01-07", "--batch-preflight",
-        "--output-dir", str(tmp_path),
+        "--output-dir", "results",
     )
     assert main(args) == 0
     first_output = capsys.readouterr().out
@@ -994,10 +996,10 @@ def test_cli_batch_preflight_stops_at_first_qualifying_date_without_quants(
         "maximum_interior_gap_seconds": 5,
         "result_source": "NEW_PREFLIGHT",
     }
-    assert json.loads((tmp_path / "2026-01-05.json").read_text())[
+    assert json.loads((results_dir / "2026-01-05.json").read_text())[
         "historical_session"] == "2026-01-05"
-    assert (tmp_path / "2026-01-06.json").exists()
-    assert not (tmp_path / "2026-01-07.json").exists()
+    assert (results_dir / "2026-01-06.json").exists()
+    assert not (results_dir / "2026-01-07.json").exists()
 
     calls.clear()
     assert main(args) == 0
@@ -1016,7 +1018,10 @@ def test_cli_batch_legacy_gap_only_cache_fails_closed_without_refetch(
     import quant.historical_replay_h1 as module
 
     day = "2026-01-05"
-    (tmp_path / f"{day}.json").write_text(json.dumps({
+    monkeypatch.chdir(tmp_path)
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    (results_dir / f"{day}.json").write_text(json.dumps({
         "historical_session": day,
         "data_reason_codes": ["COIN_INTERQUOTE_GAP"],
         "quote_coverage": [{
@@ -1032,7 +1037,7 @@ def test_cli_batch_legacy_gap_only_cache_fails_closed_without_refetch(
         module.AlpacaHistoricalSipReader, "from_environment",
         classmethod(lambda _cls: unexpected()),
     )
-    result = main((day, "--batch-preflight", "--output-dir", str(tmp_path)))
+    result = main((day, "--batch-preflight", "--output-dir", "results"))
     payload = json.loads(capsys.readouterr().out)
 
     assert result == 2
@@ -1040,6 +1045,32 @@ def test_cli_batch_legacy_gap_only_cache_fails_closed_without_refetch(
         "maximum_interior_gap_seconds": None,
         "qualifying_date": None,
     }
+
+
+@pytest.mark.parametrize("output_dir", ("/tmp/atom-results", "../atom-results"))
+def test_cli_batch_preflight_rejects_output_paths_outside_working_directory(
+    monkeypatch, capsys, tmp_path, output_dir,
+):
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit):
+        main(("2026-01-05", "--batch-preflight", "--output-dir", output_dir))
+    assert "--output-dir" in capsys.readouterr().err
+
+
+def test_cli_batch_preflight_rejects_symlink_escape(
+    monkeypatch, capsys, tmp_path,
+):
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / "results").symlink_to(outside, target_is_directory=True)
+    monkeypatch.chdir(root)
+
+    with pytest.raises(SystemExit):
+        main(("2026-01-05", "--batch-preflight", "--output-dir", "results"))
+    assert "current working directory" in capsys.readouterr().err
 
 
 def test_cached_preflight_requires_exact_coverage_proof_and_digest_equivalence():

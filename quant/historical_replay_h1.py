@@ -1311,6 +1311,23 @@ def _selection(day: date, threshold: int, *, cached: bool) -> dict[str, object]:
     }
 
 
+def _validated_batch_output_dir(value: str) -> Path:
+    """Resolve a batch output directory inside the current working tree."""
+
+    requested = Path(value)
+    if requested.is_absolute():
+        raise ValueError("--output-dir must be a relative path")
+    root = Path.cwd().resolve()
+    output_dir = (root / requested).resolve()
+    try:
+        output_dir.relative_to(root)
+    except ValueError as error:
+        raise ValueError(
+            "--output-dir must stay inside the current working directory"
+        ) from error
+    return output_dir
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run one read-only ATOM TRUE V9 H1 historical SIP session",
@@ -1354,7 +1371,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     except ValueError as error:
         parser.error(str(error))
     if arguments.batch_preflight:
-        output_dir = Path(arguments.output_dir)
+        try:
+            output_dir = _validated_batch_output_dir(arguments.output_dir)
+        except ValueError as error:
+            parser.error(str(error))
         output_dir.mkdir(parents=True, exist_ok=True)
         cached_results = {
             day: result for day in days
