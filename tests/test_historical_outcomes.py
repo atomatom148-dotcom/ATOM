@@ -144,16 +144,12 @@ class _Cursor:
     def execute(self, sql, params=()):
         self.connection.statements.append(sql)
         if sql.startswith("SELECT f.quant_id"):
-            after = None if len(params) == 2 else params[1:4]
-            if after is None:
-                self.connection.page_position = 0
-            elif self.connection.page_position:
-                previous = self.connection.join_rows[
-                    self.connection.page_position - 1]
-                assert (previous[0], previous[1], previous[9]) == after
-            start = self.connection.page_position
-            self.rows = self.connection.join_rows[start:start + params[-1]]
-            self.connection.page_position += len(self.rows)
+            quant_id, horizon = params[1:3]
+            after = None if len(params) == 4 else params[3]
+            candidates = [row for row in self.connection.join_rows
+                          if row[0:2] == (quant_id, horizon)
+                          and (after is None or row[9] > after)]
+            self.rows = candidates[:params[-1]]
             self.connection.max_page_rows = max(self.connection.max_page_rows,
                                                 len(self.rows))
         elif sql == "SET LOCAL statement_timeout = '30min'": self.rows=[]
@@ -173,7 +169,6 @@ class _Connection:
                           for index, row in enumerate(rows)]
         self.join_rows.sort(key=lambda row: (row[0], row[1], row[9]))
         self.statements=[]; self.max_page_rows=0; self.cursor_names=[]
-        self.page_position=0
     def cursor(self, name=None, binary=False):
         self.cursor_names.append(name)
         return _Cursor(self, name is not None)
@@ -208,12 +203,18 @@ class ScoringTests(unittest.TestCase):
                          "SET LOCAL statement_timeout = '30min'")
         page_statements = [sql for sql in connection.statements
                            if sql.startswith("SELECT f.quant_id")]
-        self.assertEqual(len(page_statements), 378)
+        # 377 data pages, one terminal page for that identity, and one empty
+        # page for each of the other 71 quant/horizon identities.
+        self.assertEqual(len(page_statements), 449)
         self.assertLessEqual(connection.max_page_rows, 2_000)
         self.assertTrue(all("LIMIT %s" in sql and "OFFSET" not in sql
                             for sql in page_statements))
-        self.assertTrue(all("(f.quant_id,f.horizon,f.cutoff_at)>" in sql
-                            for sql in page_statements[1:]))
+        self.assertTrue(all("AND f.quant_id=%s AND f.horizon=%s" in sql
+                            for sql in page_statements))
+        self.assertTrue(all("ORDER BY f.cutoff_at,f.quant_id,f.horizon"
+                            in sql for sql in page_statements))
+        self.assertTrue(any("(f.cutoff_at,f.quant_id,f.horizon)>" in sql
+                            for sql in page_statements))
         self.assertEqual(len(receipt.metrics), 72)
 
     def test_keyset_ties_are_complete_deterministic_and_match_single_page(self):
@@ -231,6 +232,29 @@ class ScoringTests(unittest.TestCase):
         metric = next(m for m in paged.metrics
                       if (m.quant_id, m.horizon) == ("q1_momentum", "30S"))
         self.assertEqual(metric.resolved_count, 7)
+
+    def test_index_aligned_pages_preserve_legacy_receipt_byte_order(self):
+        import hashlib
+        rows = []
+        for index, (quant_id, horizon) in enumerate((
+                ("q2_mean_reversion", "30S"),
+                ("q10_options_vol", "1M"),
+                ("q1_momentum", "30S"))):
+            for cutoff in (2, 0, 1):
+                rows.append((quant_id, horizon, float(index + cutoff + 1),
+                             "AVAILABLE", float(cutoff + 1), "AVAILABLE",
+                             format(index * 3 + cutoff, "064x"),
+                             "COIN_MIDPOINT_LOG_RETURN_BPS_1", "d"*64,
+                             BASE + timedelta(microseconds=cutoff)))
+        receipt = score(_Connection(rows), "run", fetch_size=2)
+        expected = hashlib.sha256()
+        for row in sorted(rows, key=lambda value: (value[0], value[1],
+                                                    value[9])):
+            q, h, predicted, _, actual, _, outcome_hash, version, source, _ = row
+            expected.update(
+                f"{q}|{h}|{predicted.hex()}|{actual.hex()}|{outcome_hash}|{version}|{source}\n".encode()
+            )
+        self.assertEqual(receipt.content_hash_summary, expected.hexdigest())
 
     def test_scoring_uses_ordinary_cursor_for_each_bounded_statement(self):
         connection = self._connection()
