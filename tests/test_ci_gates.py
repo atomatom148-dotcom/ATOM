@@ -9,6 +9,10 @@ def test_ordinary_ci_runs_full_suite_on_pull_requests_and_main():
     assert "pull_request:" in workflow
     assert "branches: [main]" in workflow
     assert "permissions:\n  contents: read" in workflow
+    assert "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683" in workflow
+    assert "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065" in workflow
+    assert "actions/checkout@v4" not in workflow
+    assert "actions/setup-python@v5" not in workflow
     assert "PYTHONPATH=. python -m pytest -q" in workflow
     assert "secrets." not in workflow
 
