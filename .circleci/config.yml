@@ -3,7 +3,7 @@ version: 2.1
 jobs:
   test:
     docker:
-      - image: cimg/python:3.12
+      - image: cimg/python:3.12-node
       - image: cimg/postgres:16.4
         environment:
           POSTGRES_PASSWORD: postgres
@@ -13,9 +13,6 @@ jobs:
       PYTHONPATH: .
     steps:
       - checkout
-      - run:
-          name: Install system dependencies
-          command: sudo apt-get update && sudo apt-get install -y nodejs
       - run:
           name: Install Python dependencies
           command: python -m pip install -r requirements.txt pytest
