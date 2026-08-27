@@ -75,6 +75,7 @@ _WEB_ENDPOINT_METRIC_PATHS = frozenset({
     "/api/v9-math",
     "/api/performance",
     "/api/phase-e",
+    "/api/historical-replay",
     "/api/live",
     "/api/dashboard",
 })
@@ -87,6 +88,7 @@ class DashboardEvidenceSnapshot:
     phase_e_cohorts: tuple[object, ...] = ()
     as_of_epoch: float | None = None
     status: str = "UNAVAILABLE"
+    historical_replay: object | None = None
 
 
 class DashboardEvidenceCache:
@@ -107,9 +109,19 @@ class DashboardEvidenceCache:
                 return self._snapshot
         with self._lock:
             current = self._snapshot
+        historical_replay = current.historical_replay
+        historical_reader = getattr(
+            self._store, "historical_replay_summary", None,
+        )
+        if callable(historical_reader):
+            try:
+                historical_replay = historical_reader()
+            except Exception:
+                pass
+        with self._lock:
             self._snapshot = DashboardEvidenceSnapshot(
                 counts, current.phase_e_cohorts,
-                current.as_of_epoch, current.status,
+                current.as_of_epoch, current.status, historical_replay,
             )
         try:
             cohorts = tuple(self._store.phase_e_cohorts(as_of_epoch))
@@ -117,7 +129,7 @@ class DashboardEvidenceCache:
             if callable(volatility_reader):
                 cohorts += tuple(volatility_reader(as_of_epoch))
             candidate = DashboardEvidenceSnapshot(
-                counts, cohorts, as_of_epoch, "AVAILABLE",
+                counts, cohorts, as_of_epoch, "AVAILABLE", historical_replay,
             )
         except Exception:
             with self._lock:
@@ -149,6 +161,7 @@ def dashboard_data(
     evidence_counts: tuple[int, int] | None = None,
     phase_e_cohorts: Iterable[object] = (),
     evidence_status: str = "UNAVAILABLE",
+    historical_replay_summary: object | None = None,
     cross_asset_state: CrossAssetState | None = None,
     market_display: LatestMarketDisplay | None = None,
     v9_output: object | None = None,
@@ -365,6 +378,30 @@ def dashboard_data(
             "Status": evidence_status,
         },
         "phase_e_cohorts": visible_cohorts,
+        "historical_replay": {
+            "Status": (
+                "AVAILABLE" if historical_replay_summary is not None
+                else "UNAVAILABLE"
+            ),
+            "Certified Sessions": getattr(
+                historical_replay_summary, "certified_sessions", None,
+            ),
+            "Cutoffs": getattr(historical_replay_summary, "cutoff_count", None),
+            "Families": getattr(historical_replay_summary, "family_count", 12),
+            "Horizons": getattr(historical_replay_summary, "horizon_count", 6),
+            "Slots / Cutoff": getattr(
+                historical_replay_summary, "slots_per_cutoff", 72,
+            ),
+            "Available Slots": getattr(
+                historical_replay_summary, "available_slot_count", None,
+            ),
+            "Unavailable Slots": getattr(
+                historical_replay_summary, "unavailable_slot_count", None,
+            ),
+            "Latest Session": getattr(
+                historical_replay_summary, "latest_session", None,
+            ),
+        },
     }
 
 
@@ -415,6 +452,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     options = data["options_data"]
     evidence = data["evidence"]
     phase_e = data["phase_e_cohorts"]
+    historical_replay = data["historical_replay"]
     accuracy_rows = (
         ("WINS", [item["directional_wins"] for item in v9_accuracy]),
         ("LOSSES", [item["directional_losses"] for item in v9_accuracy]),
@@ -484,6 +522,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
 <h2>12 QUANT FAMILIES</h2>{_table(horizons, ((item['name'], item['values']) for item in families), section='quant_families', decimal=True)}
 <h2>OPTIONS DATA</h2><div>STATUS: <span data-dashboard-field="options_data.status">{_cell(options['status'])}</span></div><div>AS OF: <span data-dashboard-field="options_data.as_of_epoch">{_cycle_cell(options['as_of_epoch'])}</span></div><div>EXPIRATION: <span data-dashboard-field="options_data.expiration">{_cell(options['expiration'])}</span></div>{option_table('calls')}{option_table('puts')}
 <h2>EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in evidence.items()), section='evidence')}{phase_e_table}
+<h2>HISTORICAL REPLAY EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in historical_replay.items()), section='historical_replay')}
 </main><script>
 (() => {{
   const cells = new Map(
@@ -577,6 +616,8 @@ def dashboard_page(data: dict[str, object]) -> bytes:
   const renderEvidence = data => {{
     Object.entries(data.evidence).forEach(([name, value]) =>
       set(`evidence.${{name}}.0`, value));
+    Object.entries(data.historical_replay).forEach(([name, value]) =>
+      set(`historical_replay.${{name}}.0`, value));
     const phaseEBody = document.getElementById("phase-e-body");
     phaseEBody.replaceChildren(...data.phase_e_cohorts.map(cohort => {{
       const values = [
@@ -760,6 +801,22 @@ def create_app(
             start_response(status, [("Content-Type", content_type),
                                     ("Content-Length", str(len(body)))])
             return [body]
+        if path == "/api/historical-replay":
+            cached = evidence_cache.snapshot() if evidence_cache is not None else DashboardEvidenceSnapshot()
+            if cached.historical_replay is None:
+                status, content_type, body = (
+                    "503 Service Unavailable", "application/json",
+                    b'{"error":"historical replay evidence unavailable"}',
+                )
+            else:
+                body = json.dumps(
+                    asdict(cached.historical_replay),
+                    separators=(",", ":"), allow_nan=False,
+                ).encode()
+                status, content_type = "200 OK", "application/json"
+            start_response(status, [("Content-Type", content_type),
+                                    ("Content-Length", str(len(body)))])
+            return [body]
         if path == "/api/live":
             publication = state.publication() if state is not None else None
             snapshot = publication.snapshot if publication is not None else None
@@ -808,6 +865,7 @@ def create_app(
             history, cutoff_epoch=cutoff_epoch, snapshot=snapshot,
             now_epoch=as_of_epoch, evidence_counts=counts, phase_e_cohorts=cohorts,
             evidence_status=cached.status,
+            historical_replay_summary=cached.historical_replay,
             cross_asset_state=cross_asset_state, market_display=market_display,
             v9_output=v9_output,
             calculate_missing=False,
