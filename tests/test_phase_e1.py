@@ -369,15 +369,12 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertEqual(len(cursor.executions), 2)
         sql, parameters = cursor.executions[1]
         normalized = " ".join(sql.split())
-        self.assertEqual(parameters, (123.5, 123.5, 123.5, 123.5))
-        self.assertIn("f.maturity_epoch <= %s", normalized)
-        self.assertIn("read_legacy_evidence_publications", normalized)
-        self.assertIn("DIRECTIONAL_FORECAST", normalized)
-        self.assertIn("DIRECTIONAL_OUTCOME", normalized)
-        self.assertIn(
-            "'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536", normalized,
-        )
-        self.assertIn("o.resolved_epoch <= %s", normalized)
+        self.assertEqual(parameters[0], 123.5)
+        self.assertEqual(json.loads(parameters[1]), [])
+        self.assertIn("read_legacy_effective_observations", normalized)
+        self.assertIn("'DIRECTIONAL_FORECAST'", normalized)
+        self.assertIn("to_timestamp(%s)", normalized)
+        self.assertIn("%s::jsonb, 64", normalized)
         self.assertIn("f.cutoff_epoch, f.forecast_id", normalized)
         self.assertRegex(normalized, r"ORDER BY .* f.cutoff_epoch, f.forecast_id")
         for statement, _ in cursor.executions:
