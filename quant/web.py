@@ -471,13 +471,20 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     phase_e_headers = ("FAMILY/HORIZON", "EFFECTIVE N", "ELIGIBLE", "ACC", "RMSE", "MAE", "BIAS", "COVERAGE")
     def phase_e_row(cohort: dict[str, object]) -> tuple[object, ...]:
         return (
-            f"{cohort['family']} / {cohort['horizon']}", cohort["effective_n"],
-            ("" if cohort["eligible"] is None else
+            f"{cohort['family']} / {cohort['horizon']}",
+            "—" if cohort["effective_n"] is None else cohort["effective_n"],
+            ("—" if cohort["eligible"] is None else
              "YES" if cohort["eligible"] else "NO"),
-            "" if cohort["directional_accuracy"] is None else f"{cohort['directional_accuracy'] * 100:.1f}%",
-            _decimal_cell(cohort["rmse_bps"]), _decimal_cell(cohort["mae_bps"]),
-            _decimal_cell(cohort["bias_bps"]),
-            "" if cohort["coverage"] is None else f"{cohort['coverage'] * 100:.1f}%",
+            ("—" if cohort["directional_accuracy"] is None else
+             f"{cohort['directional_accuracy'] * 100:.1f}%"),
+            ("—" if cohort["rmse_bps"] is None else
+             _decimal_cell(cohort["rmse_bps"])),
+            ("—" if cohort["mae_bps"] is None else
+             _decimal_cell(cohort["mae_bps"])),
+            ("—" if cohort["bias_bps"] is None else
+             _decimal_cell(cohort["bias_bps"])),
+            ("—" if cohort["coverage"] is None else
+             f"{cohort['coverage'] * 100:.1f}%"),
         )
     phase_e_body = "".join(
         "<tr>" + "".join(
@@ -621,11 +628,14 @@ def dashboard_page(data: dict[str, object]) -> bytes:
     const phaseEBody = document.getElementById("phase-e-body");
     phaseEBody.replaceChildren(...data.phase_e_cohorts.map(cohort => {{
       const values = [
-        `${{cohort.family}} / ${{cohort.horizon}}`, text(cohort.effective_n),
-        cohort.eligible == null ? "" : cohort.eligible ? "YES" : "NO",
-        cohort.directional_accuracy == null ? "" : (cohort.directional_accuracy * 100).toFixed(1) + "%",
-        decimal(cohort.rmse_bps), decimal(cohort.mae_bps), decimal(cohort.bias_bps),
-        cohort.coverage == null ? "" : (cohort.coverage * 100).toFixed(1) + "%"
+        `${{cohort.family}} / ${{cohort.horizon}}`,
+        cohort.effective_n == null ? "—" : text(cohort.effective_n),
+        cohort.eligible == null ? "—" : cohort.eligible ? "YES" : "NO",
+        cohort.directional_accuracy == null ? "—" : (cohort.directional_accuracy * 100).toFixed(1) + "%",
+        cohort.rmse_bps == null ? "—" : decimal(cohort.rmse_bps),
+        cohort.mae_bps == null ? "—" : decimal(cohort.mae_bps),
+        cohort.bias_bps == null ? "—" : decimal(cohort.bias_bps),
+        cohort.coverage == null ? "—" : (cohort.coverage * 100).toFixed(1) + "%"
       ];
       const row = document.createElement("tr");
       row.replaceChildren(...values.map(value => {{
