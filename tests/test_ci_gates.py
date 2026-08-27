@@ -17,6 +17,26 @@ def test_ordinary_ci_runs_full_suite_on_pull_requests_and_main():
     assert "secrets." not in workflow
 
 
+def test_sonar_ci_publishes_python_coverage_for_analysis():
+    workflow = (ROOT / ".github" / "workflows" / "sonar.yml").read_text()
+    properties = (ROOT / "sonar-project.properties").read_text()
+
+    assert "pull_request:" in workflow
+    assert "branches: [main]" in workflow
+    assert "permissions:\n  contents: read" in workflow
+    assert "fetch-depth: 0" in workflow
+    assert "pytest-cov" in workflow
+    assert "--cov=quant --cov-report=xml:coverage.xml" in workflow
+    assert "SonarSource/sonarqube-scan-action@1a6d90ebcb0e6a6b1d87e37ba693fe453195ae25" in workflow
+    assert "SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}" in workflow
+
+    assert "sonar.organization=atomatom148-dotcom" in properties
+    assert "sonar.projectKey=atomatom148-dotcom_ATOM" in properties
+    assert "sonar.sources=quant" in properties
+    assert "sonar.tests=tests" in properties
+    assert "sonar.python.coverage.reportPaths=coverage.xml" in properties
+
+
 def test_market_open_gate_observes_deployment_without_competing_writer():
     acceptance = (ROOT / "tests" / "test_v9_market_open_acceptance.py").read_text()
     workflow = (
