@@ -648,7 +648,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
   }};
   const refreshLive = async () => {{
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 1000);
+    const timeout = setTimeout(() => controller.abort(), 15000);
     try {{
       const response = await fetch("/api/live", {{
         cache: "no-store", signal: controller.signal
