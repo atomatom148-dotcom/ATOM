@@ -419,6 +419,63 @@ def test_v2_provider_does_not_publish_when_durable_insert_fails():
         provider.capture(datetime.fromtimestamp(NOW, timezone.utc))
 
 
+def test_v2_provider_persists_state_and_receipt_atomically():
+    candidate = SimpleNamespace(
+        state_id="v9v2:" + "d" * 64,
+        state_as_of=NOW - 1,
+        creation_status="VALID",
+    )
+    receipt = object()
+
+    class Builder:
+        last_rows_materialized = 12
+
+        def __init__(self):
+            self.last_receipt = receipt
+
+        def build(self):
+            return candidate
+
+    class Store:
+        def __init__(self):
+            self.calls = []
+
+        def insert_with_receipt(self, state, proof):
+            self.calls.append((state, proof))
+
+    store = Store()
+    snapshot = ImmutableV2StateProvider(Builder(), store=store).refresh()
+
+    assert snapshot.status == "AVAILABLE"
+    assert store.calls == [(candidate, receipt)]
+
+
+def test_v2_provider_requires_atomic_receipt_store_for_postgres_builder():
+    candidate = SimpleNamespace(
+        state_id="v9v2:" + "e" * 64,
+        state_as_of=NOW - 1,
+        creation_status="VALID",
+    )
+
+    class Builder(PostgresV2StateBuilder):
+        last_rows_materialized = 12
+
+        def __init__(self):
+            self.last_receipt = object()
+
+        def build(self):
+            return candidate
+
+    class Store:
+        def insert(self, _state):
+            raise AssertionError("split state persistence must not be attempted")
+
+    snapshot = ImmutableV2StateProvider(Builder(), store=Store()).refresh()
+
+    assert snapshot.status == "UNAVAILABLE"
+    assert snapshot.error_code == "V2_RECEIPT_PERSISTENCE_UNAVAILABLE"
+
+
 def test_v2_batch_builder_uses_read_only_repeatable_read_and_closes_snapshot():
     class Cursor:
         def __init__(self):
