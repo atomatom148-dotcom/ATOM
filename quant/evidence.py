@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import nullcontext
+import json
 import math
 from typing import Protocol, Sequence
 
@@ -481,36 +482,22 @@ class PostgresEvidenceStore:
                     (as_of_epoch,) * 16,
                 )
                 rows = cursor.fetchall()
+                cohort_specs = json.dumps([
+                    {
+                        "quant_id": str(row[0]),
+                        "formula_version": str(row[1]),
+                        "symbol": str(row[2]),
+                        "horizon": str(row[3]),
+                    }
+                    for row in rows
+                ], sort_keys=True, separators=(",", ":"))
                 cursor.execute(
                     """
-                    WITH forecast_proofs AS MATERIALIZED (
-                        SELECT *
-                        FROM atom_v9_internal.read_legacy_evidence_publications(
-                            'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536
-                        )
-                    ),
-                    outcome_proofs AS MATERIALIZED (
-                        SELECT *
-                        FROM atom_v9_internal.read_legacy_evidence_publications_for_records(
-                            'DIRECTIONAL_OUTCOME', to_timestamp(%s),
-                            ARRAY(
-                                SELECT ids.record_id
-                                FROM forecast_proofs AS ids
-                            )
-                        )
-                    )
                     SELECT f.quant_id, f.formula_version, f.symbol, f.horizon,
                            f.cutoff_epoch, f.forecast_id
-                    FROM forecast_proofs AS fp
-                    JOIN forecasts AS f ON f.forecast_id=fp.record_id
-                    JOIN outcome_proofs AS op ON op.record_id=f.forecast_id
-                    JOIN forecast_outcomes AS o
-                      ON o.forecast_id=op.record_id
-                    WHERE f.maturity_epoch <= %s
-                      AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
-                      AND o.resolved_epoch >= f.maturity_epoch
-                      AND o.resolved_epoch <= f.maturity_epoch + 5.0
-                      AND o.resolved_epoch <= %s
+                    FROM atom_v9_internal.read_legacy_effective_observations(
+                        'DIRECTIONAL_FORECAST', to_timestamp(%s), %s::jsonb, 64
+                    ) AS f
                     ORDER BY f.quant_id, f.formula_version, f.symbol,
                              CASE f.horizon
                                  WHEN '30S' THEN 1 WHEN '1M' THEN 2
@@ -519,7 +506,7 @@ class PostgresEvidenceStore:
                              END,
                              f.cutoff_epoch, f.forecast_id
                     """,
-                    (as_of_epoch, as_of_epoch, as_of_epoch, as_of_epoch),
+                    (as_of_epoch, cohort_specs),
                 )
                 effective_rows = cursor.fetchall()
 
@@ -636,37 +623,22 @@ class PostgresEvidenceStore:
                     (as_of_epoch,) * 14,
                 )
                 rows = cursor.fetchall()
+                cohort_specs = json.dumps([
+                    {
+                        "quant_id": str(row[0]),
+                        "formula_version": str(row[1]),
+                        "symbol": str(row[2]),
+                        "horizon": str(row[3]),
+                    }
+                    for row in rows
+                ], sort_keys=True, separators=(",", ":"))
                 cursor.execute(
                     """
-                    WITH forecast_proofs AS MATERIALIZED (
-                        SELECT *
-                        FROM atom_v9_internal.read_legacy_evidence_publications(
-                            'VOLATILITY_FORECAST', to_timestamp(%s), 65536
-                        )
-                    ),
-                    outcome_proofs AS MATERIALIZED (
-                        SELECT *
-                        FROM atom_v9_internal.read_legacy_evidence_publications_for_records(
-                            'VOLATILITY_OUTCOME', to_timestamp(%s),
-                            ARRAY(
-                                SELECT ids.record_id
-                                FROM forecast_proofs AS ids
-                            )
-                        )
-                    )
                     SELECT f.quant_id, f.formula_version, f.symbol, f.horizon,
                            f.cutoff_epoch, f.forecast_id
-                    FROM forecast_proofs AS fp
-                    JOIN volatility_forecasts AS f
-                      ON f.forecast_id=fp.record_id
-                    JOIN outcome_proofs AS op ON op.record_id=f.forecast_id
-                    JOIN volatility_forecast_outcomes AS o
-                      ON o.forecast_id=op.record_id
-                    WHERE f.maturity_epoch <= %s
-                      AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
-                      AND o.resolved_epoch >= f.maturity_epoch
-                      AND o.resolved_epoch <= f.maturity_epoch + 5.0
-                      AND o.resolved_epoch <= %s
+                    FROM atom_v9_internal.read_legacy_effective_observations(
+                        'VOLATILITY_FORECAST', to_timestamp(%s), %s::jsonb, 64
+                    ) AS f
                     ORDER BY f.quant_id, f.formula_version, f.symbol,
                              CASE f.horizon
                                  WHEN '30S' THEN 1 WHEN '1M' THEN 2
@@ -675,7 +647,7 @@ class PostgresEvidenceStore:
                              END,
                              f.cutoff_epoch, f.forecast_id
                     """,
-                    (as_of_epoch, as_of_epoch, as_of_epoch, as_of_epoch),
+                    (as_of_epoch, cohort_specs),
                 )
                 effective_rows = cursor.fetchall()
 
