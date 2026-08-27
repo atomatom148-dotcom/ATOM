@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import math
 import threading
 import time
-from typing import Callable
+from typing import Callable, Protocol
 
 from .evidence import DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION
 from .history import MidpointObservation
@@ -79,6 +79,25 @@ class V2RefreshSnapshot:
     error_type: str | None
     duration_ms: float | None = None
     rows_materialized: int = 0
+    error_code: str | None = None
+
+
+class V2StateStore(Protocol):
+    """Minimal durable-state boundary used by the background provider."""
+
+    def insert(self, state: V2EvidenceState) -> str: ...
+
+    def latest(self, *, requested_cutoff: float) -> tuple[V2EvidenceState | None, str]: ...
+
+
+def _v2_error_code(error: Exception) -> str:
+    stable_reason = getattr(error, "reason", None)
+    if isinstance(stable_reason, str) and stable_reason.startswith("V2_"):
+        return stable_reason[:128]
+    message = str(error).strip()
+    if isinstance(error, RuntimeError) and message.startswith("V2_"):
+        return message[:128]
+    return type(error).__name__
 
 
 class PostgresV2StateBuilder:
@@ -267,25 +286,106 @@ class ImmutableV2StateProvider:
     """Atomically publish complete frozen V2 states built outside request paths."""
 
     def __init__(self, builder: PostgresV2StateBuilder, *,
-                 metrics: OperationalMetrics | None = None):
+                 store: V2StateStore | None = None,
+                 metrics: OperationalMetrics | None = None,
+                 utc_clock: Callable[[], datetime] =
+                 lambda: datetime.now(timezone.utc)):
+        if not callable(utc_clock):
+            raise TypeError("utc_clock must be callable")
         self._builder = builder
+        self._store = store
+        self._utc_clock = utc_clock
         self._lock = threading.Lock()
         self._state: V2EvidenceState | None = None
         self._status = V2RefreshSnapshot("UNAVAILABLE", None, None, None)
         self.metrics = metrics or OperationalMetrics()
 
+    def restore(self, cutoff_at: datetime) -> V2RefreshSnapshot:
+        """Hydrate the newest compatible immutable state before live startup."""
+
+        if cutoff_at.tzinfo is None:
+            raise ValueError("cutoff_at must be timezone-aware")
+        if self._store is None:
+            snapshot = V2RefreshSnapshot(
+                "UNAVAILABLE", None, None, None, error_code="V2_STATE_STORE_DISABLED",
+            )
+            with self._lock:
+                self._status = snapshot
+            return snapshot
+        try:
+            state, lookup_status = self._store.latest(
+                requested_cutoff=cutoff_at.timestamp(),
+            )
+        except Exception as error:
+            snapshot = V2RefreshSnapshot(
+                "UNAVAILABLE", None, None, type(error).__name__,
+                error_code=_v2_error_code(error),
+            )
+            self.metrics.increment("v2_state_restore_failures_total")
+            self.metrics.set_status("v2_state_restore_status", snapshot.error_code or "FAILED")
+            with self._lock:
+                self._status = snapshot
+            return snapshot
+        if state is None:
+            snapshot = V2RefreshSnapshot(
+                "UNAVAILABLE", None, None, None, error_code=lookup_status,
+            )
+            self.metrics.set_status("v2_state_restore_status", lookup_status)
+            with self._lock:
+                self._status = snapshot
+            return snapshot
+        snapshot = V2RefreshSnapshot(
+            "AVAILABLE", state.state_id, state.state_as_of, None,
+        )
+        self.metrics.increment("v2_state_restore_success_total")
+        self.metrics.set_status("v2_state_restore_status", "AVAILABLE")
+        self.metrics.set_status("v2_background_status", "AVAILABLE")
+        with self._lock:
+            self._state = state
+            self._status = snapshot
+        return snapshot
+
     def refresh(self) -> V2RefreshSnapshot:
         started = time.perf_counter()
+        with self._lock:
+            needs_restore = self._state is None
+        if needs_restore and self._store is not None:
+            # Startup restoration is retried here so a transient database
+            # failure cannot strand the service behind a permanent raw-build
+            # overflow until its next process restart.
+            self.restore(self._utc_clock())
         try:
             candidate = self._builder.build()
+            with self._lock:
+                retained = self._state
+            if retained is not None:
+                if candidate.state_as_of < retained.state_as_of:
+                    raise RuntimeError("V2_STATE_AS_OF_REGRESSION")
+                if (candidate.state_as_of == retained.state_as_of and
+                        candidate.state_id != retained.state_id):
+                    raise RuntimeError("V2_STATE_AS_OF_CONFLICT")
+            if self._store is not None:
+                self._store.insert(candidate)
         except Exception as error:
             duration = (time.perf_counter() - started) * 1000
-            snapshot = V2RefreshSnapshot("UNAVAILABLE", None, None,
-                                         type(error).__name__, duration,
-                                         self._builder.last_rows_materialized)
+            with self._lock:
+                retained = self._state
+            status = "STALE" if retained is not None else "UNAVAILABLE"
+            snapshot = V2RefreshSnapshot(
+                status,
+                None if retained is None else retained.state_id,
+                None if retained is None else retained.state_as_of,
+                type(error).__name__, duration,
+                self._builder.last_rows_materialized,
+                _v2_error_code(error),
+            )
             self.metrics.observe("v2_background_build_duration_ms", duration)
             self.metrics.observe("v2_background_rows_materialized",
                                  float(self._builder.last_rows_materialized))
+            self.metrics.increment("v2_background_refresh_failures_total")
+            self.metrics.set_status("v2_background_status", status)
+            self.metrics.set_status("v2_background_error_code",
+                                    snapshot.error_code or "FAILED")
             with self._lock:
                 self._status = snapshot
             return snapshot
@@ -296,6 +396,8 @@ class ImmutableV2StateProvider:
         self.metrics.observe("v2_background_build_duration_ms", duration)
         self.metrics.observe("v2_background_rows_materialized",
                              float(self._builder.last_rows_materialized))
+        self.metrics.set_status("v2_background_status", "AVAILABLE")
+        self.metrics.set_status("v2_background_error_code", "NONE")
         with self._lock:
             self._state = candidate
             self._status = snapshot
