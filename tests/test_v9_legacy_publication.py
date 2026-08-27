@@ -87,3 +87,30 @@ def test_publication_proof_recorder_suppresses_only_unapplied_schema_errors():
             (), observation_epoch=1.0, resolution_symbol="COIN",
             volatility_forecasts=(), resolution_enabled=False,
         )
+
+
+def test_effective_observation_reader_is_sparse_exact_and_read_only():
+    sql = (
+        ROOT / "migrations" /
+        "021_add_cohort_effective_observation_reader.sql"
+    ).read_text()
+    normalized = " ".join(sql.split())
+    assert "read_legacy_effective_observations" in sql
+    assert "WITH RECURSIVE requested AS MATERIALIZED" in sql
+    assert "jsonb_array_length" in sql
+    assert "> 256" in sql
+    assert "LEAST(GREATEST(p_per_cohort_limit, 0), 64)" in sql
+    assert "f.cutoff_epoch>=s.cutoff_epoch+s.horizon_seconds" in normalized
+    assert "fp.commit_observed_at<to_timestamp(f.maturity_epoch)" in normalized
+    assert "op.commit_observed_at<=p_as_of" in normalized
+    assert "o.resolved_epoch<=f.maturity_epoch+5.0" in normalized
+    assert "o.resolved_epoch<=extract(epoch FROM p_as_of)" in normalized
+    assert "SECURITY DEFINER" in sql
+    assert "SET search_path=pg_catalog" in sql
+    assert "OWNER TO atom_v9_proof_owner" in sql
+    assert "TO atom_v9_v4_runtime" in sql
+    assert "CREATE INDEX IF NOT EXISTS forecasts_phase_e_cohort_cutoff_idx" in normalized
+    assert "CREATE INDEX IF NOT EXISTS volatility_forecasts_phase_e_cohort_cutoff_idx" in normalized
+    assert "INSERT INTO atom_v9_internal.legacy_evidence_publications" not in sql
+    assert "UPDATE atom_v9_internal.legacy_evidence_publications" not in sql
+    assert "DELETE FROM atom_v9_internal.legacy_evidence_publications" not in sql
