@@ -156,6 +156,9 @@ class PostgresV2StateStore:
     def _configure_transaction(cursor) -> None:
         cursor.execute(f"SET LOCAL statement_timeout = '{V2_STATEMENT_TIMEOUT}'", ())
         cursor.execute(f"SET LOCAL lock_timeout = '{V2_LOCK_TIMEOUT}'", ())
+        # Supabase may use extra_float_digits=0, which rounds float8 text
+        # results and breaks exact relational-to-canonical payload checks.
+        cursor.execute("SET LOCAL extra_float_digits = 3", ())
 
     @staticmethod
     def _decode_row(row: object, *, requested_cutoff: float | None = None,
