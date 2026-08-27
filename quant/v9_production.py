@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
+import resource
 import threading
 import time
 from typing import Callable, Protocol
@@ -42,6 +43,9 @@ from .v9_v2d_evidence_state import (
     STATE_VERSION as V2_STATE_VERSION,
     V2EvidenceState,
     build_v2d_evidence_state,
+)
+from .v9_v2_build_receipt import (
+    RECEIPT_SCHEMA_VERSION, V2BuildReceipt, seal_receipt,
 )
 from .v9_v4a_evidence import (
     V4AWriter, build_cohort, canonical_sha256, canonical_target_identity,
@@ -154,10 +158,15 @@ class PostgresV2StateBuilder:
         self._database_url = database_url
         self._connect = connect
         self.last_rows_materialized = 0
+        self.last_receipt: V2BuildReceipt | None = None
 
     def build(self, *, state_as_of: float | None = None) -> V2EvidenceState:
         requested_state_as_of = state_as_of
+        build_started = time.perf_counter()
         self.last_rows_materialized = 0
+        self.last_receipt = None
+        pages_read = 0
+        source_identities: list[str] = []
         connection = self._connect(self._database_url)
         try:
             cursor = connection.cursor()
@@ -245,7 +254,15 @@ class PostgresV2StateBuilder:
                             tuple(parameters),
                         )
                         page = tuple(cursor.fetchall())
+                        nonlocal pages_read
+                        if page:
+                            pages_read += 1
                         result.extend(page)
+                        kind = "magnitude" if volatility else "directional"
+                        source_identities.extend(
+                            f"{kind}:{item[5]}:{float(item[6]).hex()}:{item[0]}"
+                            for item in page
+                        )
                         self.last_rows_materialized += len(page)
                         if len(page) < V2_STATE_BUILD_EVIDENCE_PAGE_SIZE:
                             return tuple(result)
@@ -343,6 +360,41 @@ class PostgresV2StateBuilder:
         )
         if state.creation_status != "VALID" or state.top_level_status == "UNAVAILABLE":
             raise RuntimeError("V2_STATE_NOT_USABLE")
+        # Several contract tests replace the frozen assembler with a narrow
+        # sentinel. Receipts are emitted only for a real, validated V2 value.
+        if not isinstance(state, V2EvidenceState):
+            return state
+        family_counts = []
+        horizon_counts = []
+        effective_ns = []
+        eligible_rows = sum(len(values) for values in observations_by_horizon.values())
+        for dataset, horizon_state in zip(datasets, state.horizon_state_tuple):
+            subsets = list(dataset.directional_subsets)
+            if dataset.q3_subset is not None:
+                subsets.append(dataset.q3_subset)
+            horizon_counts.append((dataset.horizon, sum(len(s.observations) for s in subsets)))
+            family_counts.extend((dataset.horizon, subset.quant_id,
+                                  len(subset.observations)) for subset in subsets)
+            effective_ns.extend((horizon_state.horizon, item.quant_id, item.effective_n)
+                                for item in horizon_state.directional_calibrations)
+            if horizon_state.q3.quant_id is not None:
+                effective_ns.append((horizon_state.horizon, horizon_state.q3.quant_id,
+                                     float(horizon_state.q3.effective_n or 0.0)))
+        admitted_rows = sum(count for _horizon, count in horizon_counts)
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_bytes = int(peak * 1024)  # Linux reports KiB.
+        self.last_receipt = seal_receipt(V2BuildReceipt(
+            RECEIPT_SCHEMA_VERSION, state.state_id, state.state_as_of,
+            self.last_rows_materialized, self.last_rows_materialized,
+            self.last_rows_materialized, eligible_rows, admitted_rows,
+            self.last_rows_materialized - admitted_rows, pages_read,
+            V2_STATE_BUILD_EVIDENCE_PAGE_SIZE,
+            source_identities[0] if source_identities else None,
+            source_identities[-1] if source_identities else None,
+            tuple(horizon_counts), tuple(family_counts), tuple(effective_ns),
+            time.perf_counter() - build_started, peak_bytes,
+            state.evidence_manifest_hash, "",
+        ))
         return state
 
 
@@ -467,7 +519,14 @@ class ImmutableV2StateProvider:
                         candidate.state_id != retained.state_id):
                     raise RuntimeError("V2_STATE_AS_OF_CONFLICT")
             if self._store is not None:
-                self._store.insert(candidate)
+                receipt = getattr(self._builder, "last_receipt", None)
+                insert_proven = getattr(self._store, "insert_with_receipt", None)
+                if receipt is not None and callable(insert_proven):
+                    insert_proven(candidate, receipt)
+                elif isinstance(self._builder, PostgresV2StateBuilder):
+                    raise RuntimeError("V2_RECEIPT_PERSISTENCE_UNAVAILABLE")
+                else:
+                    self._store.insert(candidate)
         except Exception as error:
             duration = (time.perf_counter() - started) * 1000
             with self._lock:

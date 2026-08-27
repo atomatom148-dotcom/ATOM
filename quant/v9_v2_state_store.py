@@ -16,6 +16,7 @@ from quant.v9_v2d_evidence_state import (
     deserialize_v2_evidence_state,
     serialize_v2_evidence_state,
 )
+from quant.v9_v2_build_receipt import V2BuildReceipt, serialize_v2_build_receipt
 
 
 V2_STATE_TABLE = "public.atom_v9_v2_states"
@@ -283,6 +284,42 @@ class PostgresV2StateStore:
             if stored != state:
                 raise V2StateConflictError("V2 state identity is already in use")
             return IDEMPOTENT
+
+        return self._run(operation)
+
+    def insert_with_receipt(self, state: V2EvidenceState,
+                            receipt: V2BuildReceipt) -> str:
+        """Atomically append the proof before making its state publishable."""
+        if receipt.state_id != state.state_id or receipt.state_as_of != state.state_as_of:
+            raise V2StateInvalidError("V2 receipt does not identify its state")
+        serialized_receipt = serialize_v2_build_receipt(receipt)
+        serialized_state = _validate_state(state)
+
+        def operation(cursor):
+            cursor.execute(
+                "INSERT INTO public.atom_v9_v2_build_receipts "
+                "(receipt_sha256,state_id,state_as_of,receipt_json) VALUES (%s,%s,%s,%s) "
+                "ON CONFLICT DO NOTHING RETURNING receipt_sha256",
+                (receipt.receipt_sha256, state.state_id, state.state_as_of,
+                 serialized_receipt),
+            )
+            inserted_receipt = cursor.fetchone() is not None
+            cursor.execute(
+                f"INSERT INTO {V2_STATE_TABLE} (state_id,state_hash,state_schema_version,"
+                "state_version,model_family,symbol,state_as_of,target_spec_id,"
+                "target_data_schema_version,target_source_spec_version,top_level_status,"
+                "creation_status,state_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT DO NOTHING RETURNING state_id",
+                (state.state_id, state.state_hash, state.state_schema_version,
+                 state.state_version, state.model_family, state.symbol, state.state_as_of,
+                 state.target_spec_id, state.target_data_schema_version,
+                 state.target_source_spec_version, state.top_level_status,
+                 state.creation_status, serialized_state),
+            )
+            inserted_state = cursor.fetchone() is not None
+            if inserted_receipt != inserted_state:
+                raise V2StateConflictError("V2 state and receipt append conflict")
+            return INSERTED if inserted_state else IDEMPOTENT
 
         return self._run(operation)
 
