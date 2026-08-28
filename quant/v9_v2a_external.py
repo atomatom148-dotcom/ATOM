@@ -46,7 +46,7 @@ def _finite(value: object) -> bool:
 
 
 def _ft(value: float) -> dict[str, str]:
-    return {"$float64": (0.0 if value == 0.0 else float(value)).hex()}
+    return {"$float64": (0.0 if not value else float(value)).hex()}
 
 
 @dataclass(slots=True)
