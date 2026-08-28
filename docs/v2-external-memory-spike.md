@@ -131,8 +131,12 @@ validated abandoned workspaces whose lock owner is dead; it never executes SQL
 `DELETE`/`TRUNCATE`, touches evidence storage, or removes published artifacts.
 
 Publishing is last and transactional. Receipt/state validation happens before
-the transaction. Any exception, signal, disk-full condition, corrupt page,
-digest mismatch, lock loss, or parity mismatch rolls back. The process must not
+the transaction. Before the final commit boundary, any exception, cooperative
+signal, disk-full condition, corrupt page, digest mismatch, lock loss, or parity
+mismatch rolls back. The CLI defers SIGINT/SIGTERM across the final checked
+COMMIT boundary; after that boundary PostgreSQL may durably publish the complete
+pair even if the client disappears. Recovery therefore accepts only both rows
+or neither and retries the exact pair idempotently. The process must never
 publish a receipt alone, a state alone, or an unavailable/partial candidate.
 
 ## Implementation phases

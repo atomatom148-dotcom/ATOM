@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import pytest
+import quant.v9_v2a_external as external_module
 from spikes.v2_frozen_schema_feasibility import build_legacy, canonical_receipt
 from spikes.v2a_external_parity import observations, targets
 from quant.v9_v2a_dataset import (
@@ -27,8 +28,12 @@ from quant.v9_v2a_external import (
     _effective_n,
     _effective_n_squared,
 )
-from quant.v9_v2b_calibration import v2b_component_hash
-from quant.v9_v2d_evidence_state import serialize_v2_evidence_state
+from quant.v9_v2b_calibration import calibrate_v2b, v2b_component_hash
+from quant.v9_v2c_covariance import build_v2c_covariance
+from quant.v9_v2d_evidence_state import (
+    build_v2d_evidence_state,
+    serialize_v2_evidence_state,
+)
 
 KW = dict(
     state_as_of=2e9,
@@ -114,6 +119,21 @@ def close(view, root):
     view.close()
     cleanup_owned_workspace(path, root=root)
     assert not path.exists()
+
+
+def test_child_workspace_initialization_failure_does_not_leak(
+        tmp_path, monkeypatch):
+    original = Path.write_text
+
+    def fail_owner(self, *args, **kwargs):
+        if self.name == "owner.json":
+            raise OSError("synthetic marker failure")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_owner)
+    with pytest.raises(OSError, match="marker failure"):
+        external_module._owned_workspace(tmp_path)
+    assert not list(tmp_path.glob("atom-v2a-external-*"))
 
 
 def representative(values, forecasts, *, constant_forecast=False):
@@ -217,12 +237,23 @@ def test_exact_frozen_chain_and_receipt_parity(tmp_path):
     close(view, tmp_path)
 
 
+def test_external_v2a_reports_progress_to_parent_resource_sampler(tmp_path):
+    samples = []
+    view = build(tmp_path, resource_sampler=lambda: samples.append(True))
+    try:
+        assert samples
+    finally:
+        close(view, tmp_path)
+
+
 def test_all_72_family_horizon_slots_have_exact_external_v2a_parity(tmp_path):
     versions = tuple(
         (quant_id, f"{quant_id}-frozen", "gate-schema", "gate-source")
         for quant_id in (*DIRECTIONAL_FAMILIES, Q3)
     )
     seen_slots = set()
+    legacy_datasets = []
+    external_views = []
     for horizon, seconds in HORIZON_SECONDS.items():
         seen_slots.update((quant_id, horizon) for quant_id, *_ in versions)
         target_rows = []
@@ -302,15 +333,102 @@ def test_all_72_family_horizon_slots_have_exact_external_v2a_parity(tmp_path):
         assert external.connection.execute(
             "SELECT count(*) FROM admitted WHERE quant='q10_options_vol'"
         ).fetchone() == (0,)
-        with pytest.raises(ValueError, match="Phase 1C-A exposes V2A only"):
-            build_external_v2b(external)
-        close(external, tmp_path)
+        legacy_datasets.append(legacy)
+        external_views.append(external)
     assert seen_slots == {
         (quant_id, horizon)
         for quant_id in (*DIRECTIONAL_FAMILIES, Q3)
         for horizon in HORIZON_SECONDS
     }
     assert len(seen_slots) == 72
+    legacy_b = calibrate_v2b(legacy_datasets)
+    external_b = build_external_v2b(external_views)
+    assert external_b == legacy_b
+    legacy_covariances = tuple(
+        build_v2c_covariance(dataset, legacy_b) for dataset in legacy_datasets
+    )
+    external_covariances = tuple(
+        build_external_v2c(view, external_b) for view in external_views
+    )
+    assert external_covariances == legacy_covariances
+    legacy_state = build_v2d_evidence_state(
+        state_as_of=2e9,
+        datasets=legacy_datasets,
+        calibrations=(legacy_b,),
+        covariances=legacy_covariances,
+    )
+    external_state = build_external_v2d(
+        external_views, external_b, external_covariances, state_as_of=2e9
+    )
+    assert serialize_v2_evidence_state(external_state) == serialize_v2_evidence_state(
+        legacy_state
+    )
+    assert external_state.state_id == legacy_state.state_id
+    for view in external_views:
+        close(view, tmp_path)
+
+
+def test_multifamily_hyperprior_and_oas_are_exact_without_ram_datasets(tmp_path):
+    versions = (Q1_VERSION, Q2_VERSION)
+    target_rows, observation_rows = slot_rows("30S", versions, 12)
+    targets_bps = (1, 3, 2, 6, 4, 8, 7, 9, 5, 12, 8, 14)
+    q1 = (0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6)
+    q2 = (2, 0, 3, 1, 4, 2, 5, 3, 6, 4, 7, 5)
+    target_rows = [
+        replace(row, target_bps=float(targets_bps[index]))
+        for index, row in enumerate(target_rows)
+    ]
+    observation_rows = [
+        replace(
+            row,
+            value_bps=float(
+                q1[row.record_id // 100]
+                if row.quant_id == "q1_momentum"
+                else q2[row.record_id // 100]
+            ),
+        )
+        for row in observation_rows
+    ]
+    legacy_dataset = build_v2a_dataset(
+        state_as_of=2e9,
+        horizon="30S",
+        target_spec_id="gate-target",
+        target_data_schema_version="gate-schema",
+        target_source_spec_version="gate-source",
+        family_versions=versions,
+        targets=target_rows,
+        observations=observation_rows,
+    )
+    legacy_b = calibrate_v2b((legacy_dataset,))
+    legacy_c = build_v2c_covariance(legacy_dataset, legacy_b)
+    legacy_state = build_v2d_evidence_state(
+        state_as_of=2e9,
+        datasets=(legacy_dataset,),
+        calibrations=(legacy_b,),
+        covariances=(legacy_c,),
+    )
+    view = build_external_v2a(
+        state_as_of=2e9,
+        horizon="30S",
+        target_spec_id="gate-target",
+        target_data_schema_version="gate-schema",
+        target_source_spec_version="gate-source",
+        family_versions=versions,
+        targets=target_rows,
+        observations=observation_rows,
+        root=tmp_path,
+    )
+    external_b = build_external_v2b(view)
+    external_c = build_external_v2c(view, external_b)
+    external_state = build_external_v2d(view, external_b, external_c)
+    assert external_b == legacy_b
+    assert external_c == legacy_c
+    assert external_c.complete_case_n == 12
+    assert len(external_c.ordered_quant_ids) == 2
+    assert serialize_v2_evidence_state(external_state) == serialize_v2_evidence_state(
+        legacy_state
+    )
+    close(view, tmp_path)
 
 
 def test_interior_missing_q1_observation_preserves_dense_lag_parity(tmp_path):
@@ -335,8 +453,10 @@ def test_effective_n_counts_only_admitted_q1_rows(tmp_path, versions, expected):
     result = _effective_n(view)
     assert result.observation_count == expected
     assert result.kish_n <= expected
-    with pytest.raises(ValueError, match="Phase 1C-A exposes V2A only"):
-        build_external_v2b(view)
+    calibration = build_external_v2b(view)
+    assert tuple(item.quant_id for item in calibration.directional) == tuple(
+        quant_id for quant_id, *_ in versions
+    )
     close(view, tmp_path)
 
 
@@ -376,18 +496,18 @@ def test_marker_like_target_metadata_hashes_as_scalar(
     close(external, tmp_path)
 
 
-@pytest.mark.parametrize(
-    "versions", ((Q1_VERSION, Q2_VERSION), (Q2_VERSION,))
-)
-def test_direct_v2c_v2d_cannot_bypass_scope_guard(tmp_path, versions):
+@pytest.mark.parametrize("versions", ((Q1_VERSION, Q2_VERSION), (Q2_VERSION,)))
+def test_direct_v2c_v2d_reject_cross_view_lineage(tmp_path, versions):
     valid = build(tmp_path, 8)
     calibration = build_external_v2b(valid)
     covariance = build_external_v2c(valid, calibration)
     invalid = scope_view(tmp_path, versions)
-    with pytest.raises(ValueError, match="Phase 1C-A exposes V2A only"):
+    with pytest.raises(ValueError, match="input manifest"):
         build_external_v2c(invalid, calibration)
-    with pytest.raises(ValueError, match="Phase 1C-A exposes V2A only"):
-        build_external_v2d(invalid, calibration, covariance)
+    state = build_external_v2d(invalid, calibration, covariance)
+    assert state.horizon_state_tuple[0].reason_codes == (
+        "CROSS_LAYER_INTEGRITY_FAILURE",
+    )
     close(invalid, tmp_path)
     close(valid, tmp_path)
 
@@ -413,19 +533,13 @@ def test_direct_v2c_v2d_revalidate_v2a_integrity(tmp_path):
     "horizon", tuple(horizon for horizon in HORIZON_SECONDS if horizon != "30S")
 )
 def test_non_30s_downstream_entry_points_fail_closed(tmp_path, horizon):
-    valid = build(tmp_path, 8)
-    calibration = build_external_v2b(valid)
-    covariance = build_external_v2c(valid, calibration)
-    invalid = scope_view(tmp_path, (Q1_VERSION,), horizon=horizon)
-    for operation in (
-        lambda: build_external_v2b(invalid),
-        lambda: build_external_v2c(invalid, calibration),
-        lambda: build_external_v2d(invalid, calibration, covariance),
-    ):
-        with pytest.raises(ValueError, match="Phase 1C-A exposes V2A only"):
-            operation()
-    close(invalid, tmp_path)
-    close(valid, tmp_path)
+    view = scope_view(tmp_path, (Q1_VERSION,), horizon=horizon)
+    calibration = build_external_v2b(view)
+    covariance = build_external_v2c(view, calibration)
+    state = build_external_v2d(view, calibration, covariance)
+    assert state.creation_status == "VALID"
+    assert any(item.horizon == horizon for item in state.component_hash_tuple)
+    close(view, tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -685,6 +799,22 @@ def test_corruption_interruption_disk_full_mismatch_and_cleanup_guard(
         cleanup_owned_workspace(link, root=tmp_path)
     assert workspace.exists()
     link.unlink()
+    cleanup_owned_workspace(workspace, root=tmp_path)
+    view = build(tmp_path, 2)
+    workspace = view.workspace
+    view.close()
+    nested = workspace / "nested-mount"
+    nested.mkdir()
+    original_is_mount = Path.is_mount
+    with monkeypatch.context() as mount_patch:
+        mount_patch.setattr(
+            Path,
+            "is_mount",
+            lambda self: self == nested or original_is_mount(self),
+        )
+        with pytest.raises(ValueError, match="mount-crossing"):
+            cleanup_owned_workspace(workspace, root=tmp_path)
+    assert workspace.exists()
     cleanup_owned_workspace(workspace, root=tmp_path)
     import quant.v9_v2a_external as module
 

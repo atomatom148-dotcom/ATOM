@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Callable, Protocol
+from typing import Callable, ContextManager, Protocol
 
 from quant.evidence import DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION
 from quant.v9_v2a_dataset import SYMBOL
@@ -16,7 +16,9 @@ from quant.v9_v2d_evidence_state import (
     deserialize_v2_evidence_state,
     serialize_v2_evidence_state,
 )
-from quant.v9_v2_build_receipt import V2BuildReceipt, serialize_v2_build_receipt
+from quant.v9_v2_build_receipt import (
+    V2BuildReceipt, deserialize_v2_build_receipt, serialize_v2_build_receipt,
+)
 
 
 V2_STATE_TABLE = "public.atom_v9_v2_states"
@@ -74,6 +76,16 @@ _COLUMNS = (
     "state_json",
 )
 _SELECT = "SELECT " + ", ".join(_COLUMNS) + f" FROM {V2_STATE_TABLE}"
+_RECEIPT_COLUMNS = (
+    "receipt_sha256",
+    "state_id",
+    "state_as_of",
+    "receipt_json",
+)
+_RECEIPT_SELECT = (
+    "SELECT " + ", ".join(_RECEIPT_COLUMNS)
+    + " FROM public.atom_v9_v2_build_receipts"
+)
 
 
 def _validate_lookup_identity(*, symbol: str, target_spec_id: str,
@@ -219,15 +231,51 @@ class PostgresV2StateStore:
             raise V2StateRowInvalidError("stored V2 state is newer than requested cutoff")
         return state
 
-    def _run(self, operation):
-        connection = self._connect(self._database_url)
+    @staticmethod
+    def _decode_receipt_row(row: object) -> V2BuildReceipt:
+        """Validate persisted relational receipt identity against its JSON."""
+
+        if (not isinstance(row, (tuple, list))
+                or len(row) != len(_RECEIPT_COLUMNS)):
+            raise V2StateRowInvalidError("stored V2 receipt row has invalid shape")
+        values = dict(zip(_RECEIPT_COLUMNS, row))
+        try:
+            receipt = deserialize_v2_build_receipt(values["receipt_json"])
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise V2StateRowInvalidError(
+                "stored V2 receipt payload is invalid") from error
+        relational = {
+            "receipt_sha256": receipt.receipt_sha256,
+            "state_id": receipt.state_id,
+            "state_as_of": receipt.state_as_of,
+        }
+        for name, expected in relational.items():
+            if values[name] != expected:
+                raise V2StateRowInvalidError(
+                    f"stored V2 receipt column {name} does not match payload")
+        return receipt
+
+    def _run(self, operation, *, connection=None,
+             before_commit: Callable[[], None] | None = None,
+             commit_guard: Callable[[], ContextManager[None]] | None = None):
+        owns_connection = connection is None
+        if owns_connection:
+            connection = self._connect(self._database_url)
         cursor = None
         try:
             cursor = connection.cursor()
             self._configure_transaction(cursor)
             self._verify_role(cursor)
             result = operation(cursor)
-            connection.commit()
+            if commit_guard is None:
+                if before_commit is not None:
+                    before_commit()
+                connection.commit()
+            else:
+                with commit_guard():
+                    if before_commit is not None:
+                        before_commit()
+                    connection.commit()
             return result
         except BaseException:
             connection.rollback()
@@ -237,7 +285,8 @@ class PostgresV2StateStore:
                 if cursor is not None:
                     cursor.close()
             finally:
-                connection.close()
+                if owns_connection:
+                    connection.close()
 
     def insert(self, state: V2EvidenceState) -> str:
         serialized = _validate_state(state)
@@ -288,14 +337,24 @@ class PostgresV2StateStore:
         return self._run(operation)
 
     def insert_with_receipt(self, state: V2EvidenceState,
-                            receipt: V2BuildReceipt) -> str:
+                            receipt: V2BuildReceipt, *, connection=None,
+                            interrupt_check: Callable[[], bool] | None = None,
+                            commit_guard: Callable[[], ContextManager[None]] | None = None,
+                            ) -> str:
         """Atomically append the proof before making its state publishable."""
         if receipt.state_id != state.state_id or receipt.state_as_of != state.state_as_of:
             raise V2StateInvalidError("V2 receipt does not identify its state")
+        if receipt.evidence_manifest_hash != state.evidence_manifest_hash:
+            raise V2StateInvalidError("V2 receipt does not identify the state manifest")
         serialized_receipt = serialize_v2_build_receipt(receipt)
         serialized_state = _validate_state(state)
 
+        def check_interrupted() -> None:
+            if interrupt_check is not None and interrupt_check():
+                raise InterruptedError("V2_STATE_PUBLICATION_INTERRUPTED")
+
         def operation(cursor):
+            check_interrupted()
             cursor.execute(
                 "INSERT INTO public.atom_v9_v2_build_receipts "
                 "(receipt_sha256,state_id,state_as_of,receipt_json) VALUES (%s,%s,%s,%s) "
@@ -304,6 +363,7 @@ class PostgresV2StateStore:
                  serialized_receipt),
             )
             inserted_receipt = cursor.fetchone() is not None
+            check_interrupted()
             cursor.execute(
                 f"INSERT INTO {V2_STATE_TABLE} (state_id,state_hash,state_schema_version,"
                 "state_version,model_family,symbol,state_as_of,target_spec_id,"
@@ -317,11 +377,52 @@ class PostgresV2StateStore:
                  state.creation_status, serialized_state),
             )
             inserted_state = cursor.fetchone() is not None
+            check_interrupted()
             if inserted_receipt != inserted_state:
                 raise V2StateConflictError("V2 state and receipt append conflict")
-            return INSERTED if inserted_state else IDEMPOTENT
+            if inserted_state:
+                return INSERTED
+            # A retry is idempotent only when both immutable rows are exactly
+            # the requested pair.  ON CONFLICT alone cannot establish that.
+            cursor.execute(
+                _RECEIPT_SELECT +
+                " WHERE receipt_sha256 = %s OR state_id = %s",
+                (receipt.receipt_sha256, state.state_id),
+            )
+            receipt_rows = cursor.fetchall()
+            cursor.execute(
+                _SELECT + " WHERE state_id = %s AND state_hash = %s",
+                (state.state_id, state.state_hash),
+            )
+            state_rows = cursor.fetchall()
+            if len(receipt_rows) != 1 or len(state_rows) != 1:
+                raise V2StateConflictError("V2 state and receipt append conflict")
+            try:
+                stored_receipt = self._decode_receipt_row(receipt_rows[0])
+            except V2StateRowInvalidError as error:
+                raise V2StateConflictError("conflicting V2 receipt row is invalid") from error
+            if (stored_receipt.receipt_sha256 != receipt.receipt_sha256 or
+                    stored_receipt.state_id != receipt.state_id or
+                    stored_receipt.state_as_of != receipt.state_as_of or
+                    stored_receipt.evidence_manifest_hash !=
+                    receipt.evidence_manifest_hash or
+                    stored_receipt.evidence_manifest_hash !=
+                    state.evidence_manifest_hash):
+                raise V2StateConflictError("V2 state and receipt append conflict")
+            try:
+                stored = self._decode_row(state_rows[0])
+            except V2StateRowInvalidError as error:
+                raise V2StateConflictError("conflicting V2 state row is invalid") from error
+            if stored != state:
+                raise V2StateConflictError("V2 state and receipt append conflict")
+            return IDEMPOTENT
 
-        return self._run(operation)
+        return self._run(
+            operation,
+            connection=connection,
+            before_commit=check_interrupted,
+            commit_guard=commit_guard,
+        )
 
     def latest(
         self,

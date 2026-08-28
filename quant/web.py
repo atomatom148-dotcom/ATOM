@@ -936,7 +936,7 @@ def _start_v2(
     provider_factory: Callable | None = None,
     utc_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ):
-    """Restore durable V2 state before starting its offline refresh worker."""
+    """Restore durable V2 state without scanning history during web startup."""
 
     if builder_factory is None or provider_factory is None:
         from .v9_production import ImmutableV2StateProvider, PostgresV2StateBuilder
@@ -952,7 +952,6 @@ def _start_v2(
         utc_clock=utc_clock,
     )
     provider.restore(utc_clock())
-    provider.start()
     return provider
 
 
@@ -1111,3 +1110,4 @@ def main(*, simulator_connection_factory: Callable | None = None,
 
 if __name__ == "__main__":
     main()
+
