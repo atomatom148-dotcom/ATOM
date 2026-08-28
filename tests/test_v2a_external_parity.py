@@ -1,11 +1,16 @@
 from dataclasses import replace
+import json
+from pathlib import Path
+import subprocess
+import sys
 import pytest
 from spikes.v2_frozen_schema_feasibility import build_legacy, canonical_receipt
 from spikes.v2a_external_parity import observations, targets
 from quant.v9_v2a_dataset import (DIRECTIONAL_BPS, RawFamilyObservation,
     RawTarget, TargetIdentity, build_v2a_dataset)
 from quant.v9_v2a_external import (build_external_v2a,build_external_v2b,
-    build_external_v2c,build_external_v2d,cleanup_owned_workspace,validate_external_v2a)
+    build_external_v2c,build_external_v2d,cleanup_owned_workspace,validate_external_v2a,
+    _effective_n,_effective_n_squared)
 from quant.v9_v2b_calibration import v2b_component_hash
 from quant.v9_v2d_evidence_state import serialize_v2_evidence_state
 
@@ -105,6 +110,42 @@ def test_non_degenerate_effective_n_bias_slope_and_covariance_parity(tmp_path,va
     assert result.slope_identifiable_flag is identifiable
     assert covariance.pair_support_boolean_matrix==((True,),)
     assert covariance.pooled_variance > 0
+
+def test_multiple_retained_lags_are_exact_and_disk_accumulated(tmp_path):
+    forecasts=[float(index%3) for index in range(20)]
+    residuals=[float(index) for index in range(20)]
+    values=[forecast+residual for forecast,residual in zip(forecasts,residuals)]
+    target_rows,observation_rows=representative(values,forecasts)
+    assert_representative_parity(tmp_path,target_rows,observation_rows)
+    view=build_external_v2a(**KW,targets=target_rows,observations=observation_rows,root=tmp_path)
+    effective=_effective_n(view)
+    mean=sum(residuals)/len(residuals)
+    covariance_effective=_effective_n_squared(view,mean)
+    assert effective.retained_lags >= 4
+    assert effective.effective_n < len(residuals)
+    assert covariance_effective < len(residuals)
+    assert view.connection.execute("SELECT count(*) FROM autocorrelation_terms").fetchone()[0]==effective.retained_lags
+    assert view.connection.execute("SELECT count(*) FROM covariance_autocorrelation_terms").fetchone()[0]>=4
+    close(view,tmp_path)
+
+def test_large_nondegenerate_fresh_process_is_bounded_and_cleans(tmp_path):
+    command=[sys.executable,str(Path(__file__).parents[1]/"spikes"/"v2a_external_parity.py"),
+        "65537","--root",str(tmp_path),"--nondegenerate"]
+    completed=subprocess.run(command,check=True,capture_output=True,text=True)
+    result=json.loads(completed.stdout)
+    assert result["nondegenerate"] is True
+    budget=128*1024*1024
+    # Linux carries an invoking process's historical ru_maxrss through fork
+    # and exec. The dedicated gate starts below budget and checks the absolute
+    # peak; a full-suite parent may already exceed it, so only the child's
+    # additional high-water allocation is meaningful there.
+    if result["baseline_rss_bytes"] < budget:
+        assert result["external_v2a_peak_rss_bytes"] < budget
+        assert result["external_verification_peak_rss_bytes"] < budget
+    else:
+        assert result["external_verification_peak_rss_bytes"]-result["baseline_rss_bytes"] < budget
+    assert result["workspace_removed"] is True
+    assert not list(tmp_path.iterdir())
 
 def test_corruption_interruption_disk_full_mismatch_and_cleanup_guard(tmp_path,monkeypatch):
     view=build(tmp_path,2); view.connection.execute("UPDATE observations SET payload_hash=? WHERE record_id=1",("0"*64,)); view.connection.commit()

@@ -333,14 +333,24 @@ def _effective_n(view: ExternalV2AView) -> EffectiveN:
     scale=math.fsum(x*x for x in _scores(view))+n*mean*mean
     if abs(denominator)<=64*math.ulp(1.0)*max(1.0,scale):
         return EffectiveN(n,float(n),1.0,float(n),0,("SERIAL_DEPENDENCE_UNIDENTIFIABLE",))
-    rhos=[1.0]; retained=0
+    view.connection.execute("DROP TABLE IF EXISTS autocorrelation_terms")
+    view.connection.execute("CREATE TABLE autocorrelation_terms(lag INTEGER PRIMARY KEY,value REAL)")
+    retained=0
+    # Only one adjacent odd/even Geyer pair is live at a time.  Frozen IPS
+    # stops at the first non-positive pair, so later autocorrelations cannot
+    # affect either the retained lag or the weighted sum.
+    odd_rho=None
     for lag in range(1,n):
         products=(a[0]*a[1] for a in view.connection.execute(
             "SELECT (a.target-a.value-?),(b.target-b.value-?) FROM admitted a JOIN admitted b ON b.ordinal=a.ordinal+? ORDER BY a.ordinal",(mean,mean,lag)))
-        rhos.append(math.fsum(products)/denominator)
-        if lag%2==0 and rhos[lag-1]+rhos[lag]>0: retained=lag
-        elif lag%2==0: break
-    tau=max(1.0,1.0+2.0*math.fsum((1.0-lag/n)*rhos[lag] for lag in range(1,retained+1)))
+        rho=math.fsum(products)/denominator
+        if lag%2: odd_rho=rho
+        elif odd_rho is not None and odd_rho+rho>0:
+            view.connection.executemany("INSERT INTO autocorrelation_terms VALUES(?,?)",(
+                (lag-1,(1.0-(lag-1)/n)*odd_rho),(lag,(1.0-lag/n)*rho))); retained=lag
+        else: break
+    tau=max(1.0,1.0+2.0*math.fsum(row[0] for row in view.connection.execute(
+        "SELECT value FROM autocorrelation_terms ORDER BY lag")))
     return EffectiveN(n,float(n),tau,min(float(n),max(1.0,n/tau)),retained)
 
 
@@ -430,15 +440,20 @@ def _effective_n_squared(view,mean):
     if abs(den)<=64*math.ulp(1.0)*max(1.0,scale): return float(n)
     # Exact fallback delegates to a temporary scalar table without RAM growth.
     view.connection.execute("DROP TABLE IF EXISTS covariance_scores")
-    view.connection.execute("CREATE TEMP TABLE covariance_scores(i INTEGER PRIMARY KEY,v REAL)")
+    view.connection.execute("CREATE TABLE covariance_scores(i INTEGER PRIMARY KEY,v REAL)")
     view.connection.executemany("INSERT INTO covariance_scores VALUES(?,?)",enumerate(values()))
-    retained=0; rhos=[1.0]
+    view.connection.execute("DROP TABLE IF EXISTS covariance_autocorrelation_terms")
+    view.connection.execute("CREATE TABLE covariance_autocorrelation_terms(lag INTEGER PRIMARY KEY,value REAL)")
+    retained=0; odd_rho=None
     for lag in range(1,n):
         rho=math.fsum(r[0] for r in view.connection.execute("SELECT (a.v-?)*(b.v-?) FROM covariance_scores a JOIN covariance_scores b ON b.i=a.i+? ORDER BY a.i",(m,m,lag)))/den
-        rhos.append(rho)
-        if lag%2==0 and rhos[-2]+rho>0: retained=lag
-        elif lag%2==0: break
-    tau=max(1.0,1+2*math.fsum((1-i/n)*rhos[i] for i in range(1,retained+1)))
+        if lag%2: odd_rho=rho
+        elif odd_rho is not None and odd_rho+rho>0:
+            view.connection.executemany("INSERT INTO covariance_autocorrelation_terms VALUES(?,?)",(
+                (lag-1,(1.0-(lag-1)/n)*odd_rho),(lag,(1.0-lag/n)*rho))); retained=lag
+        else: break
+    tau=max(1.0,1+2*math.fsum(row[0] for row in view.connection.execute(
+        "SELECT value FROM covariance_autocorrelation_terms ORDER BY lag")))
     return min(float(n),max(1.0,n/tau))
 
 

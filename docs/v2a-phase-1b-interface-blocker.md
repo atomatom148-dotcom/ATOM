@@ -77,6 +77,29 @@ results/component hashes, evidence manifest, canonical state bytes and state
 ID, and canonical receipt bytes/hash. A dependency-free statement coverage gate runs
 the real adapter tests under `trace` and requires at least 80% coverage.
 
+## Final retained-lag correction
+
+Neither external Effective-N path retains an in-memory rho vector. Each lag is
+calculated in frozen order; one odd/even IPS pair is held at a time, and each
+accepted weighted term is staged in an ordered SQLite workspace table. A final
+ordered cursor feeds `math.fsum`, preserving the legacy summand order and exact
+binary64 result while RAM remains bounded even when many lags are retained.
+
+The side-by-side retained-lag fixture exercises at least four retained lags in
+both directional and covariance-score paths and requires exact V2A/V2B/V2C,
+state, and receipt parity. The additional 65,537-row non-degenerate fixture ran
+in a fresh process with alternating residuals:
+
+| Rows | V2A peak RSS | V2B/V2C verification peak RSS | Temp / peak disk | Runtime | Cleanup |
+|---:|---:|---:|---:|---:|:---:|
+| 65,537 | 30,560,256 B | 30,560,256 B | 70,864,994 B | 15.008 s | PASS |
+
+Both independently sampled RSS values are 29.14 MiB, below 128 MiB. The local
+CI-equivalent full suite passes with 1,083 tests, 7 skips, and 292 subtests; the
+coverage gate reports 94.92% statement coverage (299/315), above 80%. Hosted CI and Sonar
+results remain pending on PR #186; no local result is represented as a hosted
+service result.
+
 ## Acceptance
 
 ```
