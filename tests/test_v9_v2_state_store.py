@@ -26,6 +26,7 @@ from quant.v9_v2_build_receipt import (
     RECEIPT_SCHEMA_VERSION,
     V2BuildReceipt,
     seal_receipt,
+    serialize_v2_build_receipt,
 )
 from quant.v9_v2_state_store import (
     FOUND,
@@ -108,7 +109,8 @@ def _receipt(state, **changes):
         per_family_horizon_effective_n=(("30S", "q1_momentum", 4.0),),
         build_elapsed_seconds=1.0,
         peak_rss_bytes=1_024,
-        evidence_manifest_hash="b" * 64,
+        temporary_disk_peak_bytes=2_048,
+        evidence_manifest_hash=state.evidence_manifest_hash,
         receipt_sha256="",
     )
     return seal_receipt(replace(value, **changes))
@@ -433,7 +435,14 @@ def test_insert_with_receipt_commits_only_matching_atomic_outcomes(
     expected,
 ):
     state = _state()
-    connection = Connection([_role(), receipt_rows, state_rows])
+    responses = [_role(), receipt_rows, state_rows]
+    if not receipt_rows and not state_rows:
+        receipt = _receipt(state)
+        responses.extend([
+            [(json.loads(serialize_v2_build_receipt(receipt)),)],
+            [_row(state)],
+        ])
+    connection = Connection(responses)
 
     result = PostgresV2StateStore(
         DATABASE_URL,
