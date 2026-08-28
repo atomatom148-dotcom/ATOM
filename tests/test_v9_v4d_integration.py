@@ -1117,50 +1117,67 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
         "v4_state_build_recovery.submitted"] == 1
 
 
-def test_recovery_proof_fallback_work_is_bounded(monkeypatch):
+def test_recovery_proof_fallback_depth_and_work_are_bounded(monkeypatch):
+    def exercise(labels):
+        worker = EvidenceLedgerWorker(
+            EvidenceOutbox(), evidence_store=_RawStore(),
+            connection=_WorkerConnection(),
+        )
+        candidates_by_identity = {}
+        for label in labels:
+            cohorts = {
+                horizon: (f"{label}-{horizon}", "a" * 64)
+                for horizon in HORIZONS
+            }
+            identity = (
+                "COIN",
+                tuple((horizon, *cohorts[horizon]) for horizon in HORIZONS),
+            )
+            representatives = tuple(
+                SimpleNamespace(forecast_record_id=f"{label}-{index}")
+                for index in range(5)
+            )
+            candidates_by_identity[identity] = [
+                (cohorts, NOW + timedelta(seconds=index), representative)
+                for index, representative in enumerate(representatives)
+            ]
+        proof_requests = []
+
+        def validate(records):
+            proof_requests.append(tuple(
+                record.forecast_record_id for record in records))
+            return frozenset()
+
+        worker._validated_recovery_proof_ids = validate
+        assert worker._latest_proven_recovery_cohorts(
+            candidates_by_identity) == {}
+        counters = dict(worker.metrics.snapshot().counters)
+        return proof_requests, counters
+
     monkeypatch.setattr(
         "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_FALLBACK_DEPTH", 2)
     monkeypatch.setattr(
-        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_FALLBACK_LIMIT", 2)
-    worker = EvidenceLedgerWorker(
-        EvidenceOutbox(), evidence_store=_RawStore(),
-        connection=_WorkerConnection(),
-    )
-    cohorts = {
-        horizon: ("cohort-" + horizon, "a" * 64)
-        for horizon in HORIZONS
-    }
-    identity = (
-        "COIN",
-        tuple((horizon, *cohorts[horizon]) for horizon in HORIZONS),
-    )
-    representatives = tuple(
-        SimpleNamespace(forecast_record_id=f"forecast-{index}")
-        for index in range(5)
-    )
-    candidates = [
-        (cohorts, NOW + timedelta(seconds=index), representative)
-        for index, representative in enumerate(representatives)
+        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_FALLBACK_LIMIT", 100)
+    depth_requests, depth_counters = exercise(("depth",))
+    assert depth_requests == [
+        ("depth-4",),
+        ("depth-3",),
+        ("depth-2",),
     ]
-    proof_requests = []
-
-    def validate(records):
-        proof_requests.append(tuple(
-            record.forecast_record_id for record in records))
-        return frozenset()
-
-    worker._validated_recovery_proof_ids = validate
-    assert worker._latest_proven_recovery_cohorts({
-        identity: candidates,
-    }) == {}
-    assert proof_requests == [
-        ("forecast-4",),
-        ("forecast-3",),
-        ("forecast-2",),
-    ]
-    assert dict(worker.metrics.snapshot().counters)[
+    assert depth_counters[
         "v4_state_build_recovery.proof_fallback_truncated"] == 1
 
+    monkeypatch.setattr(
+        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_FALLBACK_DEPTH", 4)
+    monkeypatch.setattr(
+        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_FALLBACK_LIMIT", 2)
+    work_requests, work_counters = exercise(("first", "second"))
+    assert work_requests == [
+        ("first-4", "second-4"),
+        ("first-3", "second-3"),
+    ]
+    assert work_counters[
+        "v4_state_build_recovery.proof_fallback_truncated"] == 1
 
 def test_runtime_owner_replays_every_distinct_uncovered_shutdown_cohort():
     def cycle(*, cycle_id, formula_version):
