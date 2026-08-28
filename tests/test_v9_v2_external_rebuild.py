@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 from pathlib import Path
 import sqlite3
@@ -139,7 +140,7 @@ def test_source_reader_counts_unresolved_forecasts_without_admitting_them():
     resolved = (
         1, "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"], "cycle-1",
         "COIN", "30S", 0.0, 30.0, 1.0, 0.0, DATA_SCHEMA_VERSION,
-        SOURCE_SPEC_VERSION, 0.0, 2.0, 30.0, 0.0, 30.0, True,
+        SOURCE_SPEC_VERSION, 0.0, Decimal("2.0"), 30.0, 0.0, 30.0, True,
     )
     unresolved = (
         2, "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"], "cycle-2",
@@ -165,6 +166,7 @@ def test_source_reader_counts_unresolved_forecasts_without_admitting_them():
         assert first.endswith(":1")
         assert last.endswith(":2")
         assert spool.execute("SELECT count(*) FROM directional").fetchone() == (1,)
+        assert spool.execute("SELECT outcome FROM directional").fetchone() == (2.0,)
     finally:
         spool.close()
 
