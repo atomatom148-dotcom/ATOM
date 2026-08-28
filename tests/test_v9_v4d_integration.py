@@ -1001,22 +1001,41 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
         target_resolved_at=forecasts[0].target_endpoint,
         actual_return_bps=1.0,
     ), created_at=latest_created_at)
+    newer_created_at = latest_created_at + timedelta(seconds=1)
+    newer_unproven_outcome = replace(build_outcome(
+        forecast=forecasts[1],
+        target_identity=canonical_target_identity(forecasts[1]),
+        previous_observation_at=(
+            forecasts[1].target_endpoint - timedelta(seconds=1)),
+        endpoint_observation_at=forecasts[1].target_endpoint,
+        target_resolved_at=forecasts[1].target_endpoint,
+        actual_return_bps=1.0,
+    ), created_at=newer_created_at)
     recovery_row = (
         forecasts[0].symbol, forecasts[0].cutoff_at, forecasts[0].cycle_id,
         forecasts[0].v3_model_version, outcome.outcome_record_hash,
         json.dumps(_canonical(asdict(outcome)), sort_keys=True),
         latest_created_at, tuple(forecast.cohort_id for forecast in forecasts),
-        tuple(forecast.cohort_hash for forecast in forecasts), 2,
+        tuple(forecast.cohort_hash for forecast in forecasts), 4,
+    )
+    newer_unproven_row = (
+        forecasts[0].symbol, forecasts[0].cutoff_at, forecasts[0].cycle_id,
+        forecasts[0].v3_model_version,
+        newer_unproven_outcome.outcome_record_hash,
+        json.dumps(_canonical(asdict(newer_unproven_outcome)), sort_keys=True),
+        newer_created_at, tuple(forecast.cohort_id for forecast in forecasts),
+        tuple(forecast.cohort_hash for forecast in forecasts), 4,
     )
     invalid_newer_row = (
         forecasts[0].symbol, forecasts[0].cutoff_at, forecasts[0].cycle_id,
         forecasts[0].v3_model_version, "b" * 64, "{}",
-        latest_created_at + timedelta(seconds=1),
+        newer_created_at + timedelta(seconds=1),
         tuple(forecast.cohort_id for forecast in forecasts),
-        tuple(forecast.cohort_hash for forecast in forecasts), 2,
+        tuple(forecast.cohort_hash for forecast in forecasts), 4,
     )
     combined_id = "v9v4statecohort:" + canonical_sha256(tuple(
         (forecast.cohort_id, forecast.cohort_hash) for forecast in forecasts))
+    proof_requests = []
 
     class Cursor:
         def execute(self, sql, params):
@@ -1028,17 +1047,29 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
                 candidate_sql, remainder = self.sql.split("cycle_cohorts AS", 1)
                 cycle_sql = remainder.split("eligible_cycles AS", 1)[0]
                 assert "f.persisted_at <= f.target_endpoint" in candidate_sql
-                assert "read_forecast_commit_proof" in candidate_sql
-                assert "p.proof_eligible" in candidate_sql
-                assert (
-                    "p.forecast_record_hash=f.forecast_record_hash"
-                    in candidate_sql
-                )
-                assert "p.target_endpoint=f.target_endpoint" in candidate_sql
+                assert "read_forecast_commit_proof" not in candidate_sql
                 assert "f.persisted_at <= f.target_endpoint" not in cycle_sql
-                return (recovery_row, invalid_newer_row)
+                return (
+                    recovery_row, recovery_row, newer_unproven_row,
+                    invalid_newer_row,
+                )
             if "f.horizon IN" in self.sql:
                 return rows
+            if "WITH ORDINALITY" in self.sql:
+                requested = tuple(self.params[0])
+                proof_requests.append(requested)
+                forecast = forecasts[0]
+                if forecast.forecast_record_id not in requested:
+                    return ()
+                return ((
+                    forecast.forecast_record_id,
+                    forecast.forecast_record_id,
+                    forecast.forecast_record_hash,
+                    forecast.persisted_at,
+                    forecast.target_endpoint,
+                    True,
+                    "POST_COMMIT_DB_OBSERVATION_V1",
+                ),)
             if "FROM public.atom_v9_v4_states" in self.sql:
                 assert "SELECT s.symbol, s.cohort_id" in self.sql
                 assert "count(*) FILTER" in self.sql and "count(*)=2" in self.sql
@@ -1072,6 +1103,10 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
     )
     worker._submit_recovery_state_build()
 
+    assert proof_requests == [
+        (forecasts[1].forecast_record_id,),
+        (forecasts[0].forecast_record_id,),
+    ]
     assert submitted == [{
         "symbol": "COIN", "state_as_of": NOW + timedelta(minutes=3),
         "cohorts": {forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
@@ -1080,6 +1115,80 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
     }]
     assert dict(worker.metrics.snapshot().counters)[
         "v4_state_build_recovery.submitted"] == 1
+
+
+def test_recovery_proof_fallback_depth_and_work_are_bounded(monkeypatch):
+    def exercise(labels):
+        worker = EvidenceLedgerWorker(
+            EvidenceOutbox(), evidence_store=_RawStore(),
+            connection=_WorkerConnection(),
+        )
+        candidates_by_identity = {}
+        for label in labels:
+            cohorts = {
+                horizon: (f"{label}-{horizon}", "a" * 64)
+                for horizon in HORIZONS
+            }
+            identity = (
+                "COIN",
+                tuple((horizon, *cohorts[horizon]) for horizon in HORIZONS),
+            )
+            representatives = tuple(
+                SimpleNamespace(forecast_record_id=f"{label}-{index}")
+                for index in range(5)
+            )
+            candidates_by_identity[identity] = [
+                (cohorts, NOW + timedelta(seconds=index), representative)
+                for index, representative in enumerate(representatives)
+            ]
+        proof_requests = []
+
+        def validate(records):
+            proof_requests.append(tuple(
+                record.forecast_record_id for record in records))
+            return frozenset()
+
+        worker._validated_recovery_proof_ids = validate
+        assert worker._latest_proven_recovery_cohorts(
+            candidates_by_identity) == {}
+        counters = dict(worker.metrics.snapshot().counters)
+        return proof_requests, counters
+
+    monkeypatch.setattr(
+        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_FALLBACK_DEPTH", 2)
+    monkeypatch.setattr(
+        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_WORK_LIMIT", 100)
+    depth_requests, depth_counters = exercise(("depth",))
+    assert depth_requests == [
+        ("depth-4",),
+        ("depth-3",),
+        ("depth-2",),
+    ]
+    assert depth_counters[
+        "v4_state_build_recovery.proof_fallback_truncated"] == 1
+
+    monkeypatch.setattr(
+        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_FALLBACK_DEPTH", 4)
+    monkeypatch.setattr(
+        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_WORK_LIMIT", 3)
+    work_requests, work_counters = exercise(("first", "second"))
+    assert work_requests == [
+        ("first-4", "second-4"),
+        ("first-3",),
+    ]
+    assert work_counters[
+        "v4_state_build_recovery.proof_fallback_truncated"] == 1
+
+    monkeypatch.setattr(
+        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_WORK_LIMIT", 256)
+    high_cardinality_requests, high_cardinality_counters = exercise(tuple(
+        f"cohort-{index:03d}" for index in range(300)
+    ))
+    assert len(high_cardinality_requests) == 1
+    assert len(high_cardinality_requests[0]) == 256
+    assert sum(map(len, high_cardinality_requests)) == 256
+    assert high_cardinality_counters[
+        "v4_state_build_recovery.proof_fallback_truncated"] == 1
 
 
 def test_runtime_owner_replays_every_distinct_uncovered_shutdown_cohort():
@@ -1136,12 +1245,26 @@ def test_runtime_owner_replays_every_distinct_uncovered_shutdown_cohort():
         for forecasts in (first, second) for forecast in forecasts)
 
     class Cursor:
-        def execute(self, sql, _params): self.sql = sql
+        def execute(self, sql, params): self.sql, self.params = sql, params
         def fetchall(self):
             if "WITH recent_outcomes" in self.sql:
                 return recovery_rows
             if "f.horizon IN" in self.sql:
                 return lineage_rows
+            if "WITH ORDINALITY" in self.sql:
+                representatives = (first[0], second[0])
+                assert self.params == ([
+                    item.forecast_record_id for item in representatives
+                ],)
+                return tuple((
+                    item.forecast_record_id,
+                    item.forecast_record_id,
+                    item.forecast_record_hash,
+                    item.persisted_at,
+                    item.target_endpoint,
+                    True,
+                    "POST_COMMIT_DB_OBSERVATION_V1",
+                ) for item in representatives)
             if "FROM public.atom_v9_v4_states" in self.sql:
                 return ()
             return ()
