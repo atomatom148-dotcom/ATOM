@@ -238,6 +238,8 @@ def test_all_72_family_horizon_slots_have_exact_external_v2a_parity(tmp_path):
         assert external.connection.execute(
             "SELECT count(*) FROM admitted WHERE quant='q10_options_vol'"
         ).fetchone() == (0,)
+        with pytest.raises(ValueError, match="Phase 1C-A exposes V2A only"):
+            build_external_v2b(external)
         close(external, tmp_path)
 
 

@@ -785,7 +785,26 @@ def _effective_n(view: ExternalV2AView) -> EffectiveN:
     return EffectiveN(n, float(n), tau, min(float(n), max(1.0, n / tau)), retained)
 
 
+def _require_phase1b_calibration_scope(view: ExternalV2AView) -> None:
+    """Keep the legacy proof-only V2B helper fenced from Phase 1C-A views."""
+
+    expected = (
+        (
+            _Q,
+            view.formula_version,
+            view.family_data_schema_version,
+            view.family_source_spec_version,
+        ),
+    )
+    if view.horizon != _H or view.selected_family_versions != expected:
+        raise ValueError(
+            "external V2B remains proof-only for q1_momentum/30S; "
+            "Phase 1C-A exposes V2A only"
+        )
+
+
 def build_external_v2b(view: ExternalV2AView) -> V2BCalibration:
+    _require_phase1b_calibration_scope(view)
     validate_external_v2a(view)
     en = _effective_n(view)
     n = view.observation_count
