@@ -1028,17 +1028,23 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
                 candidate_sql, remainder = self.sql.split("cycle_cohorts AS", 1)
                 cycle_sql = remainder.split("eligible_cycles AS", 1)[0]
                 assert "f.persisted_at <= f.target_endpoint" in candidate_sql
-                assert "read_forecast_commit_proof" in candidate_sql
-                assert "p.proof_eligible" in candidate_sql
-                assert (
-                    "p.forecast_record_hash=f.forecast_record_hash"
-                    in candidate_sql
-                )
-                assert "p.target_endpoint=f.target_endpoint" in candidate_sql
+                assert "read_forecast_commit_proof" not in candidate_sql
                 assert "f.persisted_at <= f.target_endpoint" not in cycle_sql
-                return (recovery_row, invalid_newer_row)
+                return (recovery_row, recovery_row, invalid_newer_row)
             if "f.horizon IN" in self.sql:
                 return rows
+            if "WITH ORDINALITY" in self.sql:
+                forecast = forecasts[0]
+                assert self.params == ([forecast.forecast_record_id],)
+                return ((
+                    forecast.forecast_record_id,
+                    forecast.forecast_record_id,
+                    forecast.forecast_record_hash,
+                    forecast.persisted_at,
+                    forecast.target_endpoint,
+                    True,
+                    "POST_COMMIT_DB_OBSERVATION_V1",
+                ),)
             if "FROM public.atom_v9_v4_states" in self.sql:
                 assert "SELECT s.symbol, s.cohort_id" in self.sql
                 assert "count(*) FILTER" in self.sql and "count(*)=2" in self.sql
@@ -1136,12 +1142,26 @@ def test_runtime_owner_replays_every_distinct_uncovered_shutdown_cohort():
         for forecasts in (first, second) for forecast in forecasts)
 
     class Cursor:
-        def execute(self, sql, _params): self.sql = sql
+        def execute(self, sql, params): self.sql, self.params = sql, params
         def fetchall(self):
             if "WITH recent_outcomes" in self.sql:
                 return recovery_rows
             if "f.horizon IN" in self.sql:
                 return lineage_rows
+            if "WITH ORDINALITY" in self.sql:
+                representatives = (first[0], second[0])
+                assert self.params == ([
+                    item.forecast_record_id for item in representatives
+                ],)
+                return tuple((
+                    item.forecast_record_id,
+                    item.forecast_record_id,
+                    item.forecast_record_hash,
+                    item.persisted_at,
+                    item.target_endpoint,
+                    True,
+                    "POST_COMMIT_DB_OBSERVATION_V1",
+                ) for item in representatives)
             if "FROM public.atom_v9_v4_states" in self.sql:
                 return ()
             return ()
