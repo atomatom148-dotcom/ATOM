@@ -1179,6 +1179,7 @@ def test_recovery_proof_fallback_depth_and_work_are_bounded(monkeypatch):
     assert work_counters[
         "v4_state_build_recovery.proof_fallback_truncated"] == 1
 
+
 def test_runtime_owner_replays_every_distinct_uncovered_shutdown_cohort():
     def cycle(*, cycle_id, formula_version):
         v1, v2 = _inputs()
