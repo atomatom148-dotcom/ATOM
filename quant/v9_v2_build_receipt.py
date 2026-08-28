@@ -31,6 +31,7 @@ class V2BuildReceipt:
     per_family_horizon_effective_n: tuple[tuple[str, str, float], ...]
     build_elapsed_seconds: float
     peak_rss_bytes: int
+    temporary_disk_peak_bytes: int
     evidence_manifest_hash: str
     receipt_sha256: str
 
@@ -58,6 +59,31 @@ def seal_receipt(receipt: V2BuildReceipt) -> V2BuildReceipt:
         raise ValueError("receipt contains non-finite values")
     if receipt.rejected_rows != receipt.source_rows_read - receipt.admitted_rows:
         raise ValueError("receipt row accounting does not balance")
+    counters = (
+        receipt.stored_forecast_rows, receipt.resolved_evidence_rows,
+        receipt.source_rows_read, receipt.eligible_rows, receipt.admitted_rows,
+        receipt.rejected_rows, receipt.pages_read, receipt.page_size,
+        receipt.peak_rss_bytes, receipt.temporary_disk_peak_bytes,
+    )
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+           for value in counters) or receipt.page_size != 4_096:
+        raise ValueError("receipt contains invalid counters")
+    if receipt.eligible_rows > receipt.source_rows_read:
+        raise ValueError("eligible rows exceed source rows")
+    if receipt.admitted_rows > receipt.eligible_rows:
+        raise ValueError("admitted rows exceed eligible rows")
+    if receipt.source_rows_read and (
+            receipt.first_source_identity is None or
+            receipt.last_source_identity is None):
+        raise ValueError("non-empty receipt requires source identity bounds")
+    if not receipt.source_rows_read and (
+            receipt.first_source_identity is not None or
+            receipt.last_source_identity is not None):
+        raise ValueError("empty receipt cannot have source identity bounds")
+    if (len(receipt.evidence_manifest_hash) != 64 or
+            any(character not in "0123456789abcdef"
+                for character in receipt.evidence_manifest_hash)):
+        raise ValueError("receipt evidence manifest hash is invalid")
     sealed = replace(receipt, receipt_sha256=receipt_sha256(receipt))
     return sealed
 

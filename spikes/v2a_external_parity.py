@@ -38,7 +38,7 @@ def run(n,root,nondegenerate=False):
         (n+4095)//4096,4096,"directional:30S:0x0.0p+0:gate-000000",
         f"directional:30S:{float((n-1)*30).hex()}:gate-{n-1:06d}",(("30S",n),),
         (("30S","q1_momentum",n),),(("30S","q1_momentum",float(n)),),0.0,0,
-        state.evidence_manifest_hash,"")); receipt_bytes=serialize_v2_build_receipt(receipt)
+        peak_disk,state.evidence_manifest_hash,"")); receipt_bytes=serialize_v2_build_receipt(receipt)
     workspace=view.workspace; view.close(); cleanup_owned_workspace(workspace,root=root)
     return {"rows":n,"baseline_rss_bytes":baseline,"external_v2a_peak_rss_bytes":v2a_peak,
         "temporary_disk_bytes":disk,"peak_temporary_disk_bytes":peak_disk,

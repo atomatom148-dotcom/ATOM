@@ -292,6 +292,8 @@ class PostgresV2StateStore:
         """Atomically append the proof before making its state publishable."""
         if receipt.state_id != state.state_id or receipt.state_as_of != state.state_as_of:
             raise V2StateInvalidError("V2 receipt does not identify its state")
+        if receipt.evidence_manifest_hash != state.evidence_manifest_hash:
+            raise V2StateInvalidError("V2 receipt does not identify the state manifest")
         serialized_receipt = serialize_v2_build_receipt(receipt)
         serialized_state = _validate_state(state)
 
@@ -319,7 +321,33 @@ class PostgresV2StateStore:
             inserted_state = cursor.fetchone() is not None
             if inserted_receipt != inserted_state:
                 raise V2StateConflictError("V2 state and receipt append conflict")
-            return INSERTED if inserted_state else IDEMPOTENT
+            if inserted_state:
+                return INSERTED
+            # A retry is idempotent only when both immutable rows are exactly
+            # the requested pair.  ON CONFLICT alone cannot establish that.
+            cursor.execute(
+                "SELECT receipt_json FROM public.atom_v9_v2_build_receipts "
+                "WHERE receipt_sha256 = %s AND state_id = %s",
+                (receipt.receipt_sha256, state.state_id),
+            )
+            receipt_row = cursor.fetchone()
+            cursor.execute(
+                _SELECT + " WHERE state_id = %s AND state_hash = %s",
+                (state.state_id, state.state_hash),
+            )
+            state_rows = cursor.fetchall()
+            if (receipt_row is None or len(receipt_row) != 1 or
+                    (json.loads(receipt_row[0]) if isinstance(receipt_row[0], str)
+                     else receipt_row[0]) != json.loads(serialized_receipt) or
+                    len(state_rows) != 1):
+                raise V2StateConflictError("V2 state and receipt append conflict")
+            try:
+                stored = self._decode_row(state_rows[0])
+            except V2StateRowInvalidError as error:
+                raise V2StateConflictError("conflicting V2 state row is invalid") from error
+            if stored != state:
+                raise V2StateConflictError("V2 state and receipt append conflict")
+            return IDEMPOTENT
 
         return self._run(operation)
 
