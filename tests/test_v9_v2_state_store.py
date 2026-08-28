@@ -24,7 +24,9 @@ from quant.v9_v2d_evidence_state import (
 )
 from quant.v9_v2_build_receipt import (
     RECEIPT_SCHEMA_VERSION,
+    RESOURCE_RECEIPT_SCHEMA_VERSION,
     V2BuildReceipt,
+    receipt_sha256,
     seal_receipt,
     serialize_v2_build_receipt,
 )
@@ -191,6 +193,19 @@ def _row(state, *, replacements=None, payload=None):
         state.top_level_status,
         state.creation_status,
         json.loads(serialize_v2_evidence_state(state)) if payload is None else payload,
+    ]
+    for index, value in (replacements or {}).items():
+        values[index] = value
+    return tuple(values)
+
+
+def _receipt_row(receipt, *, replacements=None, payload=None):
+    values = [
+        receipt.receipt_sha256,
+        receipt.state_id,
+        receipt.state_as_of,
+        (json.loads(serialize_v2_build_receipt(receipt))
+         if payload is None else payload),
     ]
     for index, value in (replacements or {}).items():
         values[index] = value
@@ -406,6 +421,7 @@ def test_connection_is_closed_even_when_cursor_cleanup_fails():
     (
         {"state_id": "v9v2:" + "f" * 64},
         {"state_as_of": 9_999.0},
+        {"evidence_manifest_hash": "f" * 64},
     ),
 )
 def test_insert_with_receipt_rejects_identity_mismatch_before_connecting(changes):
@@ -438,7 +454,7 @@ def test_insert_with_receipt_commits_only_matching_atomic_outcomes(
     if not receipt_rows and not state_rows:
         receipt = _receipt(state)
         responses.extend([
-            [(json.loads(serialize_v2_build_receipt(receipt)),)],
+            [_receipt_row(receipt)],
             [_row(state)],
         ])
     connection = Connection(responses)
@@ -454,6 +470,31 @@ def test_insert_with_receipt_commits_only_matching_atomic_outcomes(
         "atom_v9_v2_build_receipts" in sql
         for sql, _ in connection.cursor_value.calls
     )
+    if expected == IDEMPOTENT:
+        retry_sql = connection.cursor_value.calls[6][0]
+        assert (
+            "SELECT receipt_sha256, state_id, state_as_of, receipt_json"
+            in retry_sql
+        )
+        assert "WHERE receipt_sha256 = %s OR state_id = %s" in retry_sql
+
+
+def test_insert_with_receipt_can_borrow_lock_owning_connection_without_closing():
+    state = _state()
+    connection = Connection([_role(), [("receipt",)], [(state.state_id,)]])
+    connector = Connector()
+
+    result = PostgresV2StateStore(
+        DATABASE_URL, connect=connector,
+    ).insert_with_receipt(
+        state, _receipt(state), connection=connection,
+    )
+
+    assert result == INSERTED
+    assert connector.calls == []
+    assert (connection.commits, connection.rollbacks) == (1, 0)
+    assert connection.cursor_value.closed is True
+    assert connection.closed is False
 
 
 @pytest.mark.parametrize(
@@ -480,3 +521,113 @@ def test_insert_with_receipt_rolls_back_split_append(
 
     assert (connection.commits, connection.rollbacks) == (0, 1)
     assert connection.closed and connection.cursor_value.closed
+
+
+@pytest.mark.parametrize(
+    ("index", "replacement"),
+    (
+        (0, "f" * 64),
+        (1, "v9v2:" + "f" * 64),
+        (2, 9_999.0),
+    ),
+)
+def test_insert_with_receipt_rejects_relational_receipt_mismatch(index, replacement):
+    state = _state()
+    receipt = _receipt(state)
+    connection = Connection([
+        _role(), [], [],
+        [_receipt_row(receipt, replacements={index: replacement})],
+        [_row(state)],
+    ])
+
+    with pytest.raises(V2StateConflictError, match="receipt row is invalid"):
+        PostgresV2StateStore(
+            DATABASE_URL, connect=Connector(connection),
+        ).insert_with_receipt(state, receipt)
+
+    assert (connection.commits, connection.rollbacks) == (0, 1)
+    assert connection.closed and connection.cursor_value.closed
+
+
+def test_insert_with_receipt_rejects_semantically_invalid_persisted_receipt():
+    state = _state()
+    receipt = _receipt(state)
+    invalid = replace(receipt, eligible_rows=receipt.source_rows_read + 1,
+                      receipt_sha256="")
+    invalid = replace(invalid, receipt_sha256=receipt_sha256(invalid))
+    payload = json.loads(serialize_v2_build_receipt(receipt))
+    payload.update({
+        "eligible_rows": invalid.eligible_rows,
+        "receipt_sha256": invalid.receipt_sha256,
+    })
+    connection = Connection([
+        _role(), [], [],
+        [(
+            invalid.receipt_sha256, invalid.state_id, invalid.state_as_of,
+            payload,
+        )],
+        [_row(state)],
+    ])
+
+    with pytest.raises(V2StateConflictError, match="receipt row is invalid"):
+        PostgresV2StateStore(
+            DATABASE_URL, connect=Connector(connection),
+        ).insert_with_receipt(state, receipt)
+
+    assert (connection.commits, connection.rollbacks) == (0, 1)
+
+
+def test_insert_with_receipt_accepts_retry_with_different_resource_telemetry():
+    state = _state()
+    requested = _receipt(state)
+    stored = _receipt(state, build_elapsed_seconds=99.0, peak_rss_bytes=99_999)
+    assert stored.receipt_sha256 == requested.receipt_sha256
+    connection = Connection([
+        _role(), [], [], [_receipt_row(stored)], [_row(state)],
+    ])
+
+    assert PostgresV2StateStore(
+        DATABASE_URL, connect=Connector(connection),
+    ).insert_with_receipt(state, requested) == IDEMPOTENT
+    assert (connection.commits, connection.rollbacks) == (1, 0)
+
+
+def test_insert_with_resource_receipt_accepts_retry_with_different_disk_peak():
+    state = _state()
+    requested = _receipt(
+        state,
+        receipt_schema_version=RESOURCE_RECEIPT_SCHEMA_VERSION,
+        temporary_disk_peak_bytes=1_000,
+    )
+    stored = _receipt(
+        state,
+        receipt_schema_version=RESOURCE_RECEIPT_SCHEMA_VERSION,
+        build_elapsed_seconds=99.0,
+        peak_rss_bytes=99_999,
+        temporary_disk_peak_bytes=2_000,
+    )
+    assert stored.receipt_sha256 == requested.receipt_sha256
+    connection = Connection([
+        _role(), [], [], [_receipt_row(stored)], [_row(state)],
+    ])
+
+    assert PostgresV2StateStore(
+        DATABASE_URL, connect=Connector(connection),
+    ).insert_with_receipt(state, requested) == IDEMPOTENT
+    assert (connection.commits, connection.rollbacks) == (1, 0)
+
+
+def test_insert_with_receipt_rejects_persisted_manifest_mismatch():
+    state = _state()
+    requested = _receipt(state)
+    conflicting = _receipt(state, evidence_manifest_hash="f" * 64)
+    connection = Connection([
+        _role(), [], [], [_receipt_row(conflicting)], [_row(state)],
+    ])
+
+    with pytest.raises(V2StateConflictError, match="append conflict"):
+        PostgresV2StateStore(
+            DATABASE_URL, connect=Connector(connection),
+        ).insert_with_receipt(state, requested)
+
+    assert (connection.commits, connection.rollbacks) == (0, 1)

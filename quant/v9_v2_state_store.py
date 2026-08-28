@@ -76,6 +76,16 @@ _COLUMNS = (
     "state_json",
 )
 _SELECT = "SELECT " + ", ".join(_COLUMNS) + f" FROM {V2_STATE_TABLE}"
+_RECEIPT_COLUMNS = (
+    "receipt_sha256",
+    "state_id",
+    "state_as_of",
+    "receipt_json",
+)
+_RECEIPT_SELECT = (
+    "SELECT " + ", ".join(_RECEIPT_COLUMNS)
+    + " FROM public.atom_v9_v2_build_receipts"
+)
 
 
 def _validate_lookup_identity(*, symbol: str, target_spec_id: str,
@@ -221,8 +231,34 @@ class PostgresV2StateStore:
             raise V2StateRowInvalidError("stored V2 state is newer than requested cutoff")
         return state
 
-    def _run(self, operation):
-        connection = self._connect(self._database_url)
+    @staticmethod
+    def _decode_receipt_row(row: object) -> V2BuildReceipt:
+        """Validate persisted relational receipt identity against its JSON."""
+
+        if (not isinstance(row, (tuple, list))
+                or len(row) != len(_RECEIPT_COLUMNS)):
+            raise V2StateRowInvalidError("stored V2 receipt row has invalid shape")
+        values = dict(zip(_RECEIPT_COLUMNS, row))
+        try:
+            receipt = deserialize_v2_build_receipt(values["receipt_json"])
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise V2StateRowInvalidError(
+                "stored V2 receipt payload is invalid") from error
+        relational = {
+            "receipt_sha256": receipt.receipt_sha256,
+            "state_id": receipt.state_id,
+            "state_as_of": receipt.state_as_of,
+        }
+        for name, expected in relational.items():
+            if values[name] != expected:
+                raise V2StateRowInvalidError(
+                    f"stored V2 receipt column {name} does not match payload")
+        return receipt
+
+    def _run(self, operation, *, connection=None):
+        owns_connection = connection is None
+        if owns_connection:
+            connection = self._connect(self._database_url)
         cursor = None
         try:
             cursor = connection.cursor()
@@ -239,7 +275,8 @@ class PostgresV2StateStore:
                 if cursor is not None:
                     cursor.close()
             finally:
-                connection.close()
+                if owns_connection:
+                    connection.close()
 
     def insert(self, state: V2EvidenceState) -> str:
         serialized = _validate_state(state)
@@ -290,7 +327,7 @@ class PostgresV2StateStore:
         return self._run(operation)
 
     def insert_with_receipt(self, state: V2EvidenceState,
-                            receipt: V2BuildReceipt) -> str:
+                            receipt: V2BuildReceipt, *, connection=None) -> str:
         """Atomically append the proof before making its state publishable."""
         if receipt.state_id != state.state_id or receipt.state_as_of != state.state_as_of:
             raise V2StateInvalidError("V2 receipt does not identify its state")
@@ -328,24 +365,29 @@ class PostgresV2StateStore:
             # A retry is idempotent only when both immutable rows are exactly
             # the requested pair.  ON CONFLICT alone cannot establish that.
             cursor.execute(
-                "SELECT receipt_json FROM public.atom_v9_v2_build_receipts "
-                "WHERE receipt_sha256 = %s AND state_id = %s",
+                _RECEIPT_SELECT +
+                " WHERE receipt_sha256 = %s OR state_id = %s",
                 (receipt.receipt_sha256, state.state_id),
             )
-            receipt_row = cursor.fetchone()
+            receipt_rows = cursor.fetchall()
             cursor.execute(
                 _SELECT + " WHERE state_id = %s AND state_hash = %s",
                 (state.state_id, state.state_hash),
             )
             state_rows = cursor.fetchall()
-            if receipt_row is None or len(receipt_row) != 1 or len(state_rows) != 1:
+            if len(receipt_rows) != 1 or len(state_rows) != 1:
                 raise V2StateConflictError("V2 state and receipt append conflict")
             try:
-                stored_receipt = deserialize_v2_build_receipt(receipt_row[0])
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                stored_receipt = self._decode_receipt_row(receipt_rows[0])
+            except V2StateRowInvalidError as error:
                 raise V2StateConflictError("conflicting V2 receipt row is invalid") from error
             if (stored_receipt.receipt_sha256 != receipt.receipt_sha256 or
-                    stored_receipt.state_id != receipt.state_id):
+                    stored_receipt.state_id != receipt.state_id or
+                    stored_receipt.state_as_of != receipt.state_as_of or
+                    stored_receipt.evidence_manifest_hash !=
+                    receipt.evidence_manifest_hash or
+                    stored_receipt.evidence_manifest_hash !=
+                    state.evidence_manifest_hash):
                 raise V2StateConflictError("V2 state and receipt append conflict")
             try:
                 stored = self._decode_row(state_rows[0])
@@ -355,7 +397,7 @@ class PostgresV2StateStore:
                 raise V2StateConflictError("V2 state and receipt append conflict")
             return IDEMPOTENT
 
-        return self._run(operation)
+        return self._run(operation, connection=connection)
 
     def latest(
         self,

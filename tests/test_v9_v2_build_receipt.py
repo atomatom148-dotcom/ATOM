@@ -1,11 +1,13 @@
 """Observability proof remains separate from frozen V2 mathematics."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
+import json
 
 import pytest
 
 from quant.v9_v2_build_receipt import (
-    RECEIPT_SCHEMA_VERSION, V2BuildReceipt, receipt_sha256, seal_receipt,
+    RECEIPT_SCHEMA_VERSION, RESOURCE_RECEIPT_SCHEMA_VERSION, V2BuildReceipt,
+    deserialize_v2_build_receipt, receipt_sha256, seal_receipt,
     serialize_v2_build_receipt,
 )
 
@@ -91,3 +93,129 @@ def test_tampered_sealed_receipt_cannot_be_serialized():
     tampered = replace(receipt, admitted_rows=receipt.admitted_rows - 1)
     with pytest.raises(ValueError, match="hash mismatch"):
         serialize_v2_build_receipt(tampered)
+
+
+def test_canonical_receipt_round_trip_preserves_frozen_bytes():
+    receipt = seal_receipt(_receipt())
+    encoded = serialize_v2_build_receipt(receipt)
+
+    assert deserialize_v2_build_receipt(encoded) == receipt
+    assert serialize_v2_build_receipt(
+        deserialize_v2_build_receipt(json.loads(encoded)),
+    ) == encoded
+    assert receipt.receipt_sha256 == (
+        "f26c73e1174ca93227e86bdd5635569d6bc931f6fc2660b8a776396215b4550d"
+    )
+    assert "temporary_disk_peak_bytes" not in encoded
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    (
+        ({"receipt_schema_version": "OTHER"}, "schema"),
+        ({"eligible_rows": 200_001}, "eligible rows exceed"),
+        ({"build_elapsed_seconds": -1.0}, "resource telemetry"),
+        ({"peak_rss_bytes": True}, "invalid counters"),
+        ({"per_horizon_admitted_counts": (("1m", -1),)}, "count table"),
+    ),
+)
+def test_deserialize_revalidates_semantics_even_with_matching_hash(changes, message):
+    invalid = replace(_receipt(), **changes)
+    invalid = replace(invalid, receipt_sha256=receipt_sha256(invalid))
+    payload = asdict(invalid)
+    payload.pop("temporary_disk_peak_bytes")
+    payload = json.loads(json.dumps(payload))
+
+    with pytest.raises(ValueError, match=message):
+        deserialize_v2_build_receipt(payload)
+
+
+def test_deserialize_rejects_malformed_count_table_shape_as_value_error():
+    receipt = seal_receipt(_receipt())
+    payload = json.loads(serialize_v2_build_receipt(receipt))
+    payload["per_horizon_admitted_counts"] = [["1m"]]
+
+    with pytest.raises(ValueError, match="count table"):
+        deserialize_v2_build_receipt(payload)
+
+
+def test_resource_receipt_round_trip_includes_disk_without_hashing_telemetry():
+    first = seal_receipt(replace(
+        _receipt(),
+        receipt_schema_version=RESOURCE_RECEIPT_SCHEMA_VERSION,
+        temporary_disk_peak_bytes=248_316_014,
+    ))
+    retry = seal_receipt(replace(
+        _receipt(),
+        receipt_schema_version=RESOURCE_RECEIPT_SCHEMA_VERSION,
+        build_elapsed_seconds=999.0,
+        peak_rss_bytes=999,
+        temporary_disk_peak_bytes=999_999,
+    ))
+
+    encoded = serialize_v2_build_receipt(first)
+    decoded = deserialize_v2_build_receipt(encoded)
+    assert decoded == first
+    assert json.loads(encoded)["temporary_disk_peak_bytes"] == 248_316_014
+    assert retry.receipt_sha256 == first.receipt_sha256
+    assert first.receipt_sha256 != seal_receipt(_receipt()).receipt_sha256
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    (
+        ({"source_rows_read": 199_999, "rejected_rows": 1},
+         "source rows must equal stored"),
+        ({"resolved_evidence_rows": 200_001},
+         "resolved evidence exceeds stored"),
+        ({"resolved_evidence_rows": 199_998},
+         "eligible rows exceed resolved"),
+    ),
+)
+def test_resource_receipt_distinguishes_source_resolution_and_eligibility(
+        changes, message):
+    value = replace(
+        _receipt(),
+        receipt_schema_version=RESOURCE_RECEIPT_SCHEMA_VERSION,
+        temporary_disk_peak_bytes=1,
+        **changes,
+    )
+    with pytest.raises(ValueError, match=message):
+        seal_receipt(value)
+
+
+@pytest.mark.parametrize(
+    "disk",
+    (None, -1, True, 1.5),
+)
+def test_resource_receipt_requires_nonnegative_integer_disk_telemetry(disk):
+    with pytest.raises(ValueError, match="requires temporary disk telemetry"):
+        seal_receipt(replace(
+            _receipt(),
+            receipt_schema_version=RESOURCE_RECEIPT_SCHEMA_VERSION,
+            temporary_disk_peak_bytes=disk,
+        ))
+
+
+def test_v1_receipt_rejects_disk_field_and_deserializer_requires_it_absent():
+    with pytest.raises(ValueError, match="v1 receipt cannot contain"):
+        seal_receipt(replace(_receipt(), temporary_disk_peak_bytes=1))
+
+    receipt = seal_receipt(_receipt())
+    payload = json.loads(serialize_v2_build_receipt(receipt))
+    payload["temporary_disk_peak_bytes"] = None
+    with pytest.raises(ValueError, match="not canonical"):
+        deserialize_v2_build_receipt(payload)
+
+
+def test_v2_deserializer_rejects_missing_disk_telemetry():
+    receipt = seal_receipt(replace(
+        _receipt(),
+        receipt_schema_version=RESOURCE_RECEIPT_SCHEMA_VERSION,
+        temporary_disk_peak_bytes=1,
+    ))
+    payload = json.loads(serialize_v2_build_receipt(receipt))
+    payload.pop("temporary_disk_peak_bytes")
+
+    with pytest.raises(ValueError, match="requires temporary disk telemetry"):
+        deserialize_v2_build_receipt(payload)
