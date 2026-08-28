@@ -1420,7 +1420,7 @@ class EvidenceLedgerWorker:
 
         forecasts_by_key = self._load_cycle_forecasts(tuple(
             candidate[0] for candidate in candidates))
-        distinct: dict[
+        distinct_candidates: dict[
             tuple[str, tuple[tuple[str, str, str], ...]],
             tuple[dict[str, tuple[str, str]], datetime, V4ForecastRecord],
         ] = {}
@@ -1444,18 +1444,19 @@ class EvidenceLedgerWorker:
             cohort_key = tuple(
                 (horizon, *cohorts[horizon]) for horizon in HORIZONS)
             identity = (forecasts[0].symbol, cohort_key)
-            prior = distinct.get(identity)
+            prior = distinct_candidates.get(identity)
             if prior is None or created_at > prior[1]:
-                distinct[identity] = (cohorts, created_at, representative)
+                distinct_candidates[identity] = (
+                    cohorts, created_at, representative)
 
         proven_ids = self._validated_recovery_proof_ids(tuple(
             representative for _cohorts, _created_at, representative
-            in distinct.values()
+            in distinct_candidates.values()
         ))
         distinct = {
             identity: (cohorts, created_at)
             for identity, (cohorts, created_at, representative)
-            in distinct.items()
+            in distinct_candidates.items()
             if representative.forecast_record_id in proven_ids
         }
 
