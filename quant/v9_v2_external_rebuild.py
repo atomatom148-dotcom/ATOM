@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 import fcntl
 import json
 import math
@@ -421,7 +422,9 @@ def _read_pages(cursor, sqlite: sqlite3.Connection, *, state_as_of: float,
         if source_page:
             pages += 1
             resolved_page = tuple(
-                row[:destination_columns] for row in source_page if row[-1] is True
+                tuple(float(value) if isinstance(value, Decimal) else value
+                      for value in row[:destination_columns])
+                for row in source_page if row[-1] is True
             )
             if resolved_page:
                 sqlite.executemany(
