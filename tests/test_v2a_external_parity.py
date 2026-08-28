@@ -7,7 +7,8 @@ import pytest
 from spikes.v2_frozen_schema_feasibility import build_legacy, canonical_receipt
 from spikes.v2a_external_parity import observations, targets
 from quant.v9_v2a_dataset import (DIRECTIONAL_BPS, RawFamilyObservation,
-    RawTarget, TargetIdentity, build_v2a_dataset)
+    DIRECTIONAL_FAMILIES, HORIZON_SECONDS, RawTarget, TargetIdentity,
+    build_v2a_dataset)
 from quant.v9_v2a_external import (build_external_v2a,build_external_v2b,
     build_external_v2c,build_external_v2d,cleanup_owned_workspace,validate_external_v2a,
     _effective_n,_effective_n_squared)
@@ -61,6 +62,65 @@ def test_exact_frozen_chain_and_receipt_parity(tmp_path):
     assert state.state_id==legacy[3].state_id
     assert canonical_receipt(state,16)==canonical_receipt(legacy[3],16)
     close(view,tmp_path)
+
+
+@pytest.mark.parametrize("horizon", tuple(HORIZON_SECONDS))
+@pytest.mark.parametrize("quant_id", DIRECTIONAL_FAMILIES)
+def test_every_directional_family_horizon_has_exact_external_v2a_v2c_parity(
+        tmp_path, horizon, quant_id):
+    seconds = HORIZON_SECONDS[horizon]
+    formula = "gate-" + quant_id
+    target_rows = []
+    observation_rows = []
+    for index, (target, forecast) in enumerate(((1., 0.), (3., 1.), (2., 1.),
+                                                 (6., 2.), (4., 2.), (8., 3.))):
+        cutoff = float(index * seconds)
+        identity = TargetIdentity(f"{quant_id}-{horizon}-{index}", cutoff,
+                                  cutoff + seconds)
+        target_rows.append(RawTarget(
+            index, identity.cycle_id, "COIN", "gate-target", "gate-schema",
+            "gate-source", horizon, cutoff, cutoff + seconds, cutoff + seconds,
+            target,
+        ))
+        observation_rows.append(RawFamilyObservation(
+            index, identity, "COIN", quant_id, formula, "gate-schema",
+            "gate-source", horizon, DIRECTIONAL_BPS, forecast, cutoff, cutoff,
+            cutoff, "FRESH",
+        ))
+    legacy = build_v2a_dataset(
+        state_as_of=2e9, horizon=horizon, target_spec_id="gate-target",
+        target_data_schema_version="gate-schema",
+        target_source_spec_version="gate-source",
+        family_versions=((quant_id, formula, "gate-schema", "gate-source"),),
+        targets=target_rows, observations=observation_rows,
+    )
+    from quant.v9_v2b_calibration import calibrate_v2b
+    from quant.v9_v2c_covariance import build_v2c_covariance
+    from quant.v9_v2d_evidence_state import build_v2d_evidence_state
+    legacy_b = calibrate_v2b((legacy,))
+    legacy_c = build_v2c_covariance(legacy, legacy_b)
+    legacy_state = build_v2d_evidence_state(
+        state_as_of=2e9, datasets=(legacy,), calibrations=(legacy_b,),
+        covariances=(legacy_c,),
+    )
+    view = build_external_v2a(
+        state_as_of=2e9, target_spec_id="gate-target",
+        target_data_schema_version="gate-schema",
+        target_source_spec_version="gate-source", formula_version=formula,
+        family_data_schema_version="gate-schema",
+        family_source_spec_version="gate-source", targets=target_rows,
+        observations=observation_rows, root=tmp_path, quant_id=quant_id,
+        horizon=horizon,
+    )
+    external_b = build_external_v2b(view)
+    external_c = build_external_v2c(view, external_b)
+    assert view.dataset_hash == legacy.dataset_hash
+    assert external_b == legacy_b
+    assert external_c == legacy_c
+    if horizon == "30S":
+        external_state = build_external_v2d(view, external_b, external_c)
+        assert serialize_v2_evidence_state(external_state) == serialize_v2_evidence_state(legacy_state)
+    close(view, tmp_path)
 
 @pytest.mark.parametrize("field,value,reason",[("formula_version","wrong","FORMULA_VERSION_MISMATCH"),
     ("data_schema_version","wrong","DATA_SCHEMA_VERSION_MISMATCH"),("source_spec_version","wrong","SOURCE_SPEC_VERSION_MISMATCH")])

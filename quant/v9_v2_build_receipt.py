@@ -31,7 +31,6 @@ class V2BuildReceipt:
     per_family_horizon_effective_n: tuple[tuple[str, str, float], ...]
     build_elapsed_seconds: float
     peak_rss_bytes: int
-    temporary_disk_peak_bytes: int
     evidence_manifest_hash: str
     receipt_sha256: str
 
@@ -63,7 +62,7 @@ def seal_receipt(receipt: V2BuildReceipt) -> V2BuildReceipt:
         receipt.stored_forecast_rows, receipt.resolved_evidence_rows,
         receipt.source_rows_read, receipt.eligible_rows, receipt.admitted_rows,
         receipt.rejected_rows, receipt.pages_read, receipt.page_size,
-        receipt.peak_rss_bytes, receipt.temporary_disk_peak_bytes,
+        receipt.peak_rss_bytes,
     )
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
            for value in counters) or receipt.page_size != 4_096:
@@ -93,3 +92,38 @@ def serialize_v2_build_receipt(receipt: V2BuildReceipt) -> str:
         raise ValueError("receipt hash mismatch")
     return json.dumps(asdict(receipt), sort_keys=True, separators=(",", ":"),
                       allow_nan=False)
+
+
+def deserialize_v2_build_receipt(payload: str | dict[str, object]) -> V2BuildReceipt:
+    """Decode and validate an existing schema-1 canonical receipt unchanged."""
+
+    value = json.loads(payload) if isinstance(payload, str) else payload
+    if not isinstance(value, dict) or set(value) != set(V2BuildReceipt.__dataclass_fields__):
+        raise ValueError("receipt payload shape is invalid")
+    try:
+        receipt = V2BuildReceipt(
+            receipt_schema_version=value["receipt_schema_version"],
+            state_id=value["state_id"], state_as_of=value["state_as_of"],
+            stored_forecast_rows=value["stored_forecast_rows"],
+            resolved_evidence_rows=value["resolved_evidence_rows"],
+            source_rows_read=value["source_rows_read"], eligible_rows=value["eligible_rows"],
+            admitted_rows=value["admitted_rows"], rejected_rows=value["rejected_rows"],
+            pages_read=value["pages_read"], page_size=value["page_size"],
+            first_source_identity=value["first_source_identity"],
+            last_source_identity=value["last_source_identity"],
+            per_horizon_admitted_counts=tuple(tuple(item) for item in value["per_horizon_admitted_counts"]),
+            per_family_horizon_admitted_counts=tuple(tuple(item) for item in value["per_family_horizon_admitted_counts"]),
+            per_family_horizon_effective_n=tuple(tuple(item) for item in value["per_family_horizon_effective_n"]),
+            build_elapsed_seconds=value["build_elapsed_seconds"],
+            peak_rss_bytes=value["peak_rss_bytes"],
+            evidence_manifest_hash=value["evidence_manifest_hash"],
+            receipt_sha256=value["receipt_sha256"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("receipt payload is invalid") from error
+    if receipt.receipt_schema_version != RECEIPT_SCHEMA_VERSION:
+        raise ValueError("receipt schema version is unsupported")
+    if serialize_v2_build_receipt(receipt) != json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False):
+        raise ValueError("receipt payload is not canonical")
+    return receipt

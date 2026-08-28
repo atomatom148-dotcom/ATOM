@@ -5,7 +5,8 @@ from dataclasses import replace
 import pytest
 
 from quant.v9_v2_build_receipt import (
-    RECEIPT_SCHEMA_VERSION, V2BuildReceipt, receipt_sha256, seal_receipt,
+    RECEIPT_SCHEMA_VERSION, V2BuildReceipt, deserialize_v2_build_receipt,
+    receipt_sha256, seal_receipt,
     serialize_v2_build_receipt,
 )
 
@@ -21,7 +22,7 @@ def _receipt(**changes):
          ("1m", "q10_options_vol", 0)),
         (("1m", "q1_momentum", 123.25),
          ("1m", "q10_options_vol", 0.0)),
-        12.5, 123_456_789, 987_654_321, "b" * 64, "",
+        12.5, 123_456_789, "b" * 64, "",
     )
     return replace(value, **changes)
 
@@ -91,3 +92,8 @@ def test_tampered_sealed_receipt_cannot_be_serialized():
     tampered = replace(receipt, admitted_rows=receipt.admitted_rows - 1)
     with pytest.raises(ValueError, match="hash mismatch"):
         serialize_v2_build_receipt(tampered)
+
+
+def test_existing_schema_one_receipt_round_trips_without_byte_changes():
+    encoded = serialize_v2_build_receipt(seal_receipt(_receipt()))
+    assert serialize_v2_build_receipt(deserialize_v2_build_receipt(encoded)) == encoded

@@ -19,7 +19,7 @@ import tempfile
 from typing import Iterable
 
 from quant.v9_v2a_dataset import (
-    DATASET_SCHEMA_VERSION, DIRECTIONAL_BPS, METHOD_VERSION, ExclusionCount,
+    DATASET_SCHEMA_VERSION, DIRECTIONAL_BPS, HORIZON_SECONDS, METHOD_VERSION, ExclusionCount,
     FamilyLineage, RawFamilyObservation, RawTarget, TargetIdentity,
 )
 from quant.v9_v2b_calibration import (
@@ -37,8 +37,6 @@ from quant.v9_v2d_evidence_state import (
 )
 
 _OWNER = "ATOM-V9-V2A-EXTERNAL-1"
-_Q = "q1_momentum"
-_H = "30S"
 
 
 def _finite(value: object) -> bool:
@@ -68,10 +66,13 @@ class ExternalV2AView:
     exclusions: tuple[ExclusionCount, ...]
     dataset_hash: str
     peak_disk_bytes: int
+    quant_id: str
+    horizon: str
+    numerical_type: str
 
     @property
     def family_lineage(self) -> tuple[FamilyLineage, ...]:
-        return (FamilyLineage(_Q, self.formula_version,
+        return (FamilyLineage(self.quant_id, self.formula_version,
                               self.family_data_schema_version,
                               self.family_source_spec_version),)
 
@@ -126,7 +127,7 @@ def _stream_hash(view: ExternalV2AView) -> str:
         ("dataset_schema_version", DATASET_SCHEMA_VERSION),
         ("directional_subsets", "subsets"),
         ("exclusions", "exclusions"),
-        ("family_lineage", "lineage"), ("horizon", _H),
+        ("family_lineage", "lineage"), ("horizon", view.horizon),
         ("method_version", METHOD_VERSION), ("pair_support", "[]"),
         ("q3_subset", None), ("raw_resolved_count", view.raw_resolved_count),
         ("skeleton", "skeleton"), ("state_as_of", view.state_as_of),
@@ -158,13 +159,13 @@ def _stream_hash(view: ExternalV2AView) -> str:
                 identity=_row_object(("cutoff_epoch","cycle_id","maturity_epoch"),(row[10],row[9],row[11]))
                 values=(*row[:9],identity,row[12])
                 put(json.dumps(_row_object(keys,values),sort_keys=True,separators=(",",":"),ensure_ascii=True))
-            put('],"quant_id":"q1_momentum"}]')
+            put('],"quant_id":' + scalar(view.quant_id) + '}]')
         elif value == "exclusions":
             put(json.dumps([{"count":x.count,"reason_code":x.reason_code} for x in view.exclusions],
                            sort_keys=True,separators=(",",":")))
         elif value == "lineage":
             put(json.dumps([{"data_schema_version":view.family_data_schema_version,
-                             "formula_version":view.formula_version,"quant_id":_Q,
+                             "formula_version":view.formula_version,"quant_id":view.quant_id,
                              "source_spec_version":view.family_source_spec_version}],
                            sort_keys=True,separators=(",",":")))
         elif value == "skeleton":
@@ -188,8 +189,15 @@ def build_external_v2a(*, state_as_of: float, target_spec_id: str,
                        formula_version: str, family_data_schema_version: str,
                        family_source_spec_version: str, targets: Iterable[RawTarget],
                        observations: Iterable[RawFamilyObservation], root: Path | None = None,
-                       interrupt: str | None = None) -> ExternalV2AView:
-    """Stage and seal the scoped view. Inputs are offline iterables only."""
+                       interrupt: str | None = None,
+                       quant_id: str = "q1_momentum", horizon: str = "30S",
+                       numerical_type: str = DIRECTIONAL_BPS) -> ExternalV2AView:
+    """Stage and seal one frozen family/horizon view from offline iterables."""
+    from quant.v9_v2a_dataset import DIRECTIONAL_FAMILIES, HORIZON_SECONDS
+    if horizon not in HORIZON_SECONDS or quant_id not in DIRECTIONAL_FAMILIES:
+        raise ValueError("external directional view requires a frozen family/horizon")
+    if numerical_type != DIRECTIONAL_BPS:
+        raise ValueError("Q3 magnitude views use the frozen magnitude builder")
     workspace = _owned_workspace(root)
     con = None
     peak_disk = 0
@@ -215,11 +223,11 @@ def build_external_v2a(*, state_as_of: float, target_spec_id: str,
             if not t.cycle_id: exclude("MALFORMED_RECORD"); continue
             if not all(_finite(x) for x in (t.cutoff_epoch,t.maturity_epoch,t.resolved_epoch,t.target_bps)):
                 exclude("NONFINITE_VALUE"); continue
-            if t.maturity_epoch != t.cutoff_epoch+30 or t.resolved_epoch<t.maturity_epoch:
+            if t.maturity_epoch != t.cutoff_epoch+HORIZON_SECONDS[horizon] or t.resolved_epoch<t.maturity_epoch:
                 exclude("TARGET_TIMING_MISMATCH"); continue
             if t.resolved_epoch>state_as_of: exclude("TARGET_UNRESOLVED"); continue
             raw += 1
-            if (t.symbol,t.horizon,t.target_spec_id)!=("COIN",_H,target_spec_id):
+            if (t.symbol,t.horizon,t.target_spec_id)!=("COIN",horizon,target_spec_id):
                 exclude("OUTSIDE_VERSION_COHORT"); continue
             if t.data_schema_version!=target_data_schema_version:
                 exclude("DATA_SCHEMA_VERSION_MISMATCH"); continue
@@ -246,14 +254,14 @@ def build_external_v2a(*, state_as_of: float, target_spec_id: str,
         con.commit()
         previous=None; skeleton_ordinal=0
         for row in con.execute("SELECT cycle,cutoff,maturity,record_id,resolved,target FROM canonical_targets ORDER BY cutoff,cycle,maturity,record_id"):
-            if previous is not None and row[1]<previous+30:
+            if previous is not None and row[1]<previous+HORIZON_SECONDS[horizon]:
                 exclude("OVERLAP_REMOVED"); continue
             previous=row[1]
             con.execute("INSERT INTO skeleton VALUES(?,?,?,?,?,?,?)",(skeleton_ordinal,*row[:3],row[3],row[4],row[5]))
             skeleton_ordinal+=1
         con.commit()
         for i,o in enumerate(observations):
-            if (o.quant_id,o.symbol,o.horizon)!=(_Q,"COIN",_H): exclude("MALFORMED_RECORD"); continue
+            if (o.quant_id,o.symbol,o.horizon)!=(quant_id,"COIN",horizon): exclude("MALFORMED_RECORD"); continue
             target=con.execute("SELECT cutoff,maturity FROM skeleton WHERE cycle=? AND cutoff=? AND maturity=?",(o.target_identity.cycle_id,o.target_identity.cutoff_epoch,o.target_identity.maturity_epoch)).fetchone()
             if target is None: exclude("MISSING_SYNCHRONIZED_FAMILY"); continue
             if o.formula_version!=formula_version: exclude("FORMULA_VERSION_MISMATCH"); continue
@@ -261,7 +269,7 @@ def build_external_v2a(*, state_as_of: float, target_spec_id: str,
             if o.source_spec_version!=family_source_spec_version: exclude("SOURCE_SPEC_VERSION_MISMATCH"); continue
             if not _finite(o.value_bps) or not all(_finite(x) for x in (o.forecast_cutoff_epoch,o.source_as_of_epoch,o.available_epoch)):
                 exclude("NONFINITE_VALUE"); continue
-            if o.numerical_type!=DIRECTIONAL_BPS: exclude("MALFORMED_RECORD"); continue
+            if o.numerical_type!=numerical_type: exclude("MALFORMED_RECORD"); continue
             if o.forecast_cutoff_epoch>state_as_of or o.available_epoch>state_as_of:
                 exclude("FUTURE_INPUT"); continue
             if o.forecast_cutoff_epoch!=target[0]: exclude("FAMILY_TARGET_MISMATCH"); continue
@@ -293,7 +301,7 @@ def build_external_v2a(*, state_as_of: float, target_spec_id: str,
             row=con.execute("SELECT cycle,cutoff,maturity,record_id,value,forecast,source_as_of,available FROM canonical_observations WHERE cycle=? AND cutoff=? AND maturity=?",skeleton[1:4]).fetchone()
             if row is None: continue
             con.execute("INSERT INTO admitted VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (ordinal,*skeleton[1:7],row[3],row[4],row[5],row[6],row[7],formula_version,family_data_schema_version,family_source_spec_version,DIRECTIONAL_BPS,_Q))
+                        (ordinal,*skeleton[1:7],row[3],row[4],row[5],row[6],row[7],formula_version,family_data_schema_version,family_source_spec_version,numerical_type,quant_id))
             ordinal+=1
             if ordinal%4096==0: sample_disk()
         sample_disk(); con.commit(); sample_disk()
@@ -303,7 +311,7 @@ def build_external_v2a(*, state_as_of: float, target_spec_id: str,
         view=ExternalV2AView(workspace,con,state_as_of,target_spec_id,target_data_schema_version,
             target_source_spec_version,formula_version,family_data_schema_version,
             family_source_spec_version,raw,skeleton_ordinal,ordinal,bounds[0],bounds[1],
-            tuple(ExclusionCount(k,counts[k]) for k in sorted(counts)),"",0)
+            tuple(ExclusionCount(k,counts[k]) for k in sorted(counts)),"",0,quant_id,horizon,numerical_type)
         view.dataset_hash=_stream_hash(view); sample_disk(); view.peak_disk_bytes=peak_disk
         succeeded = True
         return view
@@ -365,12 +373,12 @@ def build_external_v2b(view: ExternalV2AView) -> V2BCalibration:
     en=_effective_n(view); n=view.observation_count
     if not n:
         bias=BiasDiagnostic(0.0,None,None,None,ALPHA_BIAS,"UNDETERMINED")
-        item=DirectionalCalibration(_Q,view.formula_version,_H,view.family_data_schema_version,
+        item=DirectionalCalibration(view.quant_id,view.formula_version,view.horizon,view.family_data_schema_version,
             view.family_source_spec_version,view.dataset_hash,view.raw_resolved_count,
             view.skeleton_count,0,0.0,1.0,0.0,0.0,0.0,None,None,0.0,1.0,False,
             False,((0.0,0.0),(0.0,0.0)),0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,
             bias,"UNAVAILABLE",("NO_EVIDENCE",))
-        return V2BCalibration(V2B_VERSION,((_H,view.dataset_hash),),(item,),(),0.0,
+        return V2BCalibration(V2B_VERSION,((view.horizon,view.dataset_hash),),(item,),(),0.0,
             "SCALE_CONDITIONING_UNAVAILABLE_PENDING_CAUSAL_V3_REPLAY")
     weight=en.effective_n/n
     sx=weight*math.fsum(row[0] for row in view.connection.execute("SELECT value FROM admitted ORDER BY ordinal"))
@@ -391,20 +399,20 @@ def build_external_v2b(view: ExternalV2AView) -> V2BCalibration:
         bias=BiasDiagnostic(residual_mean,se,z,math.erfc(abs(z)/math.sqrt(2)),ALPHA_BIAS,"PASS" if abs(z)<=1.959963984540054 else "FAIL")
     raw=math.fsum(row[0]-row[1] for row in view.connection.execute("SELECT value,target FROM admitted ORDER BY ordinal"))/n
     mse=math.fsum(x*x for x in _scores(view))/n; mae=math.fsum(abs(x) for x in _scores(view))/n
-    item=DirectionalCalibration(_Q,view.formula_version,_H,view.family_data_schema_version,
+    item=DirectionalCalibration(view.quant_id,view.formula_version,view.horizon,view.family_data_schema_version,
         view.family_source_spec_version,view.dataset_hash,view.raw_resolved_count,view.skeleton_count,n,
         en.kish_n,en.serial_dependence_factor,en.effective_n,0.0,0.0,None,None,0.0,1.0,False,identifiable,
         ((0.0,0.0),(0.0,0.0)),0.0,raw,-residual_mean,math.sqrt(mse),mae,variance,math.sqrt(variance),
         n/view.skeleton_count,bias,"PROVISIONAL",tuple(dict.fromkeys(reasons)))
-    return V2BCalibration(V2B_VERSION,((_H,view.dataset_hash),),(item,),(),0.0,
+    return V2BCalibration(V2B_VERSION,((view.horizon,view.dataset_hash),),(item,),(),0.0,
         "SCALE_CONDITIONING_UNAVAILABLE_PENDING_CAUSAL_V3_REPLAY")
 
 
 def build_external_v2c(view: ExternalV2AView, calibration: V2BCalibration) -> V2CCovariance:
     cal=calibration.directional[0]; n=view.observation_count
     if not n:
-        return V2CCovariance(V2C_VERSION,_H,view.dataset_hash,v2b_component_hash(calibration,_H),
-            (_Q,),(view.formula_version,),view.family_lineage,((0.0,),),((0.0,),),
+        return V2CCovariance(V2C_VERSION,view.horizon,view.dataset_hash,v2b_component_hash(calibration,view.horizon),
+            (view.quant_id,),(view.formula_version,),view.family_lineage,((0.0,),),((0.0,),),
             ((False,),),((0.0,),),(),0,(),((0.0,),),None,None,None,((0.0,),),
             ((0.0,),),None,None,0,None,None,None,None,False,"UNAVAILABLE",
             ("COMPLETE_CASE_DEPENDENCE_UNAVAILABLE","PAIR_COVARIANCE_UNSUPPORTED",
@@ -429,8 +437,8 @@ def build_external_v2c(view: ExternalV2AView, calibration: V2BCalibration) -> V2
     else:
         reasons.update(("COMPLETE_CASE_DEPENDENCE_UNAVAILABLE","SUPPORTED_POSITIVE_SCALE_UNAVAILABLE")); status="UNAVAILABLE"; dependence=False; ridge=None; stable=0.0
         matrices=(((0.0,),),((0.0,),),((0.0,),))
-    return V2CCovariance(V2C_VERSION,_H,view.dataset_hash,v2b_component_hash(calibration,_H),(_Q,),(view.formula_version,),view.family_lineage,
-        ((float(n),),),((en,),),((supported,),),((covariance,),),(_Q,),n,(),matrices[0],
+    return V2CCovariance(V2C_VERSION,view.horizon,view.dataset_hash,v2b_component_hash(calibration,view.horizon),(view.quant_id,),(view.formula_version,),view.family_lineage,
+        ((float(n),),),((en,),),((supported,),),((covariance,),),(view.quant_id,),n,(),matrices[0],
         "STANDARD_COMPLETE_CASE_OAS" if n>=2 else None,1.0 if n>=2 else None,empirical if n>=2 else None,
         matrices[1],matrices[2],candidate if n>=2 else None,candidate if n>=2 else None,0,
         0.0 if n>=2 else None,0.0 if n>=2 else None,ridge,1.0 if ridge is not None else None,
@@ -471,14 +479,14 @@ def build_external_v2d(view, calibration, covariance) -> V2EvidenceState:
         cal.residual_standard_deviation,cal.status,tuple(sorted(cal.reason_codes)))
     hs_reasons=tuple(sorted(set(cal.reason_codes)|set(covariance.reason_codes)|{"Q3_EVIDENCE_UNAVAILABLE"}|
                             ({"COVARIANCE_UNAVAILABLE"} if covariance.status=="UNAVAILABLE" and cal.status!="UNAVAILABLE" else set())))
-    horizon=HorizonEvidenceState(_H,30,"UNAVAILABLE" if covariance.status=="UNAVAILABLE" else "PROVISIONAL",
-        hs_reasons,(directional,),view.family_lineage,(_Q,),covariance.pair_support_boolean_matrix,
+    horizon=HorizonEvidenceState(view.horizon,HORIZON_SECONDS[view.horizon],"UNAVAILABLE" if covariance.status=="UNAVAILABLE" else "PROVISIONAL",
+        hs_reasons,(directional,),view.family_lineage,(view.quant_id,),covariance.pair_support_boolean_matrix,
         covariance.stabilized_covariance_matrix if covariance.status!="UNAVAILABLE" else None,
         covariance.dependence_modeled,covariance.status,covariance.reason_codes,
         Q3MagnitudeState("UNAVAILABLE",("Q3_EVIDENCE_UNAVAILABLE",)))
-    components=tuple(sorted((ComponentHash(_H,"V2A",view.dataset_hash),
-        ComponentHash(_H,"V2B",v2b_component_hash(calibration,_H)),
-        ComponentHash(_H,"V2C",_digest(covariance)))))
+    components=tuple(sorted((ComponentHash(view.horizon,"V2A",view.dataset_hash),
+        ComponentHash(view.horizon,"V2B",v2b_component_hash(calibration,view.horizon)),
+        ComponentHash(view.horizon,"V2C",_digest(covariance)))))
     manifest=_digest(tuple((x.horizon,x.layer,x.digest) for x in components))
     horizons=(horizon,*(_missing(h) for h in ("1M","5M","15M","30M","1H")))
     reasons=tuple(sorted({r for h in horizons for r in h.reason_codes}))
