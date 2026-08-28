@@ -1,0 +1,342 @@
+{
+  "fresh_process_per_phase": true,
+  "measurements": [
+    {
+      "baseline_rss_bytes": 31383552,
+      "component_hashes": [
+        {
+          "digest": "654510005acfc5757e043c035554f7d8d22abb5767e7af6ae88b7ff556b05e3b",
+          "horizon": "30S",
+          "layer": "V2A"
+        },
+        {
+          "digest": "4d44afd2f1614f6f0df69868165dc9973b8c0749ee7283b3f91f4f9a31df6f66",
+          "horizon": "30S",
+          "layer": "V2B"
+        },
+        {
+          "digest": "b8e06299d623f2e012a4c48273f8f335df572944e0d2adfaae6d7c4d99be54f8",
+          "horizon": "30S",
+          "layer": "V2C"
+        }
+      ],
+      "dataset_hash": "654510005acfc5757e043c035554f7d8d22abb5767e7af6ae88b7ff556b05e3b",
+      "elapsed_seconds": 0.5945066770000267,
+      "peak_rss_bytes": 41082880,
+      "phase": "construction",
+      "rows": 1000,
+      "state_hash": "5857845000ac7b5dfb59139957d25b9aed981034e654fba9e531c92625e037a2",
+      "state_id": "v9v2:5857845000ac7b5dfb59139957d25b9aed981034e654fba9e531c92625e037a2",
+      "state_size_bytes": 8171,
+      "v2a_observation_rows": 1000,
+      "v2a_skeleton_rows": 1000,
+      "v2b_directional_records": 1,
+      "v2c_matrix_dimension": 1
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.012356077997537795,
+      "peak_rss_bytes": 31371264,
+      "phase": "serialization",
+      "rows": 1000,
+      "state_size_bytes": 8171
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.02589323400025023,
+      "peak_rss_bytes": 31371264,
+      "phase": "deserialization",
+      "rows": 1000,
+      "state_size_bytes": 8171
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.008928300998377381,
+      "peak_rss_bytes": 31371264,
+      "phase": "live_restore",
+      "rows": 1000,
+      "state_size_bytes": 8171
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "component_hashes": [
+        {
+          "digest": "9144acba9b6e90c53874d3dee76599977ecf7be2f402f9e978154d5c9d3d5e78",
+          "horizon": "30S",
+          "layer": "V2A"
+        },
+        {
+          "digest": "9c94004bdbb08841bb4010d9e8fecd5c6e8e509e56622bf97d00a9584c7f2975",
+          "horizon": "30S",
+          "layer": "V2B"
+        },
+        {
+          "digest": "9874564dd5bce8775ca3ecea07f56d888f4ebc07b05a388c4e6abf5fad125710",
+          "horizon": "30S",
+          "layer": "V2C"
+        }
+      ],
+      "dataset_hash": "9144acba9b6e90c53874d3dee76599977ecf7be2f402f9e978154d5c9d3d5e78",
+      "elapsed_seconds": 6.154490615001123,
+      "peak_rss_bytes": 118620160,
+      "phase": "construction",
+      "rows": 10000,
+      "state_hash": "c5784edfa0692d2ff9ca56cc76cc15beff55464126266c41bc9cc1f057f847fe",
+      "state_id": "v9v2:c5784edfa0692d2ff9ca56cc76cc15beff55464126266c41bc9cc1f057f847fe",
+      "state_size_bytes": 8172,
+      "v2a_observation_rows": 10000,
+      "v2a_skeleton_rows": 10000,
+      "v2b_directional_records": 1,
+      "v2c_matrix_dimension": 1
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.012119865998101886,
+      "peak_rss_bytes": 31371264,
+      "phase": "serialization",
+      "rows": 10000,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.013144735999958357,
+      "peak_rss_bytes": 31371264,
+      "phase": "deserialization",
+      "rows": 10000,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.010328230997401988,
+      "peak_rss_bytes": 31371264,
+      "phase": "live_restore",
+      "rows": 10000,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31383552,
+      "component_hashes": [
+        {
+          "digest": "d87f7415940e10cb0b6832dfb62d32091919aa9d061cccceb92187461d382671",
+          "horizon": "30S",
+          "layer": "V2A"
+        },
+        {
+          "digest": "49b5ba4f3dcacd2e27fdc448d254df4ab9312a4fa9095497fa2a47dda7a27dd3",
+          "horizon": "30S",
+          "layer": "V2B"
+        },
+        {
+          "digest": "542e428d49517853868f561226271ef0eda0fbebe7f5c02feedf64fbeea038fb",
+          "horizon": "30S",
+          "layer": "V2C"
+        }
+      ],
+      "dataset_hash": "d87f7415940e10cb0b6832dfb62d32091919aa9d061cccceb92187461d382671",
+      "elapsed_seconds": 45.64117089199863,
+      "peak_rss_bytes": 592826368,
+      "phase": "construction",
+      "rows": 65535,
+      "state_hash": "b1c89f5fcc4df931f70c3f95b66503ebebeeaa730e06e203adaf5921104b39cd",
+      "state_id": "v9v2:b1c89f5fcc4df931f70c3f95b66503ebebeeaa730e06e203adaf5921104b39cd",
+      "state_size_bytes": 8172,
+      "v2a_observation_rows": 65535,
+      "v2a_skeleton_rows": 65535,
+      "v2b_directional_records": 1,
+      "v2c_matrix_dimension": 1
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.012689630999375368,
+      "peak_rss_bytes": 31371264,
+      "phase": "serialization",
+      "rows": 65535,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.01609025899961125,
+      "peak_rss_bytes": 31371264,
+      "phase": "deserialization",
+      "rows": 65535,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.016290273000777233,
+      "peak_rss_bytes": 31371264,
+      "phase": "live_restore",
+      "rows": 65535,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "component_hashes": [
+        {
+          "digest": "1e73a620e46dfe14f6ffb256bdbcd433df2e23191a170b6ae0495faf2e5ef633",
+          "horizon": "30S",
+          "layer": "V2A"
+        },
+        {
+          "digest": "d7ab1dc44f7d0e11bcdf43a151df3063e88921ad3355eb4ad37bb32d4300ac9b",
+          "horizon": "30S",
+          "layer": "V2B"
+        },
+        {
+          "digest": "30c6599ad104b9eccd0d5c5063fe3fd015b4168015bf82981a36193b3cffba01",
+          "horizon": "30S",
+          "layer": "V2C"
+        }
+      ],
+      "dataset_hash": "1e73a620e46dfe14f6ffb256bdbcd433df2e23191a170b6ae0495faf2e5ef633",
+      "elapsed_seconds": 44.71343100600279,
+      "peak_rss_bytes": 592867328,
+      "phase": "construction",
+      "rows": 65536,
+      "state_hash": "816cefcb1d4e9f86baaf428ff32483fa2878b401e12218a3146559954c2fa9d9",
+      "state_id": "v9v2:816cefcb1d4e9f86baaf428ff32483fa2878b401e12218a3146559954c2fa9d9",
+      "state_size_bytes": 8172,
+      "v2a_observation_rows": 65536,
+      "v2a_skeleton_rows": 65536,
+      "v2b_directional_records": 1,
+      "v2c_matrix_dimension": 1
+    },
+    {
+      "baseline_rss_bytes": 31391744,
+      "elapsed_seconds": 0.0127244060022349,
+      "peak_rss_bytes": 31391744,
+      "phase": "serialization",
+      "rows": 65536,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.013635349001560826,
+      "peak_rss_bytes": 31371264,
+      "phase": "deserialization",
+      "rows": 65536,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.016426771999249468,
+      "peak_rss_bytes": 31371264,
+      "phase": "live_restore",
+      "rows": 65536,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "component_hashes": [
+        {
+          "digest": "f12651038f83c688f1d9c9460a14f6eb231be6de4aa0c48bbab1ad2d79afaf07",
+          "horizon": "30S",
+          "layer": "V2A"
+        },
+        {
+          "digest": "202322aa603c82879aef014c90f946e4871b3d10ed3c23ab74d7341923e3f0f9",
+          "horizon": "30S",
+          "layer": "V2B"
+        },
+        {
+          "digest": "008c8231560d29f199894d575bffe8736bde6a5998fc02751013c24cf8ea48c6",
+          "horizon": "30S",
+          "layer": "V2C"
+        }
+      ],
+      "dataset_hash": "f12651038f83c688f1d9c9460a14f6eb231be6de4aa0c48bbab1ad2d79afaf07",
+      "elapsed_seconds": 45.86767215099826,
+      "peak_rss_bytes": 592891904,
+      "phase": "construction",
+      "rows": 65537,
+      "state_hash": "4e7bc6c431ba7682ce63c9aa553624e06e8707bea3e5a30f0362148f1b0f02e4",
+      "state_id": "v9v2:4e7bc6c431ba7682ce63c9aa553624e06e8707bea3e5a30f0362148f1b0f02e4",
+      "state_size_bytes": 8172,
+      "v2a_observation_rows": 65537,
+      "v2a_skeleton_rows": 65537,
+      "v2b_directional_records": 1,
+      "v2c_matrix_dimension": 1
+    },
+    {
+      "baseline_rss_bytes": 31375360,
+      "elapsed_seconds": 0.012529447001725202,
+      "peak_rss_bytes": 31375360,
+      "phase": "serialization",
+      "rows": 65537,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31453184,
+      "elapsed_seconds": 0.013178361998143373,
+      "peak_rss_bytes": 31453184,
+      "phase": "deserialization",
+      "rows": 65537,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.012487338000937598,
+      "peak_rss_bytes": 31371264,
+      "phase": "live_restore",
+      "rows": 65537,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31432704,
+      "component_hashes": [
+        {
+          "digest": "c7b8269c84ecd4c0cf63a88bf0580c5b4f5fdca323cfa1fe8a942227ea5fc81d",
+          "horizon": "30S",
+          "layer": "V2A"
+        },
+        {
+          "digest": "20a5ddd2b5fefbed10ac6d42eb29463b79b5ccc4a1d81464d18cea942300f44a",
+          "horizon": "30S",
+          "layer": "V2B"
+        },
+        {
+          "digest": "5fa5c8a5a9522d58af4ddf5f9d2fa0ae57dc22733235a92d0fc786f304a31224",
+          "horizon": "30S",
+          "layer": "V2C"
+        }
+      ],
+      "dataset_hash": "c7b8269c84ecd4c0cf63a88bf0580c5b4f5fdca323cfa1fe8a942227ea5fc81d",
+      "elapsed_seconds": 140.4994413759996,
+      "peak_rss_bytes": 1756434432,
+      "phase": "construction",
+      "rows": 200000,
+      "state_hash": "3eb07f8708bfb3f8564773e4fff347b3bf789c57d366adf074b37f1e2feb14ac",
+      "state_id": "v9v2:3eb07f8708bfb3f8564773e4fff347b3bf789c57d366adf074b37f1e2feb14ac",
+      "state_size_bytes": 8172,
+      "v2a_observation_rows": 200000,
+      "v2a_skeleton_rows": 200000,
+      "v2b_directional_records": 1,
+      "v2c_matrix_dimension": 1
+    },
+    {
+      "baseline_rss_bytes": 31371264,
+      "elapsed_seconds": 0.015465272001165431,
+      "peak_rss_bytes": 31371264,
+      "phase": "serialization",
+      "rows": 200000,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31391744,
+      "elapsed_seconds": 0.01308489100119914,
+      "peak_rss_bytes": 31391744,
+      "phase": "deserialization",
+      "rows": 200000,
+      "state_size_bytes": 8172
+    },
+    {
+      "baseline_rss_bytes": 31440896,
+      "elapsed_seconds": 0.010327977000997635,
+      "peak_rss_bytes": 31440896,
+      "phase": "live_restore",
+      "rows": 200000,
+      "state_size_bytes": 8172
+    }
+  ],
+  "schema": "ATOM-V9-V2-FROZEN-SCHEMA-FEASIBILITY-1"
+}

@@ -12,13 +12,11 @@ of completed immutable states only. A separate command owns extraction, build,
 verification, and publication. Evidence and previously published state rows are
 append-only inputs and are never cleanup targets.
 
-There is one important blocker: the frozen `V2ADataset` embeds every admitted
-target, observation, pair-support identity, and complete-case identity in
-tuples. Consequently the **current in-memory object and serializer are O(n)**.
-Disk-backed ingestion alone cannot truthfully demonstrate bounded end-to-end
-RAM. The implementation must add streaming, byte-identical component encoders
-and disk-backed component views behind new offline-only interfaces; changing
-the state schema to references would violate parity and is rejected.
+Phase 1A subsequently established `FEASIBLE_WITH_EXTERNAL_BUILD`: frozen V2A
+construction embeds O(n) row tuples, but the final serialized V2D state and live
+restore are bounded. See `docs/v2-frozen-schema-feasibility.md` for the measured
+object-graph proof. Disk-backed ingestion alone still cannot demonstrate a
+bounded end-to-end build; external construction must preserve byte identity.
 
 ## Proposed data flow
 
@@ -154,8 +152,9 @@ a predeclared fixed budget across the required cardinalities.
 
 ## Risks and blockers
 
-* Frozen payload size itself grows with evidence; a streaming serializer and
-  validator are mandatory even after external math is complete.
+* Frozen V2A construction grows with evidence, while Phase 1A proves the final
+  V2D payload and restore are bounded; external math remains mandatory for a
+  bounded end-to-end build.
 * SQLite/PostgreSQL collation, NULL, float, and tie behavior can silently alter
   order; canonical tokens and explicit total ordering are required.
 * V2B/V2C may contain order-sensitive floating-point loops; SQL aggregates,
