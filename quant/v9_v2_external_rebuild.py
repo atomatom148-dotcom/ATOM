@@ -426,11 +426,28 @@ def _read_pages(cursor, sqlite: sqlite3.Connection, *, state_as_of: float,
                       for value in row[:destination_columns])
                 for row in source_page if row[-1] is True
             )
+            inserted_rows = 0
             if resolved_page:
+                before = sqlite.total_changes
                 sqlite.executemany(
-                    f"INSERT INTO {destination} VALUES({placeholders})",
+                    f"INSERT OR IGNORE INTO {destination} VALUES({placeholders})",
                     resolved_page,
                 )
+                inserted_rows = sqlite.total_changes - before
+                if inserted_rows != len(resolved_page):
+                    # A page boundary may replay an identity. Admit it only
+                    # when its complete normalized evidence row is identical;
+                    # conflicting reuse of forecast_id must fail closed.
+                    for candidate in resolved_page:
+                        stored = sqlite.execute(
+                            f"SELECT * FROM {destination} WHERE forecast_id=?",
+                            (candidate[0],),
+                        ).fetchone()
+                        if stored != candidate:
+                            raise RuntimeError(
+                                "V2_EVIDENCE_IDENTITY_CONFLICT:"
+                                f"{destination}:{candidate[0]}"
+                            )
             sqlite.commit()
             kind = "magnitude" if volatility else "directional"
             page_first = source_page[0]
@@ -443,7 +460,7 @@ def _read_pages(cursor, sqlite: sqlite3.Connection, *, state_as_of: float,
                 f"{kind}:{page_last[5]}:{float(page_last[6]).hex()}:"
                 f"{page_last[0]}")
             rows_read += len(source_page)
-            resolved_rows += len(resolved_page)
+            resolved_rows += inserted_rows
             sample_disk()
         if len(source_page) < V2_STATE_BUILD_EVIDENCE_PAGE_SIZE:
             return pages, rows_read, resolved_rows, first_identity, last_identity
