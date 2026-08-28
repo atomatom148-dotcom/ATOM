@@ -52,6 +52,7 @@ _LOCK_NAME = ".atom-v9-v2-external-rebuild.lock"
 class ExternalRebuildResult:
     state: V2EvidenceState
     receipt: V2BuildReceipt
+    temporary_disk_peak_bytes: int
     publication_status: str | None
 
 
@@ -370,14 +371,14 @@ def rebuild_external_v2(*, database_url: str, workspace_root: Path,
                 V2_STATE_BUILD_EVIDENCE_PAGE_SIZE,
                 first_identity, last_identity,
                 tuple(horizon_counts), tuple(family_counts), tuple(effective_ns),
-                time.perf_counter() - started, rss, peak_disk,
+                time.perf_counter() - started, rss,
                 state.evidence_manifest_hash, "",
             ))
             publication = None
             if publish:
                 publication_store = store or PostgresV2StateStore(database_url)
                 publication = publication_store.insert_with_receipt(state, receipt)
-            return ExternalRebuildResult(state, receipt, publication)
+            return ExternalRebuildResult(state, receipt, peak_disk, publication)
         finally:
             if sqlite is not None:
                 sqlite.close()
@@ -400,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         "state_hash": result.state.state_hash,
         "evidence_manifest_hash": result.state.evidence_manifest_hash,
         "receipt_sha256": result.receipt.receipt_sha256,
-        "temporary_disk_peak_bytes": result.receipt.temporary_disk_peak_bytes,
+        "temporary_disk_peak_bytes": result.temporary_disk_peak_bytes,
         "publication_status": result.publication_status,
     }, sort_keys=True))
     return 0
