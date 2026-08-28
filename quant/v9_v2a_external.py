@@ -61,6 +61,7 @@ from quant.v9_v2d_evidence_state import (
 )
 
 _OWNER = "ATOM-V9-V2A-EXTERNAL-2"
+_OWNER_FILE = "owner.json"
 _Q = "q1_momentum"
 _H = "30S"
 
@@ -73,8 +74,12 @@ def _finite(value):
     )
 
 
+def _canonical_float(value):
+    return float(value) or 0.0
+
+
 def _ft(value):
-    return {"$float64": (0.0 if value == 0.0 else float(value)).hex()}
+    return {"$float64": _canonical_float(value).hex()}
 
 
 def _row_object(keys, values):
@@ -120,7 +125,7 @@ class ExternalV2AView:
 def _owned_workspace(root):
     path = Path(tempfile.mkdtemp(prefix="atom-v2a-external-", dir=root)).resolve()
     os.chmod(path, 0o700)
-    (path / "owner.json").write_text(
+    (path / _OWNER_FILE).write_text(
         json.dumps({"owner": _OWNER, "path": str(path), "uid": os.getuid()}),
         encoding="ascii",
     )
@@ -137,7 +142,7 @@ def cleanup_owned_workspace(path, *, root=None):
     if not path.name.startswith("atom-v2a-external-"):
         raise ValueError("refusing to clean an unowned workspace")
     try:
-        data = json.loads((path / "owner.json").read_text(encoding="ascii"))
+        data = json.loads((path / _OWNER_FILE).read_text(encoding="ascii"))
     except (OSError, ValueError) as error:
         raise ValueError("refusing to clean an unowned workspace") from error
     if data != {"owner": _OWNER, "path": str(path), "uid": os.getuid()}:
@@ -209,7 +214,7 @@ def _stream_hash(view):
         if fi:
             put(",")
         put(json.dumps(name) + ":")
-        if value == "complete":
+        if name == "complete_case_target_identities":
             if not directional:
                 put("[]")
             else:
@@ -219,12 +224,12 @@ def _stream_hash(view):
                     (*directional, len(directional)),
                 )
                 _stream_array(put, rows, _identity_json)
-        elif value in ("subsets", "q3"):
-            families = directional if value == "subsets" else ([Q3] if q3 else [])
-            if value == "q3" and not q3:
+        elif name in ("directional_subsets", "q3_subset"):
+            families = directional if name == "directional_subsets" else ([Q3] if q3 else [])
+            if name == "q3_subset" and not q3:
                 put("null")
                 continue
-            if value == "subsets":
+            if name == "directional_subsets":
                 put("[")
             for family_index, q in enumerate(families):
                 if family_index:
@@ -263,9 +268,9 @@ def _stream_hash(view):
 
                 _stream_array(put, rows, encode)
                 put(',"quant_id":' + scalar(q) + "}")
-            if value == "subsets":
+            if name == "directional_subsets":
                 put("]")
-        elif value == "exclusions":
+        elif name == "exclusions":
             put(
                 json.dumps(
                     [
@@ -276,7 +281,7 @@ def _stream_hash(view):
                     separators=(",", ":"),
                 )
             )
-        elif value == "lineage":
+        elif name == "family_lineage":
             put(
                 json.dumps(
                     [
@@ -292,7 +297,7 @@ def _stream_hash(view):
                     separators=(",", ":"),
                 )
             )
-        elif value == "pairs":
+        elif name == "pair_support":
             put("[")
             pi = 0
             for i, left in enumerate(directional):
@@ -314,7 +319,7 @@ def _stream_hash(view):
                     put("}")
                     pi += 1
             put("]")
-        elif value == "skeleton":
+        elif name == "skeleton":
             keys = (
                 "cutoff_epoch",
                 "identity",
@@ -601,7 +606,7 @@ CREATE TABLE admitted(skeleton_ordinal INTEGER,cycle TEXT,cutoff REAL,maturity R
                     o.target_identity.cutoff_epoch,
                     o.target_identity.maturity_epoch,
                     o.record_id,
-                    0.0 if o.value_bps == 0.0 else o.value_bps,
+                    _canonical_float(o.value_bps),
                     o.forecast_cutoff_epoch,
                     o.source_as_of_epoch,
                     o.available_epoch,
@@ -715,9 +720,19 @@ def _scores(view):
         yield target - value
 
 
+def _family_observation_count(view: ExternalV2AView, quant_id: str = _Q) -> int:
+    return int(
+        view.connection.execute(
+            "SELECT count(*) FROM admitted WHERE quant=?", (quant_id,)
+        ).fetchone()[0]
+    )
+
+
 def validate_external_v2a(view: ExternalV2AView) -> None:
     """Fail closed if the sealed owned workspace or staged bytes changed."""
-    marker = json.loads((view.workspace / "owner.json").read_text(encoding="ascii"))
+    marker = json.loads(
+        (view.workspace / _OWNER_FILE).read_text(encoding="ascii")
+    )
     if marker != {"owner": _OWNER, "path": str(view.workspace), "uid": os.getuid()}:
         raise ValueError("workspace ownership validation failed")
     for payload, digest in view.connection.execute(
@@ -730,12 +745,28 @@ def validate_external_v2a(view: ExternalV2AView) -> None:
 
 
 def _effective_n(view: ExternalV2AView) -> EffectiveN:
-    n = view.observation_count
+    n = _family_observation_count(view)
     if not n:
         return EffectiveN(0, 0.0, 1.0, 0.0, 0)
-    mean = math.fsum(_scores(view)) / n
-    denominator = math.fsum((x - mean) ** 2 for x in _scores(view))
-    scale = math.fsum(x * x for x in _scores(view)) + n * mean * mean
+    view.connection.execute("DROP TABLE IF EXISTS effective_n_scores")
+    view.connection.execute(
+        "CREATE TABLE effective_n_scores(position INTEGER PRIMARY KEY,value REAL)"
+    )
+    view.connection.executemany(
+        "INSERT INTO effective_n_scores VALUES(?,?)", enumerate(_scores(view))
+    )
+
+    def scores():
+        return (
+            row[0]
+            for row in view.connection.execute(
+                "SELECT value FROM effective_n_scores ORDER BY position"
+            )
+        )
+
+    mean = math.fsum(scores()) / n
+    denominator = math.fsum((x - mean) ** 2 for x in scores())
+    scale = math.fsum(x * x for x in scores()) + n * mean * mean
     if abs(denominator) <= 64 * math.ulp(1.0) * max(1.0, scale):
         return EffectiveN(
             n, float(n), 1.0, float(n), 0, ("SERIAL_DEPENDENCE_UNIDENTIFIABLE",)
@@ -753,8 +784,8 @@ def _effective_n(view: ExternalV2AView) -> EffectiveN:
         products = (
             a[0] * a[1]
             for a in view.connection.execute(
-                "SELECT (a.target-a.value-?),(b.target-b.value-?) FROM admitted a JOIN admitted b ON b.quant=a.quant AND b.skeleton_ordinal=a.skeleton_ordinal+? WHERE a.quant=? ORDER BY a.skeleton_ordinal",
-                (mean, mean, lag, _Q),
+                "SELECT (a.value-?),(b.value-?) FROM effective_n_scores a JOIN effective_n_scores b ON b.position=a.position+? ORDER BY a.position",
+                (mean, mean, lag),
             )
         )
         rho = math.fsum(products) / denominator
@@ -807,7 +838,7 @@ def build_external_v2b(view: ExternalV2AView) -> V2BCalibration:
     _require_phase1b_calibration_scope(view)
     validate_external_v2a(view)
     en = _effective_n(view)
-    n = view.observation_count
+    n = _family_observation_count(view)
     if not n:
         bias = BiasDiagnostic(0.0, None, None, None, ALPHA_BIAS, "UNDETERMINED")
         item = DirectionalCalibration(
@@ -967,7 +998,8 @@ def build_external_v2b(view: ExternalV2AView) -> V2BCalibration:
 def build_external_v2c(
     view: ExternalV2AView, calibration: V2BCalibration
 ) -> V2CCovariance:
-    n = view.observation_count
+    _require_phase1b_calibration_scope(view)
+    n = _family_observation_count(view)
     if not n:
         return V2CCovariance(
             V2C_VERSION,
@@ -1085,7 +1117,7 @@ def _effective_n_squared(view, mean):
     def values():
         return ((x - mean) ** 2 for x in _scores(view))
 
-    n = view.observation_count
+    n = _family_observation_count(view)
     m = math.fsum(values()) / n
     den = math.fsum((x - m) ** 2 for x in values())
     scale = math.fsum(x * x for x in values()) + n * m * m
@@ -1142,6 +1174,7 @@ def _effective_n_squared(view, mean):
 
 
 def build_external_v2d(view, calibration, covariance) -> V2EvidenceState:
+    _require_phase1b_calibration_scope(view)
     cal = calibration.directional[0]
     directional = DirectionalCalibrationState(
         cal.quant_id,

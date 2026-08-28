@@ -40,6 +40,68 @@ KW = dict(
     family_source_spec_version="gate-source",
 )
 
+Q1_VERSION = ("q1_momentum", "gate-q1", "gate-schema", "gate-source")
+Q2_VERSION = ("q2_mean_reversion", "gate-q2", "gate-schema", "gate-source")
+
+
+def slot_rows(horizon, versions, n=8):
+    seconds = HORIZON_SECONDS[horizon]
+    target_rows = []
+    observation_rows = []
+    for index in range(n):
+        cutoff = float(index * seconds)
+        identity = TargetIdentity(f"{horizon}-{index}", cutoff, cutoff + seconds)
+        target_rows.append(
+            RawTarget(
+                index,
+                identity.cycle_id,
+                "COIN",
+                "gate-target",
+                "gate-schema",
+                "gate-source",
+                horizon,
+                cutoff,
+                cutoff + seconds,
+                cutoff + seconds,
+                float(index + 1),
+            )
+        )
+        for family_index, (quant_id, formula, schema, source) in enumerate(versions):
+            observation_rows.append(
+                RawFamilyObservation(
+                    index * 100 + family_index,
+                    identity,
+                    "COIN",
+                    quant_id,
+                    formula,
+                    schema,
+                    source,
+                    horizon,
+                    MAGNITUDE_BPS if quant_id == Q3 else DIRECTIONAL_BPS,
+                    float(index + family_index + 1),
+                    cutoff,
+                    cutoff,
+                    cutoff,
+                    "FRESH",
+                )
+            )
+    return target_rows, observation_rows
+
+
+def scope_view(tmp_path, versions, horizon="30S", n=8):
+    target_rows, observation_rows = slot_rows(horizon, versions, n)
+    return build_external_v2a(
+        state_as_of=2e9,
+        horizon=horizon,
+        target_spec_id="gate-target",
+        target_data_schema_version="gate-schema",
+        target_source_spec_version="gate-source",
+        family_versions=versions,
+        targets=target_rows,
+        observations=observation_rows,
+        root=tmp_path,
+    )
+
 
 def build(tmp_path, n=16, **extra):
     return build_external_v2a(
@@ -160,7 +222,9 @@ def test_all_72_family_horizon_slots_have_exact_external_v2a_parity(tmp_path):
         (quant_id, f"{quant_id}-frozen", "gate-schema", "gate-source")
         for quant_id in (*DIRECTIONAL_FAMILIES, Q3)
     )
+    seen_slots = set()
     for horizon, seconds in HORIZON_SECONDS.items():
+        seen_slots.update((quant_id, horizon) for quant_id, *_ in versions)
         target_rows = []
         observation_rows = []
         for index in range(4):
@@ -241,6 +305,110 @@ def test_all_72_family_horizon_slots_have_exact_external_v2a_parity(tmp_path):
         with pytest.raises(ValueError, match="Phase 1C-A exposes V2A only"):
             build_external_v2b(external)
         close(external, tmp_path)
+    assert seen_slots == {
+        (quant_id, horizon)
+        for quant_id in (*DIRECTIONAL_FAMILIES, Q3)
+        for horizon in HORIZON_SECONDS
+    }
+    assert len(seen_slots) == 72
+
+
+def test_interior_missing_q1_observation_preserves_dense_lag_parity(tmp_path):
+    forecasts = [float(index % 3) for index in range(20)]
+    residuals = [float(index) for index in range(20)]
+    values = [forecast + residual for forecast, residual in zip(forecasts, residuals)]
+    target_rows, observation_rows = representative(values, forecasts)
+    observation_rows.pop(7)
+    dataset, calibration, _ = assert_representative_parity(
+        tmp_path, target_rows, observation_rows
+    )
+    assert len(dataset.directional_subsets[0].observations) == 19
+    assert calibration.directional[0].effective_n == pytest.approx(3.2183048539)
+
+
+@pytest.mark.parametrize(
+    "versions,expected",
+    (((Q1_VERSION, Q2_VERSION), 8), ((Q2_VERSION,), 0)),
+)
+def test_effective_n_counts_only_admitted_q1_rows(tmp_path, versions, expected):
+    view = scope_view(tmp_path, versions)
+    result = _effective_n(view)
+    assert result.observation_count == expected
+    assert result.kish_n <= expected
+    with pytest.raises(ValueError, match="Phase 1C-A exposes V2A only"):
+        build_external_v2b(view)
+    close(view, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "builder_field,target_field,marker",
+    (
+        ("target_spec_id", "target_spec_id", "complete"),
+        ("target_data_schema_version", "data_schema_version", "pairs"),
+        ("target_source_spec_version", "source_spec_version", "q3"),
+    ),
+)
+def test_marker_like_target_metadata_hashes_as_scalar(
+    tmp_path, builder_field, target_field, marker
+):
+    target_rows, observation_rows = slot_rows("30S", (Q1_VERSION,), 4)
+    target_rows = [replace(row, **{target_field: marker}) for row in target_rows]
+    kwargs = dict(KW)
+    kwargs[builder_field] = marker
+    legacy = build_v2a_dataset(
+        state_as_of=kwargs["state_as_of"],
+        horizon="30S",
+        target_spec_id=kwargs["target_spec_id"],
+        target_data_schema_version=kwargs["target_data_schema_version"],
+        target_source_spec_version=kwargs["target_source_spec_version"],
+        family_versions=(Q1_VERSION,),
+        targets=target_rows,
+        observations=observation_rows,
+    )
+    external = build_external_v2a(
+        **kwargs,
+        targets=target_rows,
+        observations=observation_rows,
+        root=tmp_path,
+    )
+    assert external.dataset_hash == legacy.dataset_hash
+    validate_external_v2a(external)
+    close(external, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "versions", ((Q1_VERSION, Q2_VERSION), (Q2_VERSION,))
+)
+def test_direct_v2c_v2d_cannot_bypass_scope_guard(tmp_path, versions):
+    valid = build(tmp_path, 8)
+    calibration = build_external_v2b(valid)
+    covariance = build_external_v2c(valid, calibration)
+    invalid = scope_view(tmp_path, versions)
+    with pytest.raises(ValueError, match="Phase 1C-A exposes V2A only"):
+        build_external_v2c(invalid, calibration)
+    with pytest.raises(ValueError, match="Phase 1C-A exposes V2A only"):
+        build_external_v2d(invalid, calibration, covariance)
+    close(invalid, tmp_path)
+    close(valid, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "horizon", tuple(horizon for horizon in HORIZON_SECONDS if horizon != "30S")
+)
+def test_non_30s_downstream_entry_points_fail_closed(tmp_path, horizon):
+    valid = build(tmp_path, 8)
+    calibration = build_external_v2b(valid)
+    covariance = build_external_v2c(valid, calibration)
+    invalid = scope_view(tmp_path, (Q1_VERSION,), horizon=horizon)
+    for operation in (
+        lambda: build_external_v2b(invalid),
+        lambda: build_external_v2c(invalid, calibration),
+        lambda: build_external_v2d(invalid, calibration, covariance),
+    ):
+        with pytest.raises(ValueError, match="Phase 1C-A exposes V2A only"):
+            operation()
+    close(invalid, tmp_path)
+    close(valid, tmp_path)
 
 
 @pytest.mark.parametrize(
