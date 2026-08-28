@@ -50,7 +50,7 @@ EVIDENCE_RECOVERY_OUTCOME_LIMIT = 65_536
 V4_STATE_BUILD_EVIDENCE_LIMIT = 65_536
 EVIDENCE_RECOVERY_CYCLE_QUERY_CHUNK = 4_096
 EVIDENCE_RECOVERY_PROOF_FALLBACK_DEPTH = 4
-EVIDENCE_RECOVERY_PROOF_FALLBACK_LIMIT = 256
+EVIDENCE_RECOVERY_PROOF_WORK_LIMIT = 256
 EVIDENCE_HANDOFF_CANDIDATE_CYCLE_LIMIT = 256
 EVIDENCE_LEGACY_WRITER_QUIESCENCE_SECONDS = 2.5
 _TERMINAL_FAILURE_REASONS = frozenset({
@@ -1035,7 +1035,7 @@ class EvidenceLedgerWorker:
                 tuple[str, tuple[tuple[str, str, str], ...]],
                 tuple[dict[str, tuple[str, str]], datetime],
             ]:
-        """Choose newest proven candidates with strictly bounded fallback work."""
+        """Choose newest proven candidates with strictly bounded proof work."""
 
         ordered_candidates = {
             identity: tuple(sorted(
@@ -1046,20 +1046,22 @@ class EvidenceLedgerWorker:
             for identity, identity_candidates
             in candidates_by_identity.items()
         }
+        ordered_items = tuple(ordered_candidates.items())
+        proof_items = ordered_items[:EVIDENCE_RECOVERY_PROOF_WORK_LIMIT]
         proven_ids = self._validated_recovery_proof_ids(tuple(
             identity_candidates[0][2]
-            for identity_candidates in ordered_candidates.values()
+            for _identity, identity_candidates in proof_items
         ))
         unresolved = {
             identity: identity_candidates[1:]
-            for identity, identity_candidates in ordered_candidates.items()
+            for identity, identity_candidates in proof_items
             if (identity_candidates[0][2].forecast_record_id not in proven_ids and
                 len(identity_candidates) > 1)
         }
-        fallback_work = 0
+        proof_work = len(proof_items)
         for _depth in range(EVIDENCE_RECOVERY_PROOF_FALLBACK_DEPTH):
             remaining_budget = (
-                EVIDENCE_RECOVERY_PROOF_FALLBACK_LIMIT - fallback_work)
+                EVIDENCE_RECOVERY_PROOF_WORK_LIMIT - proof_work)
             if not unresolved or remaining_budget <= 0:
                 break
             round_items = []
@@ -1074,7 +1076,7 @@ class EvidenceLedgerWorker:
             round_proven_ids = self._validated_recovery_proof_ids(
                 round_candidates)
             proven_ids |= round_proven_ids
-            fallback_work += len(round_candidates)
+            proof_work += len(round_candidates)
             selected_identities = {
                 identity for identity, _identity_candidates in round_items
             }
@@ -1089,11 +1091,11 @@ class EvidenceLedgerWorker:
                     next_unresolved[identity] = identity_candidates[1:]
             unresolved = next_unresolved
 
-        if unresolved:
+        if unresolved or len(proof_items) < len(ordered_items):
             self.metrics.increment(
                 "v4_state_build_recovery.proof_fallback_truncated")
         distinct = {}
-        for identity, identity_candidates in ordered_candidates.items():
+        for identity, identity_candidates in proof_items:
             newest_proven = next((
                 (cohorts, created_at)
                 for cohorts, created_at, representative

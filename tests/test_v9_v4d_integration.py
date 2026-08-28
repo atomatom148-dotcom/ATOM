@@ -1157,7 +1157,7 @@ def test_recovery_proof_fallback_depth_and_work_are_bounded(monkeypatch):
     monkeypatch.setattr(
         "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_FALLBACK_DEPTH", 2)
     monkeypatch.setattr(
-        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_FALLBACK_LIMIT", 100)
+        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_WORK_LIMIT", 100)
     depth_requests, depth_counters = exercise(("depth",))
     assert depth_requests == [
         ("depth-4",),
@@ -1170,13 +1170,24 @@ def test_recovery_proof_fallback_depth_and_work_are_bounded(monkeypatch):
     monkeypatch.setattr(
         "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_FALLBACK_DEPTH", 4)
     monkeypatch.setattr(
-        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_FALLBACK_LIMIT", 2)
+        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_WORK_LIMIT", 3)
     work_requests, work_counters = exercise(("first", "second"))
     assert work_requests == [
         ("first-4", "second-4"),
-        ("first-3", "second-3"),
+        ("first-3",),
     ]
     assert work_counters[
+        "v4_state_build_recovery.proof_fallback_truncated"] == 1
+
+    monkeypatch.setattr(
+        "quant.evidence_outbox.EVIDENCE_RECOVERY_PROOF_WORK_LIMIT", 256)
+    high_cardinality_requests, high_cardinality_counters = exercise(tuple(
+        f"cohort-{index:03d}" for index in range(300)
+    ))
+    assert len(high_cardinality_requests) == 1
+    assert len(high_cardinality_requests[0]) == 256
+    assert sum(map(len, high_cardinality_requests)) == 256
+    assert high_cardinality_counters[
         "v4_state_build_recovery.proof_fallback_truncated"] == 1
 
 
