@@ -171,6 +171,54 @@ def test_source_reader_counts_unresolved_forecasts_without_admitting_them():
         spool.close()
 
 
+def test_source_reader_admits_identical_replayed_identity_once():
+    resolved = (
+        1, "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"], "cycle-1",
+        "COIN", "30S", 0.0, 30.0, 1.0, 0.0, DATA_SCHEMA_VERSION,
+        SOURCE_SPEC_VERSION, 0.0, 2.0, 30.0, 0.0, 30.0, True,
+    )
+
+    class SourceCursor:
+        def execute(self, _sql, _parameters): pass
+        def fetchall(self): return (resolved, resolved)
+
+    spool = sqlite3.connect(":memory:")
+    try:
+        _configure_sqlite(spool)
+        result = _read_pages(
+            SourceCursor(), spool, state_as_of=NOW - 1, volatility=False,
+            sample_disk=lambda: None,
+        )
+        assert result[:3] == (1, 2, 1)
+        assert spool.execute("SELECT count(*) FROM directional").fetchone() == (1,)
+    finally:
+        spool.close()
+
+
+def test_source_reader_fails_closed_on_conflicting_replayed_identity():
+    first = (
+        1, "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"], "cycle-1",
+        "COIN", "30S", 0.0, 30.0, 1.0, 0.0, DATA_SCHEMA_VERSION,
+        SOURCE_SPEC_VERSION, 0.0, 2.0, 30.0, 0.0, 30.0, True,
+    )
+    conflicting = (*first[:8], 9.0, *first[9:])
+
+    class SourceCursor:
+        def execute(self, _sql, _parameters): pass
+        def fetchall(self): return (first, conflicting)
+
+    spool = sqlite3.connect(":memory:")
+    try:
+        _configure_sqlite(spool)
+        with pytest.raises(RuntimeError, match="V2_EVIDENCE_IDENTITY_CONFLICT"):
+            _read_pages(
+                SourceCursor(), spool, state_as_of=NOW - 1, volatility=False,
+                sample_disk=lambda: None,
+            )
+    finally:
+        spool.close()
+
+
 def test_database_owner_fails_before_workspace_when_lock_is_unavailable(tmp_path):
     directional, magnitude = _source_rows()
 
