@@ -91,10 +91,13 @@ def _owned_workspace(root: Path | None) -> Path:
 
 
 def cleanup_owned_workspace(path: Path, *, root: Path | None = None) -> None:
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError("refusing to clean an unowned workspace")
     path = path.resolve()
     if root is not None and path.parent != root.resolve():
         raise ValueError("workspace is outside the configured root")
-    if not path.name.startswith("atom-v2a-external-") or path.is_symlink():
+    if not path.name.startswith("atom-v2a-external-"):
         raise ValueError("refusing to clean an unowned workspace")
     marker = path / "owner.json"
     try:
