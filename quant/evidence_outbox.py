@@ -903,11 +903,21 @@ class EvidenceLedgerWorker:
     def _validated_forecasts(self, rows, *, invalid_metric: str) -> list[V4ForecastRecord]:
         recovered = []
         proof_reader = V4AWriter(self._connection)
-        for expected_hash, payload in rows:
+        for row in rows:
             try:
+                expected_hash, payload, *proof = row
                 record = deserialize_forecast_record(
                     payload, expected_hash=str(expected_hash))
-                record = proof_reader.read_forecast_commit_proof(record)
+                # Production recovery queries return the authoritative proof in
+                # the same database round trip.  The two-column fallback keeps
+                # narrow test doubles and the single-row handoff anchor honest.
+                if proof:
+                    if len(proof) != 6:
+                        raise ValueError("invalid forecast commit proof row")
+                    record = V4AWriter._apply_commit_proof(
+                        record, tuple(proof))
+                else:
+                    record = proof_reader.read_forecast_commit_proof(record)
             except Exception:
                 # The production migration is an explicit gate. Until it is
                 # approved, missing proof infrastructure must fail closed
@@ -918,29 +928,56 @@ class EvidenceLedgerWorker:
                 recovered.append(record)
         return recovered
 
+    def _validated_lineage_forecasts(
+            self, rows, *, invalid_metric: str) -> list[V4ForecastRecord]:
+        """Validate immutable cohort identities without admitting evidence."""
+
+        recovered = []
+        for row in rows:
+            try:
+                expected_hash, payload, *_unused = row
+                recovered.append(deserialize_forecast_record(
+                    payload, expected_hash=str(expected_hash)))
+            except Exception:
+                self.metrics.increment(invalid_metric)
+        return recovered
+
     @staticmethod
     def _close_cursor(cursor) -> None:
         close = getattr(cursor, "close", None)
         if callable(close):
             close()
 
-    def _load_pending(self) -> list[V4ForecastRecord]:
-        """Recover only durable, unresolved forecasts in the conservative window."""
+    @staticmethod
+    def _proof_reader_unavailable(error: Exception) -> bool:
+        return getattr(error, "sqlstate", None) in {
+            "3F000",  # invalid_schema_name
+            "42P01",  # undefined_table
+            "42501",  # insufficient_privilege
+            "42883",  # undefined_function
+        }
+
+    def _load_recovery_rows(self, *, proof_sql: str, params: tuple,
+                            unavailable_metric: str) -> tuple:
+        """Prefer one proof-aware query while preserving fail-closed startup."""
+
         cursor = self._connection.cursor()
         try:
-            cursor.execute(
-                """SELECT f.forecast_record_hash, f.record_json
-                   FROM public.atom_v9_v4_forecasts AS f
-                   WHERE f.symbol='COIN'
-                     AND f.target_endpoint >= now() - interval '1 hour'
-                     AND NOT EXISTS (
-                         SELECT 1 FROM public.atom_v9_v4_outcomes AS o
-                         WHERE o.forecast_record_id=f.forecast_record_id)
-                   ORDER BY f.target_endpoint, f.forecast_record_id""", ())
+            try:
+                cursor.execute(proof_sql, params)
+            except Exception as error:
+                if not self._proof_reader_unavailable(error):
+                    raise
+                rollback = getattr(self._connection, "rollback", None)
+                if callable(rollback):
+                    rollback()
+                self.metrics.increment(unavailable_metric)
+                return ()
             rows = tuple(cursor.fetchall())
             commit = getattr(self._connection, "commit", None)
             if callable(commit):
                 commit()
+            return rows
         except Exception:
             rollback = getattr(self._connection, "rollback", None)
             if callable(rollback):
@@ -948,6 +985,27 @@ class EvidenceLedgerWorker:
             raise
         finally:
             self._close_cursor(cursor)
+
+    def _load_pending(self) -> list[V4ForecastRecord]:
+        """Recover only durable, unresolved forecasts in the conservative window."""
+        rows = self._load_recovery_rows(
+            proof_sql="""SELECT f.forecast_record_hash, f.record_json,
+                          p.forecast_record_id, p.forecast_record_hash,
+                          p.commit_observed_at, p.target_endpoint,
+                          p.proof_eligible, p.proof_method
+                   FROM public.atom_v9_v4_forecasts AS f
+                   JOIN LATERAL atom_v9_internal.read_forecast_commit_proof(
+                       f.forecast_record_id
+                   ) AS p ON p.proof_eligible
+                   WHERE f.symbol='COIN'
+                     AND f.target_endpoint >= now() - interval '1 hour'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM public.atom_v9_v4_outcomes AS o
+                         WHERE o.forecast_record_id=f.forecast_record_id)
+                   ORDER BY f.target_endpoint, f.forecast_record_id""",
+            params=(),
+            unavailable_metric="evidence_recovery.proof_reader_unavailable",
+        )
         return self._validated_forecasts(
             rows, invalid_metric="evidence_recovery.invalid_record")
 
@@ -957,11 +1015,15 @@ class EvidenceLedgerWorker:
 
         lower = datetime.fromtimestamp(previous.event_epoch, timezone.utc)
         upper = datetime.fromtimestamp(current.event_epoch, timezone.utc)
-        cursor = self._connection.cursor()
-        try:
-            cursor.execute(
-                """SELECT f.forecast_record_hash, f.record_json
+        rows = self._load_recovery_rows(
+            proof_sql="""SELECT f.forecast_record_hash, f.record_json,
+                          p.forecast_record_id, p.forecast_record_hash,
+                          p.commit_observed_at, p.target_endpoint,
+                          p.proof_eligible, p.proof_method
                    FROM public.atom_v9_v4_forecasts AS f
+                   JOIN LATERAL atom_v9_internal.read_forecast_commit_proof(
+                       f.forecast_record_id
+                   ) AS p ON p.proof_eligible
                    WHERE f.symbol='COIN'
                      AND f.target_endpoint > %s
                      AND f.target_endpoint <= %s
@@ -970,19 +1032,9 @@ class EvidenceLedgerWorker:
                          SELECT 1 FROM public.atom_v9_v4_outcomes AS o
                          WHERE o.forecast_record_id=f.forecast_record_id)
                    ORDER BY f.target_endpoint, f.forecast_record_id""",
-                (lower, upper),
-            )
-            rows = tuple(cursor.fetchall())
-            commit = getattr(self._connection, "commit", None)
-            if callable(commit):
-                commit()
-        except Exception:
-            rollback = getattr(self._connection, "rollback", None)
-            if callable(rollback):
-                rollback()
-            raise
-        finally:
-            self._close_cursor(cursor)
+            params=(lower, upper),
+            unavailable_metric="evidence_recovery.proof_reader_unavailable",
+        )
         return self._validated_forecasts(
             rows, invalid_metric="evidence_recovery.invalid_due_record")
 
@@ -1038,7 +1090,7 @@ class EvidenceLedgerWorker:
             raise
         finally:
             self._close_cursor(cursor)
-        siblings = self._validated_forecasts(
+        siblings = self._validated_lineage_forecasts(
             tuple(rows), invalid_metric="v4_state_build_lineage.invalid_record")
         grouped: dict[
             tuple[str, datetime, str, str], list[V4ForecastRecord]
@@ -1229,6 +1281,13 @@ class EvidenceLedgerWorker:
                        FROM recent_outcomes AS r
                        JOIN public.atom_v9_v4_forecasts AS f
                          USING (forecast_record_id)
+                       JOIN LATERAL
+                            atom_v9_internal.read_forecast_commit_proof(
+                                f.forecast_record_id
+                            ) AS p
+                         ON p.proof_eligible
+                        AND p.forecast_record_hash=f.forecast_record_hash
+                        AND p.target_endpoint=f.target_endpoint
                        WHERE f.symbol='COIN'
                          AND f.persisted_at <= f.target_endpoint
                    ), cycle_cohorts AS (
@@ -1258,8 +1317,7 @@ class EvidenceLedgerWorker:
                          ON f.symbol=r.symbol AND f.cutoff_at=r.cutoff_at
                         AND f.cycle_id=r.cycle_id
                         AND f.v3_model_version=r.v3_model_version
-                       WHERE f.persisted_at <= f.target_endpoint
-                         AND f.horizon IN (%s,%s,%s,%s,%s,%s)
+                       WHERE f.horizon IN (%s,%s,%s,%s,%s,%s)
                        GROUP BY r.symbol, r.cutoff_at, r.cycle_id,
                                 r.v3_model_version, r.outcome_record_id,
                                 r.outcome_record_hash,

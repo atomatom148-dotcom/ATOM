@@ -224,6 +224,104 @@ def test_worker_recovers_only_persisted_proof_eligible_unresolved_forecasts():
     assert worker._pending == [forecast]
 
 
+def test_worker_recovers_pending_and_due_proofs_without_n_plus_one_reads():
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None,
+        compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "cohort",
+        cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    forecast = calculated.persistence[0].forecast
+    payload = json.dumps(_canonical(asdict(forecast)), sort_keys=True)
+    proof = (
+        forecast.forecast_record_id,
+        forecast.forecast_record_hash,
+        NOW,
+        forecast.target_endpoint,
+        True,
+        "POST_COMMIT_DB_OBSERVATION_V1",
+    )
+
+    class Cursor:
+        def execute(self, sql, _params):
+            connection.queries.append(sql)
+            assert "JOIN LATERAL" in sql
+            assert "read_forecast_commit_proof" in sql
+        def fetchall(self):
+            return ((forecast.forecast_record_hash, payload, *proof),)
+        def fetchone(self):
+            raise AssertionError("authoritative proofs must not use N+1 reads")
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def __init__(self): self.queries = []
+        def cursor(self): return Cursor()
+
+    connection = Connection()
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=connection)
+
+    assert len(connection.queries) == 1
+    assert len(worker._pending) == 1
+    assert worker._pending[0].persistence_proof_eligible is True
+    due = worker._load_due(
+        MidpointObservation(forecast.target_endpoint.timestamp() - 1, 100.0),
+        MidpointObservation(forecast.target_endpoint.timestamp(), 101.0),
+    )
+    assert len(connection.queries) == 2
+    assert "f.target_endpoint > %s" in connection.queries[1]
+    assert due[0].persistence_proof_eligible is True
+
+
+def test_worker_missing_proof_reader_starts_bounded_and_fail_closed():
+    class MissingProofReader(Exception):
+        sqlstate = "42883"
+
+    class Cursor:
+        def execute(self, sql, _params):
+            connection.queries.append(sql)
+            raise MissingProofReader("undefined proof function")
+        def fetchall(self): raise AssertionError("query must fail closed")
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def __init__(self):
+            self.queries = []
+            self.commits = 0
+            self.rollbacks = 0
+        def cursor(self): return Cursor()
+        def commit(self): self.commits += 1
+        def rollback(self): self.rollbacks += 1
+
+    connection = Connection()
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(), evidence_store=_RawStore(), connection=connection)
+
+    assert worker._pending == []
+    assert len(connection.queries) == 1
+    assert "JOIN LATERAL" in connection.queries[0]
+    assert connection.commits == 0
+    assert connection.rollbacks == 1
+    counters = dict(worker.metrics.snapshot().counters)
+    assert counters["evidence_recovery.proof_reader_unavailable"] == 1
+    assert "evidence_recovery.invalid_record" not in counters
+
+
+def test_worker_recovery_does_not_hide_non_schema_query_failures():
+    class Cursor:
+        def execute(self, _sql, _params):
+            raise RuntimeError("database unavailable")
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def cursor(self): return Cursor()
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        EvidenceLedgerWorker(
+            EvidenceOutbox(), evidence_store=_RawStore(),
+            connection=Connection(),
+        )
+
+
 def test_worker_recovers_cross_deploy_forecast_in_exact_provider_bracket():
     v1, v2 = _inputs()
     calculated = V4DCoordinator(
@@ -927,6 +1025,17 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
             if "WITH recent_outcomes" in self.sql:
                 assert "LEFT JOIN eligible_cycles" in self.sql
                 assert "DISTINCT ON" not in self.sql
+                candidate_sql, remainder = self.sql.split("cycle_cohorts AS", 1)
+                cycle_sql = remainder.split("eligible_cycles AS", 1)[0]
+                assert "f.persisted_at <= f.target_endpoint" in candidate_sql
+                assert "read_forecast_commit_proof" in candidate_sql
+                assert "p.proof_eligible" in candidate_sql
+                assert (
+                    "p.forecast_record_hash=f.forecast_record_hash"
+                    in candidate_sql
+                )
+                assert "p.target_endpoint=f.target_endpoint" in candidate_sql
+                assert "f.persisted_at <= f.target_endpoint" not in cycle_sql
                 return (recovery_row, invalid_newer_row)
             if "f.horizon IN" in self.sql:
                 return rows
@@ -1601,6 +1710,33 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
     assert store.calls == [(state, NOW + timedelta(minutes=2))]
 
 
+@pytest.mark.parametrize(
+    "builder_type", (PostgresV4BStateBuilder, PostgresV4CStateBuilder))
+def test_postgres_v4_builders_fail_closed_above_current_evidence_bound(
+        builder_type):
+    class Cursor:
+        def execute(self, _sql, _params): pass
+        def fetchall(self):
+            return (None,) * (V4_STATE_BUILD_EVIDENCE_LIMIT + 1)
+        def close(self): pass
+    class Connection(_WorkerConnection):
+        def cursor(self): return Cursor()
+
+    inserted = []
+    store = SimpleNamespace(
+        insert=lambda *_args: inserted.append(True) or "INSERT")
+    builder = builder_type(Connection(), state_store=store)
+    builder.prepare(
+        symbol="COIN", state_as_of=NOW,
+        cohorts={horizon: ("cohort", "a" * 64) for horizon in HORIZONS},
+    )
+
+    with pytest.raises(
+            RuntimeError, match="V4_STATE_EVIDENCE_ROW_LIMIT_EXCEEDED"):
+        builder.build_and_publish()
+    assert inserted == []
+
+
 def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state(monkeypatch):
     v1, v2 = _inputs()
     calculated = V4DCoordinator(
@@ -1762,9 +1898,18 @@ def test_new_worker_outcome_submits_v4_state_build_off_fifo(monkeypatch):
     due = forecasts[0]
     previous = MidpointObservation(due.target_endpoint.timestamp() - 1, 100.0)
     current = MidpointObservation(due.target_endpoint.timestamp(), 101.0)
+    lineage = tuple(
+        replace(
+            forecast,
+            persisted_at=forecast.target_endpoint + timedelta(microseconds=1),
+            persistence_proof_eligible=False,
+            persistence_reason="FORECAST_COMMIT_PROOF_OBSERVED_LATE",
+        ) if forecast.horizon == "1M" else forecast
+        for forecast in forecasts
+    )
     lineage_rows = tuple((forecast.forecast_record_hash,
                           json.dumps(_canonical(asdict(forecast)), sort_keys=True))
-                         for forecast in forecasts)
+                         for forecast in lineage)
 
     class LineageCursor:
         def execute(self, sql, _params): self.sql = sql
