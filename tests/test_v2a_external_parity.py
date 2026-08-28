@@ -157,14 +157,14 @@ def test_corruption_interruption_disk_full_mismatch_and_cleanup_guard(tmp_path,m
     for phase in ("ingestion","ordered_pass"):
         with pytest.raises(InterruptedError): build(tmp_path,2,interrupt=phase)
         assert not list(tmp_path.iterdir())
-    import quant.v9_v2a_external as module
-    monkeypatch.setattr(module.sqlite3,"connect",lambda *_: (_ for _ in ()).throw(module.sqlite3.OperationalError("database or disk is full")))
-    with pytest.raises(module.sqlite3.OperationalError,match="disk is full"): build(tmp_path,2)
-    assert not list(tmp_path.iterdir())
     view=build(tmp_path,2); workspace=view.workspace; view.close()
     link=tmp_path/"atom-v2a-external-link"; link.symlink_to(workspace,target_is_directory=True)
     with pytest.raises(ValueError,match="unowned"): cleanup_owned_workspace(link,root=tmp_path)
     assert workspace.exists()
     link.unlink(); cleanup_owned_workspace(workspace,root=tmp_path)
+    import quant.v9_v2a_external as module
+    monkeypatch.setattr(module.sqlite3,"connect",lambda *_: (_ for _ in ()).throw(module.sqlite3.OperationalError("database or disk is full")))
+    with pytest.raises(module.sqlite3.OperationalError,match="disk is full"): build(tmp_path,2)
+    assert not list(tmp_path.iterdir())
     unowned=tmp_path/"not-owned"; unowned.mkdir()
     with pytest.raises(ValueError,match="unowned"): cleanup_owned_workspace(unowned,root=tmp_path)
