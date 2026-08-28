@@ -986,6 +986,43 @@ class EvidenceLedgerWorker:
         finally:
             self._close_cursor(cursor)
 
+    def _validated_recovery_proof_ids(
+            self, records: tuple[V4ForecastRecord, ...]) -> frozenset[str]:
+        """Batch-check one representative proof per validated recovery cohort."""
+
+        by_id = {record.forecast_record_id: record for record in records}
+        if not by_id:
+            return frozenset()
+        rows = self._load_recovery_rows(
+            proof_sql="""SELECT requested.forecast_record_id,
+                          p.forecast_record_id, p.forecast_record_hash,
+                          p.commit_observed_at, p.target_endpoint,
+                          p.proof_eligible, p.proof_method
+                   FROM unnest(%s::text[]) WITH ORDINALITY
+                        AS requested(forecast_record_id, proof_order)
+                   JOIN LATERAL atom_v9_internal.read_forecast_commit_proof(
+                       requested.forecast_record_id
+                   ) AS p ON p.proof_eligible
+                   ORDER BY requested.proof_order""",
+            params=(list(by_id),),
+            unavailable_metric=(
+                "v4_state_build_recovery.proof_reader_unavailable"),
+        )
+        proven = set()
+        for requested_id, *proof in rows:
+            record = by_id.get(str(requested_id))
+            try:
+                if record is None or len(proof) != 6:
+                    raise ValueError("invalid recovery commit proof row")
+                verified = V4AWriter._apply_commit_proof(record, tuple(proof))
+            except Exception:
+                self.metrics.increment(
+                    "v4_state_build_recovery.invalid_proof")
+                continue
+            if verified.persistence_proof_eligible is True:
+                proven.add(record.forecast_record_id)
+        return frozenset(proven)
+
     def _load_pending(self) -> list[V4ForecastRecord]:
         """Recover only durable, unresolved forecasts in the conservative window."""
         rows = self._load_recovery_rows(
@@ -1281,13 +1318,6 @@ class EvidenceLedgerWorker:
                        FROM recent_outcomes AS r
                        JOIN public.atom_v9_v4_forecasts AS f
                          USING (forecast_record_id)
-                       JOIN LATERAL
-                            atom_v9_internal.read_forecast_commit_proof(
-                                f.forecast_record_id
-                            ) AS p
-                         ON p.proof_eligible
-                        AND p.forecast_record_hash=f.forecast_record_hash
-                        AND p.target_endpoint=f.target_endpoint
                        WHERE f.symbol='COIN'
                          AND f.persisted_at <= f.target_endpoint
                    ), cycle_cohorts AS (
@@ -1392,13 +1422,17 @@ class EvidenceLedgerWorker:
             candidate[0] for candidate in candidates))
         distinct: dict[
             tuple[str, tuple[tuple[str, str, str], ...]],
-            tuple[dict[str, tuple[str, str]], datetime],
+            tuple[dict[str, tuple[str, str]], datetime, V4ForecastRecord],
         ] = {}
         for key, outcome, created_at, expected_ids, expected_hashes in candidates:
             forecasts = forecasts_by_key.get(key)
-            if (forecasts is None or
-                    outcome.forecast_record_id not in {
-                        record.forecast_record_id for record in forecasts} or
+            representative = (
+                next((record for record in forecasts
+                      if record.forecast_record_id ==
+                      outcome.forecast_record_id), None)
+                if forecasts is not None else None
+            )
+            if (forecasts is None or representative is None or
                     tuple(record.cohort_id for record in forecasts) != expected_ids or
                     tuple(record.cohort_hash for record in forecasts) != expected_hashes):
                 self.metrics.increment("v4_state_build_recovery.unavailable")
@@ -1412,7 +1446,18 @@ class EvidenceLedgerWorker:
             identity = (forecasts[0].symbol, cohort_key)
             prior = distinct.get(identity)
             if prior is None or created_at > prior[1]:
-                distinct[identity] = (cohorts, created_at)
+                distinct[identity] = (cohorts, created_at, representative)
+
+        proven_ids = self._validated_recovery_proof_ids(tuple(
+            representative for _cohorts, _created_at, representative
+            in distinct.values()
+        ))
+        distinct = {
+            identity: (cohorts, created_at)
+            for identity, (cohorts, created_at, representative)
+            in distinct.items()
+            if representative.forecast_record_id in proven_ids
+        }
 
         combined_ids = {
             identity: "v9v4statecohort:" + canonical_sha256(
