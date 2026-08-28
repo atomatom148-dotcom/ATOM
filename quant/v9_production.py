@@ -393,7 +393,7 @@ class PostgresV2StateBuilder:
             source_identities[-1] if source_identities else None,
             tuple(horizon_counts), tuple(family_counts), tuple(effective_ns),
             time.perf_counter() - build_started, peak_bytes,
-            state.evidence_manifest_hash, "",
+            0, state.evidence_manifest_hash, "",
         ))
         return state
 

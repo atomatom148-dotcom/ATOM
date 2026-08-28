@@ -5,7 +5,7 @@ from quant import web
 
 
 class V2StateStartupTests(unittest.TestCase):
-    def test_restore_completes_before_background_worker_starts(self):
+    def test_startup_restores_without_starting_historical_rebuild_worker(self):
         database_url = "postgresql://unused"
         restored_at = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
         metrics = object()
@@ -59,7 +59,6 @@ class V2StateStartupTests(unittest.TestCase):
         self.assertEqual(lifecycle, [
             ("clock", None),
             ("restore", restored_at),
-            ("start", None),
         ])
 
 
