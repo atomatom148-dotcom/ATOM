@@ -193,6 +193,7 @@ def build_external_v2a(*, state_as_of: float, target_spec_id: str,
     workspace = _owned_workspace(root)
     con = None
     peak_disk = 0
+    succeeded = False
     def sample_disk() -> None:
         nonlocal peak_disk
         peak_disk=max(peak_disk,sum(p.stat().st_size for p in workspace.iterdir() if p.is_file()))
@@ -304,11 +305,13 @@ def build_external_v2a(*, state_as_of: float, target_spec_id: str,
             family_source_spec_version,raw,skeleton_ordinal,ordinal,bounds[0],bounds[1],
             tuple(ExclusionCount(k,counts[k]) for k in sorted(counts)),"",0)
         view.dataset_hash=_stream_hash(view); sample_disk(); view.peak_disk_bytes=peak_disk
+        succeeded = True
         return view
-    except BaseException:
-        if con is not None: con.close()
-        cleanup_owned_workspace(workspace,root=root)
-        raise
+    finally:
+        if not succeeded:
+            if con is not None:
+                con.close()
+            cleanup_owned_workspace(workspace,root=root)
 
 
 def _scores(view):
