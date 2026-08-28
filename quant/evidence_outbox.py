@@ -1420,9 +1420,11 @@ class EvidenceLedgerWorker:
 
         forecasts_by_key = self._load_cycle_forecasts(tuple(
             candidate[0] for candidate in candidates))
-        distinct_candidates: dict[
+        candidates_by_identity: dict[
             tuple[str, tuple[tuple[str, str, str], ...]],
-            tuple[dict[str, tuple[str, str]], datetime, V4ForecastRecord],
+            list[tuple[
+                dict[str, tuple[str, str]], datetime, V4ForecastRecord
+            ]],
         ] = {}
         for key, outcome, created_at, expected_ids, expected_hashes in candidates:
             forecasts = forecasts_by_key.get(key)
@@ -1444,21 +1446,43 @@ class EvidenceLedgerWorker:
             cohort_key = tuple(
                 (horizon, *cohorts[horizon]) for horizon in HORIZONS)
             identity = (forecasts[0].symbol, cohort_key)
-            prior = distinct_candidates.get(identity)
-            if prior is None or created_at > prior[1]:
-                distinct_candidates[identity] = (
-                    cohorts, created_at, representative)
+            candidates_by_identity.setdefault(identity, []).append(
+                (cohorts, created_at, representative))
 
-        proven_ids = self._validated_recovery_proof_ids(tuple(
-            representative for _cohorts, _created_at, representative
-            in distinct_candidates.values()
-        ))
-        distinct = {
-            identity: (cohorts, created_at)
-            for identity, (cohorts, created_at, representative)
-            in distinct_candidates.items()
-            if representative.forecast_record_id in proven_ids
+        ordered_candidates = {
+            identity: tuple(sorted(
+                identity_candidates,
+                key=lambda candidate: candidate[1],
+                reverse=True,
+            ))
+            for identity, identity_candidates
+            in candidates_by_identity.items()
         }
+        proven_ids = self._validated_recovery_proof_ids(tuple(
+            identity_candidates[0][2]
+            for identity_candidates in ordered_candidates.values()
+        ))
+        fallback_candidates = tuple(
+            representative
+            for identity_candidates in ordered_candidates.values()
+            if identity_candidates[0][2].forecast_record_id not in proven_ids
+            for _cohorts, _created_at, representative
+            in identity_candidates[1:]
+        )
+        if fallback_candidates:
+            proven_ids |= self._validated_recovery_proof_ids(
+                fallback_candidates)
+
+        distinct = {}
+        for identity, identity_candidates in ordered_candidates.items():
+            newest_proven = next((
+                (cohorts, created_at)
+                for cohorts, created_at, representative
+                in identity_candidates
+                if representative.forecast_record_id in proven_ids
+            ), None)
+            if newest_proven is not None:
+                distinct[identity] = newest_proven
 
         combined_ids = {
             identity: "v9v4statecohort:" + canonical_sha256(
