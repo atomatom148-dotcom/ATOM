@@ -1,76 +1,84 @@
-# ATOM V9 Phase 1B — external V2A parity prototype gate
+# ATOM V9 Phase 1B — external V2A parity prototype
 
-**Verdict: `BLOCKED_BY_FROZEN_V2A_INTERFACE`.** This investigation stopped at
-the mandatory interface gate. No production database was accessed and no
-publishing, deployment, migration, live-service, formula, schema, codec,
-state, or receipt change was made.
+**Verdict: PASS.** The approved freeze amendment adds a separate offline-only
+SQLite view and external q1_momentum / 30S adapters. The legacy `V2ADataset`,
+public V2A→V2D path, production database, publishing, web, migrations, and live
+services are unchanged.
 
-## Precise blocker
+## Data flow and invariants
 
-The frozen `V2ADataset` result is not a bounded logical view. Its public fields
-require concrete tuples containing every admitted target, observation, pair
-support identity, and complete-case identity. For q1_momentum / 30S, the
-`skeleton`, `directional_subsets[0].observations`, and
-`complete_case_target_identities` fields each contain O(n) objects. Constructing
-the exact frozen logical result therefore necessarily reconstructs the full
-O(n) object graph in RAM.
+Ordered offline target and observation iterators are admitted into a mode-0700,
+ownership-marked temporary workspace in 4,096-row commits. SQLite performs only
+ordered storage, grouping, and joins; all floating-point reductions use Python
+`math.fsum` in frozen row order. Deterministic passes construct the skeleton,
+q1 observations, complete cases, and streaming canonical V2A SHA-256 without
+materializing a `V2ADataset`. Separate external V2B and V2C adapters scan the
+view and return the existing bounded result dataclasses. The external V2D
+adapter produces and validates the existing canonical state. Receipt creation
+uses the existing frozen receipt codec.
 
-The canonical identity boundary makes a disk-backed sequence adapter
-insufficient. `v2a_dataset_hash` recursively calls `dataclasses.asdict`, which
-deep-copies the entire dataclass graph before JSON encoding it. The legacy
-builder repeats this expansion when sealing the draft with its hash. Replacing
-tuples with SQLite cursors, lazy sequences, paths, or references would change
-the frozen result schema and would not be accepted by this canonicalizer.
+The external path has no row ceiling, sampling, truncation, `OFFSET`, or window.
+The exact frozen paired-IPS operation order is retained. A non-degenerate input
+can require quadratic-time ordered lag passes, matching the frozen algorithm;
+the authoritative constant-residual fixture takes its identical early-return
+path.
 
-The required existing V2B verification path independently assumes the same
-materialized interface. Its `_series` function constructs an O(n) target
-dictionary and concrete `pairs`, `x`, `y`, and `score` tuples. Its frozen
-`effective_n` then creates concrete `values` and `centered` tuples (and, for a
-non-degenerate series, an autocorrelation list). Those V2B allocations may be
-measured separately, but they prevent a lazy proxy from serving as a transparent
-drop-in for the existing path without changing frozen interfaces and operation
-boundaries.
+Every successful read revalidates staged payload digests, ownership metadata,
+and the streaming dataset hash. Success and all exceptions close and remove
+only the validated owned workspace. Cleanup refuses paths outside the selected
+root, names without the owned prefix, absent/invalid markers, and marker/path or
+UID mismatches.
 
-SQLite staging followed by creation of those tuples would only move ingestion
-to disk; it would still materialize the full V2A result and would violate the
-explicit instruction not to disguise staging as bounded-memory construction.
+## Exact parity
 
-## Prototype data-flow decision
+The 16-row Phase 1A golden fixture was rebuilt through both paths in one test.
+Equality is exact for the V2A hash, V2B component hash, V2C value/component
+hash, evidence manifest, canonical state bytes, state hash/ID, canonical receipt
+bytes, and receipt SHA-256. The six cardinality dataset and state hashes also
+match the authoritative fresh-process legacy results checked into
+`docs/v2-frozen-schema-measurements.json`.
 
-The proposed ingestion path would have been ordered fixture iterators → owned
-temporary SQLite workspace → deterministic target pass → deterministic family
-pass → streaming canonical hash → frozen V2B/V2C/V2D parity verification.
-Work stopped before implementing this path because its output cannot cross the
-frozen `V2ADataset` boundary while both preserving its exact logical type and
-remaining below a fixed memory budget.
+## Fresh-process measurements
 
-## Acceptance and measurements
+Linux x86-64, CPython 3.14.4, local overlay filesystem. `ru_maxrss` is absolute
+process peak RSS. Each row was run in a new interpreter. Temporary disk is the
+sealed workspace; peak temporary disk is sampled before and after every page
+commit and ordered-pass seal. V2B/V2C/V2D verification runs after the recorded
+external-V2A peak and is not attributed to that memory gate.
 
-No parity or resource result is claimed. In particular, the six required
-cardinalities and failure-injection matrix were **not run**, because measuring
-a staging-only implementation after identifying this blocker would not satisfy
-the acceptance criterion. The authoritative Phase 1A measurement already shows
-legacy construction at 1,756,434,432 bytes peak RSS for 200,000 rows, far above
-the 128 MiB gate.
+| Rows | External V2A peak RSS | Temp disk | Peak temp disk | End-to-end runtime |
+|---:|---:|---:|---:|---:|
+| 1,000 | 25,550,848 B | 819,298 B | 819,298 B | 0.324 s |
+| 10,000 | 28,262,400 B | 8,040,546 B | 8,040,546 B | 2.081 s |
+| 65,535 | 29,708,288 B | 58,458,210 B | 58,458,210 B | 13.483 s |
+| 65,536 | 29,847,552 B | 58,458,210 B | 58,458,210 B | 12.551 s |
+| 65,537 | 29,708,288 B | 58,458,210 B | 58,458,210 B | 12.552 s |
+| 200,000 | 29,593,600 B | 180,981,858 B | 180,981,858 B | 40.576 s |
 
-| Required result | Status |
-|---|---|
-| Scope q1_momentum / 30S | inspected |
-| V2A dataset hash parity | not claimed — blocked before candidate construction |
-| V2B/V2C/evidence-manifest parity | not claimed — no valid V2A candidate |
-| State/receipt byte and identity parity | not claimed — no valid V2A candidate |
-| External V2A peak RSS below 128 MiB | not claimed — frozen output is O(n) |
-| Temporary/peak disk usage and runtime | not measured — staging-only figures are non-accepting |
-| Required failure tests | not run — no conforming prototype exists to test |
-| Workspace cleanup | not applicable — no prototype workspace is created |
+The 200,000-row peak is 28.22 MiB, leaving 99.78 MiB below the fixed 128 MiB
+budget. Peak RSS remains essentially flat from 65,535 through 200,000 rather
+than growing proportionally with evidence count.
 
-## Smallest interface change that would unblock a later phase
+## Failure matrix
 
-A freeze exception would be required for an explicit disk-backed V2A view and
-a streaming canonical V2A encoder/hash accepted by streaming V2B/V2C adapters.
-The view would need bounded iterators for skeleton rows, family observations,
-pair support, and complete cases, plus scalar metadata and exclusions. V2B
-would also need exact-order multi-pass reductions that reproduce every frozen
-floating-point operation without materializing its `_Series` tuples. Until
-that exception is granted, the correct fail-closed result is this blocker,
-not a prototype or a parity claim.
+Focused tests cover duplicate identity, missing target, wrong formula, wrong
+data/source schema, non-causal observations, a 4,096/4,097 page-boundary
+omission, staged-payload corruption, simulated disk full, interruption during
+ingestion, interruption during the ordered pass, refusal to clean an unowned
+path, and parity mismatch validation. Every construction failure removes its
+owned workspace; corruption and mismatch fail closed before V2B.
+
+## Acceptance
+
+```
+SCOPE: q1_momentum / 30S
+ROWS: 200000
+DATASET_HASH_MATCH: YES
+V2B_HASH_MATCH: YES
+V2C_HASH_MATCH: YES
+STATE_BYTES_MATCH: YES
+STATE_ID_MATCH: YES
+RECEIPT_HASH_MATCH: YES
+PEAK_RSS: 29,593,600 B (< 128 MiB)
+WORKSPACE_CLEANUP: PASS
+```
