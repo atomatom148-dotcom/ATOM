@@ -49,6 +49,8 @@ EVIDENCE_RUNTIME_LOCK_ID = int.from_bytes(b"ATOMV9EL", "big")
 EVIDENCE_RECOVERY_OUTCOME_LIMIT = 65_536
 V4_STATE_BUILD_EVIDENCE_LIMIT = 65_536
 EVIDENCE_RECOVERY_CYCLE_QUERY_CHUNK = 4_096
+EVIDENCE_RECOVERY_PROOF_FALLBACK_DEPTH = 4
+EVIDENCE_RECOVERY_PROOF_FALLBACK_LIMIT = 256
 EVIDENCE_HANDOFF_CANDIDATE_CYCLE_LIMIT = 256
 EVIDENCE_LEGACY_WRITER_QUIESCENCE_SECONDS = 2.5
 _TERMINAL_FAILURE_REASONS = frozenset({
@@ -1023,6 +1025,85 @@ class EvidenceLedgerWorker:
                 proven.add(record.forecast_record_id)
         return frozenset(proven)
 
+    def _latest_proven_recovery_cohorts(
+            self, candidates_by_identity: dict[
+                tuple[str, tuple[tuple[str, str, str], ...]],
+                list[tuple[
+                    dict[str, tuple[str, str]], datetime, V4ForecastRecord
+                ]],
+            ]) -> dict[
+                tuple[str, tuple[tuple[str, str, str], ...]],
+                tuple[dict[str, tuple[str, str]], datetime],
+            ]:
+        """Choose newest proven candidates with strictly bounded fallback work."""
+
+        ordered_candidates = {
+            identity: tuple(sorted(
+                identity_candidates,
+                key=lambda candidate: candidate[1],
+                reverse=True,
+            ))
+            for identity, identity_candidates
+            in candidates_by_identity.items()
+        }
+        proven_ids = self._validated_recovery_proof_ids(tuple(
+            identity_candidates[0][2]
+            for identity_candidates in ordered_candidates.values()
+        ))
+        unresolved = {
+            identity: identity_candidates[1:]
+            for identity, identity_candidates in ordered_candidates.items()
+            if (identity_candidates[0][2].forecast_record_id not in proven_ids and
+                len(identity_candidates) > 1)
+        }
+        fallback_work = 0
+        for _depth in range(EVIDENCE_RECOVERY_PROOF_FALLBACK_DEPTH):
+            remaining_budget = (
+                EVIDENCE_RECOVERY_PROOF_FALLBACK_LIMIT - fallback_work)
+            if not unresolved or remaining_budget <= 0:
+                break
+            round_items = []
+            for identity, identity_candidates in unresolved.items():
+                if len(round_items) >= remaining_budget:
+                    break
+                round_items.append((identity, identity_candidates))
+            round_candidates = tuple(
+                identity_candidates[0][2]
+                for _identity, identity_candidates in round_items
+            )
+            round_proven_ids = self._validated_recovery_proof_ids(
+                round_candidates)
+            proven_ids |= round_proven_ids
+            fallback_work += len(round_candidates)
+            selected_identities = {
+                identity for identity, _identity_candidates in round_items
+            }
+            next_unresolved = {}
+            for identity, identity_candidates in unresolved.items():
+                if identity not in selected_identities:
+                    next_unresolved[identity] = identity_candidates
+                elif (identity_candidates[0][2].forecast_record_id
+                      in round_proven_ids):
+                    continue
+                elif len(identity_candidates) > 1:
+                    next_unresolved[identity] = identity_candidates[1:]
+            unresolved = next_unresolved
+
+        if unresolved:
+            self.metrics.increment(
+                "v4_state_build_recovery.proof_fallback_truncated")
+        distinct = {}
+        for identity, identity_candidates in ordered_candidates.items():
+            newest_proven = next((
+                (cohorts, created_at)
+                for cohorts, created_at, representative
+                in identity_candidates
+                if representative.forecast_record_id in proven_ids
+            ), None)
+            if newest_proven is not None:
+                distinct[identity] = newest_proven
+        return distinct
+
     def _load_pending(self) -> list[V4ForecastRecord]:
         """Recover only durable, unresolved forecasts in the conservative window."""
         rows = self._load_recovery_rows(
@@ -1449,40 +1530,8 @@ class EvidenceLedgerWorker:
             candidates_by_identity.setdefault(identity, []).append(
                 (cohorts, created_at, representative))
 
-        ordered_candidates = {
-            identity: tuple(sorted(
-                identity_candidates,
-                key=lambda candidate: candidate[1],
-                reverse=True,
-            ))
-            for identity, identity_candidates
-            in candidates_by_identity.items()
-        }
-        proven_ids = self._validated_recovery_proof_ids(tuple(
-            identity_candidates[0][2]
-            for identity_candidates in ordered_candidates.values()
-        ))
-        fallback_candidates = tuple(
-            representative
-            for identity_candidates in ordered_candidates.values()
-            if identity_candidates[0][2].forecast_record_id not in proven_ids
-            for _cohorts, _created_at, representative
-            in identity_candidates[1:]
-        )
-        if fallback_candidates:
-            proven_ids |= self._validated_recovery_proof_ids(
-                fallback_candidates)
-
-        distinct = {}
-        for identity, identity_candidates in ordered_candidates.items():
-            newest_proven = next((
-                (cohorts, created_at)
-                for cohorts, created_at, representative
-                in identity_candidates
-                if representative.forecast_record_id in proven_ids
-            ), None)
-            if newest_proven is not None:
-                distinct[identity] = newest_proven
+        distinct = self._latest_proven_recovery_cohorts(
+            candidates_by_identity)
 
         combined_ids = {
             identity: "v9v4statecohort:" + canonical_sha256(
