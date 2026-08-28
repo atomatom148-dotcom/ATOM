@@ -109,7 +109,6 @@ def _receipt(state, **changes):
         per_family_horizon_effective_n=(("30S", "q1_momentum", 4.0),),
         build_elapsed_seconds=1.0,
         peak_rss_bytes=1_024,
-        temporary_disk_peak_bytes=2_048,
         evidence_manifest_hash=state.evidence_manifest_hash,
         receipt_sha256="",
     )

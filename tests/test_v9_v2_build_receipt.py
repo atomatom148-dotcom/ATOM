@@ -21,7 +21,7 @@ def _receipt(**changes):
          ("1m", "q10_options_vol", 0)),
         (("1m", "q1_momentum", 123.25),
          ("1m", "q10_options_vol", 0.0)),
-        12.5, 123_456_789, 987_654_321, "b" * 64, "",
+        12.5, 123_456_789, "b" * 64, "",
     )
     return replace(value, **changes)
 

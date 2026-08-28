@@ -116,7 +116,7 @@ def test_external_pipeline_builds_all_72_slots_matches_legacy_and_restores_v3(
     assert all(count == 0 for horizon, quant_id, count
                in result.receipt.per_family_horizon_admitted_counts
                if quant_id == "q10_options_vol")
-    assert result.receipt.temporary_disk_peak_bytes > 0
+    assert result.temporary_disk_peak_bytes > 0
     assert not list(tmp_path.glob("atom-v2-external-rebuild-*"))
 
     cutoff = datetime.fromtimestamp(NOW, timezone.utc)
@@ -152,13 +152,12 @@ def test_command_dispatches_external_pipeline_not_legacy(tmp_path, monkeypatch, 
         "state_id": "id", "state_hash": "a" * 64,
         "evidence_manifest_hash": "b" * 64,
     })()
-    receipt = type("Receipt", (), {
-        "receipt_sha256": "c" * 64, "temporary_disk_peak_bytes": 123,
-    })()
+    receipt = type("Receipt", (), {"receipt_sha256": "c" * 64})()
     monkeypatch.setattr(
         "quant.v9_v2_external_rebuild.rebuild_external_v2",
         lambda **kwargs: (called.append(kwargs) or type("Result", (), {
             "state": state, "receipt": receipt, "publication_status": None,
+            "temporary_disk_peak_bytes": 123,
         })()),
     )
     monkeypatch.setattr(

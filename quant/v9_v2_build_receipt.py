@@ -31,7 +31,6 @@ class V2BuildReceipt:
     per_family_horizon_effective_n: tuple[tuple[str, str, float], ...]
     build_elapsed_seconds: float
     peak_rss_bytes: int
-    temporary_disk_peak_bytes: int
     evidence_manifest_hash: str
     receipt_sha256: str
 
@@ -43,7 +42,6 @@ def _identity_payload(receipt: V2BuildReceipt) -> dict[str, object]:
     payload.pop("receipt_sha256")
     payload.pop("build_elapsed_seconds")
     payload.pop("peak_rss_bytes")
-    payload.pop("temporary_disk_peak_bytes")
     return payload
 
 
@@ -64,7 +62,7 @@ def seal_receipt(receipt: V2BuildReceipt) -> V2BuildReceipt:
         receipt.stored_forecast_rows, receipt.resolved_evidence_rows,
         receipt.source_rows_read, receipt.eligible_rows, receipt.admitted_rows,
         receipt.rejected_rows, receipt.pages_read, receipt.page_size,
-        receipt.peak_rss_bytes, receipt.temporary_disk_peak_bytes,
+        receipt.peak_rss_bytes,
     )
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
            for value in counters) or receipt.page_size != 4_096:

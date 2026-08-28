@@ -89,7 +89,7 @@ def canonical_receipt(state, rows: int) -> str:
         f"directional:30S:{float((rows - 1) * 30).hex()}:gate-{rows - 1:06d}",
         (("30S", rows),), (("30S", "q1_momentum", rows),),
         (("30S", "q1_momentum", float(rows)),), 0.0, 0,
-        0, state.evidence_manifest_hash, "",
+        state.evidence_manifest_hash, "",
     ))
     return serialize_v2_build_receipt(receipt)
 
