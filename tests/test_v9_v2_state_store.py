@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 import json
 
@@ -495,6 +496,68 @@ def test_insert_with_receipt_can_borrow_lock_owning_connection_without_closing()
     assert (connection.commits, connection.rollbacks) == (1, 0)
     assert connection.cursor_value.closed is True
     assert connection.closed is False
+
+
+@pytest.mark.parametrize("interrupt_at", (2, 3, 4))
+def test_insert_with_receipt_rolls_back_when_interrupted_during_publication(
+        interrupt_at):
+    state = _state()
+    connection = Connection([_role(), [(state.state_id,)], [(state.state_id,)]])
+    checks = 0
+
+    def interrupted():
+        nonlocal checks
+        checks += 1
+        return checks >= interrupt_at
+
+    with pytest.raises(InterruptedError, match="V2_STATE_PUBLICATION_INTERRUPTED"):
+        PostgresV2StateStore(
+            DATABASE_URL,
+            connect=Connector(connection),
+        ).insert_with_receipt(
+            state,
+            _receipt(state),
+            interrupt_check=interrupted,
+        )
+
+    assert (connection.commits, connection.rollbacks) == (0, 1)
+    assert connection.closed and connection.cursor_value.closed
+
+
+def test_insert_with_receipt_holds_commit_guard_through_commit():
+    state = _state()
+    events = []
+
+    class GuardedConnection(Connection):
+        def commit(self):
+            assert events == ["enter"]
+            events.append("commit")
+            super().commit()
+
+    @contextmanager
+    def commit_guard():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    connection = GuardedConnection([
+        _role(), [(state.state_id,)], [(state.state_id,)],
+    ])
+    result = PostgresV2StateStore(
+        DATABASE_URL,
+        connect=Connector(connection),
+    ).insert_with_receipt(
+        state,
+        _receipt(state),
+        interrupt_check=lambda: False,
+        commit_guard=commit_guard,
+    )
+
+    assert result == INSERTED
+    assert events == ["enter", "commit", "exit"]
+    assert (connection.commits, connection.rollbacks) == (1, 0)
 
 
 @pytest.mark.parametrize(

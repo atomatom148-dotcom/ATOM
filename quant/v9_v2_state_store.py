@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Callable, Protocol
+from typing import Callable, ContextManager, Protocol
 
 from quant.evidence import DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION
 from quant.v9_v2a_dataset import SYMBOL
@@ -255,7 +255,9 @@ class PostgresV2StateStore:
                     f"stored V2 receipt column {name} does not match payload")
         return receipt
 
-    def _run(self, operation, *, connection=None):
+    def _run(self, operation, *, connection=None,
+             before_commit: Callable[[], None] | None = None,
+             commit_guard: Callable[[], ContextManager[None]] | None = None):
         owns_connection = connection is None
         if owns_connection:
             connection = self._connect(self._database_url)
@@ -265,7 +267,15 @@ class PostgresV2StateStore:
             self._configure_transaction(cursor)
             self._verify_role(cursor)
             result = operation(cursor)
-            connection.commit()
+            if commit_guard is None:
+                if before_commit is not None:
+                    before_commit()
+                connection.commit()
+            else:
+                with commit_guard():
+                    if before_commit is not None:
+                        before_commit()
+                    connection.commit()
             return result
         except BaseException:
             connection.rollback()
@@ -327,7 +337,10 @@ class PostgresV2StateStore:
         return self._run(operation)
 
     def insert_with_receipt(self, state: V2EvidenceState,
-                            receipt: V2BuildReceipt, *, connection=None) -> str:
+                            receipt: V2BuildReceipt, *, connection=None,
+                            interrupt_check: Callable[[], bool] | None = None,
+                            commit_guard: Callable[[], ContextManager[None]] | None = None,
+                            ) -> str:
         """Atomically append the proof before making its state publishable."""
         if receipt.state_id != state.state_id or receipt.state_as_of != state.state_as_of:
             raise V2StateInvalidError("V2 receipt does not identify its state")
@@ -336,7 +349,12 @@ class PostgresV2StateStore:
         serialized_receipt = serialize_v2_build_receipt(receipt)
         serialized_state = _validate_state(state)
 
+        def check_interrupted() -> None:
+            if interrupt_check is not None and interrupt_check():
+                raise InterruptedError("V2_STATE_PUBLICATION_INTERRUPTED")
+
         def operation(cursor):
+            check_interrupted()
             cursor.execute(
                 "INSERT INTO public.atom_v9_v2_build_receipts "
                 "(receipt_sha256,state_id,state_as_of,receipt_json) VALUES (%s,%s,%s,%s) "
@@ -345,6 +363,7 @@ class PostgresV2StateStore:
                  serialized_receipt),
             )
             inserted_receipt = cursor.fetchone() is not None
+            check_interrupted()
             cursor.execute(
                 f"INSERT INTO {V2_STATE_TABLE} (state_id,state_hash,state_schema_version,"
                 "state_version,model_family,symbol,state_as_of,target_spec_id,"
@@ -358,6 +377,7 @@ class PostgresV2StateStore:
                  state.creation_status, serialized_state),
             )
             inserted_state = cursor.fetchone() is not None
+            check_interrupted()
             if inserted_receipt != inserted_state:
                 raise V2StateConflictError("V2 state and receipt append conflict")
             if inserted_state:
@@ -397,7 +417,12 @@ class PostgresV2StateStore:
                 raise V2StateConflictError("V2 state and receipt append conflict")
             return IDEMPOTENT
 
-        return self._run(operation, connection=connection)
+        return self._run(
+            operation,
+            connection=connection,
+            before_commit=check_interrupted,
+            commit_guard=commit_guard,
+        )
 
     def latest(
         self,

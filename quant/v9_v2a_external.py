@@ -169,6 +169,15 @@ def cleanup_owned_workspace(path, *, root=None):
         raise ValueError("refusing to clean an unowned workspace") from error
     if data != {"owner": _OWNER, "path": str(path), "uid": os.getuid()}:
         raise ValueError("refusing to clean an unowned workspace")
+    try:
+        nested_mount = any(
+            item.is_dir() and not item.is_symlink() and item.is_mount()
+            for item in path.rglob("*")
+        )
+    except OSError as error:
+        raise ValueError("refusing to clean an unowned workspace") from error
+    if nested_mount:
+        raise ValueError("refusing to clean a mount-crossing workspace")
     shutil.rmtree(path)
 
 

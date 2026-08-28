@@ -267,6 +267,30 @@ def _raise_if_interrupted(interrupt_check: Callable[[], bool] | None) -> None:
 
 
 @contextmanager
+def _publication_commit_guard(interrupt_check):
+    """Defer cooperative termination across PostgreSQL's commit boundary.
+
+    Once COMMIT starts, PostgreSQL may atomically make both immutable rows
+    durable even if the client disappears. Blocking the handled termination
+    signals across the final check and COMMIT gives the CLI one explicit
+    outcome: a signal wins before this boundary, or the complete pair commits.
+    """
+
+    signals = {signal.SIGINT, signal.SIGTERM}
+    mask = getattr(signal, "pthread_sigmask", None)
+    previous = None
+    _raise_if_interrupted(interrupt_check)
+    if callable(mask):
+        previous = mask(signal.SIG_BLOCK, signals)
+    try:
+        _raise_if_interrupted(interrupt_check)
+        yield
+    finally:
+        if previous is not None:
+            mask(signal.SIG_SETMASK, previous)
+
+
+@contextmanager
 def _cancel_on_interrupt(connection, interrupt_check):
     """Cancel blocking PostgreSQL work after a command termination signal."""
 
@@ -274,20 +298,31 @@ def _cancel_on_interrupt(connection, interrupt_check):
     watcher = None
     if interrupt_check is not None:
         def watch() -> None:
-            while not stop.wait(0.05):
-                if not interrupt_check():
-                    continue
-                cancel = getattr(connection, "cancel_safe", None)
-                if not callable(cancel):
-                    cancel = getattr(connection, "cancel", None)
-                if callable(cancel):
-                    try:
-                        cancel()
-                    except Exception:
-                        # The ordinary rebuild path will observe the signal or
-                        # broken session and fail publication closed.
-                        pass
-                return
+            mask = getattr(signal, "pthread_sigmask", None)
+            previous = None
+            if callable(mask):
+                previous = mask(
+                    signal.SIG_BLOCK,
+                    {signal.SIGINT, signal.SIGTERM},
+                )
+            try:
+                while not stop.wait(0.05):
+                    if not interrupt_check():
+                        continue
+                    cancel = getattr(connection, "cancel_safe", None)
+                    if not callable(cancel):
+                        cancel = getattr(connection, "cancel", None)
+                    if callable(cancel):
+                        try:
+                            cancel()
+                        except Exception:
+                            # The ordinary rebuild path will observe the signal or
+                            # broken session and fail publication closed.
+                            pass
+                    return
+            finally:
+                if previous is not None:
+                    mask(signal.SIG_SETMASK, previous)
 
         watcher = threading.Thread(
             target=watch, name="v2-external-db-cancel", daemon=True,
@@ -688,7 +723,13 @@ def rebuild_external_v2(*, database_url: str, workspace_root: Path,
             if publish:
                 publication_store = store or PostgresV2StateStore(database_url)
                 publication = publication_store.insert_with_receipt(
-                    state, receipt, connection=source
+                    state,
+                    receipt,
+                    connection=source,
+                    interrupt_check=interrupt_check,
+                    commit_guard=lambda: _publication_commit_guard(
+                        interrupt_check
+                    ),
                 )
             return ExternalRebuildResult(state, receipt, peak_disk, publication)
         except sqlite3.OperationalError as error:

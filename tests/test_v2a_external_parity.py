@@ -800,6 +800,22 @@ def test_corruption_interruption_disk_full_mismatch_and_cleanup_guard(
     assert workspace.exists()
     link.unlink()
     cleanup_owned_workspace(workspace, root=tmp_path)
+    view = build(tmp_path, 2)
+    workspace = view.workspace
+    view.close()
+    nested = workspace / "nested-mount"
+    nested.mkdir()
+    original_is_mount = Path.is_mount
+    with monkeypatch.context() as mount_patch:
+        mount_patch.setattr(
+            Path,
+            "is_mount",
+            lambda self: self == nested or original_is_mount(self),
+        )
+        with pytest.raises(ValueError, match="mount-crossing"):
+            cleanup_owned_workspace(workspace, root=tmp_path)
+    assert workspace.exists()
+    cleanup_owned_workspace(workspace, root=tmp_path)
     import quant.v9_v2a_external as module
 
     monkeypatch.setattr(

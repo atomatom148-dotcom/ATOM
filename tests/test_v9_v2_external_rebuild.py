@@ -25,6 +25,8 @@ from quant.v9_v2_external_rebuild import (
     _cancel_on_interrupt,
     _cleanup_stale_workspaces,
     _configure_sqlite,
+    _interrupt_signals,
+    _publication_commit_guard,
     _read_pages,
     main,
     rebuild_external_v2,
@@ -266,8 +268,12 @@ def test_interruption_cleans_workspace_and_does_not_publish(tmp_path):
         return checks >= 5
 
     class RejectingStore:
-        def insert_with_receipt(self, _state, _receipt, *, connection):
+        def insert_with_receipt(
+                self, _state, _receipt, *, connection, interrupt_check,
+                commit_guard):
             assert connection is not None
+            assert interrupt_check is interrupted
+            assert callable(commit_guard)
             raise AssertionError("interrupted candidate must not publish")
 
     with pytest.raises(InterruptedError):
@@ -293,9 +299,13 @@ def test_late_interruption_cancels_before_atomic_publication(
         return sealed
 
     class Store:
-        def insert_with_receipt(self, _state, _receipt, *, connection):
+        def insert_with_receipt(
+                self, _state, _receipt, *, connection, interrupt_check,
+                commit_guard):
             nonlocal published
             assert connection is not None
+            assert callable(interrupt_check)
+            assert callable(commit_guard)
             published = True
             return "INSERTED"
 
@@ -310,6 +320,21 @@ def test_late_interruption_cancels_before_atomic_publication(
         )
     assert published is False
     assert not list(tmp_path.glob("atom-v2-external-rebuild-*"))
+
+
+@pytest.mark.skipif(
+    not hasattr(external_rebuild_module.signal, "pthread_sigmask"),
+    reason="POSIX signal masks are unavailable",
+)
+def test_publication_commit_guard_defers_sigterm_until_atomic_boundary():
+    with _interrupt_signals() as interrupted:
+        with _publication_commit_guard(interrupted):
+            external_rebuild_module.os.kill(
+                external_rebuild_module.os.getpid(),
+                external_rebuild_module.signal.SIGTERM,
+            )
+            assert interrupted() is False
+        assert interrupted() is True
 
 
 def test_external_pipeline_builds_all_72_slots_matches_legacy_and_restores_v3(
@@ -449,8 +474,12 @@ def test_external_pipeline_rejects_boolean_state_as_of(tmp_path):
     assert not list(tmp_path.glob("atom-v2-external-rebuild-*"))
 
     class RejectingStore:
-        def insert_with_receipt(self, state, receipt, *, connection):
+        def insert_with_receipt(
+                self, state, receipt, *, connection, interrupt_check,
+                commit_guard):
             assert connection is not None
+            assert interrupt_check is None
+            assert callable(commit_guard)
             assert state.state_id == receipt.state_id
             assert state.evidence_manifest_hash == receipt.evidence_manifest_hash
             raise RuntimeError("synthetic publication failure")
