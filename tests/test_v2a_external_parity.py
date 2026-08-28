@@ -392,6 +392,23 @@ def test_direct_v2c_v2d_cannot_bypass_scope_guard(tmp_path, versions):
     close(valid, tmp_path)
 
 
+def test_direct_v2c_v2d_revalidate_v2a_integrity(tmp_path):
+    view = build(tmp_path, 8)
+    calibration = build_external_v2b(view)
+    covariance = build_external_v2c(view, calibration)
+    view.connection.execute(
+        "UPDATE observations SET payload_hash=? WHERE record_id=1", ("0" * 64,)
+    )
+    view.connection.commit()
+    for operation in (
+        lambda: build_external_v2c(view, calibration),
+        lambda: build_external_v2d(view, calibration, covariance),
+    ):
+        with pytest.raises(ValueError, match="corrupt staged payload"):
+            operation()
+    close(view, tmp_path)
+
+
 @pytest.mark.parametrize(
     "horizon", tuple(horizon for horizon in HORIZON_SECONDS if horizon != "30S")
 )

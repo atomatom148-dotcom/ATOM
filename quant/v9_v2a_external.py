@@ -999,6 +999,7 @@ def build_external_v2c(
     view: ExternalV2AView, calibration: V2BCalibration
 ) -> V2CCovariance:
     _require_phase1b_calibration_scope(view)
+    validate_external_v2a(view)
     n = _family_observation_count(view)
     if not n:
         return V2CCovariance(
@@ -1175,6 +1176,7 @@ def _effective_n_squared(view, mean):
 
 def build_external_v2d(view, calibration, covariance) -> V2EvidenceState:
     _require_phase1b_calibration_scope(view)
+    validate_external_v2a(view)
     cal = calibration.directional[0]
     directional = DirectionalCalibrationState(
         cal.quant_id,
