@@ -1001,22 +1001,41 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
         target_resolved_at=forecasts[0].target_endpoint,
         actual_return_bps=1.0,
     ), created_at=latest_created_at)
+    newer_created_at = latest_created_at + timedelta(seconds=1)
+    newer_unproven_outcome = replace(build_outcome(
+        forecast=forecasts[1],
+        target_identity=canonical_target_identity(forecasts[1]),
+        previous_observation_at=(
+            forecasts[1].target_endpoint - timedelta(seconds=1)),
+        endpoint_observation_at=forecasts[1].target_endpoint,
+        target_resolved_at=forecasts[1].target_endpoint,
+        actual_return_bps=1.0,
+    ), created_at=newer_created_at)
     recovery_row = (
         forecasts[0].symbol, forecasts[0].cutoff_at, forecasts[0].cycle_id,
         forecasts[0].v3_model_version, outcome.outcome_record_hash,
         json.dumps(_canonical(asdict(outcome)), sort_keys=True),
         latest_created_at, tuple(forecast.cohort_id for forecast in forecasts),
-        tuple(forecast.cohort_hash for forecast in forecasts), 2,
+        tuple(forecast.cohort_hash for forecast in forecasts), 4,
+    )
+    newer_unproven_row = (
+        forecasts[0].symbol, forecasts[0].cutoff_at, forecasts[0].cycle_id,
+        forecasts[0].v3_model_version,
+        newer_unproven_outcome.outcome_record_hash,
+        json.dumps(_canonical(asdict(newer_unproven_outcome)), sort_keys=True),
+        newer_created_at, tuple(forecast.cohort_id for forecast in forecasts),
+        tuple(forecast.cohort_hash for forecast in forecasts), 4,
     )
     invalid_newer_row = (
         forecasts[0].symbol, forecasts[0].cutoff_at, forecasts[0].cycle_id,
         forecasts[0].v3_model_version, "b" * 64, "{}",
-        latest_created_at + timedelta(seconds=1),
+        newer_created_at + timedelta(seconds=1),
         tuple(forecast.cohort_id for forecast in forecasts),
-        tuple(forecast.cohort_hash for forecast in forecasts), 2,
+        tuple(forecast.cohort_hash for forecast in forecasts), 4,
     )
     combined_id = "v9v4statecohort:" + canonical_sha256(tuple(
         (forecast.cohort_id, forecast.cohort_hash) for forecast in forecasts))
+    proof_requests = []
 
     class Cursor:
         def execute(self, sql, params):
@@ -1030,12 +1049,18 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
                 assert "f.persisted_at <= f.target_endpoint" in candidate_sql
                 assert "read_forecast_commit_proof" not in candidate_sql
                 assert "f.persisted_at <= f.target_endpoint" not in cycle_sql
-                return (recovery_row, recovery_row, invalid_newer_row)
+                return (
+                    recovery_row, recovery_row, newer_unproven_row,
+                    invalid_newer_row,
+                )
             if "f.horizon IN" in self.sql:
                 return rows
             if "WITH ORDINALITY" in self.sql:
+                requested = tuple(self.params[0])
+                proof_requests.append(requested)
                 forecast = forecasts[0]
-                assert self.params == ([forecast.forecast_record_id],)
+                if forecast.forecast_record_id not in requested:
+                    return ()
                 return ((
                     forecast.forecast_record_id,
                     forecast.forecast_record_id,
@@ -1078,6 +1103,10 @@ def test_runtime_owner_replays_latest_resolved_cohort_after_shutdown():
     )
     worker._submit_recovery_state_build()
 
+    assert proof_requests == [
+        (forecasts[1].forecast_record_id,),
+        (forecasts[0].forecast_record_id,),
+    ]
     assert submitted == [{
         "symbol": "COIN", "state_as_of": NOW + timedelta(minutes=3),
         "cohorts": {forecast.horizon: (forecast.cohort_id, forecast.cohort_hash)
