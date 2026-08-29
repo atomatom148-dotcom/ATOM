@@ -1,9 +1,10 @@
 """One-shot live proof for the frozen read-only Schwab S1 boundary.
 
-The proof is deliberately outside the production quant package. It opens at
-most one streamer connection, keeps normalized snapshots only in memory, emits
-only a value-free receipt, and stops after one fresh NDX/COIN-book pair or a
-short deadline. It has no V9, evidence, UI, database, account, or order path.
+The proof is deliberately outside the production quant runtime graph. It opens
+at most one streamer connection, keeps normalized snapshots only in memory,
+emits only a value-free receipt, and stops after one fresh NDX/COIN-book pair
+or a short deadline. It has no V9, evidence, UI, database, account, or order
+path.
 """
 
 from __future__ import annotations

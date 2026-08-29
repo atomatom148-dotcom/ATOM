@@ -12,7 +12,7 @@ QUANT = ROOT / "quant"
 BUS = QUANT / "schwab_market_bus.py"
 WORKER = QUANT / "schwab_market_worker.py"
 S1_MODULES = (BUS, WORKER)
-S2_PROOF = ROOT / "schwab_s2_live_proof.py"
+S2_PROOF = QUANT / "schwab_s2_live_proof.py"
 SCHWAB_BOUNDARY_MODULES = (*S1_MODULES, S2_PROOF)
 
 EXPECTED_QUANT_EXPORTS = (
@@ -194,7 +194,7 @@ class SchwabMarketAuthorityTests(unittest.TestCase):
 
     def test_no_existing_quant_module_consumes_schwab_s1(self) -> None:
         for path in sorted(QUANT.glob("*.py")):
-            if path in S1_MODULES:
+            if path in SCHWAB_BOUNDARY_MODULES:
                 continue
             with self.subTest(module=path.name):
                 tree = _tree(path)

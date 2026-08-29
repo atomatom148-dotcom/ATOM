@@ -8,7 +8,7 @@ import time
 import unittest
 
 from quant import schwab_market_bus, schwab_market_worker
-import schwab_s2_live_proof as s2
+from quant import schwab_s2_live_proof as s2
 
 
 NOW = 1_700_000_001.0
