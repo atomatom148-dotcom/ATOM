@@ -63,6 +63,7 @@ BEGIN
                   AND f.formula_version=c.formula_version
                   AND f.symbol=c.symbol
                   AND f.horizon=c.horizon
+                  AND f.created_epoch<=extract(epoch FROM p_as_of)
                 ORDER BY f.cutoff_epoch DESC, f.forecast_id DESC
                 LIMIT v_limit + 1
             ) AS f
@@ -104,6 +105,7 @@ BEGIN
                   AND f.formula_version=c.formula_version
                   AND f.symbol=c.symbol
                   AND f.horizon=c.horizon
+                  AND f.created_epoch<=extract(epoch FROM p_as_of)
                 ORDER BY f.cutoff_epoch DESC, f.forecast_id DESC
                 LIMIT v_limit + 1
             ) AS f
