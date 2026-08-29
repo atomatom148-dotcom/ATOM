@@ -91,6 +91,30 @@ forecast summary; the scoring input summary; and a canonical SHA-256 over all
 72 metric objects. The full 72 metrics must also compare field-for-field.
 Floating-point equality is exact; no tolerance or reordering is allowed.
 
+The metric digest bytes are frozen by
+`metric_hash_contract` in the machine-readable baseline bundle:
+
+1. Require exactly the Cartesian order of the listed 12 `quant_order` values
+   followed by the listed six `horizon_order` values (quant outer, horizon
+   inner). Duplicate, missing, extra, or reordered metric objects fail.
+2. Rebuild each object with exactly the listed `field_order`; missing or extra
+   fields fail. `eligible_count` and `resolved_count` are non-boolean JSON
+   integers. `directional_wins` and `directional_losses` are either
+   non-boolean JSON integers or JSON `null`.
+3. `directional_accuracy`, `rmse`, `mae`, and `bias` are either finite
+   IEEE-754 binary64 values or JSON `null`; `coverage` is always a finite
+   binary64 value. NaN and positive or negative infinity fail.
+4. Replace every non-null binary64 value with the lowercase ASCII string
+   returned by Python 3.12 `float.hex()`. Preserve JSON `null` unchanged. This
+   preserves signed zero and exact binary value without decimal ambiguity.
+5. Serialize the 72-object array as UTF-8 JSON with `ensure_ascii=False`,
+   `allow_nan=False`, `sort_keys=False`, separators `(",", ":")`, and no
+   trailing newline. Hash those exact bytes with SHA-256 and encode the digest
+   as lowercase hexadecimal.
+
+The digest is a secondary receipt: promotion also requires all original metric
+fields to compare exactly before float-to-hex transformation.
+
 The baseline ordered-content hashes are SHA-256 over the UTF-8 stored
 `content_sha256` values joined by one LF with no trailing separator. Forecasts
 use `(cutoff_at, quant_id, horizon)` order; outcomes use
@@ -107,6 +131,12 @@ diagnostics only.
 
 The read-only baseline bundle is
 `docs/h2-d2-canary-baselines.json`.
+Its canonical values and the SHA-256 source digests of the current H2-D-1
+orchestrator and all three executed stage modules are pinned by contract tests.
+Source hashing reads UTF-8 text, removes all terminal LF characters, appends
+exactly one LF, and hashes those normalized bytes.
+Changing a digest or stage implementation requires a separately approved freeze
+update; an arbitrary well-formed replacement hash is not accepted.
 
 - `2026-06-15` exercises the legacy certified-manifest resume path with run ID
   `h2a-2026-06-15-persistence-v3`.

@@ -5,6 +5,16 @@
   "capture_mode": "read_only",
   "parallel_runtime_enabled": false,
   "future_canary_worker_limit": 2,
+  "sequential_runtime_source_hash_contract": {
+    "algorithm": "sha256_utf8_source_v1",
+    "terminal_lf_normalization": "strip_all_then_append_one_lf"
+  },
+  "sequential_runtime_source_sha256": {
+    "quant/historical_batch_h2d.py": "a4c9b42829b463c3d919caceea7e0252ad7062bae0d713120c17eeb7ee529683",
+    "quant/historical_replay_h1.py": "0b8958d704973f031096fd541d2306b6d751c81f136470ff08d074874ae0cb10",
+    "quant/historical_evidence_verifier.py": "75bc9690b45b7b6e1278a88c587de3593436cb1ef6f9d5796872cdbf828c9709",
+    "quant/historical_outcomes.py": "89397df5816d9f2a8909d5912ffb9b6820be9341a961222e666c59f7684b6797"
+  },
   "ordered_content_hash_contract": {
     "algorithm": "sha256_utf8_newline_join_v1",
     "row_value": "stored lowercase content_sha256",
@@ -12,6 +22,57 @@
     "trailing_separator": false,
     "forecast_order": ["cutoff_at", "quant_id", "horizon"],
     "outcome_order": ["cutoff_at", "horizon"]
+  },
+  "metric_hash_contract": {
+    "algorithm": "sha256_utf8_metric_array_v1",
+    "quant_order": [
+      "q1_momentum",
+      "q2_mean_reversion",
+      "q3_volatility",
+      "q4_stat_arb",
+      "q5_microstructure",
+      "q6_volume_liquidity",
+      "q7_relative_value",
+      "q8_cross_asset",
+      "q9_factor",
+      "q10_options_vol",
+      "q11_regime",
+      "q12_event_session"
+    ],
+    "horizon_order": ["30S", "1M", "5M", "15M", "30M", "1H"],
+    "field_order": [
+      "quant_id",
+      "horizon",
+      "eligible_count",
+      "resolved_count",
+      "directional_wins",
+      "directional_losses",
+      "directional_accuracy",
+      "rmse",
+      "mae",
+      "bias",
+      "coverage"
+    ],
+    "integer_fields": ["eligible_count", "resolved_count"],
+    "nullable_integer_fields": ["directional_wins", "directional_losses"],
+    "nullable_float_fields": [
+      "directional_accuracy",
+      "rmse",
+      "mae",
+      "bias"
+    ],
+    "required_float_fields": ["coverage"],
+    "float_encoding": "finite_ieee754_binary64_python_float_hex_string",
+    "null_encoding": "json_null",
+    "json_encoding": {
+      "ensure_ascii": false,
+      "allow_nan": false,
+      "sort_keys": false,
+      "item_separator": ",",
+      "key_separator": ":",
+      "trailing_newline": false
+    },
+    "digest_encoding": "lowercase_hex"
   },
   "sessions": [
     {
