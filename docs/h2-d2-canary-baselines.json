@@ -45,8 +45,21 @@
     "row_value": "stored lowercase content_sha256",
     "separator": "\n",
     "trailing_separator": false,
+    "key_component_order": {
+      "cutoff_at": "ascending_utc_instant",
+      "quant_id": "ascending_unsigned_utf8_bytes",
+      "horizon": "ascending_unsigned_utf8_bytes"
+    },
+    "database_collation": "forbidden",
     "forecast_order": ["cutoff_at", "quant_id", "horizon"],
-    "outcome_order": ["cutoff_at", "horizon"]
+    "outcome_order": ["cutoff_at", "horizon"],
+    "bytewise_order_examples": {
+      "quant_id": [
+        "q1", "q10", "q11", "q12", "q2", "q3",
+        "q4", "q5", "q6", "q7", "q8", "q9"
+      ],
+      "horizon": ["15M", "1H", "1M", "30M", "30S", "5M"]
+    }
   },
   "metric_hash_contract": {
     "algorithm": "sha256_utf8_metric_array_v1",
