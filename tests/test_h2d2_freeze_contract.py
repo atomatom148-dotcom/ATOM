@@ -48,6 +48,7 @@ KNOWN_CONCURRENCY_IMPORT_NAMES = {
 KNOWN_CONCURRENCY_FULL_IMPORT_NAMES = {
     "faulthandler.dump_traceback_later",
     "logging.config.listen",
+    "pydoc.browse",
     "pydoc._start_server",
 }
 FORBIDDEN_STAGE_IMPORT_ROOTS = SENSITIVE_MODULE_ROOTS - {
@@ -477,6 +478,348 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         return tuple(loads)
 
     module_binding_events = lexical_binding_events(tree)
+    integrity_import_parents, resolve_integrity_import = lexical_import_origins(
+        tree
+    )
+
+    def is_module_binding_scope(node: ast.AST) -> bool:
+        parent = integrity_import_parents.get(node)
+        while parent is not None and parent is not tree:
+            if isinstance(parent, (
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.DictComp,
+                ast.FunctionDef,
+                ast.GeneratorExp,
+                ast.Lambda,
+                ast.ListComp,
+                ast.SetComp,
+            )):
+                return False
+            parent = integrity_import_parents.get(parent)
+        return parent is tree
+
+    def assigned_expression(target: ast.Name) -> ast.AST | None:
+        current: ast.AST = target
+        path = []
+        parent = integrity_import_parents.get(current)
+        while isinstance(parent, (ast.List, ast.Tuple)):
+            path.append(parent.elts.index(current))
+            current = parent
+            parent = integrity_import_parents.get(current)
+        if isinstance(parent, ast.Starred):
+            return None
+        value = None
+        if isinstance(parent, ast.Assign) and current in parent.targets:
+            value = parent.value
+        elif isinstance(parent, (ast.AnnAssign, ast.NamedExpr)):
+            if parent.target is current:
+                value = parent.value
+        for index in reversed(path):
+            if not isinstance(value, (ast.List, ast.Tuple)):
+                return None
+            if index >= len(value.elts):
+                return None
+            value = value.elts[index]
+        return value
+
+    def module_alias_is_json(
+            name: str,
+            reference: ast.AST,
+            before: tuple[int, int],
+            seen: frozenset[tuple[str, tuple[int, int]]] = frozenset(),
+    ) -> bool:
+        marker = (name, before)
+        if marker in seen:
+            return False
+        seen = seen | {marker}
+        module_body = tree.body
+
+        def definitely_precedes(node: ast.AST) -> bool:
+            event_owner = node
+            while (
+                not isinstance(event_owner, ast.stmt)
+                and integrity_import_parents.get(event_owner) is not None
+            ):
+                event_owner = integrity_import_parents[event_owner]
+            event_child = node
+            while (
+                integrity_import_parents.get(event_child) is not tree
+                and integrity_import_parents.get(event_child) is not None
+            ):
+                event_child = integrity_import_parents[event_child]
+            reference_child = reference
+            while (
+                integrity_import_parents.get(reference_child) is not tree
+                and integrity_import_parents.get(reference_child) is not None
+            ):
+                reference_child = integrity_import_parents[reference_child]
+            return (
+                event_child is event_owner
+                and
+                not isinstance(event_owner, ast.AugAssign)
+                and
+                event_child in module_body
+                and reference_child in module_body
+                and module_body.index(event_child) < module_body.index(reference_child)
+            )
+
+        events = []
+        for node in ast.walk(tree):
+            position = (
+                getattr(node, "lineno", -1),
+                getattr(node, "col_offset", -1),
+            )
+            if position >= before or not is_module_binding_scope(node):
+                continue
+            if (
+                isinstance(node, ast.Name)
+                and node.id == name
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and definitely_precedes(node)
+            ):
+                events.append((position, node))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if (alias.asname or alias.name.split(".", 1)[0]) == name:
+                        if definitely_precedes(alias):
+                            events.append((position, alias))
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if (alias.asname or alias.name) == name:
+                        if definitely_precedes(alias):
+                            events.append((position, alias))
+            elif isinstance(node, (
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.FunctionDef,
+            )) and node.name == name and definitely_precedes(node):
+                events.append((position, node))
+        if not events:
+            return False
+        position, event = max(events, key=lambda item: item[0])
+        if isinstance(event, ast.alias):
+            return event.name == "json"
+        if not isinstance(event, ast.Name) or isinstance(event.ctx, ast.Del):
+            return False
+        value = assigned_expression(event)
+        if isinstance(value, ast.Name):
+            return module_alias_is_json(value.id, event, position, seen)
+        return False
+
+    lexical_scope_types = (
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.DictComp,
+        ast.FunctionDef,
+        ast.GeneratorExp,
+        ast.Lambda,
+        ast.ListComp,
+        ast.SetComp,
+    )
+
+    def lexical_scope(node: ast.AST) -> ast.AST:
+        parent = integrity_import_parents.get(node)
+        while parent is not None and parent is not tree:
+            if isinstance(parent, lexical_scope_types):
+                return parent
+            parent = integrity_import_parents.get(parent)
+        return tree
+
+    def outer_lexical_scope(scope: ast.AST) -> ast.AST:
+        if scope is tree:
+            return tree
+        parent = integrity_import_parents.get(scope)
+        while parent is not None and parent is not tree:
+            if isinstance(parent, lexical_scope_types):
+                if (
+                    isinstance(scope, (
+                        ast.AsyncFunctionDef,
+                        ast.FunctionDef,
+                        ast.Lambda,
+                    ))
+                    and isinstance(parent, ast.ClassDef)
+                ):
+                    parent = integrity_import_parents.get(parent)
+                    continue
+                return parent
+            parent = integrity_import_parents.get(parent)
+        return tree
+
+    def lexical_alias_is_json(
+            name: str,
+            scope: ast.AST,
+            reference: ast.AST,
+            before: tuple[int, int],
+            seen: frozenset[
+                tuple[str, int, tuple[int, int]]
+        ] = frozenset(),
+    ) -> bool:
+        if scope is tree:
+            return module_alias_is_json(name, reference, before)
+        marker = (name, id(scope), before)
+        if marker in seen:
+            return False
+        seen = seen | {marker}
+        direct_nodes = tuple(
+            node for node in ast.walk(scope)
+            if lexical_scope(node) is scope
+        )
+        if any(
+            isinstance(node, ast.Global) and name in node.names
+            for node in direct_nodes
+        ):
+            return module_alias_is_json(name, reference, before)
+        if any(
+            isinstance(node, ast.Nonlocal) and name in node.names
+            for node in direct_nodes
+        ):
+            return lexical_alias_is_json(
+                name,
+                outer_lexical_scope(scope),
+                reference,
+                before,
+                seen,
+            )
+        scope_body = scope.body if isinstance(scope.body, list) else []
+
+        def definitely_precedes(node: ast.AST) -> bool:
+            event_owner = node
+            while (
+                not isinstance(event_owner, ast.stmt)
+                and integrity_import_parents.get(event_owner) is not None
+            ):
+                event_owner = integrity_import_parents[event_owner]
+            event_child = node
+            while (
+                integrity_import_parents.get(event_child) is not scope
+                and integrity_import_parents.get(event_child) is not None
+            ):
+                event_child = integrity_import_parents[event_child]
+            reference_child = reference
+            while (
+                integrity_import_parents.get(reference_child) is not scope
+                and integrity_import_parents.get(reference_child) is not None
+            ):
+                reference_child = integrity_import_parents[reference_child]
+            return (
+                event_child is event_owner
+                and
+                not isinstance(event_owner, ast.AugAssign)
+                and
+                event_child in scope_body
+                and reference_child in scope_body
+                and scope_body.index(event_child) < scope_body.index(reference_child)
+            )
+
+        events = []
+        for node in direct_nodes:
+            position = (
+                getattr(node, "lineno", -1),
+                getattr(node, "col_offset", -1),
+            )
+            if (
+                isinstance(node, ast.Name)
+                and node.id == name
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and definitely_precedes(node)
+            ):
+                events.append((position, node))
+            elif isinstance(node, ast.arg) and node.arg == name:
+                events.append((position, node))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if (alias.asname or alias.name.split(".", 1)[0]) == name:
+                        if definitely_precedes(alias):
+                            events.append((position, alias))
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if (alias.asname or alias.name) == name:
+                        if definitely_precedes(alias):
+                            events.append((position, alias))
+            elif (
+                node is not scope
+                and isinstance(node, (
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                    ast.FunctionDef,
+                ))
+                and node.name == name
+                and definitely_precedes(node)
+            ):
+                events.append((position, node))
+        if not events:
+            return lexical_alias_is_json(
+                name,
+                outer_lexical_scope(scope),
+                reference,
+                before,
+                seen,
+            )
+        prior_events = [event for event in events if event[0] < before]
+        if not prior_events:
+            return False
+        position, event = max(prior_events, key=lambda item: item[0])
+        if isinstance(event, ast.alias):
+            return event.name == "json"
+        if isinstance(event, ast.arg):
+            positional = scope.args.posonlyargs + scope.args.args
+            defaults = {
+                argument.arg: default
+                for argument, default in zip(
+                    positional[-len(scope.args.defaults):],
+                    scope.args.defaults,
+                )
+            } if scope.args.defaults else {}
+            defaults.update(
+                (argument.arg, default)
+                for argument, default in zip(
+                    scope.args.kwonlyargs,
+                    scope.args.kw_defaults,
+                )
+                if default is not None
+            )
+            default = defaults.get(event.arg)
+            return (
+                isinstance(default, ast.Name)
+                and lexical_alias_is_json(
+                    default.id,
+                    outer_lexical_scope(scope),
+                    scope,
+                    (scope.lineno, scope.col_offset),
+                    seen,
+                )
+            )
+        if not isinstance(event, ast.Name) or isinstance(event.ctx, ast.Del):
+            return False
+        value = assigned_expression(event)
+        if isinstance(value, ast.Name):
+            return lexical_alias_is_json(
+                value.id,
+                scope,
+                event,
+                position,
+                seen,
+            )
+        return False
+
+    def canonical_json_receiver(node: ast.Name) -> bool:
+        return lexical_alias_is_json(
+            node.id,
+            lexical_scope(node),
+            node,
+            (node.lineno, node.col_offset),
+        )
+
+    json_dumps_mutations = tuple(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        and node.attr == "dumps"
+        and isinstance(node.value, ast.Name)
+        and canonical_json_receiver(node.value)
+    )
 
     top_level_execute = [
         node for node in tree.body
@@ -990,6 +1333,7 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         canonical_json_alias is None
         or module_binding_events.get("json", ()) != (canonical_json_alias,)
         or module_binding_events.get("print", ())
+        or json_dumps_mutations
         or main_binding_events.get("json", ())
         or main_binding_events.get("print", ())
         or any(
@@ -1327,6 +1671,267 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
             contains_reachable_terminator(child)
             for child in ast.iter_child_nodes(node)
         )
+
+    def evaluated_in_execute(node: ast.AST) -> bool:
+        original = node
+        child = node
+        parent = execute_parents.get(child)
+        while parent is not None and parent is not execute_function:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if child in parent.body:
+                    return False
+                if annotations_are_deferred:
+                    annotation_roots = [
+                        argument.annotation
+                        for argument in (
+                            *parent.args.posonlyargs,
+                            *parent.args.args,
+                            *parent.args.kwonlyargs,
+                        )
+                        if argument.annotation is not None
+                    ]
+                    annotation_roots.extend(
+                        argument.annotation
+                        for argument in (parent.args.vararg, parent.args.kwarg)
+                        if argument is not None
+                        and argument.annotation is not None
+                    )
+                    if parent.returns is not None:
+                        annotation_roots.append(parent.returns)
+                    if any(
+                        original is root
+                        or is_descendant_of(original, root)
+                        for root in annotation_roots
+                    ):
+                        return False
+            elif isinstance(parent, ast.Lambda) and child is parent.body:
+                return False
+            child = parent
+            parent = execute_parents.get(child)
+        return parent is execute_function
+
+    def is_descendant_of(node: ast.AST, ancestor: ast.AST) -> bool:
+        parent = execute_parents.get(node)
+        while parent is not None:
+            if parent is ancestor:
+                return True
+            parent = execute_parents.get(parent)
+        return False
+
+    def nearest_enclosing_loop(node: ast.AST) -> ast.AST | None:
+        parent = execute_parents.get(node)
+        while parent is not None and parent is not execute_function:
+            if isinstance(parent, (ast.For, ast.AsyncFor, ast.While)):
+                return parent
+            parent = execute_parents.get(parent)
+        return None
+
+    def execute_exit_callable(
+            expression: ast.AST,
+            reference: ast.AST,
+            before: tuple[int, int],
+            seen: frozenset[str] = frozenset(),
+    ) -> bool:
+        if isinstance(expression, ast.Name):
+            if expression.id in {"exit", "quit"}:
+                return True
+            if expression.id in seen:
+                return False
+            candidates = []
+            for node in direct_lexical_nodes(execute_function):
+                if (
+                    execute_function is None
+                    or not isinstance(node, ast.Name)
+                    or node.id != expression.id
+                    or not isinstance(node.ctx, (ast.Store, ast.Del))
+                    or not hasattr(node, "lineno")
+                    or (node.lineno, node.col_offset) >= before
+                ):
+                    continue
+                owner: ast.AST = node
+                while (
+                    not isinstance(owner, ast.stmt)
+                    and execute_parents.get(owner) is not None
+                ):
+                    owner = execute_parents[owner]
+                owner_parent = execute_parents.get(owner)
+                definitely_dominates = False
+                if isinstance(owner, (ast.Assign, ast.AnnAssign, ast.Expr)):
+                    for field_name in ("body", "orelse", "finalbody"):
+                        block = getattr(owner_parent, field_name, None)
+                        if not isinstance(block, list) or owner not in block:
+                            continue
+                        reference_child = reference
+                        while (
+                            execute_parents.get(reference_child) is not owner_parent
+                            and execute_parents.get(reference_child) is not None
+                        ):
+                            reference_child = execute_parents[reference_child]
+                        if (
+                            reference_child in block
+                            and block.index(owner) < block.index(reference_child)
+                        ):
+                            definitely_dominates = True
+                            break
+                candidates.append((
+                    (node.lineno, node.col_offset),
+                    node,
+                    definitely_dominates,
+                ))
+            if not candidates:
+                return False
+            definite = [event for event in candidates if event[2]]
+            latest_definite = (
+                max(definite, key=lambda event: event[0])
+                if definite
+                else None
+            )
+            definite_position = latest_definite[0] if latest_definite else (-1, -1)
+
+            def event_is_exit(event: tuple[tuple[int, int], ast.Name, bool]) -> bool:
+                position, target, _ = event
+                value = assigned_expression(target)
+                return (
+                    value is not None
+                    and execute_exit_callable(
+                        value,
+                        target,
+                        position,
+                        seen | {expression.id},
+                    )
+                )
+
+            if latest_definite is not None and event_is_exit(latest_definite):
+                return True
+            return any(
+                position > definite_position
+                and not dominates
+                and event_is_exit(event)
+                for event in candidates
+                for position, _, dominates in (event,)
+            )
+        if not isinstance(expression, ast.Attribute):
+            return False
+        return (
+            expression.attr == "exit"
+            or (
+                expression.attr == "_exit"
+                and isinstance(expression.value, ast.Name)
+                and expression.value.id == "os"
+            )
+        )
+
+    def is_execute_exit_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and execute_exit_callable(
+                node.func,
+                node.func,
+                (node.lineno, node.col_offset),
+            )
+        )
+
+    weekend_test_dump = ast.dump(
+        ast.parse("day.weekday() >= 5", mode="eval").body,
+        include_attributes=False,
+    )
+    conflict_test_dump = ast.dump(
+        ast.parse("len(manifests) > 1", mode="eval").body,
+        include_attributes=False,
+    )
+    conflict_raise_dump = ast.dump(
+        ast.parse(
+            "raise StageFailure('EXISTING', 'CONFLICTING_SESSION_RUNS')"
+        ).body[0].exc,
+        include_attributes=False,
+    )
+
+    def is_canonical_pre_dispatch_terminator(node: ast.AST) -> bool:
+        parent = execute_parents.get(node)
+        if not isinstance(parent, ast.If) or node not in parent.body:
+            return False
+        if isinstance(node, ast.Continue):
+            return (
+                nearest_enclosing_loop(node) is day_loop
+                and parent.body[-1] is node
+                and ast.dump(parent.test, include_attributes=False)
+                == weekend_test_dump
+            )
+        return (
+            isinstance(node, ast.Raise)
+            and parent.body == [node]
+            and node.cause is None
+            and node.exc is not None
+            and ast.dump(parent.test, include_attributes=False)
+            == conflict_test_dump
+            and ast.dump(node.exc, include_attributes=False)
+            == conflict_raise_dump
+        )
+
+    execute_dispatches = (
+        tuple(
+            node
+            for node in ast.walk(day_loop)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and isinstance(node.func.ctx, ast.Load)
+            and node.func.id == "run_json"
+            and evaluated_in_execute(node)
+        )
+        if day_loop is not None
+        else ()
+    )
+    first_execute_dispatch = min(
+        execute_dispatches,
+        key=lambda node: (node.lineno, node.col_offset),
+        default=None,
+    )
+    if execute_function is not None and day_loop is not None:
+        day_loop_start = (day_loop.lineno, day_loop.col_offset)
+        dispatch_start = (
+            (first_execute_dispatch.lineno, first_execute_dispatch.col_offset)
+            if first_execute_dispatch is not None
+            else None
+        )
+        prefix_nodes = tuple(
+            node
+            for node in ast.walk(execute_function)
+            if node is not execute_function
+            and evaluated_in_execute(node)
+            and hasattr(node, "lineno")
+            and (
+                (node.lineno, getattr(node, "col_offset", 0)) < day_loop_start
+                or (
+                    dispatch_start is not None
+                    and is_descendant_of(node, day_loop)
+                    and (node.lineno, getattr(node, "col_offset", 0))
+                    < dispatch_start
+                )
+            )
+        )
+        unexpected_prefix_terminators = tuple(
+            node
+            for node in prefix_nodes
+            if (
+                isinstance(node, (
+                    ast.Assert,
+                    ast.Break,
+                    ast.Continue,
+                    ast.Raise,
+                    ast.Return,
+                    ast.Yield,
+                    ast.YieldFrom,
+                ))
+                or is_execute_exit_call(node)
+            )
+            and not (
+                isinstance(node, (ast.Break, ast.Continue))
+                and nearest_enclosing_loop(node) is not day_loop
+            )
+            and not is_canonical_pre_dispatch_terminator(node)
+        )
+        if first_execute_dispatch is None or unexpected_prefix_terminators:
+            record("execute-pre-dispatch-termination")
 
     if main_function is not None and pinned_execute_assignment is not None:
         execute_index = main_function.body.index(pinned_execute_assignment)
@@ -1777,8 +2382,10 @@ def sensitive_module_reexports(
         include_from_imports=True,
         propagate_aliases=True,
         fallback_origins={
+            "aiter": "builtins.aiter",
             "classmethod": "builtins.classmethod",
             "filter": "builtins.filter",
+            "iter": "builtins.iter",
             "map": "builtins.map",
             "max": "builtins.max",
             "min": "builtins.min",
@@ -1848,6 +2455,8 @@ def sensitive_module_reexports(
         for local_callable in callable_nodes
     }
     tracked_return_callables: set[ast.AST] = set()
+    tracked_yield_callables: set[ast.AST] = set()
+    safely_overwritten_loop_targets: dict[ast.AST, set[str]] = {}
 
     def target_names(node: ast.AST) -> set[str]:
         if isinstance(node, ast.Name):
@@ -2419,7 +3028,90 @@ def sensitive_module_reexports(
             node: ast.AST,
             scope: ast.AST | None = None,
     ) -> bool:
+        def is_safely_overwritten_in_loop(item: ast.Name) -> bool:
+            child: ast.AST = item
+            parent = parents.get(child)
+            while parent is not None:
+                if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    return False
+                if isinstance(parent, (ast.For, ast.AsyncFor)):
+                    if child in parent.body:
+                        target_position = (
+                            parent.target.lineno,
+                            parent.target.col_offset,
+                        )
+                        item_position = (item.lineno, item.col_offset)
+                        target_nodes = set(ast.walk(parent.target))
+                        containing_statement: ast.AST = item
+                        while (
+                            parents.get(containing_statement) is not parent
+                            and parents.get(containing_statement) is not None
+                        ):
+                            containing_statement = parents[containing_statement]
+                        preceding_statements = (
+                            parent.body[:parent.body.index(containing_statement)]
+                            if containing_statement in parent.body
+                            else ()
+                        )
+                        latest_direct_write: tuple[tuple[int, int], ast.AST | None] | None = None
+                        for statement in preceding_statements:
+                            write_value: ast.AST | None = None
+                            writes_name = False
+                            if isinstance(statement, ast.Assign):
+                                writes_name = any(
+                                    item.id in target_names(target)
+                                    for target in statement.targets
+                                )
+                                write_value = statement.value
+                            elif isinstance(statement, ast.AnnAssign):
+                                writes_name = item.id in target_names(statement.target)
+                                write_value = statement.value
+                            elif isinstance(statement, ast.AugAssign):
+                                writes_name = item.id in target_names(statement.target)
+                            elif isinstance(statement, ast.Delete):
+                                writes_name = any(
+                                    item.id in target_names(target)
+                                    for target in statement.targets
+                                )
+                            if writes_name:
+                                latest_direct_write = (
+                                    (statement.lineno, statement.col_offset),
+                                    write_value,
+                                )
+                        if latest_direct_write is not None:
+                            _, write_value = latest_direct_write
+                            return (
+                                write_value is not None
+                                and not contains_assignment_tracked_binding(
+                                    write_value,
+                                    scope,
+                                )
+                            )
+                        if item.id not in safely_overwritten_loop_targets.get(
+                            parent,
+                            set(),
+                        ):
+                            return False
+                        intervening_write = any(
+                            isinstance(candidate, ast.Name)
+                            and candidate not in target_nodes
+                            and candidate.id == item.id
+                            and isinstance(candidate.ctx, (ast.Store, ast.Del))
+                            and target_position
+                            < (candidate.lineno, candidate.col_offset)
+                            < item_position
+                            and enclosing_callable(candidate) is scope
+                            for candidate in ast.walk(parent)
+                        )
+                        return not intervening_write
+                    return False
+                child = parent
+                parent = parents.get(child)
+            return False
+
         def is_tracked_name(item: ast.Name) -> bool:
+            if is_safely_overwritten_in_loop(item):
+                return False
             item_scope = scope
             while item_scope is not None:
                 if item.id in scope_global_names[item_scope]:
@@ -2576,6 +3268,38 @@ def sensitive_module_reexports(
             return resolve_literal_sequence_name(node.id, scope)
         if isinstance(node, (ast.List, ast.Tuple)):
             return {tuple(node.elts)}
+        if (
+            isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp))
+            and len(node.generators) == 1
+            and not node.generators[0].ifs
+            and isinstance(node.generators[0].target, ast.Name)
+        ):
+            source_variants = resolve_literal_sequences(
+                node.generators[0].iter,
+                scope,
+            )
+            if (
+                isinstance(node.elt, ast.Name)
+                and node.elt.id == node.generators[0].target.id
+            ):
+                return source_variants
+            if not any(
+                isinstance(item, ast.Name)
+                and isinstance(item.ctx, ast.Load)
+                and item.id == node.generators[0].target.id
+                for item in ast.walk(node.elt)
+            ):
+                return {
+                    tuple(node.elt for _ in source)
+                    for source in source_variants
+                }
+        if (
+            isinstance(node, ast.Call)
+            and "builtins.iter" in import_origin_names(node.func)
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            return resolve_literal_sequences(node.args[0], scope)
         if isinstance(node, ast.NamedExpr):
             return resolve_literal_sequences(node.value, scope)
         if isinstance(node, ast.IfExp):
@@ -2764,6 +3488,8 @@ def sensitive_module_reexports(
             return "max"
         if "functools.reduce" in origins:
             return "reduce"
+        if "itertools.starmap" in origins:
+            return "starmap"
         if (
             isinstance(call.func, ast.Attribute)
             and call.func.attr == "sort"
@@ -2776,6 +3502,7 @@ def sensitive_module_reexports(
         return None
 
     forced_higher_order_findings: set[ast.Call] = set()
+    forced_iterable_findings: set[ast.AST] = set()
 
     def taint_higher_order_callback(
             callback_expressions: set[ast.AST],
@@ -2813,6 +3540,450 @@ def sensitive_module_reexports(
 
     def is_definitely_none_callback(node: ast.AST) -> bool:
         return isinstance(node, ast.Constant) and node.value is None
+
+    def own_yield_nodes(
+            local_callable: ast.AST,
+    ) -> tuple[ast.Yield | ast.YieldFrom, ...]:
+        return tuple(
+            node
+            for node in ast.walk(local_callable)
+            if isinstance(node, (ast.Yield, ast.YieldFrom))
+            and enclosing_callable(node) is local_callable
+        )
+
+    def assigned_value_for_name(
+            target: ast.AST,
+            value: ast.AST,
+            name: str,
+    ) -> ast.AST | None:
+        if isinstance(target, ast.Name):
+            return value if target.id == name else None
+        if isinstance(target, ast.Starred):
+            return assigned_value_for_name(target.value, value, name)
+        if not isinstance(target, (ast.List, ast.Tuple)):
+            return None
+        if not isinstance(value, (ast.List, ast.Tuple)):
+            return None
+        starred_indexes = [
+            index
+            for index, item in enumerate(target.elts)
+            if isinstance(item, ast.Starred)
+        ]
+        aligned = []
+        if not starred_indexes:
+            if len(target.elts) != len(value.elts):
+                return None
+            aligned = list(zip(target.elts, value.elts))
+        elif len(starred_indexes) == 1:
+            star_index = starred_indexes[0]
+            suffix_length = len(target.elts) - star_index - 1
+            if len(value.elts) < star_index + suffix_length:
+                return None
+            aligned.extend(
+                (target.elts[index], value.elts[index])
+                for index in range(star_index)
+            )
+            middle_end = len(value.elts) - suffix_length
+            aligned.append((
+                target.elts[star_index],
+                ast.List(
+                    elts=list(value.elts[star_index:middle_end]),
+                    ctx=ast.Load(),
+                ),
+            ))
+            aligned.extend(
+                (
+                    target.elts[star_index + 1 + index],
+                    value.elts[middle_end + index],
+                )
+                for index in range(suffix_length)
+            )
+        else:
+            return None
+        for target_item, value_item in reversed(aligned):
+            assigned = assigned_value_for_name(target_item, value_item, name)
+            if assigned is not None:
+                return assigned
+        return None
+
+    def latest_iterable_alias_value(
+            node: ast.Name,
+            scope: ast.AST | None,
+    ) -> tuple[ast.AST, ast.AST | None] | None:
+        lookup_scope = scope
+        while True:
+            if lookup_scope is not None and node.id in scope_global_names[lookup_scope]:
+                lookup_scope = None
+            elif (
+                lookup_scope is not None
+                and node.id in scope_nonlocal_names[lookup_scope]
+            ):
+                lookup_scope = callable_parents[lookup_scope]
+                continue
+            if node.id in scope_bound_names[lookup_scope]:
+                break
+            if lookup_scope is None:
+                return None
+            lookup_scope = callable_parents[lookup_scope]
+
+        before = (node.lineno, node.col_offset)
+        candidates = []
+        for event_scope, targets, value in alias_assignments:
+            if event_scope is not lookup_scope:
+                continue
+            assigned = next((
+                result
+                for target in targets
+                for result in (assigned_value_for_name(target, value, node.id),)
+                if result is not None
+            ), None)
+            if assigned is None or not hasattr(assigned, "lineno"):
+                continue
+            position = (assigned.lineno, assigned.col_offset)
+            if position < before:
+                candidates.append((position, assigned))
+        if not candidates:
+            return None
+        _, assigned = max(candidates, key=lambda item: item[0])
+        return assigned, lookup_scope
+
+    def is_lexical_builtin_expression(
+            expression: ast.AST,
+            scope: ast.AST | None,
+            builtin_name: str,
+            seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> bool:
+        if not isinstance(expression, ast.Name):
+            return False
+        marker = (scope, expression.id)
+        if marker in seen:
+            return False
+        latest_alias = latest_iterable_alias_value(expression, scope)
+        if latest_alias is not None:
+            assigned, assigned_scope = latest_alias
+            return is_lexical_builtin_expression(
+                assigned,
+                assigned_scope,
+                builtin_name,
+                seen | {marker},
+            )
+        lookup_scope = scope
+        while lookup_scope is not None:
+            if expression.id in scope_global_names[lookup_scope]:
+                lookup_scope = None
+                break
+            if expression.id in scope_nonlocal_names[lookup_scope]:
+                lookup_scope = callable_parents[lookup_scope]
+                continue
+            if expression.id in scope_bound_names[lookup_scope]:
+                return False
+            lookup_scope = callable_parents[lookup_scope]
+        return (
+            expression.id == builtin_name
+            and expression.id not in scope_bound_names[None]
+        )
+
+    def iterable_rows(
+            iterable: ast.AST,
+            scope: ast.AST | None,
+            seen_aliases: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> tuple[tuple[tuple[ast.AST, ast.AST | None], ...], bool]:
+        if isinstance(iterable, ast.Name):
+            alias_key = (scope, iterable.id)
+            if alias_key not in seen_aliases:
+                latest_alias = latest_iterable_alias_value(iterable, scope)
+                if latest_alias is not None:
+                    assigned, assigned_scope = latest_alias
+                    return iterable_rows(
+                        assigned,
+                        assigned_scope,
+                        seen_aliases | {alias_key},
+                    )
+        if (
+            isinstance(iterable, ast.Call)
+            and len(iterable.args) == 1
+            and not iterable.keywords
+        ):
+            wrapper_names = {
+                "iter": "builtins.iter",
+                "aiter": "builtins.aiter",
+            }
+            for wrapper_name, wrapper_origin in wrapper_names.items():
+                if is_lexical_builtin_expression(
+                    iterable.func,
+                    scope,
+                    wrapper_name,
+                ):
+                    return iterable_rows(
+                        iterable.args[0],
+                        scope,
+                        seen_aliases,
+                    )
+                if wrapper_origin in import_origin_names(iterable.func):
+                    return (), False
+        if isinstance(iterable, ast.Set):
+            return tuple((item, scope) for item in iterable.elts), False
+        if (
+            isinstance(iterable, (ast.GeneratorExp, ast.ListComp, ast.SetComp))
+            and len(iterable.generators) == 1
+            and not iterable.generators[0].ifs
+            and isinstance(iterable.generators[0].target, ast.Name)
+        ):
+            generator = iterable.generators[0]
+            source_rows, source_unknown = iterable_rows(
+                generator.iter,
+                scope,
+                seen_aliases,
+            )
+            if (
+                isinstance(iterable.elt, ast.Name)
+                and iterable.elt.id == generator.target.id
+            ):
+                return source_rows, source_unknown
+            target_is_loaded = any(
+                isinstance(item, ast.Name)
+                and isinstance(item.ctx, ast.Load)
+                and item.id == generator.target.id
+                for item in ast.walk(iterable.elt)
+            )
+            if not target_is_loaded:
+                return (
+                    tuple((iterable.elt, scope) for _ in source_rows),
+                    False,
+                )
+        literal_variants = resolve_literal_sequences(iterable, scope)
+        if literal_variants:
+            return (
+                tuple(
+                    (row, scope)
+                    for variant in literal_variants
+                    for row in variant
+                ),
+                False,
+            )
+        if isinstance(iterable, ast.Dict):
+            return tuple(
+                (key, scope) for key in iterable.keys if key is not None
+            ), False
+        if not isinstance(iterable, ast.Call):
+            return (), False
+        rows = []
+        unknown_tracked_shape = False
+        for local_callable, _ in local_call_targets(iterable):
+            yields = own_yield_nodes(local_callable)
+            if yields:
+                for yielded in yields:
+                    value = yielded.value
+                    if value is None:
+                        continue
+                    if isinstance(yielded, ast.Yield):
+                        rows.append((value, local_callable))
+                        continue
+                    variants = resolve_literal_sequences(value, local_callable)
+                    if variants:
+                        rows.extend(
+                            (row, local_callable)
+                            for variant in variants
+                            for row in variant
+                        )
+                    elif contains_assignment_tracked_binding(
+                        value,
+                        local_callable,
+                    ):
+                        unknown_tracked_shape = True
+                continue
+            returned_values = tuple(
+                node.value
+                for node in ast.walk(local_callable)
+                if isinstance(node, ast.Return)
+                and node.value is not None
+                and enclosing_callable(node) is local_callable
+            )
+            for value in returned_values:
+                variants = resolve_literal_sequences(value, local_callable)
+                if variants:
+                    rows.extend(
+                        (row, local_callable)
+                        for variant in variants
+                        for row in variant
+                    )
+                elif contains_assignment_tracked_binding(
+                    value,
+                    local_callable,
+                ):
+                    unknown_tracked_shape = True
+        if not rows and any(
+            local_callable in tracked_return_callables
+            or local_callable in tracked_yield_callables
+            for local_callable, _ in local_call_targets(iterable)
+        ):
+            unknown_tracked_shape = True
+        return tuple(rows), unknown_tracked_shape
+
+    def tracked_loop_targets(
+            target: ast.AST,
+            yielded_value: ast.AST,
+            scope: ast.AST | None,
+    ) -> tuple[set[str], bool]:
+        if isinstance(target, ast.Starred):
+            return tracked_loop_targets(target.value, yielded_value, scope)
+        if isinstance(target, ast.Name):
+            return (
+                ({target.id}, False)
+                if contains_assignment_tracked_binding(yielded_value, scope)
+                else (set(), False)
+            )
+        if isinstance(target, (ast.Attribute, ast.Subscript)):
+            return set(), contains_assignment_tracked_binding(
+                yielded_value,
+                scope,
+            )
+        if not isinstance(target, (ast.List, ast.Tuple)):
+            return set(), False
+        value_variants = resolve_literal_sequences(yielded_value, scope)
+        if not value_variants:
+            if contains_assignment_tracked_binding(yielded_value, scope):
+                return target_names(target), any(
+                    isinstance(part, (ast.Attribute, ast.Subscript))
+                    for part in ast.walk(target)
+                )
+            return set(), False
+
+        tracked_names = set()
+        persistent = False
+        starred_indexes = [
+            index
+            for index, item in enumerate(target.elts)
+            if isinstance(item, ast.Starred)
+        ]
+        for values in value_variants:
+            aligned: list[tuple[ast.AST, tuple[ast.AST, ...]]] = []
+            if not starred_indexes:
+                if len(values) != len(target.elts):
+                    continue
+                aligned = [
+                    (item, (value,))
+                    for item, value in zip(target.elts, values)
+                ]
+            elif len(starred_indexes) == 1:
+                star_index = starred_indexes[0]
+                suffix_length = len(target.elts) - star_index - 1
+                if len(values) < star_index + suffix_length:
+                    continue
+                aligned.extend(
+                    (target.elts[index], (values[index],))
+                    for index in range(star_index)
+                )
+                middle_end = len(values) - suffix_length
+                aligned.append((
+                    target.elts[star_index],
+                    tuple(values[star_index:middle_end]),
+                ))
+                aligned.extend(
+                    (
+                        target.elts[star_index + 1 + index],
+                        (values[middle_end + index],),
+                    )
+                    for index in range(suffix_length)
+                )
+            for item, assigned_values in aligned:
+                item_names = set()
+                item_persistent = False
+                for assigned_value in assigned_values:
+                    names, escapes = tracked_loop_targets(
+                        item,
+                        assigned_value,
+                        scope,
+                    )
+                    item_names.update(names)
+                    item_persistent |= escapes
+                tracked_names.update(item_names)
+                persistent |= item_persistent
+        return tracked_names, persistent
+
+    def starmap_tracked_indexes(
+            iterable: ast.AST,
+            scope: ast.AST | None,
+    ) -> tuple[set[int], bool]:
+        rows, unknown_tracked_shape = iterable_rows(iterable, scope)
+        tracked_indexes = set()
+        for row, row_scope in rows:
+            variants = resolve_literal_sequences(row, row_scope)
+            if not variants:
+                if contains_assignment_tracked_binding(row, row_scope):
+                    unknown_tracked_shape = True
+                continue
+            for values in variants:
+                tracked_indexes.update(
+                    index
+                    for index, value in enumerate(values)
+                    if contains_assignment_tracked_binding(value, row_scope)
+                )
+        return tracked_indexes, unknown_tracked_shape
+
+    def update_loop_provenance(loop: ast.For | ast.AsyncFor) -> bool:
+        if is_in_unmodeled_class_namespace(loop):
+            return False
+        updated = False
+        scope = enclosing_callable(loop)
+        rows, unknown_tracked_shape = iterable_rows(loop.iter, scope)
+        new_names = set()
+        persistent_escape = False
+        for row, row_scope in rows:
+            names, escapes = tracked_loop_targets(
+                loop.target,
+                row,
+                row_scope,
+            )
+            new_names.update(names)
+            persistent_escape |= escapes
+        if unknown_tracked_shape:
+            new_names.update(target_names(loop.target))
+            persistent_escape |= any(
+                isinstance(target_part, (ast.Attribute, ast.Subscript))
+                for target_part in ast.walk(loop.target)
+            )
+        safe_targets = safely_overwritten_loop_targets.setdefault(loop, set())
+        previous_safe_targets = set(safe_targets)
+        safe_targets.difference_update(new_names)
+        if rows and not unknown_tracked_shape:
+            safe_targets.update(target_names(loop.target) - new_names)
+        if safe_targets != previous_safe_targets:
+            updated = True
+        for name in new_names:
+            destination_scope = scope
+            if (
+                destination_scope is not None
+                and name in scope_global_names[destination_scope]
+            ):
+                destination_scope = None
+            elif (
+                destination_scope is not None
+                and name in scope_nonlocal_names[destination_scope]
+            ):
+                destination_scope = callable_parents[destination_scope]
+                while (
+                    destination_scope is not None
+                    and name not in scope_bound_names[destination_scope]
+                ):
+                    destination_scope = callable_parents[destination_scope]
+            destination_bindings = (
+                tracked_bindings
+                if destination_scope is None
+                else scoped_tracked_bindings[destination_scope]
+            )
+            if name not in destination_bindings:
+                destination_bindings.add(name)
+                updated = True
+        if persistent_escape:
+            forced_iterable_findings.add(loop)
+        return updated
+
+    for initial_loop in (
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.For, ast.AsyncFor))
+    ):
+        update_loop_provenance(initial_loop)
 
     changed = True
     while changed:
@@ -2852,6 +4023,13 @@ def sensitive_module_reexports(
             )
             if not new_names.issubset(scope_bindings):
                 scope_bindings.update(new_names)
+                changed = True
+
+        for loop in (
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.For, ast.AsyncFor))
+        ):
+            if update_loop_provenance(loop):
                 changed = True
 
         for call in (
@@ -3150,6 +4328,61 @@ def sensitive_module_reexports(
             kind = additional_higher_order_kind(call)
             scope = enclosing_callable(call)
             unresolved_starred = unresolved_higher_order_starred(call)
+            if kind == "starmap":
+                if unresolved_starred:
+                    definite_callback = (
+                        call.args[0]
+                        if call.args
+                        and not isinstance(call.args[0], ast.Starred)
+                        else None
+                    )
+                    carrier_expressions = tuple(
+                        argument.value
+                        if isinstance(argument, ast.Starred)
+                        else argument
+                        for argument in (
+                            call.args[1:]
+                            if definite_callback is not None
+                            else call.args
+                        )
+                    )
+                    if any(
+                        contains_direct_higher_order_input(carrier, scope)
+                        for carrier in carrier_expressions
+                    ):
+                        if definite_callback is None:
+                            forced_higher_order_findings.add(call)
+                        else:
+                            updated, resolved = taint_higher_order_callback(
+                                {definite_callback},
+                                set(range(64)),
+                                scope,
+                            )
+                            if updated:
+                                changed = True
+                            if not resolved:
+                                forced_higher_order_findings.add(call)
+                for normalized_args in normalized_higher_order_args(call):
+                    if len(normalized_args) != 2:
+                        continue
+                    tracked_indexes, unknown_shape = starmap_tracked_indexes(
+                        normalized_args[1],
+                        scope,
+                    )
+                    if unknown_shape:
+                        tracked_indexes.update(range(64))
+                    if not tracked_indexes:
+                        continue
+                    updated, resolved = taint_higher_order_callback(
+                        {normalized_args[0]},
+                        tracked_indexes,
+                        scope,
+                    )
+                    if updated:
+                        changed = True
+                    if not resolved:
+                        forced_higher_order_findings.add(call)
+                continue
             if unresolved_starred:
                 definite_callback = (
                     call.args[0]
@@ -3312,6 +4545,19 @@ def sensitive_module_reexports(
                 )
             ):
                 tracked_return_callables.add(local_callable)
+                changed = True
+            if (
+                local_callable not in tracked_yield_callables
+                and any(
+                    yielded.value is not None
+                    and contains_assignment_tracked_binding(
+                        yielded.value,
+                        local_callable,
+                    )
+                    for yielded in own_yield_nodes(local_callable)
+                )
+            ):
+                tracked_yield_callables.add(local_callable)
                 changed = True
 
     def contains_persistent_target(node: ast.AST) -> bool:
@@ -3561,9 +4807,773 @@ def sensitive_module_reexports(
             return positional + keyword_values, unresolved_starred
         return positional_values + keyword_values, ()
 
+    def flow_sensitive_literal_container(
+            expression: ast.AST,
+            scope: ast.AST | None,
+            seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> tuple[ast.List | ast.Tuple | ast.Dict, ast.AST | None] | None:
+        if isinstance(expression, (ast.List, ast.Tuple, ast.Dict)):
+            return expression, scope
+        if isinstance(expression, ast.Subscript):
+            resolved = flow_sensitive_literal_container(
+                expression.value,
+                scope,
+                seen,
+            )
+            if resolved is None or not isinstance(expression.slice, ast.Constant):
+                return None
+            container, container_scope = resolved
+            selected = None
+            key = expression.slice.value
+            if isinstance(container, (ast.List, ast.Tuple)) and isinstance(key, int):
+                if -len(container.elts) <= key < len(container.elts):
+                    selected = container.elts[key]
+            elif isinstance(container, ast.Dict):
+                for dict_key, dict_value in reversed(tuple(zip(
+                    container.keys,
+                    container.values,
+                ))):
+                    if (
+                        isinstance(dict_key, ast.Constant)
+                        and type(dict_key.value) is type(key)
+                        and dict_key.value == key
+                    ):
+                        selected = dict_value
+                        break
+            return (
+                flow_sensitive_literal_container(
+                    selected,
+                    container_scope,
+                    seen,
+                )
+                if selected is not None
+                else None
+            )
+        if not isinstance(expression, ast.Name):
+            return None
+        lookup_scope = scope
+        while True:
+            if lookup_scope is not None and expression.id in scope_global_names[lookup_scope]:
+                lookup_scope = None
+            elif (
+                lookup_scope is not None
+                and expression.id in scope_nonlocal_names[lookup_scope]
+            ):
+                lookup_scope = callable_parents[lookup_scope]
+                continue
+            if expression.id in scope_bound_names[lookup_scope]:
+                break
+            if lookup_scope is None:
+                return None
+            lookup_scope = callable_parents[lookup_scope]
+        alias_key = (lookup_scope, expression.id)
+        if alias_key in seen:
+            return None
+        container = tree if lookup_scope is None else lookup_scope
+        candidate_body = container.body if hasattr(container, "body") else []
+        body = candidate_body if isinstance(candidate_body, list) else []
+        direct_child: ast.AST = expression
+        while (
+            parents.get(direct_child) is not container
+            and parents.get(direct_child) is not None
+        ):
+            direct_child = parents[direct_child]
+        before_index = body.index(direct_child) if direct_child in body else len(body)
+        for statement in reversed(body[:before_index]):
+            assigned = None
+            assigned_scope = lookup_scope
+            is_binding = False
+            if isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    assigned = assigned_value_for_name(
+                        target,
+                        statement.value,
+                        expression.id,
+                    )
+                    if assigned is not None:
+                        is_binding = True
+                        break
+                    if expression.id in target_names(target):
+                        resolved_value = flow_sensitive_literal_container(
+                            statement.value,
+                            lookup_scope,
+                            seen | {alias_key},
+                        )
+                        if resolved_value is not None:
+                            value_container, assigned_scope = resolved_value
+                            assigned = assigned_value_for_name(
+                                target,
+                                value_container,
+                                expression.id,
+                            )
+                            is_binding = assigned is not None
+                            if is_binding:
+                                break
+            elif isinstance(statement, ast.AnnAssign):
+                is_binding = expression.id in target_names(statement.target)
+                assigned = statement.value if is_binding else None
+            elif isinstance(statement, (ast.AugAssign, ast.Delete)):
+                targets = (
+                    statement.targets
+                    if isinstance(statement, ast.Delete)
+                    else [statement.target]
+                )
+                is_binding = any(
+                    expression.id in target_names(target)
+                    for target in targets
+                )
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                is_binding = any(
+                    item.optional_vars is not None
+                    and expression.id in target_names(item.optional_vars)
+                    for item in statement.items
+                )
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                is_binding = statement.name == expression.id
+            elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                bound_names = {
+                    alias.asname
+                    or (
+                        alias.name
+                        if isinstance(statement, ast.ImportFrom)
+                        else alias.name.split(".")[0]
+                    )
+                    for alias in statement.names
+                }
+                is_binding = expression.id in bound_names
+            if not is_binding:
+                continue
+            if assigned is None:
+                return None
+            return flow_sensitive_literal_container(
+                assigned,
+                assigned_scope,
+                seen | {alias_key},
+            )
+        return None
+
+    def flow_sensitive_container_reference(
+            expression: ast.AST,
+            scope: ast.AST | None,
+            seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> tuple[
+        ast.List | ast.Tuple | ast.Dict,
+        tuple[object, ...],
+        ast.AST | None,
+    ] | None:
+        if isinstance(expression, (ast.List, ast.Tuple, ast.Dict)):
+            return expression, (), scope
+        if isinstance(expression, ast.Subscript):
+            if not isinstance(expression.slice, ast.Constant):
+                return None
+            resolved = flow_sensitive_container_reference(
+                expression.value,
+                scope,
+                seen,
+            )
+            if resolved is None:
+                return None
+            root, path, root_scope = resolved
+            return root, path + (expression.slice.value,), root_scope
+        if not isinstance(expression, ast.Name):
+            return None
+        lookup_scope = scope
+        while True:
+            if lookup_scope is not None and expression.id in scope_global_names[lookup_scope]:
+                lookup_scope = None
+            elif (
+                lookup_scope is not None
+                and expression.id in scope_nonlocal_names[lookup_scope]
+            ):
+                lookup_scope = callable_parents[lookup_scope]
+                continue
+            if expression.id in scope_bound_names[lookup_scope]:
+                break
+            if lookup_scope is None:
+                return None
+            lookup_scope = callable_parents[lookup_scope]
+        alias_key = (lookup_scope, expression.id)
+        if alias_key in seen:
+            return None
+        container = tree if lookup_scope is None else lookup_scope
+        candidate_body = container.body if hasattr(container, "body") else []
+        body = candidate_body if isinstance(candidate_body, list) else []
+        direct_child: ast.AST = expression
+        while (
+            parents.get(direct_child) is not container
+            and parents.get(direct_child) is not None
+        ):
+            direct_child = parents[direct_child]
+        before_index = body.index(direct_child) if direct_child in body else len(body)
+        for statement in reversed(body[:before_index]):
+            assigned = None
+            assigned_scope = lookup_scope
+            is_binding = False
+            if isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    assigned = assigned_value_for_name(
+                        target,
+                        statement.value,
+                        expression.id,
+                    )
+                    if assigned is None and expression.id in target_names(target):
+                        resolved_value = flow_sensitive_literal_container(
+                            statement.value,
+                            lookup_scope,
+                            seen | {alias_key},
+                        )
+                        if resolved_value is not None:
+                            value_container, assigned_scope = resolved_value
+                            assigned = assigned_value_for_name(
+                                target,
+                                value_container,
+                                expression.id,
+                            )
+                    if assigned is not None:
+                        is_binding = True
+                        break
+            elif isinstance(statement, ast.AnnAssign):
+                is_binding = expression.id in target_names(statement.target)
+                assigned = statement.value if is_binding else None
+            elif isinstance(statement, (ast.AugAssign, ast.Delete)):
+                targets = (
+                    statement.targets
+                    if isinstance(statement, ast.Delete)
+                    else [statement.target]
+                )
+                is_binding = any(
+                    expression.id in target_names(target)
+                    for target in targets
+                )
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                is_binding = any(
+                    item.optional_vars is not None
+                    and expression.id in target_names(item.optional_vars)
+                    for item in statement.items
+                )
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                is_binding = statement.name == expression.id
+            elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                bound_names = {
+                    alias.asname
+                    or (
+                        alias.name
+                        if isinstance(statement, ast.ImportFrom)
+                        else alias.name.split(".")[0]
+                    )
+                    for alias in statement.names
+                }
+                is_binding = expression.id in bound_names
+            if not is_binding:
+                continue
+            if assigned is None:
+                return None
+            return flow_sensitive_container_reference(
+                assigned,
+                assigned_scope,
+                seen | {alias_key},
+            )
+        return None
+
+    def flow_sensitive_container_references(
+            expression: ast.AST,
+            scope: ast.AST | None,
+            seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> set[tuple[
+        ast.List | ast.Tuple | ast.Dict,
+        tuple[object, ...],
+        ast.AST | None,
+    ]]:
+        references = set()
+        direct = flow_sensitive_container_reference(expression, scope, seen)
+        if direct is not None:
+            references.add(direct)
+
+        suffix = []
+        base = expression
+        while isinstance(base, ast.Subscript):
+            if not isinstance(base.slice, ast.Constant):
+                return references
+            suffix.append(base.slice.value)
+            base = base.value
+        if not isinstance(base, ast.Name):
+            return references
+        suffix_path = tuple(reversed(suffix))
+        lookup_scope = scope
+        while True:
+            if lookup_scope is not None and base.id in scope_global_names[lookup_scope]:
+                lookup_scope = None
+            elif lookup_scope is not None and base.id in scope_nonlocal_names[lookup_scope]:
+                lookup_scope = callable_parents[lookup_scope]
+                continue
+            if base.id in scope_bound_names[lookup_scope]:
+                break
+            if lookup_scope is None:
+                return references
+            lookup_scope = callable_parents[lookup_scope]
+        container = tree if lookup_scope is None else lookup_scope
+        candidate_body = container.body if hasattr(container, "body") else []
+        body = candidate_body if isinstance(candidate_body, list) else []
+        direct_child: ast.AST = expression
+        while (
+            parents.get(direct_child) is not container
+            and parents.get(direct_child) is not None
+        ):
+            direct_child = parents[direct_child]
+        before_index = body.index(direct_child) if direct_child in body else len(body)
+        cutoff = (-1, -1)
+        for statement in body[:before_index]:
+            if (
+                isinstance(statement, ast.Assign)
+                and any(base.id in target_names(target) for target in statement.targets)
+            ) or (
+                isinstance(statement, (ast.AnnAssign, ast.AugAssign))
+                and base.id in target_names(statement.target)
+            ) or (
+                isinstance(statement, ast.Delete)
+                and any(base.id in target_names(target) for target in statement.targets)
+            ) or (
+                isinstance(statement, (ast.With, ast.AsyncWith))
+                and any(
+                    item.optional_vars is not None
+                    and base.id in target_names(item.optional_vars)
+                    for item in statement.items
+                )
+            ) or (
+                isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and statement.name == base.id
+            ):
+                cutoff = (statement.lineno, statement.col_offset)
+
+        query_position = (expression.lineno, expression.col_offset)
+        for target in ast.walk(container):
+            if (
+                not isinstance(target, ast.Name)
+                or target.id != base.id
+                or not isinstance(target.ctx, ast.Store)
+                or enclosing_callable(target) is not lookup_scope
+            ):
+                continue
+            position = (target.lineno, target.col_offset)
+            if not cutoff < position < query_position:
+                continue
+            owner: ast.AST = target
+            while not isinstance(owner, ast.stmt) and parents.get(owner) is not None:
+                owner = parents[owner]
+            if owner in body:
+                continue
+            assigned = None
+            if isinstance(owner, ast.Assign):
+                for owner_target in owner.targets:
+                    assigned = assigned_value_for_name(
+                        owner_target,
+                        owner.value,
+                        base.id,
+                    )
+                    if assigned is not None:
+                        break
+            elif isinstance(owner, (ast.AnnAssign, ast.NamedExpr)):
+                assigned = assigned_value_for_name(
+                    owner.target,
+                    owner.value,
+                    base.id,
+                )
+            if assigned is None:
+                continue
+            alternate = flow_sensitive_container_reference(
+                assigned,
+                lookup_scope,
+                seen | {(lookup_scope, base.id)},
+            )
+            if alternate is None:
+                continue
+            root, path, root_scope = alternate
+            references.add((root, path + suffix_path, root_scope))
+        return references
+
+    def select_constant_container_path(
+            expression: ast.AST,
+            scope: ast.AST | None,
+            path: tuple[object, ...],
+            seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> tuple[ast.AST, ast.AST | None] | None:
+        current = expression
+        current_scope = scope
+        for key in path:
+            resolved = flow_sensitive_literal_container(
+                current,
+                current_scope,
+                seen,
+            )
+            if resolved is None:
+                return None
+            container, current_scope = resolved
+            selected = None
+            if isinstance(container, (ast.List, ast.Tuple)) and isinstance(key, int):
+                if -len(container.elts) <= key < len(container.elts):
+                    selected = container.elts[key]
+            elif isinstance(container, ast.Dict):
+                for dict_key, dict_value in reversed(tuple(zip(
+                    container.keys,
+                    container.values,
+                ))):
+                    if (
+                        isinstance(dict_key, ast.Constant)
+                        and dict_key.value == key
+                    ):
+                        selected = dict_value
+                        break
+            if selected is None:
+                return None
+            current = selected
+        return current, current_scope
+
+    def flow_sensitive_subscript_values(
+            expression: ast.Subscript,
+            scope: ast.AST | None,
+            seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> set[tuple[ast.AST, ast.AST | None]]:
+        queries = flow_sensitive_container_references(expression, scope, seen)
+        if not queries:
+            return set()
+
+        def definitely_precedes(owner: ast.stmt, reference: ast.AST) -> bool:
+            owner_parent = parents.get(owner)
+            if owner_parent is None:
+                return False
+            for field_name in ("body", "orelse", "finalbody"):
+                block = getattr(owner_parent, field_name, None)
+                if not isinstance(block, list) or owner not in block:
+                    continue
+                reference_child = reference
+                while (
+                    parents.get(reference_child) is not owner_parent
+                    and parents.get(reference_child) is not None
+                ):
+                    reference_child = parents[reference_child]
+                if (
+                    reference_child in block
+                    and block.index(owner) < block.index(reference_child)
+                ):
+                    return True
+            return False
+
+        def delete_replacement(
+                root: ast.AST,
+                root_scope: ast.AST | None,
+                target_path: tuple[object, ...],
+                query_path: tuple[object, ...],
+        ) -> tuple[bool, tuple[ast.AST, ast.AST | None] | None]:
+            if not target_path:
+                return False, None
+            parent_path = target_path[:-1]
+            if (
+                len(query_path) <= len(parent_path)
+                or query_path[:len(parent_path)] != parent_path
+            ):
+                return False, None
+            parent_value = select_constant_container_path(
+                root,
+                root_scope,
+                parent_path,
+                seen,
+            )
+            if parent_value is None:
+                return False, None
+            parent_expression, parent_scope = parent_value
+            resolved_parent = flow_sensitive_literal_container(
+                parent_expression,
+                parent_scope,
+                seen,
+            )
+            if resolved_parent is None:
+                return False, None
+            parent_container, parent_scope = resolved_parent
+            deleted_key = target_path[-1]
+            query_key = query_path[len(parent_path)]
+            if isinstance(parent_container, ast.Dict):
+                return (
+                    deleted_key == query_key,
+                    None,
+                )
+            if not (
+                isinstance(parent_container, (ast.List, ast.Tuple))
+                and isinstance(deleted_key, int)
+                and isinstance(query_key, int)
+            ):
+                return False, None
+            values = list(parent_container.elts)
+            delete_index = deleted_key if deleted_key >= 0 else len(values) + deleted_key
+            if not 0 <= delete_index < len(values):
+                return True, None
+            del values[delete_index]
+            query_index = query_key if query_key >= 0 else len(values) + query_key
+            if not 0 <= query_index < len(values):
+                return True, None
+            selected = values[query_index]
+            return True, select_constant_container_path(
+                selected,
+                parent_scope,
+                query_path[len(parent_path) + 1:],
+                seen,
+            )
+
+        all_possible_values = set()
+        query_position = (expression.lineno, expression.col_offset)
+        for root, query_path, root_scope in queries:
+            initial = select_constant_container_path(
+                root,
+                root_scope,
+                query_path,
+                seen,
+            )
+            possible_values = {initial} if initial is not None else set()
+            events = []
+            for owner in ast.walk(tree):
+                value = None
+                targets = []
+                is_delete = False
+                if isinstance(owner, ast.Assign):
+                    value = owner.value
+                    targets = owner.targets
+                elif isinstance(owner, ast.AnnAssign):
+                    value = owner.value
+                    targets = [owner.target]
+                elif isinstance(owner, ast.AugAssign):
+                    value = owner.value
+                    targets = [owner.target]
+                elif isinstance(owner, ast.Delete):
+                    targets = owner.targets
+                    is_delete = True
+                else:
+                    continue
+                owner_position = (owner.lineno, owner.col_offset)
+                if owner_position >= query_position:
+                    continue
+                for target in targets:
+                    if not isinstance(target, ast.Subscript):
+                        continue
+                    target_scope = enclosing_callable(target)
+                    if target_scope not in {scope, root_scope}:
+                        continue
+                    target_references = flow_sensitive_container_references(
+                        target,
+                        target_scope,
+                        seen,
+                    )
+                    if not target_references:
+                        continue
+                    replacements = set()
+                    affecting_count = 0
+                    for target_root, target_path, _ in target_references:
+                        if target_root is not root:
+                            continue
+                        if is_delete:
+                            affects, replacement = delete_replacement(
+                                root,
+                                root_scope,
+                                target_path,
+                                query_path,
+                            )
+                            if not affects:
+                                continue
+                        else:
+                            if (
+                                len(target_path) > len(query_path)
+                                or query_path[:len(target_path)] != target_path
+                            ):
+                                continue
+                            replacement = (
+                                select_constant_container_path(
+                                    value,
+                                    target_scope,
+                                    query_path[len(target_path):],
+                                    seen,
+                                )
+                                if value is not None
+                                else None
+                            )
+                        affecting_count += 1
+                        if replacement is not None:
+                            replacements.add(replacement)
+                    if not affecting_count:
+                        continue
+                    must_affect = affecting_count == len(target_references)
+                    events.append((
+                        owner_position,
+                        definitely_precedes(owner, expression) and must_affect,
+                        is_delete,
+                        replacements,
+                        isinstance(owner, ast.AugAssign),
+                    ))
+
+            for _, definite, is_delete, replacements, is_augmented in sorted(
+                events,
+                key=lambda event: event[0],
+            ):
+                if definite and not is_augmented:
+                    possible_values = set(replacements)
+                elif not is_delete:
+                    possible_values.update(replacements)
+                else:
+                    possible_values.update(replacements)
+            all_possible_values.update(possible_values)
+        return all_possible_values
+
+    def flow_sensitive_import_origins(
+            expression: ast.AST,
+            scope: ast.AST | None,
+            seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> set[str]:
+        if isinstance(expression, ast.Attribute):
+            return {
+                f"{origin}.{expression.attr}"
+                for origin in flow_sensitive_import_origins(
+                    expression.value,
+                    scope,
+                    seen,
+                )
+            }
+        if isinstance(expression, ast.Subscript):
+            selected_values = flow_sensitive_subscript_values(
+                expression,
+                scope,
+                seen,
+            )
+            return set().union(*(
+                flow_sensitive_import_origins(
+                    selected,
+                    selected_scope,
+                    seen,
+                )
+                for selected, selected_scope in selected_values
+            )) if selected_values else set()
+        if not isinstance(expression, ast.Name):
+            return set()
+
+        lookup_scope = scope
+        while True:
+            if lookup_scope is not None and expression.id in scope_global_names[lookup_scope]:
+                lookup_scope = None
+            elif (
+                lookup_scope is not None
+                and expression.id in scope_nonlocal_names[lookup_scope]
+            ):
+                lookup_scope = callable_parents[lookup_scope]
+                continue
+            if expression.id in scope_bound_names[lookup_scope]:
+                break
+            if lookup_scope is None:
+                return set(resolve_import_origins(expression))
+            lookup_scope = callable_parents[lookup_scope]
+
+        alias_key = (lookup_scope, expression.id)
+        if alias_key in seen:
+            return set()
+        container = tree if lookup_scope is None else lookup_scope
+        candidate_body = container.body if hasattr(container, "body") else []
+        body = candidate_body if isinstance(candidate_body, list) else []
+        direct_child: ast.AST = expression
+        while (
+            parents.get(direct_child) is not container
+            and parents.get(direct_child) is not None
+        ):
+            direct_child = parents[direct_child]
+        before_index = (
+            body.index(direct_child)
+            if direct_child in body
+            else len(body)
+        )
+
+        for statement in reversed(body[:before_index]):
+            assigned: ast.AST | None = None
+            assigned_scope = lookup_scope
+            is_binding = False
+            if isinstance(statement, ast.Import):
+                for alias in statement.names:
+                    if (alias.asname or alias.name.split(".")[0]) == expression.id:
+                        return {
+                            alias.name
+                            if alias.asname
+                            else alias.name.split(".")[0]
+                        }
+            elif isinstance(statement, ast.ImportFrom):
+                if statement.level == 0 and statement.module:
+                    for alias in statement.names:
+                        if (alias.asname or alias.name) == expression.id:
+                            return {f"{statement.module}.{alias.name}"}
+            elif isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    assigned = assigned_value_for_name(
+                        target,
+                        statement.value,
+                        expression.id,
+                    )
+                    if assigned is not None:
+                        is_binding = True
+                        break
+                    if expression.id in target_names(target):
+                        resolved_value = flow_sensitive_literal_container(
+                            statement.value,
+                            lookup_scope,
+                            seen | {alias_key},
+                        )
+                        if resolved_value is not None:
+                            value_container, assigned_scope = resolved_value
+                            assigned = assigned_value_for_name(
+                                target,
+                                value_container,
+                                expression.id,
+                            )
+                            is_binding = assigned is not None
+                            if is_binding:
+                                break
+            elif isinstance(statement, ast.AnnAssign):
+                is_binding = expression.id in target_names(statement.target)
+                if is_binding:
+                    assigned = statement.value
+            elif isinstance(statement, (ast.AugAssign, ast.Delete)):
+                targets = (
+                    statement.targets
+                    if isinstance(statement, ast.Delete)
+                    else [statement.target]
+                )
+                is_binding = any(
+                    expression.id in target_names(target)
+                    for target in targets
+                )
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                is_binding = any(
+                    item.optional_vars is not None
+                    and expression.id in target_names(item.optional_vars)
+                    for item in statement.items
+                )
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                is_binding = statement.name == expression.id
+            if not is_binding:
+                continue
+            if assigned is None:
+                return set()
+            return flow_sensitive_import_origins(
+                assigned,
+                assigned_scope,
+                seen | {alias_key},
+            )
+
+        if lookup_scope is not None and expression.id in {
+            argument.arg
+            for argument in (
+                lookup_scope.args.posonlyargs
+                + lookup_scope.args.args
+                + lookup_scope.args.kwonlyargs
+            )
+        }:
+            return set()
+        return set(resolve_import_origins(expression))
+
     findings = []
     for node in ast.walk(tree):
-        if node in forced_higher_order_findings:
+        if node in forced_higher_order_findings or node in forced_iterable_findings:
             findings.append(node)
         elif (
             isinstance(node, ast.Attribute)
@@ -3575,9 +5585,19 @@ def sensitive_module_reexports(
                 is_sensitive_import_name(node.attr)
                 or node.attr.startswith("_")
                 or any(
-                    qualified_name in KNOWN_CONCURRENCY_FULL_IMPORT_NAMES
+                    qualified_name in (
+                        KNOWN_CONCURRENCY_FULL_IMPORT_NAMES - {"pydoc.browse"}
+                    )
                     for qualified_name in qualified_import_attribute_names(node)
                 )
+            )
+        ):
+            findings.append(node)
+        elif (
+            isinstance(node, ast.Call)
+            and "pydoc.browse" in flow_sensitive_import_origins(
+                node.func,
+                enclosing_callable(node),
             )
         ):
             findings.append(node)
@@ -4010,6 +6030,11 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 ("pydoc", "_start_server"),
             ),
             (
+                "from pydoc import browse as open_browser\n"
+                "open_browser(0)\n",
+                ("pydoc", "browse"),
+            ),
+            (
                 "from faulthandler import dump_traceback_later\n"
                 "dump_traceback_later(1)\n",
                 ("faulthandler", "dump_traceback_later"),
@@ -4087,6 +6112,184 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 {"p": "pydoc"},
             ),
             (
+                "import pydoc as p\nopen_browser = p.browse\n"
+                "open_browser(0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "safe, open_browser = harmless, p.browse\n"
+                "open_browser(0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = [harmless, p.browse]\n"
+                "handlers[1](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = (p.browse, harmless)\n"
+                "open_browser = handlers[0]\n"
+                "open_browser(0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = {'open': p.browse}\n"
+                "handlers['open'](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "modules = [p]\n"
+                "modules[0].browse(0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = [[p.browse]]\n"
+                "handlers[0][0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = {'group': [p.browse]}\n"
+                "handlers['group'][0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = [[p.browse]]\n"
+                "inner = handlers[0]\n"
+                "inner[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "launch = p.browse\n"
+                "for launch in values:\n"
+                "    pass\n"
+                "launch(0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = [harmless]\n"
+                "handlers[0] = p.browse\n"
+                "handlers[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = {'open': harmless}\n"
+                "alias = handlers\n"
+                "alias['open'] = p.browse\n"
+                "handlers['open'](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = {'group': [harmless]}\n"
+                "inner = handlers['group']\n"
+                "inner[0] = p.browse\n"
+                "handlers['group'][0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = [p.browse]\n"
+                "if enabled:\n"
+                "    handlers[0] = harmless\n"
+                "handlers[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = [harmless]\n"
+                "if enabled:\n"
+                "    handlers[0] = p.browse\n"
+                "handlers[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = [p.browse]\n"
+                "for _ in values:\n"
+                "    handlers[0] = harmless\n"
+                "handlers[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = [harmless]\n"
+                "for _ in values:\n"
+                "    handlers[0] = p.browse\n"
+                "handlers[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = {'open': harmless, 'open': p.browse}\n"
+                "handlers['open'](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = [harmless]\n"
+                "if enabled:\n"
+                "    handlers = [p.browse]\n"
+                "handlers[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = [p.browse]\n"
+                "other = [harmless]\n"
+                "alias = handlers\n"
+                "if enabled:\n"
+                "    alias = other\n"
+                "alias[0] = harmless\n"
+                "handlers[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = [harmless, p.browse]\n"
+                "del handlers[0]\n"
+                "handlers[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = ([p.browse],)\n"
+                "(inner,) = handlers\n"
+                "inner[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = {'group': ([p.browse],)}\n"
+                "(inner,) = handlers['group']\n"
+                "inner[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = (harmless, p.browse)\n"
+                "first, *rest = handlers\n"
+                "rest[0](0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import pydoc as p\n"
+                "handlers = (harmless, p.browse)\n"
+                "selected, selected = handlers\n"
+                "selected(0)\n",
+                {"p": "pydoc"},
+            ),
+            (
                 "import faulthandler as f\n"
                 "f.dump_traceback_later(1)\n",
                 {"f": "faulthandler"},
@@ -4107,6 +6310,134 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 ast.parse(generic_listen_source),
                 {"example": "example.config"},
             )
+        )
+
+        shadowed_browse_source = (
+            "import pydoc as p\n"
+            "def harmless(p):\n"
+            "    return p.browse(0)\n"
+            "harmless(None)\n"
+        )
+        self.assertFalse(
+            sensitive_module_reexports(
+                ast.parse(shadowed_browse_source),
+                {"p": "pydoc"},
+            ),
+            "a local receiver must shadow the imported pydoc alias",
+        )
+
+        for safe_source in (
+            (
+                "import pydoc as docs\n"
+                "docs = harmless\n"
+                "docs.browse(0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "danger, safe = docs.browse, harmless\n"
+                "safe(0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = [docs.browse]\n"
+                "handlers = [harmless]\n"
+                "handlers[0](0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = (docs.browse, harmless)\n"
+                "handlers[1](0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "def harmless(docs):\n"
+                "    handlers = [docs.browse]\n"
+                "    return handlers[0](0)\n"
+                "harmless(None)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = [[docs.browse]]\n"
+                "handlers = [[harmless]]\n"
+                "handlers[0][0](0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = [[docs.browse]]\n"
+                "inner = handlers[0]\n"
+                "inner = [harmless]\n"
+                "inner[0](0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = [docs.browse]\n"
+                "handlers[0] = harmless\n"
+                "handlers[0](0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = {'open': docs.browse}\n"
+                "alias = handlers\n"
+                "alias['open'] = harmless\n"
+                "handlers['open'](0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = {'group': [docs.browse]}\n"
+                "inner = handlers['group']\n"
+                "inner[0] = harmless\n"
+                "handlers['group'][0](0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = [docs.browse]\n"
+                "del handlers[0]\n"
+                "handlers[0](0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = {'open': docs.browse, 'open': harmless}\n"
+                "handlers['open'](0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = [docs.browse, harmless]\n"
+                "del handlers[0]\n"
+                "handlers[0](0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = ([harmless],)\n"
+                "(inner,) = handlers\n"
+                "inner[0](0)\n"
+            ),
+            (
+                "import pydoc as docs\n"
+                "handlers = (docs.browse, harmless)\n"
+                "selected, selected = handlers\n"
+                "selected(0)\n"
+            ),
+        ):
+            with self.subTest(safe_pydoc_flow=safe_source):
+                self.assertFalse(
+                    sensitive_module_reexports(
+                        ast.parse(safe_source),
+                        {"docs": "pydoc"},
+                    ),
+                    "a killed or uncalled pydoc browse alias must stay safe",
+                )
+
+        example_browse_container = (
+            "import example as module\n"
+            "handlers = {'group': [[module.browse]]}\n"
+            "handlers['group'][0][0](0)\n"
+        )
+        self.assertFalse(
+            sensitive_module_reexports(
+                ast.parse(example_browse_container),
+                {"module": "example"},
+            ),
+            "an unrelated browse function must remain safe in a container",
         )
 
         lexical_shadow_source = (
@@ -4211,6 +6542,83 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "items = []\n"
                 "items += [wrap(p)]\n"
                 "items[0].os.fork()\n"
+            ),
+            "for-iterable": (
+                "for value in [p]:\n"
+                "    value.os.fork()\n"
+            ),
+            "for-destructured-iterable": (
+                "for left, (middle, *rest) in [(None, (p, p))]:\n"
+                "    middle.os.fork()\n"
+            ),
+            "for-starred-destructuring": (
+                "for left, *rest in [(None, p)]:\n"
+                "    rest[0].os.fork()\n"
+            ),
+            "for-local-return-iterable": (
+                "def wrap(value):\n"
+                "    return [value]\n"
+                "for value in wrap(p):\n"
+                "    value.os.fork()\n"
+            ),
+            "for-generator-expression-wrapper": (
+                "for value in (item for item in [p]):\n"
+                "    value.os.fork()\n"
+            ),
+            "for-set-wrapper": (
+                "for value in {p}:\n"
+                "    value.os.fork()\n"
+            ),
+            "for-builtin-iter-wrapper": (
+                "for value in iter([p]):\n"
+                "    value.os.fork()\n"
+            ),
+            "for-list-comprehension-wrapper": (
+                "for value in [item for item in [p]]:\n"
+                "    value.os.fork()\n"
+            ),
+            "for-local-generator-alias": (
+                "def rows(value):\n"
+                "    yield value\n"
+                "stream = rows(p)\n"
+                "for value in stream:\n"
+                "    value.os.fork()\n"
+            ),
+            "for-unordered-destructured-set": (
+                "for left, right in [{None, p}]:\n"
+                "    left.os.fork()\n"
+            ),
+            "async-for-iterable": (
+                "async def rows(value):\n"
+                "    yield value\n"
+                "async def run():\n"
+                "    async for value in rows(p):\n"
+                "        value.os.fork()\n"
+            ),
+            "async-for-local-generator-alias": (
+                "async def rows(value):\n"
+                "    yield value\n"
+                "async def run():\n"
+                "    stream = rows(p)\n"
+                "    async for value in stream:\n"
+                "        value.os.fork()\n"
+            ),
+            "async-for-builtin-aiter-wrapper": (
+                "async def rows(value):\n"
+                "    yield value\n"
+                "async def run():\n"
+                "    async for value in aiter(rows(p)):\n"
+                "        value.os.fork()\n"
+            ),
+            "for-persistent-target": (
+                "for holder.module in [p]:\n"
+                "    pass\n"
+            ),
+            "for-safe-kill-then-tracked-rebind": (
+                "original = p\n"
+                "for p in [None]:\n"
+                "    p = original\n"
+                "    p.os.fork()\n"
             ),
             "map": (
                 "def invoke(value):\n"
@@ -4343,6 +6751,47 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "    right.os.fork()\n"
                 "reduce(invoke, [p])\n"
             ),
+            "starmap-position": (
+                "from itertools import starmap\n"
+                "def invoke(left, right):\n"
+                "    right.os.fork()\n"
+                "starmap(invoke, [(None, p)])\n"
+            ),
+            "starmap-alias-bound-method": (
+                "import itertools as tools\n"
+                "class Runner:\n"
+                "    def invoke(self, left, right):\n"
+                "        right.os.fork()\n"
+                "apply = tools.starmap\n"
+                "apply(Runner().invoke, [(None, p)])\n"
+            ),
+            "starmap-unresolved-callback": (
+                "from itertools import starmap\n"
+                "starmap(external_callback, [(p,)])\n"
+            ),
+            "starmap-generator-row-alias": (
+                "from itertools import starmap\n"
+                "def invoke(left, right):\n"
+                "    right.os.fork()\n"
+                "rows = (row for row in [(None, p)])\n"
+                "starmap(invoke, rows)\n"
+            ),
+            "starmap-nonidentity-generator-row": (
+                "from itertools import starmap\n"
+                "def invoke(left, right):\n"
+                "    right.os.fork()\n"
+                "row = (None, p)\n"
+                "starmap(invoke, (row for _ in (0,)))\n"
+            ),
+            "starmap-local-generator-alias": (
+                "from itertools import starmap\n"
+                "def invoke(left, right):\n"
+                "    right.os.fork()\n"
+                "def rows(value):\n"
+                "    yield (None, value)\n"
+                "stream = rows(p)\n"
+                "starmap(invoke, stream)\n"
+            ),
             "reduce-initializer": (
                 "from functools import reduce\n"
                 "def invoke(left, right):\n"
@@ -4362,6 +6811,93 @@ class H2D2FreezeContractTests(unittest.TestCase):
 
         negative_sources = {
             "safe-numeric-augassign": "total = 0\ntotal += 1\n",
+            "safe-for-iterable": (
+                "for value in [None]:\n"
+                "    value.os.fork()\n"
+            ),
+            "for-overwrites-import-with-safe-value": (
+                "for p in [None]:\n"
+                "    p.os.fork()\n"
+            ),
+            "for-overwrites-import-in-destructuring": (
+                "for other, p in [(None, None)]:\n"
+                "    p.os.fork()\n"
+            ),
+            "for-body-overwrites-tracked-value": (
+                "for p in [p]:\n"
+                "    p = None\n"
+                "    p.os.fork()\n"
+            ),
+            "killed-iterable-alias": (
+                "stream = [p]\n"
+                "stream = [None]\n"
+                "for value in stream:\n"
+                "    value.os.fork()\n"
+            ),
+            "killed-builtin-iter-alias": (
+                "walk = iter\n"
+                "walk = lambda values: [None]\n"
+                "for value in walk([p]):\n"
+                "    value.os.fork()\n"
+            ),
+            "for-safe-overwrite-propagates-to-local": (
+                "for p in [None]:\n"
+                "    local = p\n"
+                "    local.os.fork()\n"
+            ),
+            "safe-for-local-shadow": (
+                "def harmless(p):\n"
+                "    for value in [p]:\n"
+                "        value.os.fork()\n"
+                "harmless(None)\n"
+            ),
+            "safe-for-destructured-position": (
+                "for left, right in [(None, p)]:\n"
+                "    left.os.fork()\n"
+            ),
+            "safe-generator-transform": (
+                "for value in (None for item in [p]):\n"
+                "    value.os.fork()\n"
+            ),
+            "safe-local-generator-alias": (
+                "def rows(value):\n"
+                "    yield None\n"
+                "stream = rows(p)\n"
+                "for value in stream:\n"
+                "    value.os.fork()\n"
+            ),
+            "safe-set-wrapper": (
+                "for value in {None}:\n"
+                "    value.os.fork()\n"
+            ),
+            "shadowed-iter-wrapper": (
+                "def iter(values):\n"
+                "    return [None]\n"
+                "for value in iter([p]):\n"
+                "    value.os.fork()\n"
+            ),
+            "shadowed-aiter-wrapper": (
+                "def aiter(values):\n"
+                "    return safe_stream\n"
+                "async def rows(value):\n"
+                "    yield value\n"
+                "async def run():\n"
+                "    async for value in aiter(rows(p)):\n"
+                "        value.os.fork()\n"
+            ),
+            "safe-async-for-iterable": (
+                "async def rows(value):\n"
+                "    yield None\n"
+                "async def run():\n"
+                "    async for value in rows(p):\n"
+                "        value.os.fork()\n"
+            ),
+            "class-loop-target-does-not-leak-to-module": (
+                "class Holder:\n"
+                "    for value in [p]:\n"
+                "        pass\n"
+                "value.os.fork()\n"
+            ),
             "local-shadow-augassign": (
                 "def harmless(p):\n"
                 "    items = []\n"
@@ -4507,6 +7043,42 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "def invoke(left, right):\n"
                 "    right.os.fork()\n"
                 "reduce(invoke, [None], p)\n"
+            ),
+            "starmap-position-precision": (
+                "from itertools import starmap\n"
+                "def invoke(left, right):\n"
+                "    left.os.fork()\n"
+                "starmap(invoke, [(None, p)])\n"
+            ),
+            "safe-starmap-iterable": (
+                "from itertools import starmap\n"
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "starmap(invoke, [(None,)])\n"
+            ),
+            "tracked-starmap-callback-is-not-carrier": (
+                "from itertools import starmap\n"
+                "starmap(p, [(None,)])\n"
+            ),
+            "shadowed-starmap": (
+                "def starmap(callback, rows):\n"
+                "    return None\n"
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "starmap(invoke, [(p,)])\n"
+            ),
+            "starmap-callback-ignores-item": (
+                "from itertools import starmap\n"
+                "def ignore(value):\n"
+                "    return None\n"
+                "starmap(ignore, [(p,)])\n"
+            ),
+            "safe-starmap-generator-row": (
+                "from itertools import starmap\n"
+                "def invoke(left, right):\n"
+                "    right.os.fork()\n"
+                "row = (None, None)\n"
+                "starmap(invoke, (row for _ in (0,)))\n"
             ),
         }
         for path, source in negative_sources.items():
@@ -5008,6 +7580,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "            configuration_digest = "
             "manifest.get(\"configuration_digest\")\n"
             "            frame_count = manifest.get(\"frame_count\")\n"
+            "            h1 = run_json([], \"H1\")\n"
             "        except Exception:\n"
             "            pass\n"
             "    return {\"count\": execute_count, "
@@ -5332,6 +7905,132 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 ),
                 "execute-dispatch-binding",
             ),
+            "execute-entry-return-before-dispatch": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    return {}\n    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-exit-before-dispatch": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    sys.exit(0)\n    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-default-exit-with-future-annotations": (
+                "from __future__ import annotations\n"
+                + valid_source.replace(
+                    "    for day in days:\n",
+                    "    def helper(value=sys.exit(1)):\n"
+                    "        return value\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-async-default-exit-with-future-annotations": (
+                "from __future__ import annotations\n"
+                + valid_source.replace(
+                    "    for day in days:\n",
+                    "    async def helper(value=sys.exit(1)):\n"
+                    "        return value\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-default-exit-alias": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    halt = sys.exit\n"
+                    "    def helper(value=halt(1)):\n"
+                    "        return value\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-destructured-exit-alias": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    halt, other = (sys.exit, None)\n"
+                    "    halt(1)\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-conditionally-killed-exit-alias": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    halt = sys.exit\n"
+                    "    if enabled:\n"
+                    "        halt = safe\n"
+                    "    halt(1)\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-loop-killed-exit-alias": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    halt = sys.exit\n"
+                    "    for _ in ():\n"
+                    "        halt = safe\n"
+                    "    halt(1)\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "day-prefix-return-before-dispatch": (
+                valid_source.replace(
+                    "            manifests = existing(day)\n",
+                    "            return {}\n"
+                    "            manifests = existing(day)\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "day-prefix-assert-before-dispatch": (
+                valid_source.replace(
+                    "            manifests = existing(day)\n",
+                    "            assert ready\n"
+                    "            manifests = existing(day)\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "day-prefix-explicit-exit-before-dispatch": (
+                valid_source.replace(
+                    "            manifests = existing(day)\n",
+                    "            parser.exit(1)\n"
+                    "            manifests = existing(day)\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "day-loop-break-before-dispatch": (
+                valid_source.replace(
+                    "        try:\n",
+                    "        break\n        try:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "day-loop-continue-before-dispatch": (
+                valid_source.replace(
+                    "        try:\n",
+                    "        continue\n        try:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
             "existing-rebinding": (
                 valid_source.replace(
                     "    execute_count = len(days)\n",
@@ -5482,6 +8181,103 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 valid_source.replace(
                     "def _run_json",
                     "json = codec\ndef _run_json",
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "module-json-dumps-store": (
+                valid_source.replace(
+                    "def _run_json",
+                    "json.dumps = serializer\ndef _run_json",
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "module-json-dumps-delete": (
+                valid_source.replace(
+                    "def _run_json",
+                    "del json.dumps\ndef _run_json",
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "module-json-dumps-augmented-store": (
+                valid_source.replace(
+                    "def _run_json",
+                    "json.dumps += serializer\ndef _run_json",
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "module-json-alias-dumps-store": (
+                valid_source.replace(
+                    "def _run_json",
+                    "codec = json\ncodec.dumps = serializer\ndef _run_json",
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "module-json-alias-dumps-delete": (
+                valid_source.replace(
+                    "def _run_json",
+                    "codec = json\ndel codec.dumps\ndef _run_json",
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "nested-json-alias-dumps-store": (
+                valid_source.replace(
+                    "def main(argv=None):",
+                    "def mutate_json():\n"
+                    "    codec = json\n"
+                    "    codec.dumps = serializer\n"
+                    "def main(argv=None):",
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "nested-json-destructured-alias-delete": (
+                valid_source.replace(
+                    "def main(argv=None):",
+                    "def mutate_json():\n"
+                    "    codec, other = json, None\n"
+                    "    del codec.dumps\n"
+                    "def main(argv=None):",
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "nested-json-conditional-alias-store": (
+                valid_source.replace(
+                    "def main(argv=None):",
+                    "def mutate_json():\n"
+                    "    codec = json\n"
+                    "    if enabled:\n"
+                    "        codec = FakeJson()\n"
+                    "    codec.dumps = serializer\n"
+                    "def main(argv=None):",
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "nested-json-default-alias-store": (
+                valid_source.replace(
+                    "def main(argv=None):",
+                    "def mutate_json(codec=json):\n"
+                    "    codec.dumps = serializer\n"
+                    "def main(argv=None):",
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "nested-json-augassign-alias-store": (
+                valid_source.replace(
+                    "def main(argv=None):",
+                    "def mutate_json():\n"
+                    "    codec = json\n"
+                    "    codec += Wrapper()\n"
+                    "    codec.dumps = serializer\n"
+                    "def main(argv=None):",
                     1,
                 ),
                 "main-output-call-target",
@@ -5840,6 +8636,16 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "    def nested_output_helpers():\n"
             "        print = json = None\n"
             "        return print, json\n",
+            "    def shadowed_json_module(json):\n"
+            "        json.dumps = None\n"
+            "        del json.dumps\n",
+            "    def locally_imported_json_shadow():\n"
+            "        import local_json as json\n"
+            "        json.dumps = None\n",
+            "    def killed_local_json_import():\n"
+            "        import json\n"
+            "        json = FakeJson()\n"
+            "        json.dumps = None\n",
         ):
             with self.subTest(safe_days_read=safe_read.strip()):
                 self.assertFalse(
@@ -5868,6 +8674,58 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "nested and comprehension-target shadows must remain local",
         )
 
+        safe_json_alias_rebind = valid_source.replace(
+            "def _run_json",
+            "codec = json\ncodec = FakeJson()\ncodec.dumps = None\n"
+            "unrelated.dumps = None\ndef _run_json",
+            1,
+        )
+        self.assertFalse(
+            execute_integrity_violations(ast.parse(safe_json_alias_rebind)),
+            "a killed json alias and unrelated dumps attribute must stay safe",
+        )
+        safe_nested_json_aliases = valid_source.replace(
+            "def main(argv=None):",
+            "def safe_json_aliases():\n"
+            "    codec = json\n"
+            "    codec = FakeJson()\n"
+            "    codec.dumps = None\n"
+            "def safe_fake_json():\n"
+            "    json = FakeJson()\n"
+            "    codec = json\n"
+            "    codec.dumps = None\n"
+            "def main(argv=None):",
+            1,
+        )
+        self.assertFalse(
+            execute_integrity_violations(ast.parse(safe_nested_json_aliases)),
+            "killed and locally fake nested json aliases must stay safe",
+        )
+
+        for safe_prefix in (
+            (
+                "    def uncalled():\n"
+                "        return None\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    for day in days:\n"
+                "        for ignored in ():\n"
+                "            break\n"
+            ),
+        ):
+            with self.subTest(safe_execute_prefix=safe_prefix.strip()):
+                self.assertFalse(
+                    execute_integrity_violations(ast.parse(
+                        valid_source.replace(
+                            "    for day in days:\n",
+                            safe_prefix,
+                            1,
+                        )
+                    )),
+                    "uncalled returns and inner-loop breaks cannot skip dispatch",
+                )
+
         deferred_annotation_shadow = (
             "from __future__ import annotations\n"
             + valid_source.replace(
@@ -5881,6 +8739,48 @@ class H2D2FreezeContractTests(unittest.TestCase):
         self.assertFalse(
             execute_integrity_violations(ast.parse(deferred_annotation_shadow)),
             "deferred annotations must not create runtime binding events",
+        )
+        safe_deferred_execute_annotation = (
+            "from __future__ import annotations\n"
+            + valid_source.replace(
+                "    for day in days:\n",
+                "    def annotated(value: sys.exit(1)):\n"
+                "        sys.exit(1)\n"
+                "    for day in days:\n",
+                1,
+            )
+        )
+        self.assertFalse(
+            execute_integrity_violations(
+                ast.parse(safe_deferred_execute_annotation)
+            ),
+            "deferred annotations and uncalled nested bodies do not execute",
+        )
+
+        safe_killed_exit_alias = valid_source.replace(
+            "    for day in days:\n",
+            "    halt = sys.exit\n"
+            "    halt = safe\n"
+            "    def helper(value=halt(1)):\n"
+            "        return value\n"
+            "    for day in days:\n",
+            1,
+        )
+        self.assertFalse(
+            execute_integrity_violations(ast.parse(safe_killed_exit_alias)),
+            "a killed exit alias must not poison a later default",
+        )
+        safe_direct_exit_alias_kill = valid_source.replace(
+            "    for day in days:\n",
+            "    halt = sys.exit\n"
+            "    halt = safe\n"
+            "    halt(1)\n"
+            "    for day in days:\n",
+            1,
+        )
+        self.assertFalse(
+            execute_integrity_violations(ast.parse(safe_direct_exit_alias_kill)),
+            "an unconditional safe rebind must kill an earlier exit alias",
         )
 
     def test_baselines_are_two_read_only_certified_complete_sessions(self):
