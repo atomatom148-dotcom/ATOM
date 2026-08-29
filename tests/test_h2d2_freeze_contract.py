@@ -51,6 +51,24 @@ KNOWN_CONCURRENCY_FULL_IMPORT_NAMES = {
     "pydoc.browse",
     "pydoc._start_server",
 }
+EXECUTABLE_DESERIALIZER_FULL_IMPORT_NAMES = {
+    "_pickle.load",
+    "_pickle.loads",
+    "cloudpickle.load",
+    "cloudpickle.loads",
+    "dill.load",
+    "dill.load_module",
+    "dill.loads",
+    "dill.Unpickler.load",
+    "joblib.load",
+    "pandas.read_pickle",
+    "pickle.load",
+    "pickle.loads",
+    "pickle.Unpickler.load",
+    "_pickle.Unpickler.load",
+    "yaml.unsafe_load",
+    "yaml.unsafe_load_all",
+}
 FORBIDDEN_STAGE_IMPORT_ROOTS = SENSITIVE_MODULE_ROOTS - {
     "os",
     "subprocess",
@@ -1868,6 +1886,409 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
             == conflict_raise_dump
         )
 
+    def literal_truth_value(node: ast.AST) -> bool | None:
+        try:
+            return bool(ast.literal_eval(node))
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return None
+
+    def finite_literal_iterable_state(
+            node: ast.AST,
+            seen: frozenset[int] = frozenset(),
+    ) -> tuple[bool, bool]:
+        marker = id(node)
+        if marker in seen:
+            return False, False
+        seen = seen | {marker}
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            definitely_empty = True
+            for item in node.elts:
+                if not isinstance(item, ast.Starred):
+                    if isinstance(item, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+                        finite, _ = finite_literal_iterable_state(item, seen)
+                        if not finite:
+                            return False, False
+                    definitely_empty = False
+                    continue
+                finite, empty = finite_literal_iterable_state(item.value, seen)
+                if not finite:
+                    return False, False
+                definitely_empty &= empty
+            return True, definitely_empty
+        if isinstance(node, ast.Dict):
+            definitely_empty = True
+            for key, value in zip(node.keys, node.values):
+                if key is not None:
+                    for evaluated in (key, value):
+                        if isinstance(
+                            evaluated,
+                            (ast.List, ast.Tuple, ast.Set, ast.Dict),
+                        ):
+                            finite, _ = finite_literal_iterable_state(
+                                evaluated,
+                                seen,
+                            )
+                            if not finite:
+                                return False, False
+                    definitely_empty = False
+                    continue
+                if not isinstance(value, ast.Dict):
+                    return False, False
+                finite, empty = finite_literal_iterable_state(value, seen)
+                if not finite:
+                    return False, False
+                definitely_empty &= empty
+            return True, definitely_empty
+        return False, False
+
+    def is_plain_finite_literal_iterable(node: ast.AST) -> bool:
+        return finite_literal_iterable_state(node)[0]
+
+    def is_bounded_comprehension_iterable(node: ast.AST) -> bool:
+        return (
+            is_plain_finite_literal_iterable(node)
+            or (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id == "days"
+            )
+        )
+
+    def target_binds_name(target: ast.AST, name: str) -> bool:
+        if isinstance(target, ast.Name):
+            return target.id == name
+        if isinstance(target, (ast.List, ast.Tuple)):
+            return any(target_binds_name(item, name) for item in target.elts)
+        if isinstance(target, ast.Starred):
+            return target_binds_name(target.value, name)
+        return False
+
+    def enclosing_comprehension_binds_name(
+            reference: ast.AST,
+            name: str,
+    ) -> bool:
+        parent = execute_parents.get(reference)
+        while parent is not None and parent is not execute_function:
+            if isinstance(parent, (
+                ast.DictComp,
+                ast.GeneratorExp,
+                ast.ListComp,
+                ast.SetComp,
+            )):
+                active_targets = []
+                for generator in parent.generators:
+                    if (
+                        reference is generator.iter
+                        or is_descendant_of(reference, generator.iter)
+                    ):
+                        break
+                    active_targets.append(generator.target)
+                    if any(
+                        reference is condition
+                        or is_descendant_of(reference, condition)
+                        for condition in generator.ifs
+                    ):
+                        break
+                if any(
+                    target_binds_name(target, name)
+                    for target in active_targets
+                ):
+                    return True
+            parent = execute_parents.get(parent)
+        return False
+
+    def known_eager_generator_arguments(call: ast.Call) -> tuple[ast.AST, ...]:
+        if not isinstance(call.func, ast.Name):
+            return ()
+        name = call.func.id
+        if (
+            name not in {"all", "any", "list"}
+            or module_binding_events.get(name, ())
+            or execute_binding_events.get(name, ())
+            or enclosing_comprehension_binds_name(call, name)
+        ):
+            return ()
+        keyword_names = [keyword.arg for keyword in call.keywords]
+        if (
+            any(name is None for name in keyword_names)
+            or len(set(keyword_names)) != len(keyword_names)
+        ):
+            return ()
+        if len(call.args) != 1 or call.keywords:
+            return ()
+        argument = call.args[0]
+        return (
+            (argument,)
+            if name == "list" or isinstance(argument, ast.GeneratorExp)
+            else ()
+        )
+
+    def known_expression_truth_value(node: ast.AST) -> bool | None:
+        literal = literal_truth_value(node)
+        if literal is not None:
+            return literal
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            operand = known_expression_truth_value(node.operand)
+            return None if operand is None else not operand
+        if isinstance(node, ast.BoolOp):
+            values = [known_expression_truth_value(value) for value in node.values]
+            if isinstance(node.op, ast.And):
+                if False in values:
+                    return False
+                return True if all(value is True for value in values) else None
+            if True in values:
+                return True
+            return False if all(value is False for value in values) else None
+        if isinstance(node, ast.IfExp):
+            test = known_expression_truth_value(node.test)
+            if test is True:
+                return known_expression_truth_value(node.body)
+            if test is False:
+                return known_expression_truth_value(node.orelse)
+            body = known_expression_truth_value(node.body)
+            orelse = known_expression_truth_value(node.orelse)
+            return body if body is not None and body == orelse else None
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Name)
+            or node.func.id not in {"all", "any"}
+        ):
+            return None
+        arguments = known_eager_generator_arguments(node)
+        if (
+            len(arguments) != 1
+            or not isinstance(arguments[0], ast.GeneratorExp)
+            or not generator_expression_is_definitely_empty(arguments[0])
+        ):
+            return None
+        return node.func.id == "all"
+
+    def generator_expression_is_definitely_empty(node: ast.GeneratorExp) -> bool:
+        for generator in node.generators:
+            if finite_literal_iterable_state(generator.iter) == (True, True):
+                return True
+            if any(
+                known_expression_truth_value(condition) is False
+                for condition in generator.ifs
+            ):
+                return True
+        return False
+
+    def expression_has_unsafe_eager_unpack(node: ast.AST) -> bool:
+        if isinstance(node, ast.Starred):
+            return (
+                not is_plain_finite_literal_iterable(node.value)
+                or expression_has_unsafe_eager_unpack(node.value)
+            )
+        if isinstance(node, ast.keyword) and node.arg is None:
+            return (
+                not isinstance(node.value, ast.Dict)
+                or not is_plain_finite_literal_iterable(node.value)
+                or expression_has_unsafe_eager_unpack(node.value)
+            )
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+            if not is_plain_finite_literal_iterable(node):
+                return True
+        if isinstance(node, ast.IfExp):
+            if expression_has_unsafe_eager_unpack(node.test):
+                return True
+            truth = known_expression_truth_value(node.test)
+            if truth is True:
+                return expression_has_unsafe_eager_unpack(node.body)
+            if truth is False:
+                return expression_has_unsafe_eager_unpack(node.orelse)
+            return (
+                expression_has_unsafe_eager_unpack(node.body)
+                or expression_has_unsafe_eager_unpack(node.orelse)
+            )
+        if isinstance(node, ast.BoolOp):
+            for value in node.values:
+                if expression_has_unsafe_eager_unpack(value):
+                    return True
+                truth = known_expression_truth_value(value)
+                if (
+                    isinstance(node.op, ast.And) and truth is False
+                ) or (
+                    isinstance(node.op, ast.Or) and truth is True
+                ):
+                    return False
+            return False
+        if isinstance(node, ast.Call) and any(
+            isinstance(argument, ast.GeneratorExp)
+            and comprehension_is_unsafe_before_dispatch(
+                argument,
+                consume_generator=True,
+            )
+            for argument in known_eager_generator_arguments(node)
+        ):
+            return True
+        if isinstance(node, ast.Lambda):
+            return any(
+                expression_has_unsafe_eager_unpack(default)
+                for default in (
+                    *node.args.defaults,
+                    *(
+                        default
+                        for default in node.args.kw_defaults
+                        if default is not None
+                    ),
+                )
+            )
+        if isinstance(node, (
+            ast.DictComp,
+            ast.GeneratorExp,
+            ast.ListComp,
+            ast.SetComp,
+        )):
+            return comprehension_is_unsafe_before_dispatch(node)
+        return any(
+            expression_has_unsafe_eager_unpack(child)
+            for child in ast.iter_child_nodes(node)
+        )
+
+    def comprehension_is_unsafe_before_dispatch(
+            node: ast.DictComp | ast.GeneratorExp | ast.ListComp | ast.SetComp,
+            *,
+            consume_generator: bool = False,
+    ) -> bool:
+        if isinstance(node, ast.GeneratorExp) and not consume_generator:
+            first_iterable = node.generators[0].iter
+            return (
+                not is_bounded_comprehension_iterable(first_iterable)
+                or expression_has_unsafe_eager_unpack(first_iterable)
+            )
+        for generator in node.generators:
+            if not is_bounded_comprehension_iterable(generator.iter):
+                return True
+            if expression_has_unsafe_eager_unpack(generator.iter):
+                return True
+            if finite_literal_iterable_state(generator.iter) == (True, True):
+                return False
+            for condition in generator.ifs:
+                if expression_has_unsafe_eager_unpack(condition):
+                    return True
+                if known_expression_truth_value(condition) is False:
+                    return False
+        body = (
+            (node.key, node.value)
+            if isinstance(node, ast.DictComp)
+            else (node.elt,)
+        )
+        return any(expression_has_unsafe_eager_unpack(item) for item in body)
+
+    def generator_expression_is_immediately_consumed(node: ast.AST) -> bool:
+        if not isinstance(node, ast.GeneratorExp):
+            return False
+        parent = execute_parents.get(node)
+        return (
+            isinstance(parent, ast.Call)
+            and node in known_eager_generator_arguments(parent)
+        )
+
+    def has_enclosing_comprehension(node: ast.AST) -> bool:
+        parent = execute_parents.get(node)
+        while parent is not None and parent is not execute_function:
+            if isinstance(parent, (
+                ast.DictComp,
+                ast.GeneratorExp,
+                ast.ListComp,
+                ast.SetComp,
+            )):
+                return True
+            parent = execute_parents.get(parent)
+        return False
+
+    def is_in_statically_dead_expression_branch(node: ast.AST) -> bool:
+        child = node
+        parent = execute_parents.get(child)
+        while parent is not None and parent is not execute_function:
+            if isinstance(parent, ast.IfExp):
+                truth = known_expression_truth_value(parent.test)
+                if (
+                    (child is parent.body and truth is False)
+                    or (child is parent.orelse and truth is True)
+                ):
+                    return True
+            elif isinstance(parent, ast.BoolOp) and child in parent.values:
+                child_index = parent.values.index(child)
+                for earlier in parent.values[:child_index]:
+                    truth = known_expression_truth_value(earlier)
+                    if (
+                        isinstance(parent.op, ast.And) and truth is False
+                    ) or (
+                        isinstance(parent.op, ast.Or) and truth is True
+                    ):
+                        return True
+            child = parent
+            parent = execute_parents.get(child)
+        return False
+
+    def block_guarantees_loop_break(
+            statements: list[ast.stmt],
+            loop: ast.While,
+    ) -> bool:
+        for statement in statements:
+            if isinstance(statement, ast.Break):
+                return nearest_enclosing_loop(statement) is loop
+            if isinstance(statement, (ast.Continue, ast.Raise, ast.Return)):
+                return False
+            if isinstance(statement, ast.If):
+                truth = literal_truth_value(statement.test)
+                if truth is True:
+                    return block_guarantees_loop_break(statement.body, loop)
+                if truth is False:
+                    return block_guarantees_loop_break(statement.orelse, loop)
+                if (
+                    statement.body
+                    and statement.orelse
+                    and block_guarantees_loop_break(statement.body, loop)
+                    and block_guarantees_loop_break(statement.orelse, loop)
+                ):
+                    return True
+        return False
+
+    def is_statically_dead_in_execute(node: ast.AST) -> bool:
+        child = node
+        parent = execute_parents.get(child)
+        while parent is not None and parent is not execute_function:
+            if isinstance(parent, ast.If):
+                truth = literal_truth_value(parent.test)
+                if (
+                    (child in parent.body and truth is False)
+                    or (child in parent.orelse and truth is True)
+                ):
+                    return True
+            elif (
+                isinstance(parent, ast.While)
+                and child in parent.body
+                and literal_truth_value(parent.test) is False
+            ):
+                return True
+            elif (
+                isinstance(parent, ast.For)
+                and child in parent.body
+                and finite_literal_iterable_state(parent.iter) == (True, True)
+            ):
+                return True
+            child = parent
+            parent = execute_parents.get(child)
+        return False
+
+    def is_unsafe_protected_loop(node: ast.AST) -> bool:
+        if is_statically_dead_in_execute(node):
+            return False
+        if isinstance(node, ast.While):
+            if literal_truth_value(node.test) is False:
+                return False
+            return not block_guarantees_loop_break(node.body, node)
+        if isinstance(node, ast.AsyncFor):
+            return True
+        return (
+            isinstance(node, ast.For)
+            and node is not day_loop
+            and not is_plain_finite_literal_iterable(node.iter)
+        )
+
     execute_dispatches = (
         tuple(
             node
@@ -1882,6 +2303,11 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         else ()
     )
     first_execute_dispatch = min(
+        execute_dispatches,
+        key=lambda node: (node.lineno, node.col_offset),
+        default=None,
+    )
+    final_execute_dispatch = max(
         execute_dispatches,
         key=lambda node: (node.lineno, node.col_offset),
         default=None,
@@ -1930,7 +2356,51 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
             )
             and not is_canonical_pre_dispatch_terminator(node)
         )
-        if first_execute_dispatch is None or unexpected_prefix_terminators:
+        final_dispatch_start = (
+            (
+                final_execute_dispatch.lineno,
+                final_execute_dispatch.col_offset,
+            )
+            if final_execute_dispatch is not None
+            else dispatch_start
+        )
+        unsafe_protected_loops = tuple(
+            node
+            for node in ast.walk(execute_function)
+            if isinstance(node, (ast.For, ast.AsyncFor, ast.While))
+            and evaluated_in_execute(node)
+            and final_dispatch_start is not None
+            and (node.lineno, node.col_offset) < final_dispatch_start
+            and is_unsafe_protected_loop(node)
+        )
+        unsafe_protected_comprehensions = tuple(
+            node
+            for node in ast.walk(execute_function)
+            if isinstance(node, (
+                ast.DictComp,
+                ast.GeneratorExp,
+                ast.ListComp,
+                ast.SetComp,
+            ))
+            and evaluated_in_execute(node)
+            and final_dispatch_start is not None
+            and (node.lineno, node.col_offset) < final_dispatch_start
+            and not is_statically_dead_in_execute(node)
+            and not has_enclosing_comprehension(node)
+            and not is_in_statically_dead_expression_branch(node)
+            and comprehension_is_unsafe_before_dispatch(
+                node,
+                consume_generator=generator_expression_is_immediately_consumed(
+                    node
+                ),
+            )
+        )
+        if (
+            first_execute_dispatch is None
+            or unexpected_prefix_terminators
+            or unsafe_protected_loops
+            or unsafe_protected_comprehensions
+        ):
             record("execute-pre-dispatch-termination")
 
     if main_function is not None and pinned_execute_assignment is not None:
@@ -2103,6 +2573,389 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
     if not exact_entrypoint:
         record("main-entrypoint")
 
+    return tuple(violations)
+
+
+def h2c_score_receipt_suffix_violations(
+        tree: ast.Module,
+) -> tuple[str, ...]:
+    expected_source = """
+def frozen_receipt_tail():
+    try:
+        scoring = run_json(
+            [py, "-m", "quant.historical_outcomes", "score", run_id],
+            "H2C_SCORE",
+        )
+        stages["scoring_seconds"] = round(time.monotonic() - started, 6)
+        if (
+            len(scoring.get("metrics", ())) != 72
+            or scoring.get("forecast_count") != expected_forecasts
+            or scoring.get("dataset_digest") != dataset_digest
+            or scoring.get("configuration_digest") != configuration_digest
+        ):
+            raise StageFailure(
+                "H2C_SCORE",
+                "SCORING_RECEIPT_MISMATCH",
+                scoring,
+            )
+        state = "SKIPPED_VERIFIED" if known else "COMPLETED"
+        item.update(
+            state=state,
+            outcome_count=scoring.get("outcome_count"),
+            metrics_count=len(scoring.get("metrics", ())),
+            outcome_writes=outcome.get("inserted"),
+            scoring_hash_summary=scoring.get("content_hash_summary"),
+            stage_timings=stages,
+            elapsed_seconds=round(time.monotonic() - session_started, 6),
+        )
+        item["receipt_sha256"] = _digest(item)
+        receipt["skipped" if known else "completed"].append(day.isoformat())
+        receipt["sessions"].append(item)
+    except Exception:
+        pass
+"""
+    expected_tree = ast.parse(expected_source)
+    expected_try = next(
+        node for node in ast.walk(expected_tree)
+        if isinstance(node, ast.Try)
+    )
+    expected_tail = tuple(
+        ast.dump(statement, include_attributes=False)
+        for statement in expected_try.body
+    )
+
+    execute_functions = tuple(
+        statement
+        for statement in tree.body
+        if isinstance(statement, ast.FunctionDef)
+        and statement.name == "execute"
+    )
+    if len(execute_functions) != 1:
+        return ("h2c-score-receipt-execute",)
+    execute_function = execute_functions[0]
+    day_loops = tuple(
+        statement
+        for statement in execute_function.body
+        if isinstance(statement, ast.For)
+        and isinstance(statement.target, ast.Name)
+        and statement.target.id == "day"
+        and isinstance(statement.iter, ast.Name)
+        and statement.iter.id == "days"
+    )
+    if len(day_loops) != 1:
+        return ("h2c-score-receipt-day-loop",)
+    day_loop = day_loops[0]
+    day_tries = tuple(
+        statement for statement in day_loop.body
+        if isinstance(statement, ast.Try)
+    )
+    if len(day_tries) != 1:
+        return ("h2c-score-receipt-try",)
+    day_try = day_tries[0]
+
+    score_assignments = tuple(
+        statement
+        for statement in day_try.body
+        if isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id == "scoring"
+        and isinstance(statement.value, ast.Call)
+        and len(statement.value.args) == 2
+        and isinstance(statement.value.args[1], ast.Constant)
+        and statement.value.args[1].value == "H2C_SCORE"
+    )
+    if len(score_assignments) != 1:
+        return ("h2c-score-receipt-dispatch",)
+    score_index = day_try.body.index(score_assignments[0])
+    observed_tail = tuple(
+        ast.dump(statement, include_attributes=False)
+        for statement in day_try.body[score_index:]
+    )
+    violations = []
+    if observed_tail != expected_tail:
+        violations.append("h2c-score-receipt-tail")
+    if day_try.orelse or day_try.finalbody:
+        violations.append("h2c-score-receipt-control-flow")
+
+    expected_weekend_guard = ast.parse(
+        """
+if day.weekday() >= 5:
+    item.update(state="REJECTED", reason="MARKET_CLOSED_WEEKEND")
+    receipt["rejected"].append(day.isoformat())
+    receipt["sessions"].append(item)
+    continue
+"""
+    ).body[0]
+    weekend_guards = tuple(
+        statement
+        for statement in day_try.body[:score_index]
+        if isinstance(statement, ast.If)
+        and ast.dump(statement, include_attributes=False)
+        == ast.dump(expected_weekend_guard, include_attributes=False)
+    )
+    if (
+        not day_try.body
+        or weekend_guards != (day_try.body[0],)
+    ):
+        violations.append("h2c-score-receipt-weekend-path")
+
+    expected_failure_handler = ast.parse(
+        """
+try:
+    pass
+except Exception as error:
+    stage = error.stage if isinstance(error, StageFailure) else "ORCHESTRATOR"
+    reason = error.reason if isinstance(error, StageFailure) else type(error).__name__
+    item.update(
+        state="FAILED",
+        failed_stage=stage,
+        reason=reason,
+        stage_timings=stages,
+        elapsed_seconds=round(time.monotonic() - session_started, 6),
+    )
+    receipt["failed"].append(day.isoformat())
+    receipt["sessions"].append(item)
+    if not continue_on_failure:
+        break
+"""
+    ).body[0].handlers[0]
+    if (
+        len(day_try.handlers) != 1
+        or ast.dump(day_try.handlers[0], include_attributes=False)
+        != ast.dump(expected_failure_handler, include_attributes=False)
+    ):
+        violations.append("h2c-score-receipt-failure-path")
+
+    def evaluated_day_try_nodes(node: ast.AST):
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                yield from evaluated_day_try_nodes(decorator)
+            for default in (
+                *node.args.defaults,
+                *(item for item in node.args.kw_defaults if item is not None),
+            ):
+                yield from evaluated_day_try_nodes(default)
+            return
+        if isinstance(node, ast.Lambda):
+            for default in (
+                *node.args.defaults,
+                *(item for item in node.args.kw_defaults if item is not None),
+            ):
+                yield from evaluated_day_try_nodes(default)
+            return
+        for child in ast.iter_child_nodes(node):
+            yield from evaluated_day_try_nodes(child)
+
+    evaluated_nodes = tuple(
+        node
+        for statement in day_try.body
+        for node in evaluated_day_try_nodes(statement)
+    )
+    canonical_state_assignment = (
+        day_try.body[score_index + 3]
+        if len(day_try.body) > score_index + 3
+        else None
+    )
+    canonical_state_target = (
+        canonical_state_assignment.targets[0]
+        if isinstance(canonical_state_assignment, ast.Assign)
+        and len(canonical_state_assignment.targets) == 1
+        and isinstance(canonical_state_assignment.targets[0], ast.Name)
+        and canonical_state_assignment.targets[0].id == "state"
+        else None
+    )
+    state_binding_nodes = tuple(
+        node
+        for node in evaluated_nodes
+        if isinstance(node, ast.Name)
+        and node.id == "state"
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+    )
+    if (
+        canonical_state_target is None
+        or state_binding_nodes != (canonical_state_target,)
+    ):
+        violations.append("h2c-score-receipt-state-inventory")
+
+    def receipt_append_key(call: ast.Call) -> str | None:
+        if not (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "append"
+            and isinstance(call.func.value, ast.Subscript)
+            and isinstance(call.func.value.value, ast.Name)
+            and call.func.value.value.id == "receipt"
+        ):
+            return None
+        selector = call.func.value.slice
+        if isinstance(selector, ast.Constant) and isinstance(selector.value, str):
+            return selector.value
+        if (
+            isinstance(selector, ast.IfExp)
+            and isinstance(selector.body, ast.Constant)
+            and selector.body.value == "skipped"
+            and isinstance(selector.orelse, ast.Constant)
+            and selector.orelse.value == "completed"
+        ):
+            return "success"
+        return None
+
+    receipt_appends = {
+        call: receipt_append_key(call)
+        for call in evaluated_nodes
+        if isinstance(call, ast.Call)
+    }
+    canonical_success_append = (
+        day_try.body[score_index + 6].value
+        if len(day_try.body) > score_index + 6
+        and isinstance(day_try.body[score_index + 6], ast.Expr)
+        and isinstance(day_try.body[score_index + 6].value, ast.Call)
+        else None
+    )
+    success_appends = tuple(
+        call
+        for call, key in receipt_appends.items()
+        if key in {"completed", "skipped", "success"}
+    )
+    if success_appends != (canonical_success_append,):
+        violations.append("h2c-score-receipt-success-inventory")
+
+    allowed_path_appends = set()
+    if weekend_guards:
+        allowed_path_appends.update(
+            node
+            for node in ast.walk(weekend_guards[0])
+            if isinstance(node, ast.Call)
+            and receipt_append_key(node) in {"rejected", "sessions"}
+        )
+    canonical_session_append = (
+        day_try.body[score_index + 7].value
+        if len(day_try.body) > score_index + 7
+        and isinstance(day_try.body[score_index + 7], ast.Expr)
+        and isinstance(day_try.body[score_index + 7].value, ast.Call)
+        else None
+    )
+    if canonical_session_append is not None:
+        allowed_path_appends.add(canonical_session_append)
+    observed_path_appends = {
+        call
+        for call, key in receipt_appends.items()
+        if key in {"rejected", "sessions"}
+    }
+    if observed_path_appends != allowed_path_appends:
+        violations.append("h2c-score-receipt-path-inventory")
+
+    pre_score_success_updates = tuple(
+        node
+        for statement in day_try.body[:score_index]
+        for node in evaluated_day_try_nodes(statement)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "item"
+        and any(
+            keyword.arg == "state"
+            and not (
+                isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == "REJECTED"
+            )
+            for keyword in node.keywords
+        )
+    )
+    if pre_score_success_updates:
+        violations.append("h2c-score-receipt-pre-score-success")
+
+    pre_score_nodes = tuple(
+        node
+        for statement in day_try.body[:score_index]
+        for node in evaluated_day_try_nodes(statement)
+    )
+    weekend_nodes = (
+        set(ast.walk(weekend_guards[0]))
+        if weekend_guards
+        else set()
+    )
+    receipt_aliases = {"receipt"}
+    item_aliases = {"item"}
+    aliases_changed = True
+    while aliases_changed:
+        aliases_changed = False
+        for node in pre_score_nodes:
+            if not (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Name)
+            ):
+                continue
+            if node.value.id in receipt_aliases and node.targets[0].id not in receipt_aliases:
+                receipt_aliases.add(node.targets[0].id)
+                aliases_changed = True
+            if node.value.id in item_aliases and node.targets[0].id not in item_aliases:
+                item_aliases.add(node.targets[0].id)
+                aliases_changed = True
+
+    def constant_subscript_key(node: ast.Subscript) -> object:
+        return (
+            node.slice.value
+            if isinstance(node.slice, ast.Constant)
+            else None
+        )
+
+    protected_receipt_accesses = tuple(
+        node
+        for node in pre_score_nodes
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in receipt_aliases
+        and constant_subscript_key(node) in {
+            "completed",
+            "rejected",
+            "sessions",
+            "skipped",
+        }
+        and node not in weekend_nodes
+    )
+    item_state_writes = tuple(
+        node
+        for node in pre_score_nodes
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        and isinstance(node.value, ast.Name)
+        and node.value.id in item_aliases
+        and constant_subscript_key(node) == "state"
+    )
+    positional_state_updates = tuple(
+        node
+        for node in pre_score_nodes
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in item_aliases
+        and node not in weekend_nodes
+        and (
+            bool(node.args)
+            or any(keyword.arg == "state" for keyword in node.keywords)
+        )
+    )
+    if (
+        protected_receipt_accesses
+        or item_state_writes
+        or positional_state_updates
+    ):
+        violations.append("h2c-score-receipt-pre-score-success")
+    scoring_stores = tuple(
+        node
+        for node in ast.walk(execute_function)
+        if isinstance(node, ast.Name)
+        and node.id == "scoring"
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+    )
+    if scoring_stores != (score_assignments[0].targets[0],):
+        violations.append("h2c-score-receipt-binding")
     return tuple(violations)
 
 
@@ -2456,6 +3309,16 @@ def sensitive_module_reexports(
     }
     tracked_return_callables: set[ast.AST] = set()
     tracked_yield_callables: set[ast.AST] = set()
+    tracked_exception_handler_payloads: dict[
+        ast.ExceptHandler,
+        set[
+            tuple[
+                tuple[ast.AST, ...],
+                ast.AST | None,
+                tuple[ast.AST, ...],
+            ]
+        ],
+    ] = {}
     safely_overwritten_loop_targets: dict[ast.AST, set[str]] = {}
 
     def target_names(node: ast.AST) -> set[str]:
@@ -3028,6 +3891,128 @@ def sensitive_module_reexports(
             node: ast.AST,
             scope: ast.AST | None = None,
     ) -> bool:
+        def is_tracked_handler_name(item: ast.Name) -> bool:
+            child: ast.AST = item
+            parent = parents.get(child)
+            while parent is not None and parent is not scope:
+                if isinstance(parent, ast.ExceptHandler):
+                    payloads = tracked_exception_handler_payloads.get(parent)
+                    if not (
+                        payloads
+                        and parent.name == item.id
+                        and child in parent.body
+                    ):
+                        return False
+                    containing_statement = child
+                    while (
+                        parents.get(containing_statement) is not parent
+                        and parents.get(containing_statement) is not None
+                    ):
+                        containing_statement = parents[containing_statement]
+                    if containing_statement in parent.body:
+                        for statement in reversed(
+                            parent.body[:parent.body.index(containing_statement)]
+                        ):
+                            assigned_value = None
+                            definitely_rebound = False
+                            if isinstance(statement, ast.Assign):
+                                definitely_rebound = any(
+                                    item.id in target_names(target)
+                                    for target in statement.targets
+                                )
+                                assigned_value = statement.value
+                            elif isinstance(statement, ast.AnnAssign):
+                                definitely_rebound = (
+                                    item.id in target_names(statement.target)
+                                )
+                                assigned_value = statement.value
+                            elif isinstance(statement, ast.Delete):
+                                definitely_rebound = any(
+                                    item.id in target_names(target)
+                                    for target in statement.targets
+                                )
+                            if not definitely_rebound:
+                                continue
+                            if assigned_value is None or not any(
+                                isinstance(reference, ast.Name)
+                                and isinstance(reference.ctx, ast.Load)
+                                and reference.id == item.id
+                                for reference in ast.walk(assigned_value)
+                            ):
+                                return False
+                            break
+
+                    cursor: ast.AST = item
+                    saw_args = False
+                    selected_index: int | None = None
+                    unknown_index = False
+                    while cursor is not node:
+                        cursor_parent = parents.get(cursor)
+                        if cursor_parent is None:
+                            break
+                        if (
+                            isinstance(cursor_parent, ast.Attribute)
+                            and cursor_parent.value is cursor
+                            and cursor_parent.attr == "args"
+                        ):
+                            saw_args = True
+                        elif (
+                            saw_args
+                            and isinstance(cursor_parent, ast.Subscript)
+                            and cursor_parent.value is cursor
+                        ):
+                            try:
+                                index = ast.literal_eval(cursor_parent.slice)
+                            except (
+                                ValueError,
+                                TypeError,
+                                SyntaxError,
+                                MemoryError,
+                                RecursionError,
+                            ):
+                                unknown_index = True
+                            else:
+                                if isinstance(index, int) and not isinstance(index, bool):
+                                    selected_index = index
+                                else:
+                                    unknown_index = True
+                        cursor = cursor_parent
+
+                    for arguments, payload_scope, keyword_values in payloads:
+                        if keyword_values or unknown_index or not saw_args:
+                            candidates = arguments + keyword_values
+                        elif selected_index is None:
+                            candidates = arguments
+                        else:
+                            normalized_index = (
+                                selected_index
+                                if selected_index >= 0
+                                else len(arguments) + selected_index
+                            )
+                            candidates = (
+                                (arguments[normalized_index],)
+                                if 0 <= normalized_index < len(arguments)
+                                else ()
+                            )
+                        if any(
+                            contains_passed_tracked_binding(
+                                candidate,
+                                payload_scope,
+                            )
+                            for candidate in candidates
+                        ):
+                            return True
+                    return False
+                if isinstance(parent, (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.Lambda,
+                )):
+                    return False
+                child = parent
+                parent = parents.get(child)
+            return False
+
         def is_safely_overwritten_in_loop(item: ast.Name) -> bool:
             child: ast.AST = item
             parent = parents.get(child)
@@ -3110,6 +4095,8 @@ def sensitive_module_reexports(
             return False
 
         def is_tracked_name(item: ast.Name) -> bool:
+            if is_tracked_handler_name(item):
+                return True
             if is_safely_overwritten_in_loop(item):
                 return False
             item_scope = scope
@@ -3765,10 +4752,65 @@ def sensitive_module_reexports(
             return tuple(
                 (key, scope) for key in iterable.keys if key is not None
             ), False
-        if not isinstance(iterable, ast.Call):
-            return (), False
         rows = []
         unknown_tracked_shape = False
+        protocol_iterators = set().union(*(
+            resolve_class_methods(class_node, method_name)
+            for class_node in resolve_instance_expression(iterable, scope)
+            for method_name in ("__iter__", "__aiter__")
+        ))
+        for local_callable in protocol_iterators:
+            yields = own_yield_nodes(local_callable)
+            if yields:
+                for yielded in yields:
+                    value = yielded.value
+                    if value is None:
+                        continue
+                    if isinstance(yielded, ast.Yield):
+                        rows.append((value, local_callable))
+                        continue
+                    variants = resolve_literal_sequences(value, local_callable)
+                    if variants:
+                        rows.extend(
+                            (row, local_callable)
+                            for variant in variants
+                            for row in variant
+                        )
+                    elif contains_assignment_tracked_binding(
+                        value,
+                        local_callable,
+                    ):
+                        unknown_tracked_shape = True
+                continue
+            for returned in (
+                node.value
+                for node in ast.walk(local_callable)
+                if isinstance(node, ast.Return)
+                and node.value is not None
+                and enclosing_callable(node) is local_callable
+            ):
+                variants = resolve_literal_sequences(returned, local_callable)
+                if variants:
+                    rows.extend(
+                        (row, local_callable)
+                        for variant in variants
+                        for row in variant
+                    )
+                elif contains_assignment_tracked_binding(
+                    returned,
+                    local_callable,
+                ):
+                    unknown_tracked_shape = True
+        if rows:
+            return tuple(rows), unknown_tracked_shape
+        if any(
+            local_callable in tracked_return_callables
+            or local_callable in tracked_yield_callables
+            for local_callable in protocol_iterators
+        ):
+            return (), True
+        if not isinstance(iterable, ast.Call):
+            return (), False
         for local_callable, _ in local_call_targets(iterable):
             yields = own_yield_nodes(local_callable)
             if yields:
@@ -3985,9 +5027,361 @@ def sensitive_module_reexports(
     ):
         update_loop_provenance(initial_loop)
 
+    def exception_type_keys(
+            expression: ast.AST,
+            scope: ast.AST | None,
+    ) -> set[tuple[str, object]]:
+        keys: set[tuple[str, object]] = {
+            ("origin", origin)
+            for origin in import_origin_names(expression)
+        }
+        keys.update(
+            ("class", class_node)
+            for class_node in resolve_class_expression(expression, scope)
+        )
+        if not keys:
+            keys.add(("syntax", ast.dump(expression, include_attributes=False)))
+        return keys
+
+    def is_unshadowed_builtin_exception(
+            expression: ast.AST,
+            scope: ast.AST | None,
+    ) -> bool:
+        if not (
+            isinstance(expression, ast.Name)
+            and expression.id in {"BaseException", "Exception"}
+        ):
+            return False
+        lookup_scope = scope
+        while True:
+            if expression.id in scope_bound_names[lookup_scope]:
+                return False
+            if lookup_scope is None:
+                return True
+            lookup_scope = callable_parents[lookup_scope]
+
+    def exception_handler_matches(
+            raised_type: ast.AST,
+            handler_type: ast.AST | None,
+            scope: ast.AST | None,
+    ) -> bool:
+        if handler_type is None:
+            return True
+        if isinstance(handler_type, ast.Tuple):
+            return any(
+                exception_handler_matches(raised_type, item, scope)
+                for item in handler_type.elts
+            )
+        if is_unshadowed_builtin_exception(handler_type, scope):
+            return True
+        raised_classes = resolve_class_expression(raised_type, scope)
+        handler_classes = resolve_class_expression(handler_type, scope)
+        if any(
+            handler_class in (local_c3_mro(raised_class) or ())
+            for raised_class in raised_classes
+            for handler_class in handler_classes
+        ):
+            return True
+        return bool(
+            exception_type_keys(raised_type, scope)
+            & exception_type_keys(handler_type, scope)
+        )
+
+    def raised_alias_assignment_dominates(
+            value: ast.AST,
+            reference: ast.AST,
+    ) -> bool:
+        owner: ast.AST = value
+        while not isinstance(owner, ast.stmt) and parents.get(owner) is not None:
+            owner = parents[owner]
+        owner_parent = parents.get(owner)
+        if owner_parent is None:
+            return False
+        for field_name in ("body", "orelse", "finalbody"):
+            block = getattr(owner_parent, field_name, None)
+            if not isinstance(block, list) or owner not in block:
+                continue
+            reference_child = reference
+            while (
+                parents.get(reference_child) is not owner_parent
+                and parents.get(reference_child) is not None
+            ):
+                reference_child = parents[reference_child]
+            return (
+                reference_child in block
+                and block.index(owner) < block.index(reference_child)
+            )
+        return False
+
+    def resolve_raised_exception_constructors(
+            expression: ast.AST,
+            scope: ast.AST | None,
+            before: tuple[int, int],
+            seen: frozenset[str] = frozenset(),
+    ) -> set[tuple[ast.Call, ast.AST | None]]:
+        if isinstance(expression, ast.Call):
+            return {(expression, scope)}
+        if isinstance(expression, ast.NamedExpr):
+            return resolve_raised_exception_constructors(
+                expression.value,
+                scope,
+                before,
+                seen,
+            )
+        if isinstance(expression, ast.IfExp):
+            return set().union(*(
+                resolve_raised_exception_constructors(
+                    branch,
+                    scope,
+                    before,
+                    seen,
+                )
+                for branch in (expression.body, expression.orelse)
+            ))
+        if not isinstance(expression, ast.Name) or expression.id in seen:
+            return set()
+        candidates = []
+        for event_scope, targets, value in alias_assignments:
+            if event_scope is not scope:
+                continue
+            if not any(expression.id in target_names(target) for target in targets):
+                continue
+            position = (value.lineno, value.col_offset)
+            if position < before:
+                candidates.append((
+                    position,
+                    value,
+                    raised_alias_assignment_dominates(value, expression),
+                ))
+        if not candidates:
+            return set()
+        definite = tuple(event for event in candidates if event[2])
+        latest_definite = (
+            max(definite, key=lambda item: item[0])
+            if definite
+            else None
+        )
+        cutoff = latest_definite[0] if latest_definite else (-1, -1)
+        possible_values = []
+        if latest_definite is not None:
+            possible_values.append(latest_definite)
+        possible_values.extend(
+            event
+            for event in candidates
+            if not event[2] and event[0] > cutoff
+        )
+        return set().union(*(
+            resolve_raised_exception_constructors(
+                value,
+                scope,
+                position,
+                seen | {expression.id},
+            )
+            for position, value, _ in possible_values
+        )) if possible_values else set()
+
+    def matching_exception_handlers(
+            raise_node: ast.Raise,
+            raised_type: ast.AST,
+    ) -> tuple[ast.ExceptHandler, ...]:
+        scope = enclosing_callable(raise_node)
+        child: ast.AST = raise_node
+        parent = parents.get(child)
+        while parent is not None and parent is not scope:
+            if isinstance(parent, (ast.Try, ast.TryStar)) and child in parent.body:
+                matches = tuple(
+                    handler
+                    for handler in parent.handlers
+                    if exception_handler_matches(
+                        raised_type,
+                        handler.type,
+                        scope,
+                    )
+                )
+                if matches:
+                    return matches[:1]
+            child = parent
+            parent = parents.get(child)
+        return ()
+
+    binary_protocol_methods = {
+        ast.Add: ("__add__", "__radd__"),
+        ast.Sub: ("__sub__", "__rsub__"),
+        ast.Mult: ("__mul__", "__rmul__"),
+        ast.MatMult: ("__matmul__", "__rmatmul__"),
+        ast.Div: ("__truediv__", "__rtruediv__"),
+        ast.FloorDiv: ("__floordiv__", "__rfloordiv__"),
+        ast.Mod: ("__mod__", "__rmod__"),
+        ast.Pow: ("__pow__", "__rpow__"),
+        ast.LShift: ("__lshift__", "__rlshift__"),
+        ast.RShift: ("__rshift__", "__rrshift__"),
+        ast.BitOr: ("__or__", "__ror__"),
+        ast.BitXor: ("__xor__", "__rxor__"),
+        ast.BitAnd: ("__and__", "__rand__"),
+    }
+    inplace_protocol_methods = {
+        ast.Add: "__iadd__",
+        ast.Sub: "__isub__",
+        ast.Mult: "__imul__",
+        ast.MatMult: "__imatmul__",
+        ast.Div: "__itruediv__",
+        ast.FloorDiv: "__ifloordiv__",
+        ast.Mod: "__imod__",
+        ast.Pow: "__ipow__",
+        ast.LShift: "__ilshift__",
+        ast.RShift: "__irshift__",
+        ast.BitOr: "__ior__",
+        ast.BitXor: "__ixor__",
+        ast.BitAnd: "__iand__",
+    }
+    comparison_protocol_methods = {
+        ast.Lt: ("__lt__", "__gt__"),
+        ast.LtE: ("__le__", "__ge__"),
+        ast.Gt: ("__gt__", "__lt__"),
+        ast.GtE: ("__ge__", "__le__"),
+        ast.Eq: ("__eq__", "__eq__"),
+        ast.NotEq: ("__ne__", "__ne__"),
+    }
+
+    def taint_local_protocol_method(
+            receiver: ast.AST,
+            method_name: str,
+            arguments: tuple[ast.AST, ...],
+            scope: ast.AST | None,
+    ) -> bool:
+        updated = False
+        methods = set().union(*(
+            resolve_class_methods(class_node, method_name)
+            for class_node in resolve_instance_expression(receiver, scope)
+        ))
+        for method in methods:
+            positional, _, vararg, _, _ = callable_parameter_bindings(method)
+            receiver_offset = int(method_descriptor_kind(method) != "static")
+            available = positional[receiver_offset:]
+            newly_tracked = set()
+            for index, argument in enumerate(arguments):
+                if not contains_passed_tracked_binding(argument, scope):
+                    continue
+                if index < len(available):
+                    newly_tracked.add(available[index].arg)
+                elif vararg is not None:
+                    newly_tracked.add(vararg.arg)
+            local_bindings = scoped_tracked_bindings[method]
+            if not newly_tracked.issubset(local_bindings):
+                local_bindings.update(newly_tracked)
+                updated = True
+        return updated
+
+    def update_implicit_protocol_provenance(node: ast.AST) -> bool:
+        scope = enclosing_callable(node)
+        invocations: list[tuple[ast.AST, str, tuple[ast.AST, ...]]] = []
+        if isinstance(node, ast.BinOp):
+            methods = binary_protocol_methods.get(type(node.op))
+            if methods is not None:
+                invocations.extend((
+                    (node.left, methods[0], (node.right,)),
+                    (node.right, methods[1], (node.left,)),
+                ))
+        elif isinstance(node, ast.AugAssign):
+            methods = binary_protocol_methods.get(type(node.op))
+            inplace = inplace_protocol_methods.get(type(node.op))
+            if inplace is not None:
+                invocations.append((node.target, inplace, (node.value,)))
+            if methods is not None:
+                invocations.extend((
+                    (node.target, methods[0], (node.value,)),
+                    (node.value, methods[1], (node.target,)),
+                ))
+        elif isinstance(node, ast.Compare):
+            left = node.left
+            for operator, right in zip(node.ops, node.comparators):
+                methods = comparison_protocol_methods.get(type(operator))
+                if methods is not None:
+                    invocations.extend((
+                        (left, methods[0], (right,)),
+                        (right, methods[1], (left,)),
+                    ))
+                elif isinstance(operator, (ast.In, ast.NotIn)):
+                    invocations.append((right, "__contains__", (left,)))
+                left = right
+        elif isinstance(node, ast.Subscript):
+            if isinstance(node.ctx, ast.Load):
+                invocations.append((node.value, "__getitem__", (node.slice,)))
+            elif isinstance(node.ctx, ast.Del):
+                invocations.append((node.value, "__delitem__", (node.slice,)))
+            elif isinstance(node.ctx, ast.Store):
+                parent = parents.get(node)
+                assigned_value = None
+                if isinstance(parent, ast.Assign) and node in parent.targets:
+                    assigned_value = parent.value
+                elif isinstance(parent, ast.AnnAssign) and parent.target is node:
+                    assigned_value = parent.value
+                elif isinstance(parent, ast.AugAssign) and parent.target is node:
+                    assigned_value = parent.value
+                if assigned_value is not None:
+                    invocations.append((
+                        node.value,
+                        "__setitem__",
+                        (node.slice, assigned_value),
+                    ))
+        updated = False
+        for receiver, method_name, arguments in invocations:
+            if taint_local_protocol_method(
+                receiver,
+                method_name,
+                arguments,
+                scope,
+            ):
+                updated = True
+        return updated
+
     changed = True
     while changed:
         changed = False
+        for raise_node in (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Raise)
+            and node.exc is not None
+        ):
+            scope = enclosing_callable(raise_node)
+            resolved_constructors = resolve_raised_exception_constructors(
+                raise_node.exc,
+                scope,
+                (raise_node.lineno, raise_node.col_offset),
+            )
+            for constructor, payload_scope in resolved_constructors:
+                positional_payload = tuple(constructor.args)
+                keyword_values = tuple(
+                    keyword.value for keyword in constructor.keywords
+                )
+                if not any(
+                    contains_passed_tracked_binding(argument, payload_scope)
+                    for argument in positional_payload + keyword_values
+                ):
+                    continue
+                for handler in matching_exception_handlers(
+                    raise_node,
+                    constructor.func,
+                ):
+                    if not handler.name:
+                        continue
+                    payloads = tracked_exception_handler_payloads.setdefault(
+                        handler,
+                        set(),
+                    )
+                    payload = (
+                        positional_payload,
+                        payload_scope,
+                        keyword_values,
+                    )
+                    if payload not in payloads:
+                        payloads.add(payload)
+                        changed = True
+
+        for protocol_node in ast.walk(tree):
+            if update_implicit_protocol_provenance(protocol_node):
+                changed = True
+
         for node in ast.walk(tree):
             value = None
             targets = []
@@ -4705,6 +6099,273 @@ def sensitive_module_reexports(
             contains_assignment_tracked_binding(node, scope)
             or expression_carries_value(node)
         )
+
+    def statement_owner(node: ast.AST) -> ast.AST:
+        owner = node
+        while not isinstance(owner, ast.stmt) and parents.get(owner) is not None:
+            owner = parents[owner]
+        return owner
+
+    def binding_scope_for_name(
+            name: str,
+            scope: ast.AST | None,
+    ) -> ast.AST | None:
+        while True:
+            if scope is not None and name in scope_global_names[scope]:
+                return None
+            if scope is not None and name in scope_nonlocal_names[scope]:
+                scope = callable_parents[scope]
+                continue
+            if name in scope_bound_names[scope]:
+                return scope
+            if scope is None:
+                return None
+            scope = callable_parents[scope]
+
+    def latest_exclusive_alias_value(
+            name: str,
+            scope: ast.AST | None,
+            reference: ast.AST,
+    ) -> tuple[ast.AST, ast.AST | None] | None:
+        lookup_scope = binding_scope_for_name(name, scope)
+        reference_position = (reference.lineno, reference.col_offset)
+        candidates = []
+        for event_scope, targets, value in alias_assignments:
+            if event_scope is not lookup_scope:
+                continue
+            assigned = next((
+                result
+                for target in targets
+                for result in (assigned_value_for_name(target, value, name),)
+                if result is not None
+            ), None)
+            if assigned is None:
+                continue
+            position = (assigned.lineno, assigned.col_offset)
+            if (
+                position < reference_position
+                and raised_alias_assignment_dominates(assigned, reference)
+            ):
+                candidates.append((position, assigned, statement_owner(assigned)))
+        if not candidates:
+            return None
+        _, assigned, chosen_owner = max(candidates, key=lambda item: item[0])
+        cutoff = (chosen_owner.lineno, chosen_owner.col_offset)
+        container = tree if lookup_scope is None else lookup_scope
+        for target in ast.walk(container):
+            if (
+                not isinstance(target, ast.Name)
+                or target.id != name
+                or not isinstance(target.ctx, (ast.Store, ast.Del))
+                or enclosing_callable(target) is not lookup_scope
+                or is_in_unmodeled_class_namespace(target)
+            ):
+                continue
+            owner = statement_owner(target)
+            position = (owner.lineno, owner.col_offset)
+            if (
+                cutoff < position < reference_position
+                and owner is not chosen_owner
+            ):
+                return None
+        for candidate in ast.walk(container):
+            if not hasattr(candidate, "lineno"):
+                continue
+            position = (candidate.lineno, candidate.col_offset)
+            if not cutoff < position < reference_position:
+                continue
+            if (
+                isinstance(candidate, ast.ExceptHandler)
+                and candidate.name == name
+                and enclosing_callable(candidate) is lookup_scope
+            ) or (
+                isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and candidate.name == name
+                and enclosing_callable(candidate) is lookup_scope
+            ) or (
+                isinstance(candidate, (ast.Import, ast.ImportFrom))
+                and enclosing_callable(candidate) is lookup_scope
+                and any(
+                    (
+                        alias.asname
+                        or (
+                            alias.name
+                            if isinstance(candidate, ast.ImportFrom)
+                            else alias.name.split(".")[0]
+                        )
+                    ) == name
+                    for alias in candidate.names
+                )
+            ):
+                return None
+        return assigned, lookup_scope
+
+    def complete_local_class_expression(
+            expression: ast.AST,
+            scope: ast.AST | None,
+            reference: ast.AST,
+            seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> tuple[set[ast.ClassDef], bool]:
+        if isinstance(expression, ast.NamedExpr):
+            return complete_local_class_expression(
+                expression.value,
+                scope,
+                reference,
+                seen,
+            )
+        if isinstance(expression, ast.IfExp):
+            branches = tuple(
+                complete_local_class_expression(
+                    branch,
+                    scope,
+                    reference,
+                    seen,
+                )
+                for branch in (expression.body, expression.orelse)
+            )
+            return (
+                set().union(*(classes for classes, _ in branches)),
+                all(complete and classes for classes, complete in branches),
+            )
+        if not isinstance(expression, ast.Name):
+            return set(), False
+        marker = (scope, expression.id)
+        if marker in seen:
+            return set(), False
+        local_classes = resolve_scoped_classes(
+            expression.id,
+            scope,
+            class_bindings,
+        )
+        declarations = {
+            class_node
+            for class_node in local_classes
+            if class_node.name == expression.id
+            and enclosing_callable(class_node) is scope
+            and (class_node.lineno, class_node.col_offset)
+            < (reference.lineno, reference.col_offset)
+        }
+        if declarations == local_classes and declarations:
+            return declarations, True
+        alias = latest_exclusive_alias_value(expression.id, scope, reference)
+        if alias is None:
+            return set(), False
+        assigned, assigned_scope = alias
+        return complete_local_class_expression(
+            assigned,
+            assigned_scope,
+            assigned,
+            seen | {marker},
+        )
+
+    def complete_local_instance_expression(
+            expression: ast.AST,
+            scope: ast.AST | None,
+            reference: ast.AST,
+            seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> tuple[set[ast.ClassDef], bool]:
+        if isinstance(expression, ast.Call):
+            return complete_local_class_expression(
+                expression.func,
+                scope,
+                reference,
+                seen,
+            )
+        if isinstance(expression, ast.NamedExpr):
+            return complete_local_instance_expression(
+                expression.value,
+                scope,
+                reference,
+                seen,
+            )
+        if isinstance(expression, ast.IfExp):
+            branches = tuple(
+                complete_local_instance_expression(
+                    branch,
+                    scope,
+                    reference,
+                    seen,
+                )
+                for branch in (expression.body, expression.orelse)
+            )
+            return (
+                set().union(*(classes for classes, _ in branches)),
+                all(complete and classes for classes, complete in branches),
+            )
+        if not isinstance(expression, ast.Name):
+            return set(), False
+        marker = (scope, expression.id)
+        if marker in seen:
+            return set(), False
+        alias = latest_exclusive_alias_value(expression.id, scope, reference)
+        if alias is None:
+            return set(), False
+        assigned, assigned_scope = alias
+        return complete_local_instance_expression(
+            assigned,
+            assigned_scope,
+            assigned,
+            seen | {marker},
+        )
+
+    def exclusively_modeled_local_setitem(
+            target: ast.Subscript,
+            scope: ast.AST | None,
+    ) -> bool:
+        classes, complete = complete_local_instance_expression(
+            target.value,
+            scope,
+            target,
+        )
+        if not complete or not classes:
+            return False
+        if classes != resolve_instance_expression(target.value, scope):
+            return False
+        for class_node in classes:
+            methods = resolve_class_methods(class_node, "__setitem__")
+            if not methods:
+                return False
+            if local_c3_mro(class_node) is None and not class_methods[
+                class_node
+            ].get("__setitem__"):
+                return False
+        return True
+
+    def generic_persistent_assignment_escape(
+            target: ast.AST,
+            value: ast.AST,
+            scope: ast.AST | None,
+            *,
+            direct: bool,
+    ) -> bool:
+        if isinstance(target, ast.Attribute):
+            return carries_state_escape_value(value, scope)
+        if isinstance(target, ast.Subscript):
+            carries_argument = (
+                carries_state_escape_value(value, scope)
+                or carries_state_escape_value(target.slice, scope)
+            )
+            return carries_argument and not (
+                direct and exclusively_modeled_local_setitem(target, scope)
+            )
+        if isinstance(target, ast.Starred):
+            return generic_persistent_assignment_escape(
+                target.value,
+                value,
+                scope,
+                direct=False,
+            )
+        if isinstance(target, (ast.List, ast.Tuple)):
+            return any(
+                generic_persistent_assignment_escape(
+                    item,
+                    value,
+                    scope,
+                    direct=False,
+                )
+                for item in target.elts
+            )
+        return False
 
     exact_setter_origins = {
         "builtins.setattr",
@@ -5425,6 +7086,15 @@ def sensitive_module_reexports(
             scope: ast.AST | None,
             seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
     ) -> set[str]:
+        if isinstance(expression, (ast.NamedExpr, ast.Starred)):
+            return flow_sensitive_import_origins(expression.value, scope, seen)
+        if isinstance(expression, ast.IfExp):
+            return (
+                flow_sensitive_import_origins(expression.body, scope, seen)
+                | flow_sensitive_import_origins(expression.orelse, scope, seen)
+            )
+        if isinstance(expression, ast.Call):
+            return flow_sensitive_import_origins(expression.func, scope, seen)
         if isinstance(expression, ast.Attribute):
             return {
                 f"{origin}.{expression.attr}"
@@ -5450,6 +7120,59 @@ def sensitive_module_reexports(
             )) if selected_values else set()
         if not isinstance(expression, ast.Name):
             return set()
+
+        child: ast.AST = expression
+        lexical_parent = parents.get(child)
+        while lexical_parent is not None and lexical_parent is not scope:
+            if (
+                isinstance(lexical_parent, (ast.For, ast.AsyncFor))
+                and child in lexical_parent.body
+                and expression.id in target_names(lexical_parent.target)
+            ):
+                return set()
+            if (
+                isinstance(lexical_parent, (ast.With, ast.AsyncWith))
+                and child in lexical_parent.body
+                and any(
+                    item.optional_vars is not None
+                    and expression.id in target_names(item.optional_vars)
+                    for item in lexical_parent.items
+                )
+            ):
+                return set()
+            if (
+                isinstance(lexical_parent, ast.ExceptHandler)
+                and child in lexical_parent.body
+                and lexical_parent.name == expression.id
+            ):
+                return set()
+            if isinstance(lexical_parent, (
+                ast.ListComp,
+                ast.SetComp,
+                ast.GeneratorExp,
+                ast.DictComp,
+            )):
+                generators = lexical_parent.generators
+                if any(
+                    expression.id in target_names(generator.target)
+                    and not (
+                        expression is generator.iter
+                        or any(
+                            expression is descendant
+                            for descendant in ast.walk(generator.iter)
+                        )
+                    )
+                    for generator in generators
+                ):
+                    return set()
+            if isinstance(lexical_parent, (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.Lambda,
+            )):
+                break
+            child = lexical_parent
+            lexical_parent = parents.get(child)
 
         lookup_scope = scope
         while True:
@@ -5485,6 +7208,55 @@ def sensitive_module_reexports(
             else len(body)
         )
 
+        def conditional_assignment_origins_after(
+                cutoff: tuple[int, int],
+        ) -> set[str]:
+            reference_position = (expression.lineno, expression.col_offset)
+            origins = set()
+            for target in ast.walk(container):
+                if (
+                    not isinstance(target, ast.Name)
+                    or target.id != expression.id
+                    or not isinstance(target.ctx, ast.Store)
+                    or enclosing_callable(target) is not lookup_scope
+                    or is_in_unmodeled_class_namespace(target)
+                ):
+                    continue
+                position = (target.lineno, target.col_offset)
+                if not cutoff < position < reference_position:
+                    continue
+                owner: ast.AST = target
+                while (
+                    not isinstance(owner, ast.stmt)
+                    and parents.get(owner) is not None
+                ):
+                    owner = parents[owner]
+                if owner in body:
+                    continue
+                assigned = None
+                if isinstance(owner, ast.Assign):
+                    for assignment_target in owner.targets:
+                        assigned = assigned_value_for_name(
+                            assignment_target,
+                            owner.value,
+                            expression.id,
+                        )
+                        if assigned is not None:
+                            break
+                elif isinstance(owner, ast.AnnAssign) and owner.value is not None:
+                    assigned = assigned_value_for_name(
+                        owner.target,
+                        owner.value,
+                        expression.id,
+                    )
+                if assigned is not None:
+                    origins.update(flow_sensitive_import_origins(
+                        assigned,
+                        lookup_scope,
+                        seen | {alias_key},
+                    ))
+            return origins
+
         for statement in reversed(body[:before_index]):
             assigned: ast.AST | None = None
             assigned_scope = lookup_scope
@@ -5496,12 +7268,18 @@ def sensitive_module_reexports(
                             alias.name
                             if alias.asname
                             else alias.name.split(".")[0]
-                        }
+                        } | conditional_assignment_origins_after(
+                            (statement.lineno, statement.col_offset)
+                        )
             elif isinstance(statement, ast.ImportFrom):
                 if statement.level == 0 and statement.module:
                     for alias in statement.names:
                         if (alias.asname or alias.name) == expression.id:
-                            return {f"{statement.module}.{alias.name}"}
+                            return {
+                                f"{statement.module}.{alias.name}"
+                            } | conditional_assignment_origins_after(
+                                (statement.lineno, statement.col_offset)
+                            )
             elif isinstance(statement, ast.Assign):
                 for target in statement.targets:
                     assigned = assigned_value_for_name(
@@ -5553,11 +7331,15 @@ def sensitive_module_reexports(
             if not is_binding:
                 continue
             if assigned is None:
-                return set()
-            return flow_sensitive_import_origins(
-                assigned,
-                assigned_scope,
-                seen | {alias_key},
+                base_origins = set()
+            else:
+                base_origins = flow_sensitive_import_origins(
+                    assigned,
+                    assigned_scope,
+                    seen | {alias_key},
+                )
+            return base_origins | conditional_assignment_origins_after(
+                (statement.lineno, statement.col_offset)
             )
 
         if lookup_scope is not None and expression.id in {
@@ -5595,6 +7377,16 @@ def sensitive_module_reexports(
             findings.append(node)
         elif (
             isinstance(node, ast.Call)
+            and EXECUTABLE_DESERIALIZER_FULL_IMPORT_NAMES.intersection(
+                flow_sensitive_import_origins(
+                    node.func,
+                    enclosing_callable(node),
+                )
+            )
+        ):
+            findings.append(node)
+        elif (
+            isinstance(node, ast.Call)
             and "pydoc.browse" in flow_sensitive_import_origins(
                 node.func,
                 enclosing_callable(node),
@@ -5625,19 +7417,32 @@ def sensitive_module_reexports(
             )
             if (
                 value is not None
-                and any(contains_persistent_target(target) for target in targets)
-                and carries_state_escape_value(
-                    value,
-                    enclosing_callable(node),
+                and any(
+                    generic_persistent_assignment_escape(
+                        target,
+                        value,
+                        enclosing_callable(node),
+                        direct=True,
+                    )
+                    for target in targets
                 )
             ):
                 findings.append(node)
         elif (
             isinstance(node, ast.AugAssign)
             and contains_persistent_target(node.target)
-            and carries_state_escape_value(
-                node.value,
-                enclosing_callable(node),
+            and (
+                carries_state_escape_value(
+                    node.value,
+                    enclosing_callable(node),
+                )
+                or (
+                    isinstance(node.target, ast.Subscript)
+                    and carries_state_escape_value(
+                        node.target.slice,
+                        enclosing_callable(node),
+                    )
+                )
             )
         ):
             findings.append(node)
@@ -7557,6 +9362,364 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     f"safe state operation was rejected: {safe_case}",
                 )
 
+    def test_deserializer_exception_and_protocol_guards_are_flow_sensitive(self):
+        deserializer_positives = (
+            "import pickle\npickle.loads(blob)\n",
+            "from pickle import load as decode\ndecode(stream)\n",
+            (
+                "import pickle as codec\n"
+                "decode = codec.loads\n"
+                "alias = decode\n"
+                "alias(blob)\n"
+            ),
+            "import _pickle\n_pickle.loads(blob)\n",
+            "import dill\ndill.load(stream)\n",
+            "import cloudpickle\ncloudpickle.loads(blob)\n",
+            "import joblib\njoblib.load(path)\n",
+            "import pandas\npandas.read_pickle(path)\n",
+            "import yaml\nyaml.unsafe_load(blob)\n",
+            "import pickle\npickle.Unpickler(stream).load()\n",
+            (
+                "import pickle\n"
+                "decode = pickle.Unpickler(stream).load\n"
+                "decode()\n"
+            ),
+            (
+                "import pickle\n"
+                "decode = harmless\n"
+                "if enabled:\n"
+                "    decode = pickle.loads\n"
+                "decode(blob)\n"
+            ),
+            (
+                "import pickle\n"
+                "decode = pickle.loads\n"
+                "if enabled:\n"
+                "    decode = harmless\n"
+                "decode(blob)\n"
+            ),
+        )
+        for source in deserializer_positives:
+            with self.subTest(executable_deserializer=source.strip()):
+                self.assertTrue(
+                    sensitive_module_reexports(ast.parse(source), {}),
+                )
+
+        deserializer_negatives = (
+            "import json\njson.loads(blob)\n",
+            "import pickle\npickle.dumps(blob)\n",
+            "import example\nexample.loads(blob)\n",
+            (
+                "import pickle\n"
+                "decode = pickle.loads\n"
+                "decode = harmless\n"
+                "decode(blob)\n"
+            ),
+            (
+                "import pickle\n"
+                "def run(pickle):\n"
+                "    return pickle.loads(blob)\n"
+            ),
+            (
+                "from pickle import loads as decode\n"
+                "for decode in [harmless]:\n"
+                "    decode(blob)\n"
+            ),
+            (
+                "from pickle import loads as decode\n"
+                "with context() as decode:\n"
+                "    decode(blob)\n"
+            ),
+            (
+                "from pickle import loads as decode\n"
+                "try:\n"
+                "    pass\n"
+                "except Exception as decode:\n"
+                "    decode(blob)\n"
+            ),
+            (
+                "from pickle import loads as decode\n"
+                "[decode(blob) for decode in [harmless]]\n"
+            ),
+            "import pickle\ndecode = pickle.loads\n",
+        )
+        for source in deserializer_negatives:
+            with self.subTest(safe_deserializer_shape=source.strip()):
+                self.assertFalse(
+                    sensitive_module_reexports(ast.parse(source), {}),
+                )
+
+        prefix = "from shutil import fnmatch as p\n"
+        exception_positives = (
+            (
+                "try:\n"
+                "    raise RuntimeError(p)\n"
+                "except RuntimeError as error:\n"
+                "    error.args[0].os.fork()\n"
+            ),
+            (
+                "failure = RuntimeError(p)\n"
+                "try:\n"
+                "    raise failure\n"
+                "except RuntimeError as error:\n"
+                "    payload = error.args[0]\n"
+                "    payload.os.fork()\n"
+            ),
+            (
+                "try:\n"
+                "    raise RuntimeError(None, p)\n"
+                "except Exception as error:\n"
+                "    error.args[1].os.fork()\n"
+            ),
+            (
+                "try:\n"
+                "    raise RuntimeError(p)\n"
+                "except (ValueError, RuntimeError) as error:\n"
+                "    alias = error\n"
+                "    alias.args[0].os.fork()\n"
+            ),
+            (
+                "failure = RuntimeError(p)\n"
+                "if enabled:\n"
+                "    failure = RuntimeError(None)\n"
+                "try:\n"
+                "    raise failure\n"
+                "except RuntimeError as error:\n"
+                "    error.args[0].os.fork()\n"
+            ),
+            (
+                "try:\n"
+                "    raise (RuntimeError(p) if enabled else RuntimeError(None))\n"
+                "except RuntimeError as error:\n"
+                "    error.args[0].os.fork()\n"
+            ),
+            (
+                "class Failure(Exception):\n"
+                "    pass\n"
+                "try:\n"
+                "    raise Failure(payload=p)\n"
+                "except Failure as error:\n"
+                "    error.args[0].os.fork()\n"
+            ),
+        )
+        for body in exception_positives:
+            with self.subTest(exception_payload=body.strip()):
+                self.assertTrue(
+                    sensitive_module_reexports(
+                        ast.parse(prefix + body),
+                        {"p": "shutil.fnmatch"},
+                    )
+                )
+
+        exception_negatives = (
+            (
+                "try:\n"
+                "    raise RuntimeError(p)\n"
+                "except ValueError as error:\n"
+                "    error.args[0].os.fork()\n"
+            ),
+            (
+                "failure = RuntimeError(None)\n"
+                "if enabled:\n"
+                "    failure = RuntimeError(p)\n"
+                "failure = RuntimeError(None)\n"
+                "try:\n"
+                "    raise failure\n"
+                "except RuntimeError as error:\n"
+                "    error.args[0].os.fork()\n"
+            ),
+            (
+                "try:\n"
+                "    raise RuntimeError('safe')\n"
+                "except RuntimeError as error:\n"
+                "    error.args[0].os.fork()\n"
+            ),
+            (
+                "try:\n"
+                "    raise RuntimeError(None, p)\n"
+                "except RuntimeError as error:\n"
+                "    error.args[0].os.fork()\n"
+            ),
+            (
+                "try:\n"
+                "    raise RuntimeError(p)\n"
+                "except RuntimeError as error:\n"
+                "    error = harmless\n"
+                "    error.os.fork()\n"
+            ),
+            (
+                "try:\n"
+                "    raise RuntimeError(p)\n"
+                "except RuntimeError:\n"
+                "    pass\n"
+                "except Exception as error:\n"
+                "    error.args[0].os.fork()\n"
+            ),
+        )
+        for body in exception_negatives:
+            with self.subTest(safe_exception_flow=body.strip()):
+                self.assertFalse(
+                    sensitive_module_reexports(
+                        ast.parse(prefix + body),
+                        {"p": "shutil.fnmatch"},
+                    )
+                )
+
+        protocol_positives = (
+            (
+                "class Runner:\n"
+                "    def __eq__(self, value):\n"
+                "        value.os.fork()\n"
+                "Runner() == p\n"
+            ),
+            (
+                "class Base:\n"
+                "    @staticmethod\n"
+                "    def __lt__(value):\n"
+                "        value.os.fork()\n"
+                "class Runner(Base):\n"
+                "    pass\n"
+                "Runner() < p\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __add__(self, value):\n"
+                "        value.os.fork()\n"
+                "Runner() + p\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __radd__(self, value):\n"
+                "        value.os.fork()\n"
+                "p + Runner()\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __getitem__(self, key):\n"
+                "        key.os.fork()\n"
+                "Runner()[p]\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __setitem__(self, key, value):\n"
+                "        value.os.fork()\n"
+                "Runner()[None] = p\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __contains__(self, value):\n"
+                "        value.os.fork()\n"
+                "p in Runner()\n"
+            ),
+            (
+                "class Base:\n"
+                "    def __iter__(self):\n"
+                "        yield p\n"
+                "class Runner(Base):\n"
+                "    pass\n"
+                "for value in Runner():\n"
+                "    value.os.fork()\n"
+            ),
+            "external[p] = None\n",
+            (
+                "class Runner:\n"
+                "    def __setitem__(self, key, value):\n"
+                "        return None\n"
+                "(Runner() if enabled else external)[None] = p\n"
+            ),
+            (
+                "class Runner:\n"
+                "    pass\n"
+                "Runner()[None] = p\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __setitem__(self, key, value):\n"
+                "        return None\n"
+                "[Runner()[None]] = [p]\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __setitem__(self, key, value):\n"
+                "        return None\n"
+                "Runner()[None] += p\n"
+            ),
+        )
+        for body in protocol_positives:
+            with self.subTest(implicit_protocol=body.strip()):
+                self.assertTrue(
+                    sensitive_module_reexports(
+                        ast.parse(prefix + body),
+                        {"p": "shutil.fnmatch"},
+                    )
+                )
+
+        protocol_negatives = (
+            (
+                "class Runner:\n"
+                "    def __eq__(self, value):\n"
+                "        return value\n"
+                "Runner() == p\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __radd__(self, value):\n"
+                "        self.os.fork()\n"
+                "p + Runner()\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __getitem__(self, key):\n"
+                "        key.os.fork()\n"
+                "Runner()[None]\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __iter__(self):\n"
+                "        yield None\n"
+                "for value in Runner():\n"
+                "    value.os.fork()\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __setitem__(self, key, value):\n"
+                "        return None\n"
+                "Runner()[None] = p\n"
+            ),
+            (
+                "class Runner:\n"
+                "    def __setitem__(self, key, value):\n"
+                "        return None\n"
+                "runner = Runner()\n"
+                "runner[None] = p\n"
+            ),
+            (
+                "class A:\n"
+                "    def __setitem__(self, key, value):\n"
+                "        return None\n"
+                "class B:\n"
+                "    def __setitem__(self, key, value):\n"
+                "        return None\n"
+                "(A() if enabled else B())[None] = p\n"
+            ),
+            (
+                "class Base:\n"
+                "    def __setitem__(self, key, value):\n"
+                "        return None\n"
+                "class Runner(Base):\n"
+                "    pass\n"
+                "Runner()[None] = p\n"
+            ),
+        )
+        for body in protocol_negatives:
+            with self.subTest(safe_protocol_operand=body.strip()):
+                self.assertFalse(
+                    sensitive_module_reexports(
+                        ast.parse(prefix + body),
+                        {"p": "shutil.fnmatch"},
+                    )
+                )
+
     def test_execute_integrity_guard_rejects_shadows_and_relocations(self):
         valid_source = (
             "import json\n"
@@ -7921,6 +10084,303 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 ),
                 "execute-pre-dispatch-termination",
             ),
+            "execute-entry-unbounded-while": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    while True:\n"
+                    "        pass\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-unknown-while": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    while ready:\n"
+                    "        work()\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-unknown-for": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    for ignored in stream:\n"
+                    "        work(ignored)\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-starred-literal-for": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    for ignored in [*stream]:\n"
+                    "        pass\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-unpacked-dict-for": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    for ignored in {**mapping}:\n"
+                    "        pass\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-mixed-starred-literal-for": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    for ignored in [*(1, 2), *stream]:\n"
+                    "        pass\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-mixed-unpacked-dict-for": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    for ignored in {**{'a': 1}, **mapping}:\n"
+                    "        pass\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-generator-starred-literal-for": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    for ignored in "
+                    "[*(item for item in iter(int, 1))]:\n"
+                    "        pass\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-nested-unknown-starred-for": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    for ignored in [[*stream]]:\n"
+                    "        pass\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-starred-nested-unknown-for": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    for ignored in [*(1, [*stream])]:\n"
+                    "        pass\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-dict-value-unknown-starred-for": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    for ignored in {'key': [*stream]}:\n"
+                    "        pass\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-invalid-finite-dict-unpack-for": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    for ignored in {**[]}:\n"
+                    "        pass\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-generator-expression": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = any(False for ignored in iter(int, 1))\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-generator-unknown-first-source": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    deferred = (item for item in stream)\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-eager-comprehension-any-filter": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = [ignored for ignored in [1] "
+                    "if any(item for item in stream)]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-eager-comprehension-all-filter": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = [ignored for ignored in [1] "
+                    "if all(item for item in stream)]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-all-empty-keeps-body-live": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = [[*stream] for ignored in [1] "
+                    "if all(item for item in [])]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-shadowed-any-empty-not-folded": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    any = lambda values: True\n"
+                    "    consumed = [[*stream] for ignored in [1] "
+                    "if any(item for item in [])]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-negated-any-empty-keeps-body-live": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = [[*stream] for ignored in [1] "
+                    "if not any(item for item in [])]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-any-empty-or-evaluates-unsafe-rhs": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = [ignored for ignored in [1] "
+                    "if any(item for item in []) or [*stream]]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-all-empty-and-evaluates-comprehension": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = all(item for item in []) and "
+                    "[item for item in stream]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-consumed-generator-starred-body": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = list([*stream] for ignored in [1])\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-consumed-generator-later-source": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = list(item for ignored in [1] "
+                    "for item in stream)\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-consumed-generator-filter": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = list(ignored for ignored in [1] "
+                    "if any(item for item in stream))\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-unbounded-list-comprehension": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = [ignored for ignored in stream]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-eager-comprehension-starred-body": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = [[*stream] for ignored in [1]]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-eager-dict-comprehension-starred-value": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = "
+                    "{ignored: [*stream] for ignored in [1]}\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-eager-comprehension-nested-starred-body": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = "
+                    "[consume([*stream]) for ignored in [1]]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-eager-comprehension-call-starred-body": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = "
+                    "[consume(*stream) for ignored in [1]]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "execute-entry-eager-comprehension-call-dict-unpack": (
+                valid_source.replace(
+                    "    for day in days:\n",
+                    "    consumed = "
+                    "[consume(**mapping) for ignored in [1]]\n"
+                    "    for day in days:\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
             "execute-default-exit-with-future-annotations": (
                 "from __future__ import annotations\n"
                 + valid_source.replace(
@@ -8010,6 +10470,16 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 valid_source.replace(
                     "            manifests = existing(day)\n",
                     "            parser.exit(1)\n"
+                    "            manifests = existing(day)\n",
+                    1,
+                ),
+                "execute-pre-dispatch-termination",
+            ),
+            "day-prefix-unbounded-while": (
+                valid_source.replace(
+                    "            manifests = existing(day)\n",
+                    "            while True:\n"
+                    "                pass\n"
                     "            manifests = existing(day)\n",
                     1,
                 ),
@@ -8705,7 +11175,229 @@ class H2D2FreezeContractTests(unittest.TestCase):
         for safe_prefix in (
             (
                 "    def uncalled():\n"
-                "        return None\n"
+                "        while True:\n"
+                "            pass\n"
+                "        return any(False for item in iter(int, 1))\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    if False:\n"
+                "        while True:\n"
+                "            pass\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    while True:\n"
+                "        break\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    for ignored in [1, 2]:\n"
+                "        pass\n"
+                "    finite = any(False for ignored in ())\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    for ignored in [*(1, 2)]:\n"
+                "        pass\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    for ignored in (*(1, 2),):\n"
+                "        pass\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    for ignored in {*(1, 2)}:\n"
+                "        pass\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    for ignored in {**{'a': 1}}:\n"
+                "        pass\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    for ignored in [[*(1, 2)]]:\n"
+                "        pass\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    for ignored in [*(1, [*(2, 3)])]:\n"
+                "        pass\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    for ignored in {'key': [*(1, 2)]}:\n"
+                "        pass\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    for ignored in [*()]:\n"
+                "        while True:\n"
+                "            pass\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    finite = [[*(1, 2)] for ignored in [1]]\n"
+                "    finite_dict = "
+                "{ignored: [*(1, 2)] for ignored in [1]}\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    dead = [[*stream] for ignored in []]\n"
+                "    filtered = "
+                "{ignored: [*stream] for ignored in [1] if False}\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    dead = "
+                "[[*stream] for ignored in [] for item in stream]\n"
+                "    deferred = ([*stream] for ignored in [1])\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    dead_nested = "
+                "[[[*stream] for item in [1]] for ignored in []]\n"
+                "    dead_unbounded = "
+                "[[item for item in stream] for ignored in []]\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    deferred_nested = "
+                "([[*stream] for item in [1]] for ignored in [1])\n"
+                "    deferred_unbounded = "
+                "([item for item in stream] for ignored in [1])\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    deferred_body = ([*stream] for ignored in [1])\n"
+                "    deferred_later = "
+                "(item for ignored in [1] for item in stream)\n"
+                "    deferred_filter = "
+                "(ignored for ignored in [1] "
+                "if any(item for item in stream))\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    consumed_empty = "
+                "list([*stream] for ignored in [])\n"
+                "    consumed_filtered = "
+                "list([*stream] for ignored in [1] if False)\n"
+                "    consumed_dead_later = "
+                "list(item for ignored in [] for item in stream)\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    eager_empty_any = "
+                "[ignored for ignored in [1] if any(item for item in [])]\n"
+                "    eager_finite_all = "
+                "[ignored for ignored in [1] if all(item for item in [1])]\n"
+                "    drained_dead_any = "
+                "list(ignored for ignored in [1] "
+                "if any(item for item in [] for later in stream))\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    eager_dead_any_body = "
+                "[[*stream] for ignored in [1] "
+                "if any(item for item in [])]\n"
+                "    drained_dead_any_body = "
+                "list([*stream] for ignored in [1] "
+                "if any(item for item in []))\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    dead_composed_any = "
+                "[[*stream] for ignored in [1] "
+                "if any(item for item in []) and ready]\n"
+                "    dead_any_choice = "
+                "[[*stream] for ignored in [1] "
+                "if ([*stream] if any(item for item in []) else [])]\n"
+                "    dead_negated_all = "
+                "[[*stream] for ignored in [1] "
+                "if not all(item for item in [])]\n"
+                "    all_short_circuit = "
+                "[ignored for ignored in [1] "
+                "if all(item for item in []) or [*stream]]\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    dead_outer_any_choice = "
+                "([item for item in stream] "
+                "if any(value for value in []) else [])\n"
+                "    dead_outer_any_and = "
+                "(any(value for value in []) and "
+                "[item for item in stream])\n"
+                "    dead_outer_all_or = "
+                "(all(value for value in []) or "
+                "[item for item in stream])\n"
+                "    dead_outer_not_all = "
+                "([item for item in stream] "
+                "if not all(value for value in []) else [])\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    any = lambda value: False\n"
+                "    shadowed_any = "
+                "[ignored for ignored in [1] "
+                "if any(item for seed in [1] for item in stream)]\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    list = lambda value: value\n"
+                "    shadowed_consumer = "
+                "list([*stream] for ignored in [1])\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    target_shadowed_consumer = "
+                "[list([*stream] for ignored in [1]) "
+                "for list in [lambda value: value]]\n"
+                "    invalid_consumer_shape = "
+                "list(([*stream] for ignored in [1]), unexpected=True)\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    safe_call_unpacks = "
+                "[consume(*(1, 2), **{'key': 1}) for ignored in [1]]\n"
+                "    dead_choice = "
+                "[([*stream] if False else []) for ignored in [1]]\n"
+                "    dead_bool = "
+                "[(False and [*stream]) for ignored in [1]]\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    dead_nested_choice = "
+                "[([item for item in stream] if False else []) "
+                "for ignored in [1]]\n"
+                "    dead_nested_bool = "
+                "[(False and [item for item in stream]) "
+                "for ignored in [1]]\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    dead_later_generator = "
+                "[item for ignored in [] "
+                "for item in [value for value in stream]]\n"
+                "    filtered_later_generator = "
+                "[item for ignored in [1] if False "
+                "for item in [value for value in stream]]\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    filtered_later_condition = "
+                "[ignored for ignored in [1] if False "
+                "if any(value for value in stream)]\n"
+                "    for day in days:\n"
+            ),
+            (
+                "    dead_outer_choice = "
+                "([item for item in stream] if False else [])\n"
+                "    dead_outer_and = "
+                "(False and [item for item in stream])\n"
+                "    dead_outer_or = "
+                "(True or [item for item in stream])\n"
                 "    for day in days:\n"
             ),
             (
@@ -8781,6 +11473,107 @@ class H2D2FreezeContractTests(unittest.TestCase):
         self.assertFalse(
             execute_integrity_violations(ast.parse(safe_direct_exit_alias_kill)),
             "an unconditional safe rebind must kill an earlier exit alias",
+        )
+
+    def test_h2c_score_receipt_guard_and_success_tail_are_exact(self):
+        source = BATCH.read_text(encoding="utf-8")
+        self.assertFalse(
+            h2c_score_receipt_suffix_violations(ast.parse(source)),
+        )
+        guard_source = (
+            "            if (len(scoring.get(\"metrics\", ())) != 72 or\n"
+            "                    scoring.get(\"forecast_count\") != expected_forecasts or\n"
+            "                    scoring.get(\"dataset_digest\") != dataset_digest or\n"
+            "                    scoring.get(\"configuration_digest\") != configuration_digest):\n"
+            "                raise StageFailure(\"H2C_SCORE\", \"SCORING_RECEIPT_MISMATCH\", scoring)\n"
+        )
+        self.assertIn(guard_source, source)
+        score_dispatch_source = (
+            "            scoring = run_json([py, \"-m\", "
+            "\"quant.historical_outcomes\", \"score\", run_id], \"H2C_SCORE\")\n"
+        )
+        self.assertIn(score_dispatch_source, source)
+        mutations = {
+            "deleted-guard": source.replace(guard_source, "", 1),
+            "weakened-metric-count": source.replace(
+                "len(scoring.get(\"metrics\", ())) != 72",
+                "len(scoring.get(\"metrics\", ())) != 71",
+                1,
+            ),
+            "changed-failure-reason": source.replace(
+                "\"SCORING_RECEIPT_MISMATCH\", scoring",
+                "\"SCORING_MISMATCH\", scoring",
+                1,
+            ),
+            "state-before-guard": source.replace(
+                guard_source,
+                "            state = \"COMPLETED\"\n" + guard_source,
+                1,
+            ),
+            "duplicate-scoring-binding": source.replace(
+                guard_source,
+                "            scoring = dict(scoring)\n" + guard_source,
+                1,
+            ),
+            "emission-before-guard": source.replace(
+                guard_source,
+                "            receipt[\"sessions\"].append(item)\n" + guard_source,
+                1,
+            ),
+            "pre-score-state-binding": source.replace(
+                score_dispatch_source,
+                "            state = \"COMPLETED\"\n" + score_dispatch_source,
+                1,
+            ),
+            "pre-score-completed-append": source.replace(
+                score_dispatch_source,
+                "            receipt[\"completed\"].append(day.isoformat())\n"
+                + score_dispatch_source,
+                1,
+            ),
+            "pre-score-success-alias": source.replace(
+                score_dispatch_source,
+                "            success = receipt[\"skipped\"]\n"
+                "            success.append(day.isoformat())\n"
+                + score_dispatch_source,
+                1,
+            ),
+            "pre-score-item-state-subscript": source.replace(
+                score_dispatch_source,
+                "            item[\"state\"] = \"SKIPPED_VERIFIED\"\n"
+                + score_dispatch_source,
+                1,
+            ),
+            "pre-score-item-state-mapping": source.replace(
+                score_dispatch_source,
+                "            item.update({\"state\": \"COMPLETED\"})\n"
+                + score_dispatch_source,
+                1,
+            ),
+            "pre-score-extra-session": source.replace(
+                score_dispatch_source,
+                "            receipt[\"sessions\"].append(item)\n"
+                + score_dispatch_source,
+                1,
+            ),
+            "failure-handler-state-change": source.replace(
+                "item.update(state=\"FAILED\", failed_stage=stage, reason=reason,",
+                "item.update(state=\"COMPLETED\", failed_stage=stage, reason=reason,",
+                1,
+            ),
+        }
+        for mutation, mutated_source in mutations.items():
+            with self.subTest(score_receipt_mutation=mutation):
+                self.assertTrue(
+                    h2c_score_receipt_suffix_violations(
+                        ast.parse(mutated_source)
+                    )
+                )
+
+        reformatted = ast.unparse(ast.parse(source))
+        self.assertFalse(
+            h2c_score_receipt_suffix_violations(ast.parse(reformatted)),
+            "format-only changes must preserve the structural receipt contract",
         )
 
     def test_baselines_are_two_read_only_certified_complete_sessions(self):
@@ -9044,6 +11837,10 @@ class H2D2FreezeContractTests(unittest.TestCase):
         self.assertFalse(
             execute_integrity_violations(tree),
             "execute/main definition, binding, or direct-call integrity drifted",
+        )
+        self.assertFalse(
+            h2c_score_receipt_suffix_violations(tree),
+            "the final H2C score receipt guard or success emission drifted",
         )
         imported = set()
         direct_imports = set()
