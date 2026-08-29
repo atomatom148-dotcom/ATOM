@@ -338,7 +338,7 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         return tuple(result)
 
     def lexical_binding_events(
-            scope: ast.FunctionDef | ast.AsyncFunctionDef,
+            scope: ast.AST,
     ) -> dict[str, tuple[ast.AST, ...]]:
         events: dict[str, list[ast.AST]] = {}
 
@@ -476,6 +476,8 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         visit(scope, frozenset())
         return tuple(loads)
 
+    module_binding_events = lexical_binding_events(tree)
+
     top_level_execute = [
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "execute"
@@ -606,6 +608,49 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         != (run_json_parameter,)
     ):
         record("execute-dispatch-binding")
+    existing_parameter = None
+    if execute_function is not None:
+        existing_parameter = next((
+            argument
+            for argument in execute_function.args.kwonlyargs
+            if argument.arg == "existing"
+        ), None)
+    if (
+        existing_parameter is None
+        or execute_binding_events.get("existing", ())
+        != (existing_parameter,)
+    ):
+        record("execute-existing-binding")
+
+    protected_execute_names = {
+        "configuration_digest",
+        "dataset_digest",
+        "day",
+        "existing",
+        "frame_count",
+        "run_id",
+        "run_json",
+    }
+    nested_execute_nonlocals = {
+        name
+        for node in ast.walk(execute_function)
+        if execute_function is not None and isinstance(node, ast.Nonlocal)
+        for name in node.names
+        if name in protected_execute_names
+    }
+    if "run_json" in nested_execute_nonlocals:
+        record("execute-dispatch-binding")
+    if "existing" in nested_execute_nonlocals:
+        record("execute-existing-binding")
+    if "day" in nested_execute_nonlocals:
+        record("execute-day-binding")
+    if nested_execute_nonlocals.intersection({
+        "configuration_digest",
+        "dataset_digest",
+        "frame_count",
+        "run_id",
+    }):
+        record("execute-lineage-binding")
 
     day_loops = (
         tuple(
@@ -644,6 +689,41 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         else ()
     )
     day_try = day_tries[0] if len(day_tries) == 1 else None
+
+    existing_assignments = (
+        tuple(
+            node for node in direct_lexical_nodes(execute_function)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.targets[0].ctx, ast.Store)
+            and node.targets[0].id == "manifests"
+            and node.type_comment is None
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and isinstance(node.value.func.ctx, ast.Load)
+            and node.value.func.id == "existing"
+            and len(node.value.args) == 1
+            and isinstance(node.value.args[0], ast.Name)
+            and isinstance(node.value.args[0].ctx, ast.Load)
+            and node.value.args[0].id == "day"
+            and not node.value.keywords
+        )
+        if execute_function is not None
+        else ()
+    )
+    existing_assignment = (
+        existing_assignments[0]
+        if len(existing_assignments) == 1
+        else None
+    )
+    if not (
+        existing_assignment is not None
+        and execute_parents.get(existing_assignment) is day_try
+        and direct_lexical_name_loads(execute_function, "existing")
+        == (existing_assignment.value.func,)
+    ):
+        record("execute-existing-call")
 
     def simple_assignment(name: str) -> ast.Assign | None:
         matches = tuple(
@@ -878,6 +958,47 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         if main_function is not None
         else {}
     )
+    nested_main_nonlocals = {
+        name
+        for node in ast.walk(main_function)
+        if main_function is not None and isinstance(node, ast.Nonlocal)
+        for name in node.names
+        if name in {"days", "output"}
+    }
+    if "days" in nested_main_nonlocals:
+        record("days-selection-mutation")
+    if "output" in nested_main_nonlocals:
+        record("main-output-binding")
+    top_level_json_imports = tuple(
+        (statement, alias)
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "json"
+    )
+    canonical_json_alias = (
+        top_level_json_imports[0][1]
+        if (
+            len(top_level_json_imports) == 1
+            and top_level_json_imports[0][0].names
+            == [top_level_json_imports[0][1]]
+            and top_level_json_imports[0][1].asname is None
+        )
+        else None
+    )
+    if (
+        canonical_json_alias is None
+        or module_binding_events.get("json", ()) != (canonical_json_alias,)
+        or module_binding_events.get("print", ())
+        or main_binding_events.get("json", ())
+        or main_binding_events.get("print", ())
+        or any(
+            isinstance(node, ast.Global)
+            and {"json", "print"}.intersection(node.names)
+            for node in ast.walk(tree)
+        )
+    ):
+        record("main-output-call-target")
     if (
         pinned_execute_assignment is None
         or main_binding_events.get("output", ())
@@ -944,12 +1065,16 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
             and isinstance(print_call, ast.Call)
             and isinstance(print_call.func, ast.Name)
             and print_call.func.id == "print"
+            and direct_lexical_name_loads(main_function, "print")
+            == (print_call.func,)
             and not print_call.keywords
             and isinstance(dumps_call, ast.Call)
             and isinstance(dumps_call.func, ast.Attribute)
             and dumps_call.func.attr == "dumps"
             and isinstance(dumps_call.func.value, ast.Name)
             and dumps_call.func.value.id == "json"
+            and direct_lexical_name_loads(main_function, "json")
+            == (dumps_call.func.value,)
             and set(dumps_keywords) == {"separators", "sort_keys"}
             and isinstance(dumps_keywords.get("sort_keys"), ast.Constant)
             and dumps_keywords["sort_keys"].value is True
@@ -1729,6 +1854,8 @@ def sensitive_module_reexports(
             return {node.id}
         if isinstance(node, (ast.List, ast.Tuple)):
             return set().union(*(target_names(item) for item in node.elts))
+        if isinstance(node, ast.Starred):
+            return target_names(node.value)
         return set()
 
     def is_in_unmodeled_class_namespace(node: ast.AST) -> bool:
@@ -2034,6 +2161,11 @@ def sensitive_module_reexports(
                 ),
                 key=lambda item: (item.lineno, item.col_offset),
             )
+            if (
+                not resolved_bases
+                and "builtins.type" in import_origin_names(base_expression)
+            ):
+                continue
             if len(resolved_bases) != 1:
                 complete = False
             for base in resolved_bases:
@@ -2227,6 +2359,28 @@ def sensitive_module_reexports(
             enclosing_callable(call),
         ))
 
+    def effective_local_metaclasses(
+            class_node: ast.ClassDef,
+            visited: frozenset[ast.ClassDef] = frozenset(),
+    ) -> set[ast.ClassDef]:
+        if class_node in visited:
+            return set()
+        explicit = set().union(*(
+            resolve_class_expression(
+                keyword.value,
+                enclosing_callable(class_node),
+            )
+            for keyword in class_node.keywords
+            if keyword.arg == "metaclass"
+        )) if class_node.keywords else set()
+        if explicit:
+            return explicit
+        visited = visited | {class_node}
+        return set().union(*(
+            effective_local_metaclasses(base, visited)
+            for base in class_bases[class_node]
+        )) if class_bases[class_node] else set()
+
     def local_constructor_targets(
             call: ast.Call,
     ) -> tuple[tuple[
@@ -2236,6 +2390,19 @@ def sensitive_module_reexports(
         targets = set()
         scope = enclosing_callable(call)
         for class_node in resolve_class_expression(call.func, scope):
+            metaclasses = effective_local_metaclasses(class_node)
+            metacall_targets = set()
+            for metaclass in metaclasses:
+                for metacall in resolve_class_methods(metaclass, "__call__"):
+                    metacall_targets.add((
+                        metacall,
+                        0
+                        if method_descriptor_kind(metacall) == "static"
+                        else 1,
+                    ))
+            if metacall_targets:
+                targets.update(metacall_targets)
+                continue
             for allocator in resolve_class_methods(class_node, "__new__"):
                 targets.add((
                     allocator,
@@ -2519,6 +2686,17 @@ def sensitive_module_reexports(
             }
         return variants
 
+    def unresolved_higher_order_starred(
+            call: ast.Call,
+    ) -> tuple[ast.AST, ...]:
+        scope = enclosing_callable(call)
+        return tuple(
+            argument.value
+            for argument in call.args
+            if isinstance(argument, ast.Starred)
+            and not resolve_literal_sequences(argument.value, scope)
+        )
+
     def normalized_sorted_key_values(
             call: ast.Call,
     ) -> set[tuple[ast.AST, ...]]:
@@ -2598,6 +2776,44 @@ def sensitive_module_reexports(
         return None
 
     forced_higher_order_findings: set[ast.Call] = set()
+
+    def taint_higher_order_callback(
+            callback_expressions: set[ast.AST],
+            tracked_parameter_indexes: set[int],
+            scope: ast.AST | None,
+    ) -> tuple[bool, bool]:
+        callback_targets = set().union(*(
+            resolve_callable_expression(expression, scope)
+            for expression in callback_expressions
+        )) if callback_expressions else set()
+        updated = False
+        for local_callable, bound_receiver in callback_targets:
+            positional, _, vararg, _, _ = callable_parameter_bindings(
+                local_callable
+            )
+            available = positional[int(bound_receiver):]
+            newly_tracked = {
+                available[index].arg
+                for index in tracked_parameter_indexes
+                if index < len(available)
+            }
+            if (
+                vararg is not None
+                and any(
+                    index >= len(available)
+                    for index in tracked_parameter_indexes
+                )
+            ):
+                newly_tracked.add(vararg.arg)
+            local_bindings = scoped_tracked_bindings[local_callable]
+            if not newly_tracked.issubset(local_bindings):
+                local_bindings.update(newly_tracked)
+                updated = True
+        return updated, bool(callback_targets)
+
+    def is_definitely_none_callback(node: ast.AST) -> bool:
+        return isinstance(node, ast.Constant) and node.value is None
+
     changed = True
     while changed:
         changed = False
@@ -2716,12 +2932,132 @@ def sensitive_module_reexports(
                     local_bindings.update(newly_tracked)
                     changed = True
 
+        for context_node in (
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.With, ast.AsyncWith))
+        ):
+            scope = enclosing_callable(context_node)
+            enter_name = (
+                "__aenter__"
+                if isinstance(context_node, ast.AsyncWith)
+                else "__enter__"
+            )
+            for item in context_node.items:
+                if item.optional_vars is None:
+                    continue
+                enter_methods = set().union(*(
+                    resolve_class_methods(class_node, enter_name)
+                    for class_node in resolve_instance_expression(
+                        item.context_expr,
+                        scope,
+                    )
+                ))
+                if not any(
+                    method in tracked_return_callables
+                    for method in enter_methods
+                ):
+                    continue
+                new_names = target_names(item.optional_vars)
+                scope_bindings = (
+                    tracked_bindings
+                    if scope is None
+                    else scoped_tracked_bindings[scope]
+                )
+                if not new_names.issubset(scope_bindings):
+                    scope_bindings.update(new_names)
+                    changed = True
+
         for call in (
             node for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and higher_order_builtin_kind(node) is not None
         ):
             kind = higher_order_builtin_kind(call)
+            scope = enclosing_callable(call)
+            unresolved_starred = unresolved_higher_order_starred(call)
+            if unresolved_starred:
+                if kind == "sorted":
+                    carrier_expressions = tuple(
+                        argument.value
+                        if isinstance(argument, ast.Starred)
+                        else argument
+                        for argument in call.args
+                    )
+                    has_tracked_carrier = any(
+                        contains_direct_higher_order_input(carrier, scope)
+                        for carrier in carrier_expressions
+                    )
+                    callback_variants = normalized_sorted_key_values(call)
+                    callback_expressions = {
+                        variant[0]
+                        for variant in callback_variants
+                        if len(variant) == 1
+                    }
+                    if has_tracked_carrier and callback_expressions:
+                        updated, resolved = taint_higher_order_callback(
+                            callback_expressions,
+                            {0},
+                            scope,
+                        )
+                        if updated:
+                            changed = True
+                        if (
+                            not resolved
+                            and not all(
+                                is_definitely_none_callback(expression)
+                                for expression in callback_expressions
+                            )
+                        ):
+                            forced_higher_order_findings.add(call)
+                    if (
+                        has_tracked_carrier
+                        and any(
+                            keyword.arg is None
+                            and not resolve_literal_mappings(
+                                keyword.value,
+                                scope,
+                            )
+                            for keyword in call.keywords
+                        )
+                    ):
+                        forced_higher_order_findings.add(call)
+                else:
+                    definite_callback = (
+                        call.args[0]
+                        if call.args
+                        and not isinstance(call.args[0], ast.Starred)
+                        else None
+                    )
+                    carrier_expressions = tuple(
+                        argument.value
+                        if isinstance(argument, ast.Starred)
+                        else argument
+                        for argument in (
+                            call.args[1:]
+                            if definite_callback is not None
+                            else call.args
+                        )
+                    )
+                    has_tracked_carrier = any(
+                        contains_direct_higher_order_input(carrier, scope)
+                        for carrier in carrier_expressions
+                    )
+                    if has_tracked_carrier:
+                        if definite_callback is None:
+                            forced_higher_order_findings.add(call)
+                        else:
+                            tracked_indexes = (
+                                {0} if kind == "filter" else set(range(64))
+                            )
+                            updated, resolved = taint_higher_order_callback(
+                                {definite_callback},
+                                tracked_indexes,
+                                scope,
+                            )
+                            if updated:
+                                changed = True
+                            if not resolved:
+                                forced_higher_order_findings.add(call)
             if (
                 kind == "sorted"
                 and any(
@@ -2813,6 +3149,72 @@ def sensitive_module_reexports(
         ):
             kind = additional_higher_order_kind(call)
             scope = enclosing_callable(call)
+            unresolved_starred = unresolved_higher_order_starred(call)
+            if unresolved_starred:
+                definite_callback = (
+                    call.args[0]
+                    if kind == "reduce"
+                    and call.args
+                    and not isinstance(call.args[0], ast.Starred)
+                    else None
+                )
+                if kind == "list-sort":
+                    carrier_expressions = (call.func.value,)
+                elif kind == "reduce" and definite_callback is not None:
+                    carrier_expressions = tuple(
+                        argument.value
+                        if isinstance(argument, ast.Starred)
+                        else argument
+                        for argument in call.args[1:]
+                    )
+                else:
+                    carrier_expressions = tuple(
+                        argument.value
+                        if isinstance(argument, ast.Starred)
+                        else argument
+                        for argument in call.args
+                    )
+                has_unresolved_tracked_carrier = any(
+                    contains_direct_higher_order_input(carrier, scope)
+                    for carrier in carrier_expressions
+                )
+                if has_unresolved_tracked_carrier:
+                    if kind == "reduce":
+                        if definite_callback is None:
+                            forced_higher_order_findings.add(call)
+                        else:
+                            updated, resolved = taint_higher_order_callback(
+                                {definite_callback},
+                                {0, 1},
+                                scope,
+                            )
+                            if updated:
+                                changed = True
+                            if not resolved:
+                                forced_higher_order_findings.add(call)
+                    else:
+                        callback_variants = normalized_sorted_key_values(call)
+                        callback_expressions = {
+                            variant[0]
+                            for variant in callback_variants
+                            if len(variant) == 1
+                        }
+                        if callback_expressions:
+                            updated, resolved = taint_higher_order_callback(
+                                callback_expressions,
+                                {0},
+                                scope,
+                            )
+                            if updated:
+                                changed = True
+                            if (
+                                not resolved
+                                and not all(
+                                    is_definitely_none_callback(expression)
+                                    for expression in callback_expressions
+                                )
+                            ):
+                                forced_higher_order_findings.add(call)
             unresolved_keywords = any(
                 keyword.arg is None
                 and not resolve_literal_mappings(keyword.value, scope)
@@ -3894,6 +4296,21 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "args = ([p],)\n"
                 "sorted(*args, key=invoke)\n"
             ),
+            "sorted-generator-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "sorted(*(item for item in ([p],)), key=invoke)\n"
+            ),
+            "map-generator-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "map(invoke, *(item for item in ([p],)))\n"
+            ),
+            "filter-generator-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "filter(invoke, *(item for item in ([p],)))\n"
+            ),
             "sorted-literal-key-mapping": (
                 "def invoke(value):\n"
                 "    value.os.fork()\n"
@@ -4018,6 +4435,19 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "def ignore(value):\n"
                 "    return None\n"
                 "sorted([p], key=ignore)\n"
+            ),
+            "sorted-generator-callback-ignores-item": (
+                "def ignore(value):\n"
+                "    return None\n"
+                "sorted(*(item for item in ([p],)), key=ignore)\n"
+            ),
+            "safe-sorted-generator-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "sorted(*(item for item in ([None],)), key=invoke)\n"
+            ),
+            "tracked-map-callback-is-not-carrier": (
+                "map(p, *(item for item in ([None],)))\n"
             ),
             "sorted-without-key": "sorted([p])\n",
             "sorted-mapping-reverse-only": (
@@ -4304,6 +4734,68 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "        return object.__new__(passed_cls)\n"
                 "Holder(p)\n"
             ),
+            "metaclass-call-store": (
+                "class Meta(type):\n"
+                "    def __call__(cls, value):\n"
+                "        cls.module = value\n"
+                "class Holder(metaclass=Meta):\n"
+                "    pass\n"
+                "Holder(p)\n"
+            ),
+            "inherited-metaclass-call-alias-keyword": (
+                "class Meta(type):\n"
+                "    @classmethod\n"
+                "    def __call__(meta, cls, value):\n"
+                "        value.os.fork()\n"
+                "class Base(metaclass=Meta):\n"
+                "    pass\n"
+                "class Holder(Base):\n"
+                "    pass\n"
+                "Constructor = Holder\n"
+                "Constructor(value=p)\n"
+            ),
+            "static-metaclass-call-star": (
+                "class Meta(type):\n"
+                "    @staticmethod\n"
+                "    def __call__(value):\n"
+                "        value.os.fork()\n"
+                "class Holder(metaclass=Meta):\n"
+                "    pass\n"
+                "Holder(*(p,))\n"
+            ),
+            "with-enter-return": (
+                "class Context:\n"
+                "    def __enter__(self):\n"
+                "        return p\n"
+                "with Context() as value:\n"
+                "    value.os.fork()\n"
+            ),
+            "with-enter-destructuring-and-alias": (
+                "class Context:\n"
+                "    def __enter__(self):\n"
+                "        return (p, p)\n"
+                "manager = Context()\n"
+                "with manager as (left, *rest):\n"
+                "    rest[0].os.fork()\n"
+            ),
+            "with-enter-multiple-items": (
+                "class Safe:\n"
+                "    def __enter__(self):\n"
+                "        return None\n"
+                "class Context:\n"
+                "    def __enter__(self):\n"
+                "        return p\n"
+                "with Safe() as left, Context() as right:\n"
+                "    right.os.fork()\n"
+            ),
+            "async-with-enter-return": (
+                "class Context:\n"
+                "    async def __aenter__(self):\n"
+                "        return p\n"
+                "async def run():\n"
+                "    async with Context() as value:\n"
+                "        value.os.fork()\n"
+            ),
         }
         for escape, source in positive_sources.items():
             with self.subTest(escape=escape):
@@ -4441,6 +4933,39 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "        return object.__new__(cls)\n"
                 "Holder(p)\n"
             ),
+            "metaclass-receiver-only": (
+                "class Meta(type):\n"
+                "    def __call__(cls, value):\n"
+                "        cls.module = cls\n"
+                "class Holder(metaclass=Meta):\n"
+                "    pass\n"
+                "Holder(p)\n"
+            ),
+            "metaclass-call-overrides-dangerous-init": (
+                "class Meta(type):\n"
+                "    def __call__(cls, value):\n"
+                "        return None\n"
+                "class Holder(metaclass=Meta):\n"
+                "    def __init__(self, value):\n"
+                "        self.module = value\n"
+                "Holder(p)\n"
+            ),
+            "with-enter-safe-return": (
+                "class Context:\n"
+                "    def __enter__(self):\n"
+                "        return None\n"
+                "with Context() as value:\n"
+                "    value.os.fork()\n"
+            ),
+            "with-nested-return-does-not-escape": (
+                "class Context:\n"
+                "    def __enter__(self):\n"
+                "        def nested():\n"
+                "            return p\n"
+                "        return None\n"
+                "with Context() as value:\n"
+                "    value.os.fork()\n"
+            ),
             "insert-star-tracked-index": "items.insert(*(p, 'safe'))\n",
             "legitimate-mutators": (
                 "items.append('safe')\n"
@@ -4462,6 +4987,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
 
     def test_execute_integrity_guard_rejects_shadows_and_relocations(self):
         valid_source = (
+            "import json\n"
             "def _run_json(command, stage):\n    return {}\n"
             "def _existing_manifests(day):\n    return ()\n"
             "def requested_dates(*, dates, start, end, maximum):\n"
@@ -4472,6 +4998,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "    _execute_result = None\n"
             "    for day in days:\n"
             "        try:\n"
+            "            manifests = existing(day)\n"
             "            manifest = {\"replay_run_id\": \"known\", "
             "\"dataset_digest\": \"d\", \"configuration_digest\": \"c\", "
             "\"frame_count\": 1}\n"
@@ -4805,6 +5332,45 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 ),
                 "execute-dispatch-binding",
             ),
+            "existing-rebinding": (
+                valid_source.replace(
+                    "    execute_count = len(days)\n",
+                    "    existing = None\n"
+                    "    execute_count = len(days)\n",
+                    1,
+                ),
+                "execute-existing-binding",
+            ),
+            "existing-call-replacement": (
+                valid_source.replace(
+                    "            manifests = existing(day)\n",
+                    "            manifests = ()\n",
+                    1,
+                ),
+                "execute-existing-call",
+            ),
+            "nested-nonlocal-existing": (
+                valid_source.replace(
+                    "    execute_count = len(days)\n",
+                    "    def mutate():\n"
+                    "        nonlocal existing\n"
+                    "        existing = None\n"
+                    "    execute_count = len(days)\n",
+                    1,
+                ),
+                "execute-existing-binding",
+            ),
+            "nested-nonlocal-lineage": (
+                valid_source.replace(
+                    "            dataset_digest = manifest.get",
+                    "            def mutate():\n"
+                    "                nonlocal run_id\n"
+                    "                run_id = None\n"
+                    "            dataset_digest = manifest.get",
+                    1,
+                ),
+                "execute-lineage-binding",
+            ),
             "day-rebinding": (
                 valid_source.replace(
                     "    return {\"count\": execute_count, ",
@@ -4895,6 +5461,52 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     1,
                 ),
                 "main-output-use",
+            ),
+            "module-print-binding": (
+                "print = sink\n" + valid_source,
+                "main-output-call-target",
+            ),
+            "main-print-binding": (
+                valid_source.replace(
+                    exact_call,
+                    "    print = sink\n" + exact_call,
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "json-import-alias": (
+                valid_source.replace("import json\n", "import json as codec\n", 1),
+                "main-output-call-target",
+            ),
+            "module-json-rebinding": (
+                valid_source.replace(
+                    "def _run_json",
+                    "json = codec\ndef _run_json",
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "nested-global-output-targets": (
+                valid_source.replace(
+                    exact_call,
+                    "    def mutate_targets():\n"
+                    "        global print, json\n"
+                    "        print = json = None\n"
+                    + exact_call,
+                    1,
+                ),
+                "main-output-call-target",
+            ),
+            "nested-nonlocal-output": (
+                valid_source.replace(
+                    "    print(json.dumps(output, sort_keys=True, ",
+                    "    def mutate_output():\n"
+                    "        nonlocal output\n"
+                    "        output = {}\n"
+                    "    print(json.dumps(output, sort_keys=True, ",
+                    1,
+                ),
+                "main-output-binding",
             ),
             "output-status-replacement": (
                 valid_source.replace(
@@ -5225,6 +5837,9 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "    class Nested:\n"
             "        days = ()\n",
             "    nested_lambda = lambda: (days := ())\n",
+            "    def nested_output_helpers():\n"
+            "        print = json = None\n"
+            "        return print, json\n",
         ):
             with self.subTest(safe_days_read=safe_read.strip()):
                 self.assertFalse(
@@ -5239,10 +5854,10 @@ class H2D2FreezeContractTests(unittest.TestCase):
 
         safe_execute_shadows = valid_source.replace(
             "    return {\"count\": execute_count, ",
-            "    def nested_bindings(run_json, day, run_id, dataset_digest, "
+            "    def nested_bindings(run_json, existing, day, run_id, dataset_digest, "
             "configuration_digest, frame_count):\n"
             "        return None\n"
-            "    shadows = [None for run_json in () for day in () "
+            "    shadows = [None for run_json in () for existing in () for day in () "
             "for run_id in () for dataset_digest in () "
             "for configuration_digest in () for frame_count in ()]\n"
             "    return {\"count\": execute_count, ",
