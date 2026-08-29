@@ -525,6 +525,294 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         else:
             pinned_execute_assignment = assignment
 
+    main_integrity_parents = {
+        child: parent
+        for parent in ast.walk(main_function) if main_function is not None
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def main_lexical_nodes(node: ast.AST) -> tuple[ast.AST, ...]:
+        result = []
+
+        def visit(item: ast.AST) -> None:
+            if item is not node and isinstance(item, (
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.FunctionDef,
+                ast.Lambda,
+            )):
+                result.append(item)
+                return
+            result.append(item)
+            if isinstance(item, (
+                ast.DictComp,
+                ast.GeneratorExp,
+                ast.ListComp,
+                ast.SetComp,
+            )):
+                return
+            for child in ast.iter_child_nodes(item):
+                visit(child)
+
+        visit(node)
+        return tuple(result)
+
+    main_nodes = (
+        main_lexical_nodes(main_function)
+        if main_function is not None
+        else ()
+    )
+    days_assignments = [
+        node for node in main_nodes
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.targets[0].ctx, ast.Store)
+        and node.targets[0].id == "days"
+    ]
+    pinned_days_assignment = None
+    if len(days_assignments) == 1:
+        days_assignment = days_assignments[0]
+        days_call = days_assignment.value
+        days_parent = main_integrity_parents.get(days_assignment)
+        expected_keywords = (
+            ("dates", "dates"),
+            ("start", "start"),
+            ("end", "end"),
+            ("maximum", "max_sessions"),
+        )
+        exact_days_assignment = (
+            days_assignment.type_comment is None
+            and isinstance(days_call, ast.Call)
+            and isinstance(days_call.func, ast.Name)
+            and isinstance(days_call.func.ctx, ast.Load)
+            and days_call.func.id == "requested_dates"
+            and not days_call.args
+            and len(days_call.keywords) == len(expected_keywords)
+            and all(
+                keyword.arg == keyword_name
+                and isinstance(keyword.value, ast.Attribute)
+                and isinstance(keyword.value.ctx, ast.Load)
+                and keyword.value.attr == attribute_name
+                and isinstance(keyword.value.value, ast.Name)
+                and isinstance(keyword.value.value.ctx, ast.Load)
+                and keyword.value.value.id == "args"
+                for keyword, (keyword_name, attribute_name) in zip(
+                    days_call.keywords,
+                    expected_keywords,
+                )
+            )
+            and isinstance(days_parent, ast.Try)
+            and days_parent.body == [days_assignment]
+            and main_integrity_parents.get(days_parent) is main_function
+        )
+        if exact_days_assignment:
+            pinned_days_assignment = days_assignment
+    if pinned_days_assignment is None:
+        record("days-selection-shape")
+
+    if (
+        pinned_days_assignment is not None
+        and pinned_execute_assignment is not None
+    ):
+        selection_end = getattr(
+            pinned_days_assignment,
+            "end_lineno",
+            pinned_days_assignment.lineno,
+        )
+        execute_line = pinned_execute_assignment.lineno
+        if selection_end >= execute_line:
+            record("days-selection-shape")
+        else:
+            between_nodes = tuple(
+                node for node in main_nodes
+                if hasattr(node, "lineno")
+                and selection_end < node.lineno < execute_line
+            )
+            aliases = {"days"}
+            aliases_changed = True
+            while aliases_changed:
+                aliases_changed = False
+                for node in between_nodes:
+                    target = value = None
+                    if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                        target, value = node.targets[0], node.value
+                    elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+                        target, value = node.target, node.value
+                    if (
+                        isinstance(target, ast.Name)
+                        and isinstance(value, ast.Name)
+                        and value.id in aliases
+                        and target.id not in aliases
+                    ):
+                        aliases.add(target.id)
+                        aliases_changed = True
+
+            def alias_root(node: ast.AST) -> str | None:
+                while isinstance(node, (
+                    ast.Attribute,
+                    ast.Starred,
+                    ast.Subscript,
+                )):
+                    node = node.value
+                return node.id if isinstance(node, ast.Name) else None
+
+            def mutates_days_target(node: ast.AST) -> bool:
+                if isinstance(node, ast.Name):
+                    return (
+                        node.id == "days"
+                        and isinstance(node.ctx, (ast.Store, ast.Del))
+                    )
+                if isinstance(node, (ast.Attribute, ast.Subscript)):
+                    return alias_root(node) in aliases
+                if isinstance(node, (ast.List, ast.Tuple)):
+                    return any(mutates_days_target(item) for item in node.elts)
+                if isinstance(node, ast.Starred):
+                    return mutates_days_target(node.value)
+                return False
+
+            mutator_names = {
+                "__delitem__",
+                "__iadd__",
+                "__imul__",
+                "__setitem__",
+                "add",
+                "append",
+                "clear",
+                "discard",
+                "extend",
+                "insert",
+                "pop",
+                "remove",
+                "reverse",
+                "setdefault",
+                "sort",
+                "update",
+            }
+
+            def target_binds_days(target: ast.AST | None) -> bool:
+                if isinstance(target, ast.Name):
+                    return target.id == "days"
+                if isinstance(target, (ast.List, ast.Tuple)):
+                    return any(target_binds_days(item) for item in target.elts)
+                if isinstance(target, ast.Starred):
+                    return target_binds_days(target.value)
+                return False
+
+            def import_binds_days(node: ast.Import | ast.ImportFrom) -> bool:
+                return any(
+                    (
+                        alias.asname
+                        or (
+                            alias.name.split(".", 1)[0]
+                            if isinstance(node, ast.Import)
+                            else alias.name
+                        )
+                    ) == "days"
+                    for alias in node.names
+                )
+
+            def pattern_binds_days(pattern: ast.AST) -> bool:
+                return any(
+                    (
+                        isinstance(item, (ast.MatchAs, ast.MatchStar))
+                        and item.name == "days"
+                    )
+                    or (
+                        isinstance(item, ast.MatchMapping)
+                        and item.rest == "days"
+                    )
+                    for item in ast.walk(pattern)
+                )
+
+            days_rebound = any(
+                (
+                    isinstance(node, (ast.For, ast.AsyncFor))
+                    and target_binds_days(node.target)
+                )
+                or (
+                    isinstance(node, (ast.With, ast.AsyncWith))
+                    and any(
+                        target_binds_days(item.optional_vars)
+                        for item in node.items
+                    )
+                )
+                or (
+                    isinstance(node, (ast.Import, ast.ImportFrom))
+                    and import_binds_days(node)
+                )
+                or (
+                    isinstance(node, (
+                        ast.AsyncFunctionDef,
+                        ast.ClassDef,
+                        ast.FunctionDef,
+                    ))
+                    and node.name == "days"
+                )
+                or (
+                    isinstance(node, ast.ExceptHandler)
+                    and (
+                        node.name == "days"
+                        or (
+                            isinstance(node.name, ast.Name)
+                            and node.name.id == "days"
+                        )
+                    )
+                )
+                or (
+                    isinstance(node, (ast.Global, ast.Nonlocal))
+                    and "days" in node.names
+                )
+                or (
+                    isinstance(node, ast.Match)
+                    and any(
+                        pattern_binds_days(case.pattern)
+                        for case in node.cases
+                    )
+                )
+                for node in between_nodes
+            )
+            days_mutated = any(
+                (
+                    isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+                    and any(
+                        mutates_days_target(target)
+                        for target in (
+                            node.targets
+                            if isinstance(node, ast.Assign)
+                            else [node.target]
+                        )
+                    )
+                )
+                or (
+                    isinstance(node, (ast.AugAssign, ast.Delete))
+                    and any(
+                        mutates_days_target(target)
+                        for target in (
+                            node.targets
+                            if isinstance(node, ast.Delete)
+                            else [node.target]
+                        )
+                    )
+                )
+                or (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in mutator_names
+                    and alias_root(node.func.value) in aliases
+                )
+                or (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"delattr", "setattr"}
+                    and node.args
+                    and alias_root(node.args[0]) in aliases
+                )
+                for node in between_nodes
+            )
+            if days_mutated or days_rebound:
+                record("days-selection-mutation")
+
     def contains_reachable_terminator(node: ast.AST) -> bool:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             return False
@@ -999,6 +1287,7 @@ def sensitive_module_reexports(
             "map": "builtins.map",
             "object": "builtins.object",
             "setattr": "builtins.setattr",
+            "sorted": "builtins.sorted",
             "staticmethod": "builtins.staticmethod",
             "type": "builtins.type",
         },
@@ -1566,6 +1855,22 @@ def sensitive_module_reexports(
             enclosing_callable(call),
         ))
 
+    def local_constructor_targets(
+            call: ast.Call,
+    ) -> tuple[tuple[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        bool,
+    ], ...]:
+        targets = set()
+        scope = enclosing_callable(call)
+        for class_node in resolve_class_expression(call.func, scope):
+            for initializer in resolve_class_methods(class_node, "__init__"):
+                targets.add((
+                    initializer,
+                    method_descriptor_kind(initializer) != "static",
+                ))
+        return tuple(targets)
+
     def contains_tracked_binding(
             node: ast.AST,
             scope: ast.AST | None = None,
@@ -1688,6 +1993,8 @@ def sensitive_module_reexports(
             return "map"
         if "builtins.filter" in origins:
             return "filter"
+        if "builtins.sorted" in origins:
+            return "sorted"
         return None
 
     literal_sequence_bindings: dict[
@@ -1751,6 +2058,70 @@ def sensitive_module_reexports(
                         sequence,
                     )
 
+    literal_mapping_bindings: dict[
+        ast.AST | None,
+        dict[str, set[tuple[tuple[str, ast.AST], ...]]],
+    ] = {scope: {} for scope in scopes}
+
+    def bind_literal_mapping(
+            scope: ast.AST | None,
+            name: str,
+            mapping: tuple[tuple[str, ast.AST], ...],
+    ) -> bool:
+        bindings = literal_mapping_bindings[scope].setdefault(name, set())
+        if mapping in bindings:
+            return False
+        bindings.add(mapping)
+        return True
+
+    def resolve_literal_mapping_name(
+            name: str,
+            scope: ast.AST | None,
+    ) -> set[tuple[tuple[str, ast.AST], ...]]:
+        while True:
+            if name in scope_bound_names[scope]:
+                return set(literal_mapping_bindings[scope].get(name, ()))
+            if scope is None:
+                return set()
+            scope = callable_parents[scope]
+
+    def resolve_literal_mappings(
+            node: ast.AST,
+            scope: ast.AST | None,
+    ) -> set[tuple[tuple[str, ast.AST], ...]]:
+        if isinstance(node, ast.Name):
+            return resolve_literal_mapping_name(node.id, scope)
+        if isinstance(node, ast.Dict):
+            if any(
+                not isinstance(key, ast.Constant)
+                or not isinstance(key.value, str)
+                for key in node.keys
+            ):
+                return set()
+            values_by_key = {
+                key.value: value
+                for key, value in zip(node.keys, node.values)
+            }
+            return {tuple(values_by_key.items())}
+        return set()
+
+    literal_mappings_changed = True
+    while literal_mappings_changed:
+        literal_mappings_changed = False
+        for scope, targets, value in alias_assignments:
+            mappings = resolve_literal_mappings(value, scope)
+            if not mappings:
+                continue
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                for mapping in mappings:
+                    literal_mappings_changed |= bind_literal_mapping(
+                        scope,
+                        target.id,
+                        mapping,
+                    )
+
     def normalized_higher_order_args(
             call: ast.Call,
     ) -> set[tuple[ast.AST, ...]]:
@@ -1764,6 +2135,34 @@ def sensitive_module_reexports(
             )
             if not expansions:
                 return set()
+            variants = {
+                prefix + expansion
+                for prefix in variants
+                for expansion in expansions
+            }
+        return variants
+
+    def normalized_sorted_key_values(
+            call: ast.Call,
+    ) -> set[tuple[ast.AST, ...]]:
+        variants = {()}
+        scope = enclosing_callable(call)
+        for keyword in call.keywords:
+            if keyword.arg == "key":
+                expansions = {(keyword.value,)}
+            elif keyword.arg is None:
+                mappings = resolve_literal_mappings(keyword.value, scope)
+                if not mappings:
+                    return set()
+                expansions = {
+                    tuple(
+                        value for name, value in mapping
+                        if name == "key"
+                    )
+                    for mapping in mappings
+                }
+            else:
+                expansions = {()}
             variants = {
                 prefix + expansion
                 for prefix in variants
@@ -1814,9 +2213,13 @@ def sensitive_module_reexports(
         for call in (
             node for node in ast.walk(tree)
             if isinstance(node, ast.Call)
-            and local_call_targets(node)
+            and (local_call_targets(node) or local_constructor_targets(node))
         ):
-            for local_callable, bound_receiver in local_call_targets(call):
+            call_targets = {
+                *local_call_targets(call),
+                *local_constructor_targets(call),
+            }
+            for local_callable, bound_receiver in call_targets:
                 (
                     positional,
                     named,
@@ -1884,54 +2287,68 @@ def sensitive_module_reexports(
         ):
             kind = higher_order_builtin_kind(call)
             for normalized_args in normalized_higher_order_args(call):
-                if len(normalized_args) < 2:
-                    continue
-                callback_targets = resolve_callable_expression(
-                    normalized_args[0],
-                    enclosing_callable(call),
-                )
-                if not callback_targets:
-                    continue
-                iterable_arguments = normalized_args[1:]
-                for local_callable, bound_receiver in callback_targets:
-                    positional, _, vararg, _, _ = callable_parameter_bindings(
-                        local_callable
+                if kind == "sorted":
+                    callback_variants = normalized_sorted_key_values(call)
+                    if len(normalized_args) != 1:
+                        continue
+                else:
+                    if len(normalized_args) < 2:
+                        continue
+                    callback_variants = {(normalized_args[0],)}
+                for callback_expressions in callback_variants:
+                    if len(callback_expressions) != 1:
+                        continue
+                    iterable_arguments = (
+                        normalized_args
+                        if kind == "sorted"
+                        else normalized_args[1:]
                     )
-                    available = positional[int(bound_receiver):]
-                    newly_tracked = set()
-                    if kind == "filter":
-                        if any(
-                            contains_passed_tracked_binding(
-                                argument,
-                                enclosing_callable(call),
-                            )
-                            for argument in iterable_arguments
-                        ):
-                            if available:
-                                newly_tracked.add(available[0].arg)
-                            elif vararg is not None:
-                                newly_tracked.add(vararg.arg)
-                    else:
-                        for index, argument in enumerate(iterable_arguments):
-                            if not contains_passed_tracked_binding(
-                                argument,
-                                enclosing_callable(call),
-                            ):
-                                continue
-                            if isinstance(argument, ast.Starred):
-                                newly_tracked.update(
-                                    parameter.arg for parameter in available
+                    callback_targets = set().union(*(
+                        resolve_callable_expression(
+                            expression,
+                            enclosing_callable(call),
+                        )
+                        for expression in callback_expressions
+                    ))
+                    for local_callable, bound_receiver in callback_targets:
+                        positional, _, vararg, _, _ = callable_parameter_bindings(
+                            local_callable
+                        )
+                        available = positional[int(bound_receiver):]
+                        newly_tracked = set()
+                        if kind in ("filter", "sorted"):
+                            if any(
+                                contains_passed_tracked_binding(
+                                    argument,
+                                    enclosing_callable(call),
                                 )
-                                if vararg is not None:
+                                for argument in iterable_arguments
+                            ):
+                                if available:
+                                    newly_tracked.add(available[0].arg)
+                                elif vararg is not None:
                                     newly_tracked.add(vararg.arg)
-                            elif index < len(available):
-                                newly_tracked.add(available[index].arg)
-                            elif vararg is not None:
-                                newly_tracked.add(vararg.arg)
-                    local_bindings = scoped_tracked_bindings[local_callable]
-                    if not newly_tracked.issubset(local_bindings):
-                        local_bindings.update(newly_tracked)
-                        changed = True
+                        else:
+                            for index, argument in enumerate(iterable_arguments):
+                                if not contains_passed_tracked_binding(
+                                    argument,
+                                    enclosing_callable(call),
+                                ):
+                                    continue
+                                if isinstance(argument, ast.Starred):
+                                    newly_tracked.update(
+                                        parameter.arg for parameter in available
+                                    )
+                                    if vararg is not None:
+                                        newly_tracked.add(vararg.arg)
+                                elif index < len(available):
+                                    newly_tracked.add(available[index].arg)
+                                elif vararg is not None:
+                                    newly_tracked.add(vararg.arg)
+                        local_bindings = scoped_tracked_bindings[local_callable]
+                        if not newly_tracked.issubset(local_bindings):
+                            local_bindings.update(newly_tracked)
+                            changed = True
 
         for local_callable in callable_nodes:
             if isinstance(local_callable, ast.Lambda):
@@ -2905,6 +3322,49 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "args = (invoke, [p])\n"
                 "filter(*args)\n"
             ),
+            "sorted-key": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "sorted([p], key=invoke)\n"
+            ),
+            "sorted-aliases": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "callback = invoke\n"
+                "order = sorted\n"
+                "order([p], key=callback)\n"
+            ),
+            "sorted-lambda": (
+                "sorted([p], key=lambda value: value.os.fork())\n"
+            ),
+            "sorted-bound-method": (
+                "class Runner:\n"
+                "    def invoke(self, value):\n"
+                "        value.os.fork()\n"
+                "sorted([p], key=Runner().invoke)\n"
+            ),
+            "sorted-literal-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "sorted(*([p],), key=invoke)\n"
+            ),
+            "sorted-alias-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "args = ([p],)\n"
+                "sorted(*args, key=invoke)\n"
+            ),
+            "sorted-literal-key-mapping": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "sorted([p], **{'key': invoke})\n"
+            ),
+            "sorted-aliased-key-mapping": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "kwargs = {'key': invoke}\n"
+                "sorted([p], **kwargs)\n"
+            ),
         }
         for path, source in positive_sources.items():
             with self.subTest(path=path):
@@ -2971,6 +3431,46 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "filter = lambda *args: None\n"
                 "args = (invoke, [p])\n"
                 "filter(*args)\n"
+            ),
+            "shadowed-sorted": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "def sorted(values, *, key):\n"
+                "    return values\n"
+                "sorted([p], key=invoke)\n"
+            ),
+            "safe-sorted-iterable": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "sorted([None], key=invoke)\n"
+            ),
+            "sorted-callback-ignores-item": (
+                "def ignore(value):\n"
+                "    return None\n"
+                "sorted([p], key=ignore)\n"
+            ),
+            "sorted-without-key": "sorted([p])\n",
+            "sorted-mapping-reverse-only": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "sorted([p], **{'reverse': invoke})\n"
+            ),
+            "safe-sorted-mapping-iterable": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "sorted([None], **{'key': invoke})\n"
+            ),
+            "sorted-mapping-callback-ignores-item": (
+                "def ignore(value):\n"
+                "    return None\n"
+                "sorted([p], **{'key': ignore})\n"
+            ),
+            "shadowed-sorted-mapping": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "def sorted(values, **kwargs):\n"
+                "    return values\n"
+                "sorted([p], **{'key': invoke})\n"
             ),
         }
         for path, source in negative_sources.items():
@@ -3117,6 +3617,40 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "holder.module = p\n"
                 "holder.module = None\n"
             ),
+            "constructor-init-store": (
+                "class Holder:\n"
+                "    def __init__(self, value):\n"
+                "        self.module = value\n"
+                "Holder(p)\n"
+            ),
+            "constructor-inherited-init": (
+                "class Base:\n"
+                "    def __init__(self, value):\n"
+                "        self.module = value\n"
+                "class Holder(Base):\n"
+                "    pass\n"
+                "Holder(p)\n"
+            ),
+            "constructor-alias": (
+                "class Holder:\n"
+                "    def __init__(self, value):\n"
+                "        self.module = value\n"
+                "Constructor = Holder\n"
+                "Constructor(p)\n"
+            ),
+            "constructor-c3-init": (
+                "class Root:\n"
+                "    def __init__(self, value):\n"
+                "        return None\n"
+                "class Left(Root):\n"
+                "    pass\n"
+                "class Right(Root):\n"
+                "    def __init__(self, value):\n"
+                "        self.module = value\n"
+                "class Holder(Left, Right):\n"
+                "    pass\n"
+                "Holder(p)\n"
+            ),
         }
         for escape, source in positive_sources.items():
             with self.subTest(escape=escape):
@@ -3200,6 +3734,28 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "        self.value = value\n"
                 "holder.module = Wrapper(None)\n"
             ),
+            "constructor-discards-value": (
+                "class Holder:\n"
+                "    def __init__(self, value):\n"
+                "        return None\n"
+                "Holder(p)\n"
+            ),
+            "constructor-local-only": (
+                "class Holder:\n"
+                "    def __init__(self, value):\n"
+                "        local = value\n"
+                "Holder(p)\n"
+            ),
+            "constructor-safe-override": (
+                "class Base:\n"
+                "    def __init__(self, value):\n"
+                "        self.module = value\n"
+                "class Holder(Base):\n"
+                "    def __init__(self, value):\n"
+                "        return None\n"
+                "Holder(p)\n"
+            ),
+            "unresolved-external-constructor": "External(p)\n",
             "insert-star-tracked-index": "items.insert(*(p, 'safe'))\n",
             "legitimate-mutators": (
                 "items.append('safe')\n"
@@ -3223,6 +3779,8 @@ class H2D2FreezeContractTests(unittest.TestCase):
         valid_source = (
             "def _run_json(command, stage):\n    return {}\n"
             "def _existing_manifests(day):\n    return ()\n"
+            "def requested_dates(*, dates, start, end, maximum):\n"
+            "    return ()\n"
             "def execute(days, *, continue_on_failure, run_json=_run_json, "
             "existing=_existing_manifests):\n"
             "    execute_count = len(days)\n"
@@ -3230,8 +3788,18 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "    return {\"count\": execute_count}\n"
             "class Executor:\n    pass\n"
             "def main(argv=None):\n"
-            "    days = ()\n"
-            "    args = type(\"Args\", (), {\"continue_on_failure\": False})()\n"
+            "    args = type(\"Args\", (), {\"dates\": (), \"start\": None, "
+            "\"end\": None, \"max_sessions\": 20, "
+            "\"continue_on_failure\": False})()\n"
+            "    try:\n"
+            "        days = requested_dates(\n"
+            "            dates=args.dates,\n"
+            "            start=args.start,\n"
+            "            end=args.end,\n"
+            "            maximum=args.max_sessions,\n"
+            "        )\n"
+            "    except ValueError as error:\n"
+            "        parser.error(str(error))\n"
             "    output = execute(days, "
             "continue_on_failure=args.continue_on_failure)\n"
             "    return output\n"
@@ -3246,6 +3814,17 @@ class H2D2FreezeContractTests(unittest.TestCase):
         exact_call = (
             "    output = execute(days, "
             "continue_on_failure=args.continue_on_failure)\n"
+        )
+        exact_days_selection = (
+            "    try:\n"
+            "        days = requested_dates(\n"
+            "            dates=args.dates,\n"
+            "            start=args.start,\n"
+            "            end=args.end,\n"
+            "            maximum=args.max_sessions,\n"
+            "        )\n"
+            "    except ValueError as error:\n"
+            "        parser.error(str(error))\n"
         )
         exact_entrypoint = (
             "if __name__ == '__main__':\n"
@@ -3288,6 +3867,153 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     1,
                 ),
                 "execute-call-shape",
+            ),
+            "days-selection-call-shape": (
+                valid_source.replace(
+                    "            maximum=args.max_sessions,\n",
+                    "            maximum=20,\n",
+                    1,
+                ),
+                "days-selection-shape",
+            ),
+            "days-reassignment": (
+                valid_source.replace(
+                    exact_call,
+                    "    days = days + days\n" + exact_call,
+                    1,
+                ),
+                "days-selection-shape",
+            ),
+            "days-augmented-assignment": (
+                valid_source.replace(
+                    exact_call,
+                    "    days *= 2\n" + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-deletion": (
+                valid_source.replace(
+                    exact_call,
+                    "    del days\n" + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-mutator": (
+                valid_source.replace(
+                    exact_call,
+                    "    days.append(None)\n" + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-subscript-write": (
+                valid_source.replace(
+                    exact_call,
+                    "    days[0] = None\n" + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-alias-mutator": (
+                valid_source.replace(
+                    exact_call,
+                    "    selected = days\n"
+                    "    selected.clear()\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-for-target": (
+                valid_source.replace(
+                    exact_call,
+                    "    for days in ():\n"
+                    "        pass\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-with-target": (
+                valid_source.replace(
+                    exact_call,
+                    "    with context() as days:\n"
+                    "        pass\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-import-alias": (
+                valid_source.replace(
+                    exact_call,
+                    "    import math as days\n" + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-from-import-alias": (
+                valid_source.replace(
+                    exact_call,
+                    "    from math import pi as days\n" + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-function-definition": (
+                valid_source.replace(
+                    exact_call,
+                    "    def days():\n"
+                    "        return None\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-async-function-definition": (
+                valid_source.replace(
+                    exact_call,
+                    "    async def days():\n"
+                    "        return None\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-class-definition": (
+                valid_source.replace(
+                    exact_call,
+                    "    class days:\n"
+                    "        pass\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-except-target": (
+                valid_source.replace(
+                    exact_call,
+                    "    try:\n"
+                    "        pass\n"
+                    "    except Exception as days:\n"
+                    "        pass\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-match-capture": (
+                valid_source.replace(
+                    exact_call,
+                    "    match None:\n"
+                    "        case days:\n"
+                    "            pass\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
             ),
             "extra-default": (
                 valid_source.replace(
@@ -3494,6 +4220,118 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 self.assertIn(
                     expected_violation,
                     execute_integrity_violations(ast.parse(mutated_source)),
+                )
+
+        async_binding_sources = {
+            ast.AsyncFor: (
+                "    for days in ():\n"
+                "        pass\n"
+            ),
+            ast.AsyncWith: (
+                "    with context() as days:\n"
+                "        pass\n"
+            ),
+        }
+        for async_type, binding_source in async_binding_sources.items():
+            with self.subTest(days_async_binding=async_type.__name__):
+                binding_tree = ast.parse(valid_source.replace(
+                    exact_call,
+                    binding_source + exact_call,
+                    1,
+                ))
+                binding_main = next(
+                    node for node in binding_tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "main"
+                )
+                binding_index = next(
+                    index for index, statement in enumerate(binding_main.body)
+                    if isinstance(statement, (ast.For, ast.With))
+                )
+                binding_statement = binding_main.body[binding_index]
+                if async_type is ast.AsyncFor:
+                    replacement = ast.AsyncFor(
+                        target=binding_statement.target,
+                        iter=binding_statement.iter,
+                        body=binding_statement.body,
+                        orelse=binding_statement.orelse,
+                        type_comment=binding_statement.type_comment,
+                    )
+                else:
+                    replacement = ast.AsyncWith(
+                        items=binding_statement.items,
+                        body=binding_statement.body,
+                        type_comment=binding_statement.type_comment,
+                    )
+                binding_main.body[binding_index] = ast.copy_location(
+                    replacement,
+                    binding_statement,
+                )
+                self.assertIn(
+                    "days-selection-mutation",
+                    execute_integrity_violations(binding_tree),
+                )
+
+        for statement_type in (ast.Global, ast.Nonlocal):
+            with self.subTest(days_scope_binding=statement_type.__name__):
+                binding_tree = ast.parse(valid_source.replace(
+                    exact_call,
+                    "    pass\n" + exact_call,
+                    1,
+                ))
+                binding_main = next(
+                    node for node in binding_tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "main"
+                )
+                binding_index = next(
+                    index for index, statement in enumerate(binding_main.body)
+                    if isinstance(statement, ast.Pass)
+                )
+                placeholder = binding_main.body[binding_index]
+                binding_main.body[binding_index] = ast.copy_location(
+                    statement_type(names=["days"]),
+                    placeholder,
+                )
+                self.assertIn(
+                    "days-selection-mutation",
+                    execute_integrity_violations(binding_tree),
+                )
+
+        for safe_read in (
+            "    count = len(days)\n",
+            "    preview = tuple(days)\n",
+            "    first = days[0] if days else None\n",
+            "    shadowed = [days for days in ()]\n",
+            "    for item in days:\n        pass\n",
+            "    with context() as item:\n        pass\n",
+            "    import math as calendar\n",
+            "    from math import pi as ratio\n",
+            "    def nested():\n"
+            "        for days in ():\n"
+            "            pass\n",
+            "    async def nested_async():\n"
+            "        async for days in stream():\n"
+            "            pass\n"
+            "        async with context() as days:\n"
+            "            pass\n",
+            "    try:\n"
+            "        pass\n"
+            "    except Exception as error:\n"
+            "        pass\n",
+            "    match None:\n"
+            "        case other:\n"
+            "            pass\n",
+        ):
+            with self.subTest(safe_days_read=safe_read.strip()):
+                self.assertFalse(
+                    execute_integrity_violations(ast.parse(
+                        valid_source.replace(
+                            exact_call,
+                            safe_read + exact_call,
+                            1,
+                        )
+                    )),
                 )
 
     def test_baselines_are_two_read_only_certified_complete_sessions(self):
