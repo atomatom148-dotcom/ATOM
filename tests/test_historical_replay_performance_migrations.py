@@ -45,6 +45,8 @@ class HistoricalReplayPerformanceMigrationTests(unittest.TestCase):
 
     def test_scoring_index_matches_the_frozen_query_shape(self):
         sql = _normalized(INDEX_MIGRATION)
+        self.assertIn("SET STATEMENT_TIMEOUT = '0';", sql)
+        self.assertIn("SET LOCK_TIMEOUT = '5S';", sql)
         self.assertIn(
             "CREATE INDEX CONCURRENTLY "
             "ATOM_HISTORICAL_REPLAY_FORECASTS_SCORING_IDX "
@@ -53,6 +55,16 @@ class HistoricalReplayPerformanceMigrationTests(unittest.TestCase):
             sql,
         )
         self.assertEqual(sql.count("CREATE INDEX CONCURRENTLY"), 1)
+        self.assertIn("RESET LOCK_TIMEOUT;", sql)
+        self.assertIn("RESET STATEMENT_TIMEOUT;", sql)
+        self.assertLess(
+            sql.index("SET STATEMENT_TIMEOUT = '0';"),
+            sql.index("CREATE INDEX CONCURRENTLY"),
+        )
+        self.assertLess(
+            sql.index("CREATE INDEX CONCURRENTLY"),
+            sql.index("RESET STATEMENT_TIMEOUT;"),
+        )
         for forbidden in ("IF NOT EXISTS", "BEGIN", "COMMIT"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, sql)
