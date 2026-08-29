@@ -230,6 +230,493 @@ def local_runtime_dependencies(relative_path: str, tree: ast.AST) -> set[str]:
     return dependencies
 
 
+def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
+    violations = []
+
+    def record(label: str) -> None:
+        if label not in violations:
+            violations.append(label)
+
+    def contains_own_yield(node: ast.AST) -> bool:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return False
+        if isinstance(node, (ast.Yield, ast.YieldFrom)):
+            return True
+        return any(
+            contains_own_yield(child)
+            for child in ast.iter_child_nodes(node)
+        )
+
+    top_level_execute = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "execute"
+    ]
+    execute_function = (
+        top_level_execute[0]
+        if len(top_level_execute) == 1
+        else None
+    )
+    if execute_function is None:
+        record("execute-top-level-definition")
+    else:
+        if execute_function.decorator_list:
+            record("execute-decoration")
+        arguments = execute_function.args
+        kw_defaults = arguments.kw_defaults
+        exact_execute_signature = (
+            not arguments.posonlyargs
+            and [argument.arg for argument in arguments.args] == ["days"]
+            and arguments.vararg is None
+            and [argument.arg for argument in arguments.kwonlyargs] == [
+                "continue_on_failure",
+                "run_json",
+                "existing",
+            ]
+            and arguments.kwarg is None
+            and not arguments.defaults
+            and len(kw_defaults) == 3
+            and kw_defaults[0] is None
+            and isinstance(kw_defaults[1], ast.Name)
+            and isinstance(kw_defaults[1].ctx, ast.Load)
+            and kw_defaults[1].id == "_run_json"
+            and isinstance(kw_defaults[2], ast.Name)
+            and isinstance(kw_defaults[2].ctx, ast.Load)
+            and kw_defaults[2].id == "_existing_manifests"
+        )
+        if not exact_execute_signature:
+            record("execute-signature")
+        if any(contains_own_yield(statement) for statement in execute_function.body):
+            record("execute-generator")
+
+    execute_declarations = tuple(
+        node for node in ast.walk(tree)
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        )
+        and node.name == "execute"
+    )
+    if (
+        execute_function is None
+        or any(node is not execute_function for node in execute_declarations)
+    ):
+        record("execute-shadow")
+
+    execute_name_writes = any(
+        isinstance(node, ast.Name)
+        and node.id == "execute"
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        for node in ast.walk(tree)
+    )
+    execute_arguments = any(
+        isinstance(node, ast.arg) and node.arg == "execute"
+        for node in ast.walk(tree)
+    )
+    execute_scope_declarations = any(
+        isinstance(node, (ast.Global, ast.Nonlocal))
+        and "execute" in node.names
+        for node in ast.walk(tree)
+    )
+    execute_imports = any(
+        (
+            isinstance(node, ast.Import)
+            and any(
+                (alias.asname or alias.name.split(".")[0]) == "execute"
+                for alias in node.names
+            )
+        )
+        or (
+            isinstance(node, ast.ImportFrom)
+            and any(
+                (alias.asname or alias.name) == "execute"
+                for alias in node.names
+            )
+        )
+        for node in ast.walk(tree)
+    )
+    execute_except_names = any(
+        isinstance(node, ast.ExceptHandler) and node.name == "execute"
+        for node in ast.walk(tree)
+    )
+    execute_match_captures = any(
+        (
+            isinstance(node, (ast.MatchAs, ast.MatchStar))
+            and node.name == "execute"
+        )
+        or (
+            isinstance(node, ast.MatchMapping)
+            and node.rest == "execute"
+        )
+        for node in ast.walk(tree)
+    )
+    if any((
+        execute_name_writes,
+        execute_arguments,
+        execute_scope_declarations,
+        execute_imports,
+        execute_except_names,
+        execute_match_captures,
+    )):
+        record("execute-shadow")
+
+    top_level_main = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    ]
+    main_function = top_level_main[0] if len(top_level_main) == 1 else None
+    if main_function is None:
+        record("main-top-level-definition")
+    else:
+        if main_function.decorator_list:
+            record("main-decoration")
+        arguments = main_function.args
+        exact_main_signature = (
+            not arguments.posonlyargs
+            and [argument.arg for argument in arguments.args] == ["argv"]
+            and arguments.vararg is None
+            and not arguments.kwonlyargs
+            and arguments.kwarg is None
+            and len(arguments.defaults) == 1
+            and isinstance(arguments.defaults[0], ast.Constant)
+            and arguments.defaults[0].value is None
+            and not arguments.kw_defaults
+        )
+        if not exact_main_signature:
+            record("main-signature")
+        if any(contains_own_yield(statement) for statement in main_function.body):
+            record("main-generator")
+
+    main_declarations = tuple(
+        node for node in ast.walk(tree)
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        )
+        and node.name == "main"
+    )
+    if (
+        main_function is None
+        or any(node is not main_function for node in main_declarations)
+    ):
+        record("main-shadow")
+
+    main_name_writes = any(
+        isinstance(node, ast.Name)
+        and node.id == "main"
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        for node in ast.walk(tree)
+    )
+    main_arguments = any(
+        isinstance(node, ast.arg) and node.arg == "main"
+        for node in ast.walk(tree)
+    )
+    main_scope_declarations = any(
+        isinstance(node, (ast.Global, ast.Nonlocal))
+        and "main" in node.names
+        for node in ast.walk(tree)
+    )
+    main_imports = any(
+        (
+            isinstance(node, ast.Import)
+            and any(
+                (alias.asname or alias.name.split(".")[0]) == "main"
+                for alias in node.names
+            )
+        )
+        or (
+            isinstance(node, ast.ImportFrom)
+            and any(
+                (alias.asname or alias.name) == "main"
+                for alias in node.names
+            )
+        )
+        for node in ast.walk(tree)
+    )
+    main_except_names = any(
+        isinstance(node, ast.ExceptHandler) and node.name == "main"
+        for node in ast.walk(tree)
+    )
+    main_match_captures = any(
+        (
+            isinstance(node, (ast.MatchAs, ast.MatchStar))
+            and node.name == "main"
+        )
+        or (
+            isinstance(node, ast.MatchMapping)
+            and node.rest == "main"
+        )
+        for node in ast.walk(tree)
+    )
+    if any((
+        main_name_writes,
+        main_arguments,
+        main_scope_declarations,
+        main_imports,
+        main_except_names,
+        main_match_captures,
+    )):
+        record("main-shadow")
+
+    execute_loads = tuple(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id == "execute"
+    )
+    if len(execute_loads) != 1:
+        record("execute-load-count")
+
+    direct_assignments = []
+    pinned_execute_assignment = None
+    if main_function is not None:
+        direct_assignments = [
+            statement for statement in main_function.body
+            if isinstance(statement, ast.Assign)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id == "execute"
+        ]
+    if len(direct_assignments) != 1:
+        record("execute-call-shape")
+    else:
+        assignment = direct_assignments[0]
+        call = assignment.value
+        keyword = call.keywords[0] if len(call.keywords) == 1 else None
+        exact_call = (
+            len(assignment.targets) == 1
+            and isinstance(assignment.targets[0], ast.Name)
+            and isinstance(assignment.targets[0].ctx, ast.Store)
+            and assignment.targets[0].id == "output"
+            and assignment.type_comment is None
+            and len(execute_loads) == 1
+            and call.func is execute_loads[0]
+            and len(call.args) == 1
+            and isinstance(call.args[0], ast.Name)
+            and isinstance(call.args[0].ctx, ast.Load)
+            and call.args[0].id == "days"
+            and keyword is not None
+            and keyword.arg == "continue_on_failure"
+            and isinstance(keyword.value, ast.Attribute)
+            and isinstance(keyword.value.ctx, ast.Load)
+            and keyword.value.attr == "continue_on_failure"
+            and isinstance(keyword.value.value, ast.Name)
+            and isinstance(keyword.value.value.ctx, ast.Load)
+            and keyword.value.value.id == "args"
+        )
+        if not exact_call:
+            record("execute-call-shape")
+        else:
+            pinned_execute_assignment = assignment
+
+    def contains_reachable_terminator(node: ast.AST) -> bool:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return False
+        if isinstance(node, (
+            ast.Assert,
+            ast.Break,
+            ast.Continue,
+            ast.Raise,
+            ast.Return,
+            ast.Yield,
+            ast.YieldFrom,
+        )):
+            return True
+        if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in {"exit", "quit"}
+            ):
+                return True
+            if (
+                isinstance(node.func, ast.Attribute)
+                and (
+                    node.func.attr == "exit"
+                    or (
+                        node.func.attr == "_exit"
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "os"
+                    )
+                )
+            ):
+                return True
+        return any(
+            contains_reachable_terminator(child)
+            for child in ast.iter_child_nodes(node)
+        )
+
+    if main_function is not None and pinned_execute_assignment is not None:
+        execute_index = main_function.body.index(pinned_execute_assignment)
+        if any(
+            contains_reachable_terminator(statement)
+            for statement in main_function.body[:execute_index]
+        ):
+            record("main-early-termination")
+
+    main_loads = tuple(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id == "main"
+    )
+    if len(main_loads) != 1:
+        record("main-load-count")
+
+    module_name_loads = tuple(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id == "__name__"
+    )
+    system_exit_loads = tuple(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id == "SystemExit"
+    )
+    integrity_parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def is_module_scope(node: ast.AST) -> bool:
+        parent = integrity_parents.get(node)
+        while parent is not None and parent is not tree:
+            if isinstance(parent, (
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.FunctionDef,
+                ast.Lambda,
+            )):
+                return False
+            parent = integrity_parents.get(parent)
+        return parent is tree
+
+    def has_protected_module_binding(name: str) -> bool:
+        return any(
+            (
+                isinstance(node, ast.Name)
+                and node.id == name
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and is_module_scope(node)
+            )
+            or (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and node.name == name
+                and is_module_scope(node)
+            )
+            or (
+                isinstance(node, ast.Import)
+                and is_module_scope(node)
+                and any(
+                    (alias.asname or alias.name.split(".")[0]) == name
+                    for alias in node.names
+                )
+            )
+            or (
+                isinstance(node, ast.ImportFrom)
+                and is_module_scope(node)
+                and any(
+                    (alias.asname or alias.name) == name
+                    for alias in node.names
+                )
+            )
+            or (
+                isinstance(node, ast.ExceptHandler)
+                and node.name == name
+                and is_module_scope(node)
+            )
+            or (
+                isinstance(node, (ast.Global, ast.Nonlocal))
+                and name in node.names
+            )
+            or (
+                isinstance(node, (ast.MatchAs, ast.MatchStar))
+                and node.name == name
+                and is_module_scope(node)
+            )
+            or (
+                isinstance(node, ast.MatchMapping)
+                and node.rest == name
+                and is_module_scope(node)
+            )
+            for node in ast.walk(tree)
+        )
+
+    if (
+        has_protected_module_binding("__name__")
+        or has_protected_module_binding("SystemExit")
+    ):
+        record("main-entrypoint")
+    entrypoints = [
+        statement for statement in tree.body
+        if isinstance(statement, ast.If)
+        and isinstance(statement.test, ast.Compare)
+        and isinstance(statement.test.left, ast.Name)
+        and isinstance(statement.test.left.ctx, ast.Load)
+        and statement.test.left.id == "__name__"
+        and len(statement.test.ops) == 1
+        and isinstance(statement.test.ops[0], ast.Eq)
+        and len(statement.test.comparators) == 1
+        and isinstance(statement.test.comparators[0], ast.Constant)
+        and statement.test.comparators[0].value == "__main__"
+    ]
+    exact_entrypoint = False
+    if len(entrypoints) == 1:
+        entrypoint = entrypoints[0]
+        raise_statement = (
+            entrypoint.body[0]
+            if len(entrypoint.body) == 1
+            else None
+        )
+        system_exit_call = (
+            raise_statement.exc
+            if isinstance(raise_statement, ast.Raise)
+            else None
+        )
+        main_call = (
+            system_exit_call.args[0]
+            if (
+                isinstance(system_exit_call, ast.Call)
+                and len(system_exit_call.args) == 1
+            )
+            else None
+        )
+        exact_entrypoint = (
+            not entrypoint.orelse
+            and tree.body[-1] is entrypoint
+            and len(module_name_loads) == 1
+            and entrypoint.test.left is module_name_loads[0]
+            and isinstance(raise_statement, ast.Raise)
+            and raise_statement.cause is None
+            and isinstance(system_exit_call, ast.Call)
+            and isinstance(system_exit_call.func, ast.Name)
+            and isinstance(system_exit_call.func.ctx, ast.Load)
+            and system_exit_call.func.id == "SystemExit"
+            and len(system_exit_loads) == 1
+            and system_exit_call.func is system_exit_loads[0]
+            and not system_exit_call.keywords
+            and isinstance(main_call, ast.Call)
+            and isinstance(main_call.func, ast.Name)
+            and isinstance(main_call.func.ctx, ast.Load)
+            and main_call.func.id == "main"
+            and len(main_loads) == 1
+            and main_call.func is main_loads[0]
+            and not main_call.args
+            and not main_call.keywords
+        )
+        entrypoint_index = tree.body.index(entrypoint)
+        if any(
+            contains_reachable_terminator(statement)
+            for statement in tree.body[:entrypoint_index]
+        ):
+            exact_entrypoint = False
+    if not exact_entrypoint:
+        record("main-entrypoint")
+
+    return tuple(violations)
+
+
 def lexical_import_origins(
         tree: ast.Module,
         *,
@@ -507,7 +994,10 @@ def sensitive_module_reexports(
         propagate_aliases=True,
         fallback_origins={
             "classmethod": "builtins.classmethod",
+            "object": "builtins.object",
+            "setattr": "builtins.setattr",
             "staticmethod": "builtins.staticmethod",
+            "type": "builtins.type",
         },
     )
 
@@ -587,6 +1077,9 @@ def sensitive_module_reexports(
 
     scopes: set[ast.AST | None] = {None, *callable_nodes}
     scope_bound_names = {scope: set() for scope in scopes}
+    scope_import_names = {scope: set() for scope in scopes}
+    scope_global_names = {scope: set() for scope in scopes}
+    scope_nonlocal_names = {scope: set() for scope in scopes}
     callable_bindings: dict[
         ast.AST | None,
         dict[
@@ -662,16 +1155,24 @@ def sensitive_module_reexports(
         elif isinstance(node, ast.ExceptHandler) and node.name:
             scope_bound_names[scope].add(node.name)
         elif isinstance(node, ast.Import):
-            scope_bound_names[scope].update(
+            imported_names = {
                 alias.asname or alias.name.split(".")[0]
                 for alias in node.names
-            )
+            }
+            scope_bound_names[scope].update(imported_names)
+            scope_import_names[scope].update(imported_names)
         elif isinstance(node, ast.ImportFrom):
-            scope_bound_names[scope].update(
+            imported_names = {
                 alias.asname or alias.name
                 for alias in node.names
                 if alias.name != "*"
-            )
+            }
+            scope_bound_names[scope].update(imported_names)
+            scope_import_names[scope].update(imported_names)
+        elif isinstance(node, ast.Global):
+            scope_global_names[scope].update(node.names)
+        elif isinstance(node, ast.Nonlocal):
+            scope_nonlocal_names[scope].update(node.names)
         elif isinstance(node, ast.ClassDef):
             scope_bound_names[scope].add(node.name)
 
@@ -857,8 +1358,10 @@ def sensitive_module_reexports(
                 ).add(statement)
 
     class_bases: dict[ast.ClassDef, tuple[ast.ClassDef, ...]] = {}
+    class_base_resolution_complete: dict[ast.ClassDef, bool] = {}
     for class_node in class_nodes:
         bases = []
+        complete = True
         for base_expression in class_node.bases:
             resolved_bases = sorted(
                 resolve_class_expression(
@@ -867,32 +1370,90 @@ def sensitive_module_reexports(
                 ),
                 key=lambda item: (item.lineno, item.col_offset),
             )
+            if len(resolved_bases) != 1:
+                complete = False
             for base in resolved_bases:
-                if base not in bases:
+                if base in bases:
+                    complete = False
+                else:
                     bases.append(base)
         class_bases[class_node] = tuple(bases)
+        class_base_resolution_complete[class_node] = complete
 
-    def find_class_methods(
+    class_mro_cache: dict[
+        ast.ClassDef,
+        tuple[ast.ClassDef, ...] | None,
+    ] = {}
+
+    def local_c3_mro(
+            class_node: ast.ClassDef,
+            resolving: frozenset[ast.ClassDef] = frozenset(),
+    ) -> tuple[ast.ClassDef, ...] | None:
+        if class_node in class_mro_cache:
+            return class_mro_cache[class_node]
+        if (
+            class_node in resolving
+            or not class_base_resolution_complete[class_node]
+        ):
+            class_mro_cache[class_node] = None
+            return None
+        resolving = resolving | {class_node}
+        base_mros = []
+        for base in class_bases[class_node]:
+            base_mro = local_c3_mro(base, resolving)
+            if base_mro is None:
+                class_mro_cache[class_node] = None
+                return None
+            base_mros.append(list(base_mro))
+        sequences = base_mros + [list(class_bases[class_node])]
+        result = [class_node]
+        while any(sequences):
+            sequences = [sequence for sequence in sequences if sequence]
+            candidate = next((
+                sequence[0]
+                for sequence in sequences
+                if all(
+                    sequence[0] not in other[1:]
+                    for other in sequences
+                )
+            ), None)
+            if candidate is None:
+                class_mro_cache[class_node] = None
+                return None
+            result.append(candidate)
+            for sequence in sequences:
+                if sequence and sequence[0] is candidate:
+                    sequence.pop(0)
+        resolved = tuple(result)
+        class_mro_cache[class_node] = resolved
+        return resolved
+
+    def conservative_local_methods(
             class_node: ast.ClassDef,
             method_name: str,
             visited: frozenset[ast.ClassDef] = frozenset(),
-    ) -> tuple[bool, set[ast.FunctionDef | ast.AsyncFunctionDef]]:
+    ) -> set[ast.FunctionDef | ast.AsyncFunctionDef]:
         if class_node in visited:
-            return False, set()
+            return set()
         if method_name in class_member_names[class_node]:
-            return True, set(class_methods[class_node].get(method_name, ()))
+            return set(class_methods[class_node].get(method_name, ()))
         visited = visited | {class_node}
-        for base in class_bases[class_node]:
-            found, inherited = find_class_methods(base, method_name, visited)
-            if found:
-                return True, inherited
-        return False, set()
+        return set().union(*(
+            conservative_local_methods(base, method_name, visited)
+            for base in class_bases[class_node]
+        )) if class_bases[class_node] else set()
 
     def resolve_class_methods(
             class_node: ast.ClassDef,
             method_name: str,
     ) -> set[ast.FunctionDef | ast.AsyncFunctionDef]:
-        return find_class_methods(class_node, method_name)[1]
+        mro = local_c3_mro(class_node)
+        if mro is None:
+            return conservative_local_methods(class_node, method_name)
+        for candidate in mro:
+            if method_name in class_member_names[candidate]:
+                return set(class_methods[candidate].get(method_name, ()))
+        return set()
 
     def method_descriptor_kind(
             method: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -1006,14 +1567,27 @@ def sensitive_module_reexports(
             node: ast.AST,
             scope: ast.AST | None = None,
     ) -> bool:
-        active_bindings = set(tracked_bindings)
-        while scope is not None:
-            active_bindings.update(scoped_tracked_bindings[scope])
-            scope = callable_parents[scope]
+        def is_tracked_name(item: ast.Name) -> bool:
+            item_scope = scope
+            while item_scope is not None:
+                if item.id in scope_global_names[item_scope]:
+                    item_scope = None
+                    break
+                if item.id in scope_nonlocal_names[item_scope]:
+                    item_scope = callable_parents[item_scope]
+                    continue
+                if item.id in scope_bound_names[item_scope]:
+                    return (
+                        item.id in scoped_tracked_bindings[item_scope]
+                        or item.id in scope_import_names[item_scope]
+                    )
+                item_scope = callable_parents[item_scope]
+            return item.id in tracked_bindings
+
         return any(
             isinstance(item, ast.Name)
             and isinstance(item.ctx, ast.Load)
-            and item.id in active_bindings
+            and is_tracked_name(item)
             for item in ast.walk(node)
         )
 
@@ -1027,15 +1601,11 @@ def sensitive_module_reexports(
             if isinstance(call, ast.Call)
             for item in ast.walk(call.func)
         }
-        active_bindings = set(tracked_bindings)
-        while scope is not None:
-            active_bindings.update(scoped_tracked_bindings[scope])
-            scope = callable_parents[scope]
         return any(
             isinstance(item, ast.Name)
             and isinstance(item.ctx, ast.Load)
-            and item.id in active_bindings
             and item not in callable_references
+            and contains_tracked_binding(item, scope)
             for item in ast.walk(node)
         )
 
@@ -1214,6 +1784,253 @@ def sensitive_module_reexports(
                 tracked_return_callables.add(local_callable)
                 changed = True
 
+    def contains_persistent_target(node: ast.AST) -> bool:
+        if isinstance(node, (ast.Attribute, ast.Subscript)):
+            return True
+        if isinstance(node, ast.Starred):
+            return contains_persistent_target(node.value)
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return any(contains_persistent_target(item) for item in node.elts)
+        return False
+
+    def carries_state_escape_value(
+            node: ast.AST,
+            scope: ast.AST | None,
+    ) -> bool:
+        def direct_tracked_roots(argument: ast.AST) -> set[str]:
+            if isinstance(argument, ast.Name):
+                return (
+                    {argument.id}
+                    if contains_tracked_binding(argument, scope)
+                    else set()
+                )
+            if isinstance(argument, (ast.Attribute, ast.Subscript)):
+                return direct_tracked_roots(argument.value)
+            if isinstance(argument, (ast.List, ast.Tuple, ast.Set)):
+                return set().union(*(
+                    direct_tracked_roots(item) for item in argument.elts
+                )) if argument.elts else set()
+            if isinstance(argument, ast.Dict):
+                return set().union(*(
+                    direct_tracked_roots(item)
+                    for item in (*argument.keys, *argument.values)
+                    if item is not None
+                )) if argument.keys or argument.values else set()
+            if isinstance(argument, (ast.Starred, ast.NamedExpr)):
+                return direct_tracked_roots(argument.value)
+            if isinstance(argument, ast.IfExp):
+                return (
+                    direct_tracked_roots(argument.body)
+                    | direct_tracked_roots(argument.orelse)
+                )
+            return set()
+
+        def expression_carries_value(expression: ast.AST) -> bool:
+            if direct_tracked_roots(expression):
+                return True
+            if isinstance(expression, (
+                ast.Attribute,
+                ast.NamedExpr,
+                ast.Starred,
+                ast.Subscript,
+            )):
+                return expression_carries_value(expression.value)
+            if isinstance(expression, (ast.List, ast.Tuple, ast.Set)):
+                return any(
+                    expression_carries_value(item)
+                    for item in expression.elts
+                )
+            if isinstance(expression, ast.Dict):
+                return any(
+                    expression_carries_value(item)
+                    for item in (*expression.keys, *expression.values)
+                    if item is not None
+                )
+            if isinstance(expression, ast.IfExp):
+                return (
+                    expression_carries_value(expression.body)
+                    or expression_carries_value(expression.orelse)
+                )
+            if not isinstance(expression, ast.Call):
+                return False
+            local_targets = local_call_targets(expression)
+            if local_targets:
+                return any(
+                    local_callable in tracked_return_callables
+                    for local_callable, _ in local_targets
+                )
+            if not isinstance(expression.func, (ast.Name, ast.Attribute)):
+                return False
+            local_classes = resolve_class_expression(expression.func, scope)
+            if local_classes and not any(
+                resolve_class_methods(class_node, "__init__")
+                for class_node in local_classes
+            ):
+                return False
+            if isinstance(expression.func, ast.Name):
+                public_name = expression.func.id.lstrip("_")
+                if (
+                    not local_classes
+                    and public_name
+                    and public_name[0].isupper()
+                ):
+                    return False
+            else:
+                receiver = expression.func.value
+
+                def name_is_lexically_bound(name: str) -> bool:
+                    name_scope = scope
+                    while name_scope is not None:
+                        if name in scope_global_names[name_scope]:
+                            name_scope = None
+                            break
+                        if name in scope_nonlocal_names[name_scope]:
+                            name_scope = callable_parents[name_scope]
+                            continue
+                        if name in scope_bound_names[name_scope]:
+                            return True
+                        name_scope = callable_parents[name_scope]
+                    return name in scope_bound_names[None]
+
+                receiver_names = {
+                    item.id
+                    for item in ast.walk(receiver)
+                    if isinstance(item, ast.Name)
+                }
+                receiver_is_unresolved = any(
+                    not name_is_lexically_bound(name)
+                    for name in receiver_names
+                )
+                if not (
+                    import_origin_names(receiver)
+                    or direct_tracked_roots(receiver)
+                    or receiver_is_unresolved
+                ):
+                    return False
+            arguments = (
+                *expression.args,
+                *(keyword.value for keyword in expression.keywords),
+            )
+            callable_names = {
+                item.id
+                for item in ast.walk(expression.func)
+                if isinstance(item, ast.Name)
+            }
+            for argument in arguments:
+                argument_roots = direct_tracked_roots(argument)
+                if argument_roots:
+                    if argument_roots - callable_names:
+                        return True
+                elif expression_carries_value(argument):
+                    return True
+            return False
+
+        return (
+            contains_assignment_tracked_binding(node, scope)
+            or expression_carries_value(node)
+        )
+
+    exact_setter_origins = {
+        "builtins.setattr",
+        "builtins.object.__setattr__",
+        "builtins.type.__setattr__",
+    }
+    mutator_stored_positions = {
+        "append": {0},
+        "extend": {0},
+        "insert": {1},
+        "add": {0},
+        "update": None,
+        "setdefault": {0, 1},
+        "__setitem__": {0, 1},
+    }
+    mutator_stored_keywords = {
+        "append": {"item", "object", "value"},
+        "extend": {"items", "iterable", "values"},
+        "insert": {"item", "object", "value"},
+        "add": {"element", "item", "value"},
+        "update": None,
+        "setdefault": {"default", "key"},
+        "__setitem__": {"key", "value"},
+    }
+
+    def normalized_positional_values(
+            call: ast.Call,
+    ) -> tuple[tuple[ast.AST, ...], tuple[ast.AST, ...]]:
+        values = []
+        unresolved_starred = []
+
+        def append_argument(argument: ast.AST) -> None:
+            if not isinstance(argument, ast.Starred):
+                values.append(argument)
+            elif isinstance(argument.value, (ast.List, ast.Tuple)):
+                for item in argument.value.elts:
+                    append_argument(item)
+            else:
+                unresolved_starred.append(argument.value)
+
+        for argument in call.args:
+            append_argument(argument)
+        return tuple(values), tuple(unresolved_starred)
+
+    def setter_stored_values(
+            call: ast.Call,
+    ) -> tuple[tuple[ast.AST, ...], tuple[ast.AST, ...]]:
+        if local_call_targets(call):
+            return (), ()
+        positional, unresolved_starred = normalized_positional_values(call)
+        origins = import_origin_names(call.func)
+        if exact_setter_origins.intersection(origins):
+            stored_index = 2
+        elif (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "__setattr__"
+        ):
+            stored_index = 1
+        else:
+            return (), ()
+        if unresolved_starred:
+            return positional, unresolved_starred
+        return (
+            (positional[stored_index],)
+            if len(positional) > stored_index
+            else (),
+            (),
+        )
+
+    def mutator_stored_values(
+            call: ast.Call,
+    ) -> tuple[tuple[ast.AST, ...], tuple[ast.AST, ...]]:
+        if not isinstance(call.func, ast.Attribute) or local_call_targets(call):
+            return (), ()
+        method_name = call.func.attr
+        if method_name not in mutator_stored_positions:
+            return (), ()
+        positional, unresolved_starred = normalized_positional_values(call)
+        positions = mutator_stored_positions[method_name]
+        positional_values = (
+            positional
+            if positions is None
+            else tuple(
+                argument
+                for index, argument in enumerate(positional)
+                if index in positions
+            )
+        )
+        keyword_names = mutator_stored_keywords[method_name]
+        keyword_values = tuple(
+            keyword.value
+            for keyword in call.keywords
+            if (
+                keyword.arg is None
+                or keyword_names is None
+                or keyword.arg in keyword_names
+            )
+        )
+        if unresolved_starred:
+            return positional + keyword_values, unresolved_starred
+        return positional_values + keyword_values, ()
+
     findings = []
     for node in ast.walk(tree):
         if (
@@ -1236,6 +2053,10 @@ def sensitive_module_reexports(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id in {"delattr", "getattr", "setattr", "vars"}
+            and (
+                node.func.id != "setattr"
+                or "builtins.setattr" in import_origin_names(node.func)
+            )
             and node.args
             and contains_tracked_binding(
                 node.args[0],
@@ -1243,6 +2064,47 @@ def sensitive_module_reexports(
             )
         ):
             findings.append(node)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            value = node.value
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            if (
+                value is not None
+                and any(contains_persistent_target(target) for target in targets)
+                and carries_state_escape_value(
+                    value,
+                    enclosing_callable(node),
+                )
+            ):
+                findings.append(node)
+        elif (
+            isinstance(node, ast.AugAssign)
+            and contains_persistent_target(node.target)
+            and carries_state_escape_value(
+                node.value,
+                enclosing_callable(node),
+            )
+        ):
+            findings.append(node)
+        elif isinstance(node, ast.Call):
+            setter_values, setter_unresolved = setter_stored_values(node)
+            mutator_values, mutator_unresolved = mutator_stored_values(node)
+            if any(
+                carries_state_escape_value(
+                    stored_value,
+                    enclosing_callable(node),
+                )
+                for stored_value in (
+                    *setter_values,
+                    *setter_unresolved,
+                    *mutator_values,
+                    *mutator_unresolved,
+                )
+            ):
+                findings.append(node)
     return tuple(findings)
 
 
@@ -1399,6 +2261,44 @@ class H2D2FreezeContractTests(unittest.TestCase):
             (
                 (
                     "from shutil import fnmatch as p\n"
+                    "class A:\n"
+                    "    def invoke(self, value):\n        return value\n"
+                    "class B(A):\n    pass\n"
+                    "class C(A):\n"
+                    "    def invoke(self, value):\n        value.os.fork()\n"
+                    "class D(B, C):\n    pass\n"
+                    "D().invoke(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "class A:\n"
+                    "    def invoke(self, value):\n        value.os.fork()\n"
+                    "class B:\n"
+                    "    def invoke(self, value):\n        return value\n"
+                    "class X(A, B):\n    pass\n"
+                    "class Y(B, A):\n    pass\n"
+                    "class Z(X, Y):\n    pass\n"
+                    "Z().invoke(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "from framework import Unknown\n"
+                    "class Local:\n"
+                    "    def invoke(self, value):\n        value.os.fork()\n"
+                    "class Runner(Unknown, Local):\n    pass\n"
+                    "Runner().invoke(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
                     "class Base:\n"
                     "    @classmethod\n"
                     "    def invoke(cls, value):\n        value.os.fork()\n"
@@ -1469,6 +2369,17 @@ class H2D2FreezeContractTests(unittest.TestCase):
         )
 
         for safe_source in (
+            (
+                "from shutil import fnmatch as p\n"
+                "class A:\n"
+                "    def invoke(self, value):\n        return value\n"
+                "class B(A):\n"
+                "    def invoke(self, value):\n        return value\n"
+                "class C(A):\n"
+                "    def invoke(self, value):\n        value.os.fork()\n"
+                "class D(B, C):\n    pass\n"
+                "D().invoke(p)\n"
+            ),
             (
                 "from shutil import fnmatch as p\n"
                 "class Base:\n"
@@ -1721,6 +2632,522 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "full-path concurrency origins cannot leak across functions",
         )
 
+    def test_reexport_guard_rejects_persistent_state_escape(self):
+        prefix = "from shutil import fnmatch as p\n"
+
+        def findings(body: str) -> tuple[ast.AST, ...]:
+            return sensitive_module_reexports(
+                ast.parse(prefix + body),
+                {"p": "shutil.fnmatch"},
+            )
+
+        positive_sources = {
+            "instance-setter": (
+                "class Runner:\n"
+                "    def set(self, value):\n"
+                "        self.module = value\n"
+                "    def invoke(self):\n"
+                "        return self.module.os.fork()\n"
+                "r = Runner()\n"
+                "r.set(p)\n"
+                "r.invoke()\n"
+            ),
+            "receiver-alias": (
+                "class Runner:\n"
+                "    def set(self, value):\n"
+                "        self.module = value\n"
+                "r = Runner()\n"
+                "receiver = r\n"
+                "receiver.set(p)\n"
+            ),
+            "tuple-target": (
+                "class Runner:\n"
+                "    def set(self, value):\n"
+                "        self.module, local = value, None\n"
+                "r = Runner()\n"
+                "r.set(p)\n"
+            ),
+            "subscript-target": (
+                "class Runner:\n"
+                "    def set(self, value):\n"
+                "        self.modules[0] = value\n"
+                "r = Runner()\n"
+                "r.set(p)\n"
+            ),
+            "setter-alias": (
+                "class Runner:\n"
+                "    def set(self, value):\n"
+                "        self.module = value\n"
+                "r = Runner()\n"
+                "setter = r.set\n"
+                "setter(p)\n"
+            ),
+            "setattr-alias": (
+                "setter = setattr\n"
+                "class Runner:\n"
+                "    def set(self, value):\n"
+                "        setter(self, 'module', value)\n"
+                "r = Runner()\n"
+                "r.set(p)\n"
+            ),
+            "object-setattr": "object.__setattr__(holder, 'module', p)\n",
+            "type-setattr": "type.__setattr__(Holder, 'module', p)\n",
+            "augmented-assignment": (
+                "class Runner:\n"
+                "    def set(self, value):\n"
+                "        self.modules += [value]\n"
+                "r = Runner()\n"
+                "r.set(p)\n"
+            ),
+            "unknown-wrapper": (
+                "class Runner:\n"
+                "    def set(self, value):\n"
+                "        self.module = external_identity(value)\n"
+                "r = Runner()\n"
+                "r.set(p)\n"
+            ),
+            "wrapper-attribute-argument": (
+                "holder.module = external_identity(p.child)\n"
+            ),
+            "wrapper-subscript-argument": (
+                "holder.module = external_identity(p[0])\n"
+            ),
+            "wrapper-attribute-result": (
+                "holder.module = external_identity(p).module\n"
+            ),
+            "wrapper-subscript-result": (
+                "holder.module = external_identity(p)[0]\n"
+            ),
+            "imported-attribute-wrapper": (
+                "import external\n"
+                "holder.module = external.identity(p)\n"
+            ),
+            "unresolved-attribute-wrapper": (
+                "holder.module = external.identity(p)\n"
+            ),
+            "nested-unknown-wrapper": "holder.module = outer(inner(p))\n",
+            "nested-multi-argument-wrapper": (
+                "holder.module = outer(inner(p, None))\n"
+            ),
+            "multi-argument-wrapper": (
+                "holder.module = external_identity(p, None)\n"
+            ),
+            "local-constructor-capture": (
+                "class Wrapper:\n"
+                "    def __init__(self, value):\n"
+                "        self.value = value\n"
+                "holder.module = Wrapper(p)\n"
+            ),
+            "setattr-wrapper": (
+                "setter = setattr\n"
+                "setter(holder, 'module', external_identity(p))\n"
+            ),
+            "setattr-literal-star": (
+                "setter = setattr\n"
+                "setter(*(holder, 'module', p))\n"
+            ),
+            "object-setattr-literal-star": (
+                "object.__setattr__(holder, *('module', p))\n"
+            ),
+            "setattr-unresolved-star": (
+                "setter = setattr\n"
+                "arguments = (holder, 'module', p)\n"
+                "setter(*arguments)\n"
+            ),
+            "receiver-setattr": "holder.__setattr__('module', p)\n",
+            "receiver-setattr-star": (
+                "holder.__setattr__(*('module', p))\n"
+            ),
+            "resolved-dangerous-append-body": (
+                "class Box:\n"
+                "    def append(self, value):\n"
+                "        self.module = value\n"
+                "Box().append(p)\n"
+            ),
+            "annotated-assignment": "holder.module: object = p\n",
+            "safe-overwrite-after-escape": (
+                "holder.module = p\n"
+                "holder.module = None\n"
+            ),
+        }
+        for escape, source in positive_sources.items():
+            with self.subTest(escape=escape):
+                self.assertTrue(
+                    findings(source),
+                    f"persistent tracked state escaped through {escape}",
+                )
+
+        mutator_sources = {
+            "append": "items.append(p)\n",
+            "append-wrapper": "items.append(external_identity(p))\n",
+            "extend": "items.extend([p])\n",
+            "insert": "items.insert(0, p)\n",
+            "insert-literal-star": "items.insert(*(0, p))\n",
+            "add": "items.add(p)\n",
+            "update": "items.update({'module': p})\n",
+            "setdefault": "items.setdefault('module', p)\n",
+            "__setitem__": "items.__setitem__('module', p)\n",
+        }
+        for mutator, source in mutator_sources.items():
+            with self.subTest(mutator=mutator):
+                self.assertTrue(
+                    findings(source),
+                    f"tracked value escaped through {mutator}",
+                )
+
+        named_expression_tree = ast.parse(prefix)
+        named_expression_tree.body.append(ast.Expr(value=ast.NamedExpr(
+            target=ast.Attribute(
+                value=ast.Name(id="holder", ctx=ast.Load()),
+                attr="module",
+                ctx=ast.Store(),
+            ),
+            value=ast.Name(id="p", ctx=ast.Load()),
+        )))
+        self.assertTrue(
+            sensitive_module_reexports(
+                named_expression_tree,
+                {"p": "shutil.fnmatch"},
+            ),
+            "the AST guard must reject a persistent NamedExpr target",
+        )
+
+        negative_sources = {
+            "local-name-shadow": (
+                "def harmless(p):\n"
+                "    holder.module = p\n"
+                "harmless(None)\n"
+            ),
+            "uncalled-setter": (
+                "class Runner:\n"
+                "    def set(self, value):\n"
+                "        self.module = value\n"
+            ),
+            "safe-rhs": "holder.module = 1\n",
+            "shadowed-setattr": (
+                "def setattr(target, name, value):\n"
+                "    return value\n"
+                "setattr(holder, 'module', p)\n"
+            ),
+            "resolved-local-discard-wrapper": (
+                "def discard(value):\n"
+                "    return None\n"
+                "holder.module = outer(discard(p))\n"
+            ),
+            "resolved-safe-append": (
+                "class SafeBox:\n"
+                "    def append(self, value):\n"
+                "        return None\n"
+                "SafeBox().append(p)\n"
+            ),
+            "resolved-safe-setattr": (
+                "class SafeBox:\n"
+                "    def __setattr__(self, name, value):\n"
+                "        return None\n"
+                "SafeBox().__setattr__('module', p)\n"
+            ),
+            "local-constructor-safe-argument": (
+                "class Wrapper:\n"
+                "    def __init__(self, value):\n"
+                "        self.value = value\n"
+                "holder.module = Wrapper(None)\n"
+            ),
+            "insert-star-tracked-index": "items.insert(*(p, 'safe'))\n",
+            "legitimate-mutators": (
+                "items.append('safe')\n"
+                "items.extend([1])\n"
+                "items.insert(p, 'safe')\n"
+                "items.add(None)\n"
+                "items.update({'safe': 1})\n"
+                "items.setdefault('safe', None)\n"
+                "items.__setitem__('safe', None)\n"
+                "setattr(holder, 'module', None)\n"
+            ),
+        }
+        for safe_case, source in negative_sources.items():
+            with self.subTest(safe_case=safe_case):
+                self.assertFalse(
+                    findings(source),
+                    f"safe state operation was rejected: {safe_case}",
+                )
+
+    def test_execute_integrity_guard_rejects_shadows_and_relocations(self):
+        valid_source = (
+            "def _run_json(command, stage):\n    return {}\n"
+            "def _existing_manifests(day):\n    return ()\n"
+            "def execute(days, *, continue_on_failure, run_json=_run_json, "
+            "existing=_existing_manifests):\n"
+            "    execute_count = len(days)\n"
+            "    _execute_result = None\n"
+            "    return {\"count\": execute_count}\n"
+            "class Executor:\n    pass\n"
+            "def main(argv=None):\n"
+            "    days = ()\n"
+            "    args = type(\"Args\", (), {\"continue_on_failure\": False})()\n"
+            "    output = execute(days, "
+            "continue_on_failure=args.continue_on_failure)\n"
+            "    return output\n"
+            "if __name__ == '__main__':\n"
+            "    raise SystemExit(main())\n"
+        )
+        self.assertFalse(
+            execute_integrity_violations(ast.parse(valid_source)),
+            "the exact interface and benign similarly named locals must pass",
+        )
+
+        exact_call = (
+            "    output = execute(days, "
+            "continue_on_failure=args.continue_on_failure)\n"
+        )
+        exact_entrypoint = (
+            "if __name__ == '__main__':\n"
+            "    raise SystemExit(main())\n"
+        )
+        mutations = {
+            "decorator": (
+                valid_source.replace(
+                    "def execute(days,",
+                    "@identity\ndef execute(days,",
+                    1,
+                ),
+                "execute-decoration",
+            ),
+            "assignment": (
+                valid_source + "execute = None\n",
+                "execute-shadow",
+            ),
+            "deletion": (
+                valid_source + "del execute\n",
+                "execute-shadow",
+            ),
+            "import-alias": (
+                valid_source + "import math as execute\n",
+                "execute-shadow",
+            ),
+            "callable-alias": (
+                valid_source + "dispatcher = execute\n",
+                "execute-load-count",
+            ),
+            "default-capture": (
+                valid_source
+                + "def capture(callback=execute):\n    return callback\n",
+                "execute-load-count",
+            ),
+            "relocation": (
+                valid_source.replace(
+                    exact_call,
+                    "    if True:\n        " + exact_call.lstrip(),
+                    1,
+                ),
+                "execute-call-shape",
+            ),
+            "extra-default": (
+                valid_source.replace(
+                    "continue_on_failure, run_json=",
+                    "continue_on_failure=False, run_json=",
+                    1,
+                ),
+                "execute-signature",
+            ),
+            "wrong-dispatch-default": (
+                valid_source.replace(
+                    "run_json=_run_json",
+                    "run_json=None",
+                    1,
+                ),
+                "execute-signature",
+            ),
+            "duplicate-async": (
+                valid_source + "async def execute():\n    return None\n",
+                "execute-shadow",
+            ),
+            "duplicate-class": (
+                valid_source + "class execute:\n    pass\n",
+                "execute-shadow",
+            ),
+            "parameter-shadow": (
+                valid_source
+                + "def capture_parameter(execute):\n    return None\n",
+                "execute-shadow",
+            ),
+            "global-shadow": (
+                valid_source
+                + "def capture_global():\n    global execute\n    return None\n",
+                "execute-shadow",
+            ),
+            "except-shadow": (
+                valid_source
+                + "try:\n    pass\nexcept Exception as execute:\n    pass\n",
+                "execute-shadow",
+            ),
+            "match-capture": (
+                valid_source
+                + "def capture_match(value):\n"
+                + "    match value:\n"
+                + "        case execute:\n"
+                + "            return None\n",
+                "execute-shadow",
+            ),
+            "main-signature": (
+                valid_source.replace(
+                    "def main(argv=None):",
+                    "def main(argv=()):",
+                    1,
+                ),
+                "main-signature",
+            ),
+            "main-assignment": (
+                valid_source + "main = None\n",
+                "main-shadow",
+            ),
+            "main-deletion": (
+                valid_source + "del main\n",
+                "main-shadow",
+            ),
+            "main-import-alias": (
+                valid_source + "import math as main\n",
+                "main-shadow",
+            ),
+            "duplicate-async-main": (
+                valid_source + "async def main():\n    return None\n",
+                "main-shadow",
+            ),
+            "duplicate-class-main": (
+                valid_source + "class main:\n    pass\n",
+                "main-shadow",
+            ),
+            "entrypoint-replacement": (
+                valid_source.replace(
+                    exact_entrypoint,
+                    "if __name__ == '__main__':\n    main()\n",
+                    1,
+                ),
+                "main-entrypoint",
+            ),
+            "entrypoint-argument": (
+                valid_source.replace("SystemExit(main())", "SystemExit(main([]))", 1),
+                "main-entrypoint",
+            ),
+            "entrypoint-addition": (
+                valid_source
+                + "if __name__ == '__main__':\n    raise SystemExit(main())\n",
+                "main-entrypoint",
+            ),
+            "entrypoint-not-final": (
+                valid_source + "TRAILING = True\n",
+                "main-entrypoint",
+            ),
+            "module-name-rebinding": (
+                valid_source.replace(
+                    exact_entrypoint,
+                    "__name__ = 'disabled'\n" + exact_entrypoint,
+                    1,
+                ),
+                "main-entrypoint",
+            ),
+            "system-exit-rebinding": (
+                valid_source.replace(
+                    exact_entrypoint,
+                    "SystemExit = RuntimeError\n" + exact_entrypoint,
+                    1,
+                ),
+                "main-entrypoint",
+            ),
+            "main-early-return": (
+                valid_source.replace(
+                    exact_call,
+                    "    return 0\n" + exact_call,
+                    1,
+                ),
+                "main-early-termination",
+            ),
+            "main-early-raise": (
+                valid_source.replace(
+                    exact_call,
+                    "    raise RuntimeError\n" + exact_call,
+                    1,
+                ),
+                "main-early-termination",
+            ),
+            "main-loop-break": (
+                valid_source.replace(
+                    exact_call,
+                    "    for _ in (0,):\n        break\n" + exact_call,
+                    1,
+                ),
+                "main-early-termination",
+            ),
+            "main-loop-continue": (
+                valid_source.replace(
+                    exact_call,
+                    "    for _ in (0,):\n        continue\n" + exact_call,
+                    1,
+                ),
+                "main-early-termination",
+            ),
+            "main-exit-call": (
+                valid_source.replace(exact_call, "    exit(0)\n" + exact_call, 1),
+                "main-early-termination",
+            ),
+            "main-sys-exit-call": (
+                valid_source.replace(
+                    exact_call,
+                    "    sys.exit(0)\n" + exact_call,
+                    1,
+                ),
+                "main-early-termination",
+            ),
+            "main-parser-exit-call": (
+                valid_source.replace(
+                    exact_call,
+                    "    parser.exit(0)\n" + exact_call,
+                    1,
+                ),
+                "main-early-termination",
+            ),
+            "top-level-termination": (
+                valid_source.replace(
+                    exact_entrypoint,
+                    "raise SystemExit(0)\n" + exact_entrypoint,
+                    1,
+                ),
+                "main-entrypoint",
+            ),
+            "execute-generator": (
+                valid_source.replace(
+                    "    return {\"count\": execute_count}\n",
+                    "    if False:\n        yield None\n"
+                    "    return {\"count\": execute_count}\n",
+                    1,
+                ),
+                "execute-generator",
+            ),
+            "execute-yield-from": (
+                valid_source.replace(
+                    "    return {\"count\": execute_count}\n",
+                    "    if False:\n        yield from ()\n"
+                    "    return {\"count\": execute_count}\n",
+                    1,
+                ),
+                "execute-generator",
+            ),
+            "main-generator": (
+                valid_source.replace(
+                    "    return output\n",
+                    "    if False:\n        yield output\n"
+                    "    return output\n",
+                    1,
+                ),
+                "main-generator",
+            ),
+        }
+        for mutation, (mutated_source, expected_violation) in mutations.items():
+            with self.subTest(mutation=mutation):
+                self.assertIn(
+                    expected_violation,
+                    execute_integrity_violations(ast.parse(mutated_source)),
+                )
+
     def test_baselines_are_two_read_only_certified_complete_sessions(self):
         payload = json.loads(
             BASELINES.read_text(encoding="utf-8"),
@@ -1932,6 +3359,10 @@ class H2D2FreezeContractTests(unittest.TestCase):
             SEQUENTIAL_RUNTIME_SOURCE_SHA256["quant/historical_batch_h2d.py"],
         )
         tree = ast.parse(source)
+        self.assertFalse(
+            execute_integrity_violations(tree),
+            "execute/main definition, binding, or direct-call integrity drifted",
+        )
         imported = set()
         direct_imports = set()
         imported_bindings = {}
