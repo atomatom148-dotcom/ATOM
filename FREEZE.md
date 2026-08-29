@@ -70,6 +70,19 @@ add no UI or Render production change. Only after deterministic tests pass may
 a separate operational phase prove a live Schwab connection. No deployment or
 mathematical promotion is authorized by this amendment.
 
+## Historical replay H2-D-2 amendment
+
+Historical replay may be considered for future concurrency only at the whole
+historical-date boundary. Every frame, family calculation, horizon, and stage
+inside one date remains strictly chronological and sequential. The controlling
+contract is `docs/h2-d2-freeze.md`.
+
+H2-D-2 is a design freeze only. It does not enable a worker pool, queue,
+parallel flag, Render deployment, Supabase schema or compute change, replay
+write, or evidence mutation. After this freeze is merged, only a separately
+approved two-date read-only Parallel Canary may be implemented. Numerical,
+lineage, count, duplicate, or receipt-correlation drift stops promotion.
+
 ## Forbidden until explicit freeze amendment
 
 - Direction Brain or any forecast writer outside the approved 12-family ATOM Quant runtime
