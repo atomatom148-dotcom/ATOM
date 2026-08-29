@@ -69,7 +69,8 @@ canary must add and verify them before it can dispatch two dates.
    stale version, or generation mismatch stops; every later transition is
    conditional on the exact predecessor version and generation. If fewer than
    two compare-and-swaps succeed, no fence handoff or guardian creation occurs
-   and each partial claim must complete terminal cleanup before a retry. A
+   and each partial claim must complete terminal cleanup before any later
+   admission. A
    failure before the first supervisor compare-and-swap follows the same
    pre-claim unlock path and requires no new terminal receipt. Both fixed
    supervisors must run on that same configured Linux execution host and PID
@@ -79,8 +80,18 @@ canary must add and verify them before it can dispatch two dates.
    lifecycle, admission serialization, generation record, and workload cgroup.
    Each attestation and generation record must bind the configured host
    identity, current Linux boot ID, PID-namespace device/inode identity, and
-   supervisor service identity; any cross-host or cross-namespace combination
-   fails closed. On any admission
+   supervisor service identity. It must also bind the supervisor instance ID,
+   supervisor OS PID and procfs start-time ticks, a monotonic heartbeat
+   sequence, and the monotonic timestamp of the last fsynced heartbeat. The
+   heartbeat is evidence of the fixed supervisor's liveness only; heartbeat
+   age is never a lease, never transfers ownership, and never permits another
+   coordinator or generation to proceed. A restarted fixed supervisor may
+   recover its own service record only after its service manager has serialized
+   admission and it has proved the recorded supervisor instance dead by exact
+   `pidfd` readability plus matching procfs start-time ticks on the pinned host,
+   boot, and PID namespace. Missing or ambiguous death proof leaves the record
+   nonterminal and blocks admission. Any cross-host or cross-namespace
+   combination fails closed. On any admission
    failure after the first successful compare-and-swap but before both guardian
    claim receipts, no worker may start. The coordinator retains the global lock
    until every changed supervisor has fsynced terminal cleanup, every created
@@ -138,6 +149,25 @@ canary must add and verify them before it can dispatch two dates.
    of PostgreSQL sessions; only the fixed supervisor may change it, and any
    `CLAIMING`, `ACTIVE`, `CLEANING`, or unknown state blocks replacement
    admission.
+   A fsynced `CLAIMING` record is supervisor-owned even if the coordinator dies
+   before a guardian or liveness pipe exists. The fixed supervisor must watch
+   the recorded coordinator identity from the first successful `CLEAN` to
+   `CLAIMING` compare-and-swap. Before guardians exist, coordinator death is
+   proved only by both (a) readability of an exact coordinator `pidfd` whose
+   procfs start-time ticks matched the record when opened and (b) absence of
+   the recorded backend's global advisory-lock ownership, checked through a
+   new read-only observer session. A heartbeat timeout, observer error, PID
+   reuse, or either proof alone is insufficient. Once both proofs hold, the
+   supervisor atomically compare-and-swaps the exact generation and predecessor
+   version from `CLAIMING` to fsynced `CLEANING`; this cancellation makes every
+   late guardian creation or `ACTIVE` transition fail its predecessor CAS. It
+   closes and accounts for every claim-time descriptor, creates no worker,
+   proves the fixed cgroup `populated 0`, and within the frozen cleanup deadline
+   fsyncs a terminal aborted-before-guardian receipt before changing the record
+   to `CLEAN` as the last operation. Failure to prove emptiness, descriptor
+   custody, owner death, or terminal fsync keeps the record nonterminal and
+   blocks all replacement admission; no manual record edit, age-based reset,
+   or later coordinator admission is authorized.
 6. The coordinator retains its physical control session for the complete
    canary. Its wait loop checks `SELECT pg_backend_pid()`, and each guardian
    checks both its own shared fence ownership and the exact coordinator lock
@@ -198,16 +228,48 @@ coordinator/date-claim law. Manifest content includes performance fields, so two
 simultaneous H1 writers for one date can safely conflict even when their
 mathematics matches.
 
-## Stage, retry, and failure contract
+## Stage, generation, and failure contract
 
 - Stage order is exact: `H1`, `H2B`, `H2C_RESOLVE`, then `H2C_SCORE`.
+- The H2-D-3 configuration digest must pin a positive finite monotonic-runtime
+  deadline for each named stage, a positive finite whole-date deadline covering
+  the complete four-stage chain, and a positive finite cleanup deadline. The
+  whole-date deadline is absolute from the guardian's start authorization and
+  is not reset at stage boundaries; each stage deadline is absolute from that
+  stage's start and is not extended by progress, restarts, subprocess output, or
+  provider/database activity. The earlier of the current stage deadline and
+  whole-date deadline always governs. A missing, zero, negative, non-finite,
+  mutable, or unpinned deadline fails before either worker starts.
+- Every provider/network/database call must have its own finite operation
+  timeout no later than the governing stage/date deadline. The guardian's
+  independent monotonic watchdog must remain able to enforce the governing
+  deadline when a worker, provider SDK, database driver, launcher, process
+  group, or descendant deadlocks or ignores cancellation. Deadline expiry
+  irrevocably fails that generation; the same generation can never resume,
+  restart, or be readmitted. The supervisor fsyncs `CLEANING`, the
+  guardian freezes the date cgroup, invokes `cgroup.kill`, reaps the entire
+  process tree, proves `populated 0`, releases the shared fence only afterward,
+  and the supervisor fsyncs the terminal deadline-failure receipt before its
+  final `CLEAN` transition. Normal completion uses the same bounded
+  kill-if-needed, reap, cgroup-empty, fence-release, and terminal-receipt path;
+  it may not bypass cleanup merely because all four stage receipts validated.
+- Expiration of the cleanup deadline does not authorize abandonment or a
+  replacement generation. It is a permanent control failure: the durable
+  record remains nonterminal, admission remains blocked, and an operator must
+  repair containment without deleting, rewriting, or force-cleaning the
+  generation record.
 - Every stage receipt must return the claimed historical date and run ID. A
   missing or mismatched identity fails the date before the next stage.
-- There is no blind or timed automatic retry. Failure quarantines the date.
-  An operator may later reauthorize the whole canary date only with the same
-  date, run ID, job key, commit, runtime versions, configuration digest, dataset
-  digest, session digest, and artifact hash. If the immutable input cannot be
-  reproduced exactly, the retry fails.
+- Every failed generation is irrevocably terminal and can never resume,
+  restart, or be readmitted. There is no blind, timed, or automatic replay.
+  Failure quarantines the date. Only if policy permits, an operator may later
+  authorize a separate new generation with a new generation ID, a fresh
+  supervisor compare-and-swap, and complete admission from the beginning. That
+  new generation must replay the exact same date, run ID, job key, commit,
+  runtime versions, configuration digest, dataset digest, session digest, and
+  artifact hash. If any immutable input cannot be reproduced exactly, new
+  generation admission fails before worker start. This separately authorized
+  replay does not alter, reopen, supersede, or continue the failed generation.
 - H2-D-3 requires exactly one certified manifest and complete outcomes before
   launch. Zero manifests, incomplete outcomes, or more than one manifest fail
   closed. The current write-capable H1 persistence and H2C resolver commands
@@ -347,6 +409,29 @@ one PID namespace identity, one coordinator-owned write end per pipe, one
 corresponding guardian-owned read end, no supervisor pipe copy, and no inherited
 worker or descendant pipe end. Passing these tests belongs only to a separately
 approved H2-D-3 implementation; H2-D-2 still authorizes no runtime.
+
+A separate pre-guardian recovery fault test must kill the coordinator after
+each first and second fsynced `CLAIMING` compare-and-swap and before any
+guardian exists. It must prove the durable supervisor owner identity and
+heartbeat are bound, neither heartbeat age nor a single liveness signal permits
+takeover, both coordinator-death proofs are required, late `ACTIVE` and guardian
+creation lose their predecessor compare-and-swap, no worker starts, every
+claim-time descriptor is closed, each cgroup is `populated 0`, the aborted
+terminal receipt is fsynced, and replacement admission stays blocked until all
+changed records are `CLEAN`. It must also restart one fixed supervisor during
+that interval and prove exact prior-supervisor death and service admission are
+required before the restarted instance may perform the same recovery.
+
+Separate deadline fault tests must hang provider I/O, database I/O, a stage
+launcher, a stage child, and an uncooperative descendant, and must deadlock both
+before and after partial diagnostic output. They must exercise every named
+stage, the whole-date deadline, and normal completion. Each expiry must be
+irrevocably fail its generation with no same-generation restart, resumption,
+readmission, or next-stage start and must prove the exact
+`CLEANING` → freeze → kill → full reap → `populated 0` → shared-fence release →
+terminal-receipt → `CLEAN` ordering. The normal case must prove the same bounded
+reap, empty-cgroup, fence-release, and terminal-receipt invariants without
+changing any mathematical or evidence hash.
 
 ## Explicit non-goals
 
