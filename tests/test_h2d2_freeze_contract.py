@@ -407,16 +407,85 @@ class H2D2FreezeContractTests(unittest.TestCase):
             self.assertIsInstance(stage, ast.Constant)
             observed_stage_modules[stage.value] = command.elts[2].value
         self.assertEqual(observed_stage_modules, expected_stage_modules)
+        run_json_loads = tuple(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id == "run_json"
+        )
+        self.assertEqual(
+            set(run_json_loads),
+            {dispatch.func for dispatch in stage_dispatches},
+        )
+        direct_run_json_calls = tuple(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_run_json"
+        )
+        self.assertFalse(
+            direct_run_json_calls,
+            "direct _run_json dispatch is forbidden",
+        )
+        run_json_default_loads = tuple(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id == "_run_json"
+        )
+        self.assertEqual(len(run_json_default_loads), 1)
+        execute_functions = tuple(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "execute"
+        )
+        self.assertEqual(len(execute_functions), 1)
+        self.assertIn(
+            run_json_default_loads[0],
+            tuple(ast.walk(execute_functions[0].args)),
+        )
         dynamic_calls = {
             node.func.id
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id in {"__import__", "eval", "exec"}
+            and node.func.id in {"__import__", "compile", "eval", "exec"}
         }
         self.assertFalse(
             dynamic_calls,
             f"dynamic import or execution is forbidden: {dynamic_calls}",
+        )
+        dangerous_builtin_names = {
+            "__builtins__",
+            "__import__",
+            "builtins",
+            "compile",
+            "eval",
+            "exec",
+        }
+        indirect_dynamic_access = tuple(
+            node
+            for node in ast.walk(tree)
+            if (
+                isinstance(node, ast.Name)
+                and node.id in dangerous_builtin_names
+            )
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr in dangerous_builtin_names
+            )
+            or (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value in dangerous_builtin_names
+            )
+        )
+        self.assertFalse(
+            indirect_dynamic_access,
+            "indirect builtin import or execution access is forbidden",
         )
         dynamic_module_access = {
             node.func.id
@@ -550,11 +619,40 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     for node in ast.walk(tree)
                     if isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Name)
-                    and node.func.id in {"__import__", "eval", "exec"}
+                    and node.func.id in {"__import__", "compile", "eval", "exec"}
                 }
                 self.assertFalse(
                     dynamic_calls,
                     f"dynamic execution in {relative_path}: {dynamic_calls}",
+                )
+                dangerous_builtin_names = {
+                    "__builtins__",
+                    "__import__",
+                    "builtins",
+                    "compile",
+                    "eval",
+                    "exec",
+                }
+                indirect_dynamic_access = tuple(
+                    node
+                    for node in ast.walk(tree)
+                    if (
+                        isinstance(node, ast.Name)
+                        and node.id in dangerous_builtin_names
+                    )
+                    or (
+                        isinstance(node, ast.Attribute)
+                        and node.attr in dangerous_builtin_names
+                    )
+                    or (
+                        isinstance(node, ast.Constant)
+                        and isinstance(node.value, str)
+                        and node.value in dangerous_builtin_names
+                    )
+                )
+                self.assertFalse(
+                    indirect_dynamic_access,
+                    f"indirect dynamic execution in {relative_path}",
                 )
                 allowed_references = {("os", "environ")}
                 if relative_path == "quant/historical_replay_h1.py":
