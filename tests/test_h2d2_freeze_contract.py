@@ -79,7 +79,7 @@ ALLOWED_DYNAMIC_GETATTR_NAMES = {
     "quant/v9_v1_contract.py": {"name"},
     "quant/v9_v2d_evidence_state.py": {"name"},
 }
-BASELINE_BUNDLE_SHA256 = "0f6f714d74b516e7966cc1bdc56478e85491b7c31805129a86e06ab3a462de87"
+BASELINE_BUNDLE_SHA256 = "91262b90498295d7eec94022fb2e91caef7f7cab63ed78481b79868df1ef98e3"
 SEQUENTIAL_RUNTIME_SOURCE_SHA256 = {
     "quant/__init__.py":
         "cc01c7d624cc73967522ab474ab1b0f94485c4e7c1116dba2813892874b608ae",
@@ -228,6 +228,23 @@ def local_runtime_dependencies(relative_path: str, tree: ast.AST) -> set[str]:
         if (ROOT / initializer).is_file():
             dependencies.add(initializer.as_posix())
     return dependencies
+
+
+def is_explicit_exit_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    if isinstance(node.func, ast.Name):
+        return node.func.id in {"exit", "quit"}
+    if not isinstance(node.func, ast.Attribute):
+        return False
+    return (
+        node.func.attr == "exit"
+        or (
+            node.func.attr == "_exit"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "os"
+        )
+    )
 
 
 def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
@@ -521,24 +538,8 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
             ast.YieldFrom,
         )):
             return True
-        if isinstance(node, ast.Call):
-            if (
-                isinstance(node.func, ast.Name)
-                and node.func.id in {"exit", "quit"}
-            ):
-                return True
-            if (
-                isinstance(node.func, ast.Attribute)
-                and (
-                    node.func.attr == "exit"
-                    or (
-                        node.func.attr == "_exit"
-                        and isinstance(node.func.value, ast.Name)
-                        and node.func.value.id == "os"
-                    )
-                )
-            ):
-                return True
+        if is_explicit_exit_call(node):
+            return True
         return any(
             contains_reachable_terminator(child)
             for child in ast.iter_child_nodes(node)
@@ -994,6 +995,8 @@ def sensitive_module_reexports(
         propagate_aliases=True,
         fallback_origins={
             "classmethod": "builtins.classmethod",
+            "filter": "builtins.filter",
+            "map": "builtins.map",
             "object": "builtins.object",
             "setattr": "builtins.setattr",
             "staticmethod": "builtins.staticmethod",
@@ -1613,14 +1616,33 @@ def sensitive_module_reexports(
             node: ast.AST,
             scope: ast.AST | None,
     ) -> bool:
-        direct_local_return = (
-            isinstance(node, ast.Call)
-            and any(
-                local_callable in tracked_return_callables
-                for local_callable, _ in local_call_targets(node)
-            )
-        )
-        return direct_local_return or (
+        def contains_local_tracked_return(item: ast.AST) -> bool:
+            if isinstance(item, ast.Call):
+                return any(
+                    local_callable in tracked_return_callables
+                    for local_callable, _ in local_call_targets(item)
+                )
+            if isinstance(item, (ast.List, ast.Set, ast.Tuple)):
+                return any(
+                    contains_local_tracked_return(element)
+                    for element in item.elts
+                )
+            if isinstance(item, ast.Dict):
+                return any(
+                    contains_local_tracked_return(element)
+                    for element in (*item.keys, *item.values)
+                    if element is not None
+                )
+            if isinstance(item, (ast.NamedExpr, ast.Starred)):
+                return contains_local_tracked_return(item.value)
+            if isinstance(item, ast.IfExp):
+                return (
+                    contains_local_tracked_return(item.body)
+                    or contains_local_tracked_return(item.orelse)
+                )
+            return False
+
+        return contains_local_tracked_return(node) or (
             not any(isinstance(item, ast.Call) for item in ast.walk(node))
             and contains_tracked_binding(node, scope)
         )
@@ -1660,6 +1682,95 @@ def sensitive_module_reexports(
             defaults,
         )
 
+    def higher_order_builtin_kind(call: ast.Call) -> str | None:
+        origins = import_origin_names(call.func)
+        if "builtins.map" in origins:
+            return "map"
+        if "builtins.filter" in origins:
+            return "filter"
+        return None
+
+    literal_sequence_bindings: dict[
+        ast.AST | None,
+        dict[str, set[tuple[ast.AST, ...]]],
+    ] = {scope: {} for scope in scopes}
+
+    def bind_literal_sequence(
+            scope: ast.AST | None,
+            name: str,
+            sequence: tuple[ast.AST, ...],
+    ) -> bool:
+        bindings = literal_sequence_bindings[scope].setdefault(name, set())
+        if sequence in bindings:
+            return False
+        bindings.add(sequence)
+        return True
+
+    def resolve_literal_sequence_name(
+            name: str,
+            scope: ast.AST | None,
+    ) -> set[tuple[ast.AST, ...]]:
+        while True:
+            if name in scope_bound_names[scope]:
+                return set(literal_sequence_bindings[scope].get(name, ()))
+            if scope is None:
+                return set()
+            scope = callable_parents[scope]
+
+    def resolve_literal_sequences(
+            node: ast.AST,
+            scope: ast.AST | None,
+    ) -> set[tuple[ast.AST, ...]]:
+        if isinstance(node, ast.Name):
+            return resolve_literal_sequence_name(node.id, scope)
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return {tuple(node.elts)}
+        if isinstance(node, ast.NamedExpr):
+            return resolve_literal_sequences(node.value, scope)
+        if isinstance(node, ast.IfExp):
+            return (
+                resolve_literal_sequences(node.body, scope)
+                | resolve_literal_sequences(node.orelse, scope)
+            )
+        return set()
+
+    literal_sequences_changed = True
+    while literal_sequences_changed:
+        literal_sequences_changed = False
+        for scope, targets, value in alias_assignments:
+            sequences = resolve_literal_sequences(value, scope)
+            if not sequences:
+                continue
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                for sequence in sequences:
+                    literal_sequences_changed |= bind_literal_sequence(
+                        scope,
+                        target.id,
+                        sequence,
+                    )
+
+    def normalized_higher_order_args(
+            call: ast.Call,
+    ) -> set[tuple[ast.AST, ...]]:
+        variants = {()}
+        scope = enclosing_callable(call)
+        for argument in call.args:
+            expansions = (
+                resolve_literal_sequences(argument.value, scope)
+                if isinstance(argument, ast.Starred)
+                else {(argument,)}
+            )
+            if not expansions:
+                return set()
+            variants = {
+                prefix + expansion
+                for prefix in variants
+                for expansion in expansions
+            }
+        return variants
+
     changed = True
     while changed:
         changed = False
@@ -1673,6 +1784,12 @@ def sensitive_module_reexports(
                 value = node.value
                 targets = [node.target]
             elif isinstance(node, ast.NamedExpr):
+                value = node.value
+                targets = [node.target]
+            elif isinstance(node, ast.AugAssign) and isinstance(
+                node.target,
+                ast.Name,
+            ):
                 value = node.value
                 targets = [node.target]
             if (
@@ -1759,6 +1876,62 @@ def sensitive_module_reexports(
                 if not newly_tracked.issubset(local_bindings):
                     local_bindings.update(newly_tracked)
                     changed = True
+
+        for call in (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and higher_order_builtin_kind(node) is not None
+        ):
+            kind = higher_order_builtin_kind(call)
+            for normalized_args in normalized_higher_order_args(call):
+                if len(normalized_args) < 2:
+                    continue
+                callback_targets = resolve_callable_expression(
+                    normalized_args[0],
+                    enclosing_callable(call),
+                )
+                if not callback_targets:
+                    continue
+                iterable_arguments = normalized_args[1:]
+                for local_callable, bound_receiver in callback_targets:
+                    positional, _, vararg, _, _ = callable_parameter_bindings(
+                        local_callable
+                    )
+                    available = positional[int(bound_receiver):]
+                    newly_tracked = set()
+                    if kind == "filter":
+                        if any(
+                            contains_passed_tracked_binding(
+                                argument,
+                                enclosing_callable(call),
+                            )
+                            for argument in iterable_arguments
+                        ):
+                            if available:
+                                newly_tracked.add(available[0].arg)
+                            elif vararg is not None:
+                                newly_tracked.add(vararg.arg)
+                    else:
+                        for index, argument in enumerate(iterable_arguments):
+                            if not contains_passed_tracked_binding(
+                                argument,
+                                enclosing_callable(call),
+                            ):
+                                continue
+                            if isinstance(argument, ast.Starred):
+                                newly_tracked.update(
+                                    parameter.arg for parameter in available
+                                )
+                                if vararg is not None:
+                                    newly_tracked.add(vararg.arg)
+                            elif index < len(available):
+                                newly_tracked.add(available[index].arg)
+                            elif vararg is not None:
+                                newly_tracked.add(vararg.arg)
+                    local_bindings = scoped_tracked_bindings[local_callable]
+                    if not newly_tracked.issubset(local_bindings):
+                        local_bindings.update(newly_tracked)
+                        changed = True
 
         for local_callable in callable_nodes:
             if isinstance(local_callable, ast.Lambda):
@@ -2632,6 +2805,181 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "full-path concurrency origins cannot leak across functions",
         )
 
+    def test_explicit_exit_call_guard_covers_attribute_terminators(self):
+        for expression in (
+            "ArgumentParser().exit(1)",
+            "sys.exit(1)",
+            "parser.exit(1)",
+            "os._exit(1)",
+        ):
+            with self.subTest(expression=expression):
+                call = ast.parse(expression).body[0].value
+                self.assertTrue(is_explicit_exit_call(call))
+
+        for expression in (
+            "worker._exit(1)",
+            "worker.exiting(1)",
+            "worker.exit_code(1)",
+        ):
+            with self.subTest(safe_expression=expression):
+                call = ast.parse(expression).body[0].value
+                self.assertFalse(is_explicit_exit_call(call))
+
+    def test_taint_guard_handles_augassign_and_higher_order_builtins(self):
+        prefix = "from shutil import fnmatch as p\n"
+
+        def findings(body: str) -> tuple[ast.AST, ...]:
+            return sensitive_module_reexports(
+                ast.parse(prefix + body),
+                {"p": "shutil.fnmatch"},
+            )
+
+        positive_sources = {
+            "augassign-container": (
+                "items = []\n"
+                "items += [p]\n"
+                "items[0].os.fork()\n"
+            ),
+            "augassign-alias": (
+                "items = []\n"
+                "alias = items\n"
+                "items += [p]\n"
+                "alias[0].os.fork()\n"
+            ),
+            "augassign-local-call-literal": (
+                "def wrap(value):\n"
+                "    return value\n"
+                "items = []\n"
+                "items += [wrap(p)]\n"
+                "items[0].os.fork()\n"
+            ),
+            "map": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "map(invoke, [p])\n"
+            ),
+            "filter": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "filter(invoke, [p])\n"
+            ),
+            "builtin-and-callback-aliases": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "callback = invoke\n"
+                "mapper = map\n"
+                "mapper(callback, [p])\n"
+            ),
+            "filter-alias": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "selector = filter\n"
+                "selector(invoke, [p])\n"
+            ),
+            "bound-method-callback": (
+                "class Runner:\n"
+                "    def invoke(self, value):\n"
+                "        value.os.fork()\n"
+                "map(Runner().invoke, [p])\n"
+            ),
+            "lambda-callback": "map(lambda value: value.os.fork(), [p])\n",
+            "map-literal-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "map(*(invoke, [p]))\n"
+            ),
+            "map-alias-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "args = (invoke, [p])\n"
+                "map(*args)\n"
+            ),
+            "filter-literal-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "filter(*(invoke, [p]))\n"
+            ),
+            "filter-alias-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "args = (invoke, [p])\n"
+                "filter(*args)\n"
+            ),
+        }
+        for path, source in positive_sources.items():
+            with self.subTest(path=path):
+                self.assertTrue(
+                    findings(source),
+                    f"tracked value escaped through {path}",
+                )
+
+        negative_sources = {
+            "safe-numeric-augassign": "total = 0\ntotal += 1\n",
+            "local-shadow-augassign": (
+                "def harmless(p):\n"
+                "    items = []\n"
+                "    items += [p]\n"
+                "    return items\n"
+                "harmless(None)\n"
+            ),
+            "shadowed-map": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "def map(callback, values):\n"
+                "    return None\n"
+                "map(invoke, [p])\n"
+            ),
+            "shadowed-filter": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "filter = lambda callback, values: None\n"
+                "filter(invoke, [p])\n"
+            ),
+            "safe-map-iterable": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "map(invoke, [None])\n"
+            ),
+            "augassign-local-discard": (
+                "def discard(value):\n"
+                "    return None\n"
+                "items = []\n"
+                "items += [discard(p)]\n"
+                "items[0].os.fork()\n"
+            ),
+            "safe-map-star-iterable": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "args = (invoke, [None])\n"
+                "map(*args)\n"
+            ),
+            "safe-filter-star-iterable": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "filter(*(invoke, [None]))\n"
+            ),
+            "shadowed-map-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "def map(*args):\n"
+                "    return None\n"
+                "map(*(invoke, [p]))\n"
+            ),
+            "shadowed-filter-star": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "filter = lambda *args: None\n"
+                "args = (invoke, [p])\n"
+                "filter(*args)\n"
+            ),
+        }
+        for path, source in negative_sources.items():
+            with self.subTest(safe_path=path):
+                self.assertFalse(
+                    findings(source),
+                    f"safe higher-order or AugAssign path was rejected: {path}",
+                )
+
     def test_reexport_guard_rejects_persistent_state_escape(self):
         prefix = "from shutil import fnmatch as p\n"
 
@@ -3187,9 +3535,56 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "row_value": "stored lowercase content_sha256",
                 "separator": "\n",
                 "trailing_separator": False,
+                "key_component_order": {
+                    "cutoff_at": "ascending_utc_instant",
+                    "quant_id": "ascending_unsigned_utf8_bytes",
+                    "horizon": "ascending_unsigned_utf8_bytes",
+                },
+                "database_collation": "forbidden",
                 "forecast_order": ["cutoff_at", "quant_id", "horizon"],
                 "outcome_order": ["cutoff_at", "horizon"],
+                "bytewise_order_examples": {
+                    "quant_id": [
+                        "q1",
+                        "q10",
+                        "q11",
+                        "q12",
+                        "q2",
+                        "q3",
+                        "q4",
+                        "q5",
+                        "q6",
+                        "q7",
+                        "q8",
+                        "q9",
+                    ],
+                    "horizon": [
+                        "15M",
+                        "1H",
+                        "1M",
+                        "30M",
+                        "30S",
+                        "5M",
+                    ],
+                },
             },
+        )
+        bytewise_examples = payload["ordered_content_hash_contract"][
+            "bytewise_order_examples"
+        ]
+        for field, values in bytewise_examples.items():
+            with self.subTest(bytewise_order=field):
+                self.assertEqual(
+                    values,
+                    sorted(values, key=lambda value: value.encode("utf-8")),
+                )
+        self.assertLess(
+            bytewise_examples["quant_id"].index("q10"),
+            bytewise_examples["quant_id"].index("q2"),
+        )
+        self.assertEqual(
+            bytewise_examples["horizon"],
+            ["15M", "1H", "1M", "30M", "30S", "5M"],
         )
         self.assertEqual(
             payload["metric_hash_contract"],
@@ -3970,13 +4365,11 @@ class H2D2FreezeContractTests(unittest.TestCase):
             early_exit_calls = tuple(
                 node
                 for node in region_nodes
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id in {"exit", "quit"}
+                if is_explicit_exit_call(node)
             )
             self.assertFalse(
                 early_exit_calls,
-                "exit or quit cannot skip a later stage dispatch",
+                "explicit exit calls cannot skip a later stage dispatch",
             )
             raises = tuple(
                 sorted(
