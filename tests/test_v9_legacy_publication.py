@@ -130,6 +130,9 @@ def test_cohort_metric_reader_is_fair_bounded_and_read_only():
     assert "ORDER BY f.cutoff_epoch DESC, f.forecast_id DESC" in normalized
     assert "LIMIT v_limit + 1" in normalized
     assert "r.ordinal<=v_limit" in normalized
+    assert normalized.count(
+        "f.created_epoch<=extract(epoch FROM p_as_of)"
+    ) == 2
     assert "p.commit_observed_at<=p_as_of" in normalized
     assert "SECURITY DEFINER" in sql
     assert "SET search_path=pg_catalog" in sql
