@@ -87,16 +87,20 @@ class PhaseEStoreTests(unittest.TestCase):
             ),
         ))
         metric_sql, metric_parameters = cursor.executions[0]
+        normalized_metric_sql = " ".join(metric_sql.split())
         self.assertIn("JOIN volatility_forecasts AS f", metric_sql)
         self.assertIn("o.realized_move_bps", metric_sql)
         self.assertIn("NULL::double precision AS directional_accuracy", metric_sql)
         self.assertNotIn("outcome_bps", metric_sql)
-        self.assertEqual(metric_parameters, (100.0,) * 14)
+        self.assertEqual(metric_parameters[0], 100.0)
+        self.assertEqual(len(json.loads(metric_parameters[1])), 6)
+        self.assertEqual(metric_parameters[2:], (100.0,) * 13)
         self.assertIn("read_legacy_evidence_publications", metric_sql)
         self.assertIn("VOLATILITY_FORECAST", metric_sql)
         self.assertIn("VOLATILITY_OUTCOME", metric_sql)
         self.assertIn(
-            "'VOLATILITY_FORECAST', to_timestamp(%s), 65536", metric_sql,
+            "'VOLATILITY_FORECAST', to_timestamp(%s), %s::jsonb, 256",
+            normalized_metric_sql,
         )
         self.assertIn(
             "o.resolved_epoch >= f.maturity_epoch", cursor.executions[0][0],
@@ -148,10 +152,13 @@ class PhaseEStoreTests(unittest.TestCase):
         self.assertIn("DIRECTIONAL_FORECAST", sql)
         self.assertIn("DIRECTIONAL_OUTCOME", sql)
         self.assertIn(
-            "'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536", sql,
+            "'DIRECTIONAL_FORECAST', to_timestamp(%s), %s::jsonb, 256", sql,
         )
         self.assertIn("GROUP BY f.quant_id, f.formula_version, f.symbol, f.horizon", sql)
-        self.assertEqual(cursor.executions[0][1], (123.5,) * 16)
+        metric_parameters = cursor.executions[0][1]
+        self.assertEqual(metric_parameters[0], 123.5)
+        self.assertEqual(len(json.loads(metric_parameters[1])), 66)
+        self.assertEqual(metric_parameters[2:], (123.5,) * 15)
         self.assertEqual(sql.count("f.maturity_epoch <= %s"), 8)
         self.assertEqual(sql.count("o.resolved_epoch <= %s"), 6)
         self.assertIn("NULLIF(count(*) FILTER", sql)
@@ -170,7 +177,10 @@ class PhaseEStoreTests(unittest.TestCase):
         effective_sql = " ".join(cursor.executions[1][0].split())
         self.assertIn("read_legacy_evidence_publications", metric_sql)
         self.assertIn("read_legacy_evidence_publications_for_records", metric_sql)
-        self.assertEqual(metric_sql.count("65536"), 1)
+        self.assertIn(
+            "read_legacy_evidence_publications_for_cohorts", metric_sql,
+        )
+        self.assertEqual(metric_sql.count("256"), 1)
         self.assertIn("read_legacy_effective_observations", effective_sql)
         self.assertIn("'DIRECTIONAL_FORECAST'", effective_sql)
         self.assertIn("%s::jsonb, 64", effective_sql)
@@ -182,15 +192,15 @@ class PhaseEStoreTests(unittest.TestCase):
             "quant_id": "q1", "symbol": "COIN",
         }])
 
-    def test_global_window_metadata_is_explicit_and_truncation_is_reported(self):
+    def test_per_cohort_window_metadata_is_explicit_and_truncation_is_reported(self):
         metrics = ((
             "q1", "v1", "COIN", "30S", 1, 1, 1, 1.0,
             0.0, 1.0, 0.0, 0.0, True,
         ),)
         resolved = (("q1", "v1", "COIN", "30S", 0, 1),)
         value = store_with(Cursor(metrics, resolved)).phase_e_cohorts(100)[0]
-        self.assertEqual(value.evidence_window, "MOST_RECENT_GLOBAL")
-        self.assertEqual(value.evidence_window_limit, 65536)
+        self.assertEqual(value.evidence_window, "MOST_RECENT_PER_COHORT")
+        self.assertEqual(value.evidence_window_limit, 256)
         self.assertTrue(value.evidence_window_truncated)
 
     def test_outcome_is_invisible_until_its_resolution_epoch(self):
@@ -487,8 +497,8 @@ class PhaseEApiTests(unittest.TestCase):
                 "resolved_count": 2, "coverage": 2 / 3, "rmse_bps": 5.5,
                 "directional_accuracy": 0.5, "mae_bps": 4.5,
                 "bias_bps": -1.25, "effective_n": 2, "eligible": False,
-                "evidence_window": "MOST_RECENT_GLOBAL",
-                "evidence_window_limit": 65536,
+                "evidence_window": "MOST_RECENT_PER_COHORT",
+                "evidence_window_limit": 256,
                 "evidence_window_truncated": False,
             }],
         })
