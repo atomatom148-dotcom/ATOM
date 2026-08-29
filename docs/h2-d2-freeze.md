@@ -271,7 +271,12 @@ fields to compare exactly before float-to-hex transformation.
 The baseline ordered-content hashes are SHA-256 over the UTF-8 stored
 `content_sha256` values joined by one LF with no trailing separator. Forecasts
 use `(cutoff_at, quant_id, horizon)` order; outcomes use
-`(cutoff_at, horizon)` order.
+`(cutoff_at, horizon)` order. Every key component is ascending. `cutoff_at` is
+compared as a timezone-aware UTC instant. `quant_id` and `horizon` are encoded
+as UTF-8 and compared byte by byte as unsigned octets, with a shorter exact
+prefix sorting first. Database or locale collation must not participate. Thus
+`q1`, `q10`, `q11`, `q12`, `q2` is the relevant ASCII prefix example, and the
+six frozen horizons sort as `15M`, `1H`, `1M`, `30M`, `30S`, `5M`.
 
 `scoring_hash_summary` alone is insufficient because it hashes admitted input
 rows rather than the computed metric values. The current H2-D
