@@ -1,8 +1,10 @@
--- DB-2: operational migration. CREATE INDEX CONCURRENTLY must be parsed and
--- executed outside a transaction by a concurrent-DDL-aware runner (for
--- example, Supabase CLI v2.113.0+). The session guards prevent a configured
--- statement timeout from leaving an interrupted INVALID index while bounding
--- lock acquisition. Verify pg_index before treating DB-2 as complete.
+-- DB-2: operational migration. Execute this complete file only through one
+-- session-persistent, concurrent-DDL-aware runner (Supabase CLI v2.116.0+ or
+-- psql). Do not submit it as one payload to Supabase's MCP apply_migration or
+-- execute_sql tools: their transactional wrapper rejects concurrent builds.
+-- The session guards prevent a configured statement timeout from leaving an
+-- interrupted INVALID index while bounding lock acquisition. Verify pg_index
+-- before treating DB-2 as complete.
 SET statement_timeout = '0';
 SET lock_timeout = '5s';
 
