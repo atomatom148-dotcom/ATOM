@@ -249,6 +249,12 @@ def is_explicit_exit_call(node: ast.AST) -> bool:
 
 def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
     violations = []
+    annotations_are_deferred = any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "__future__"
+        and any(alias.name == "annotations" for alias in statement.names)
+        for statement in tree.body
+    )
 
     def record(label: str) -> None:
         if label not in violations:
@@ -263,6 +269,212 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
             contains_own_yield(child)
             for child in ast.iter_child_nodes(node)
         )
+
+    def direct_lexical_nodes(scope: ast.AST) -> tuple[ast.AST, ...]:
+        result = []
+
+        def visit(node: ast.AST) -> None:
+            result.append(node)
+            if node is not scope and isinstance(node, (
+                ast.AsyncFunctionDef,
+                ast.FunctionDef,
+            )):
+                for decorator in node.decorator_list:
+                    visit(decorator)
+                for default in node.args.defaults:
+                    visit(default)
+                for default in node.args.kw_defaults:
+                    if default is not None:
+                        visit(default)
+                if not annotations_are_deferred:
+                    for argument in (
+                        *node.args.posonlyargs,
+                        *node.args.args,
+                        *node.args.kwonlyargs,
+                    ):
+                        if argument.annotation is not None:
+                            visit(argument.annotation)
+                    for argument in (node.args.vararg, node.args.kwarg):
+                        if argument is not None and argument.annotation is not None:
+                            visit(argument.annotation)
+                    if node.returns is not None:
+                        visit(node.returns)
+                return
+            if node is not scope and isinstance(node, ast.Lambda):
+                for default in node.args.defaults:
+                    visit(default)
+                for default in node.args.kw_defaults:
+                    if default is not None:
+                        visit(default)
+                return
+            if node is not scope and isinstance(node, ast.ClassDef):
+                for decorator in node.decorator_list:
+                    visit(decorator)
+                for base in node.bases:
+                    visit(base)
+                for keyword in node.keywords:
+                    visit(keyword.value)
+                return
+            if isinstance(node, (
+                ast.DictComp,
+                ast.GeneratorExp,
+                ast.ListComp,
+                ast.SetComp,
+            )):
+                for generator in node.generators:
+                    visit(generator.iter)
+                    for condition in generator.ifs:
+                        visit(condition)
+                if isinstance(node, ast.DictComp):
+                    visit(node.key)
+                    visit(node.value)
+                else:
+                    visit(node.elt)
+                return
+            for child in ast.iter_child_nodes(node):
+                visit(child)
+
+        visit(scope)
+        return tuple(result)
+
+    def lexical_binding_events(
+            scope: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> dict[str, tuple[ast.AST, ...]]:
+        events: dict[str, list[ast.AST]] = {}
+
+        def bind(name: str | None, node: ast.AST) -> None:
+            if name:
+                events.setdefault(name, []).append(node)
+
+        for node in direct_lexical_nodes(scope):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+            ):
+                bind(node.id, node)
+            elif isinstance(node, ast.arg):
+                bind(node.arg, node)
+            elif (
+                node is not scope
+                and isinstance(node, (
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                    ast.FunctionDef,
+                ))
+            ):
+                bind(node.name, node)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    bind(alias.asname or alias.name.split(".", 1)[0], alias)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    bind(alias.asname or alias.name, alias)
+            elif isinstance(node, ast.ExceptHandler):
+                bind(
+                    node.name.id if isinstance(node.name, ast.Name) else node.name,
+                    node,
+                )
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                for name in node.names:
+                    bind(name, node)
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+                bind(node.name, node)
+            elif isinstance(node, ast.MatchMapping):
+                bind(node.rest, node)
+        return {
+            name: tuple(bound_nodes)
+            for name, bound_nodes in events.items()
+        }
+
+    def direct_lexical_name_loads(
+            scope: ast.FunctionDef | ast.AsyncFunctionDef,
+            protected_name: str,
+    ) -> tuple[ast.Name, ...]:
+        loads = []
+
+        def target_names(target: ast.AST) -> set[str]:
+            if isinstance(target, ast.Name):
+                return {target.id}
+            if isinstance(target, (ast.List, ast.Tuple)):
+                return set().union(*(
+                    target_names(item) for item in target.elts
+                )) if target.elts else set()
+            if isinstance(target, ast.Starred):
+                return target_names(target.value)
+            return set()
+
+        def visit(node: ast.AST, shadowed: frozenset[str]) -> None:
+            if node is not scope and isinstance(node, (
+                ast.AsyncFunctionDef,
+                ast.FunctionDef,
+            )):
+                for decorator in node.decorator_list:
+                    visit(decorator, shadowed)
+                for default in node.args.defaults:
+                    visit(default, shadowed)
+                for default in node.args.kw_defaults:
+                    if default is not None:
+                        visit(default, shadowed)
+                if not annotations_are_deferred:
+                    for argument in (
+                        *node.args.posonlyargs,
+                        *node.args.args,
+                        *node.args.kwonlyargs,
+                    ):
+                        if argument.annotation is not None:
+                            visit(argument.annotation, shadowed)
+                    for argument in (node.args.vararg, node.args.kwarg):
+                        if argument is not None and argument.annotation is not None:
+                            visit(argument.annotation, shadowed)
+                    if node.returns is not None:
+                        visit(node.returns, shadowed)
+                return
+            if node is not scope and isinstance(node, ast.Lambda):
+                for default in node.args.defaults:
+                    visit(default, shadowed)
+                for default in node.args.kw_defaults:
+                    if default is not None:
+                        visit(default, shadowed)
+                return
+            if node is not scope and isinstance(node, ast.ClassDef):
+                for decorator in node.decorator_list:
+                    visit(decorator, shadowed)
+                for base in node.bases:
+                    visit(base, shadowed)
+                for keyword in node.keywords:
+                    visit(keyword.value, shadowed)
+                return
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id == protected_name
+                and node.id not in shadowed
+            ):
+                loads.append(node)
+                return
+            if isinstance(node, (
+                ast.DictComp,
+                ast.GeneratorExp,
+                ast.ListComp,
+                ast.SetComp,
+            )):
+                local_shadowed = set(shadowed)
+                for generator in node.generators:
+                    visit(generator.iter, frozenset(local_shadowed))
+                    local_shadowed.update(target_names(generator.target))
+                    for condition in generator.ifs:
+                        visit(condition, frozenset(local_shadowed))
+                if isinstance(node, ast.DictComp):
+                    visit(node.key, frozenset(local_shadowed))
+                    visit(node.value, frozenset(local_shadowed))
+                else:
+                    visit(node.elt, frozenset(local_shadowed))
+                return
+            for child in ast.iter_child_nodes(node):
+                visit(child, shadowed)
+
+        visit(scope, frozenset())
+        return tuple(loads)
 
     top_level_execute = [
         node for node in tree.body
@@ -375,6 +587,131 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         execute_match_captures,
     )):
         record("execute-shadow")
+
+    execute_binding_events = (
+        lexical_binding_events(execute_function)
+        if execute_function is not None
+        else {}
+    )
+    run_json_parameter = None
+    if execute_function is not None:
+        run_json_parameter = next((
+            argument
+            for argument in execute_function.args.kwonlyargs
+            if argument.arg == "run_json"
+        ), None)
+    if (
+        run_json_parameter is None
+        or execute_binding_events.get("run_json", ())
+        != (run_json_parameter,)
+    ):
+        record("execute-dispatch-binding")
+
+    day_loops = (
+        tuple(
+            statement for statement in execute_function.body
+            if isinstance(statement, ast.For)
+            and isinstance(statement.target, ast.Name)
+            and isinstance(statement.target.ctx, ast.Store)
+            and statement.target.id == "day"
+            and isinstance(statement.iter, ast.Name)
+            and isinstance(statement.iter.ctx, ast.Load)
+            and statement.iter.id == "days"
+            and statement.type_comment is None
+        )
+        if execute_function is not None
+        else ()
+    )
+    day_loop = day_loops[0] if len(day_loops) == 1 else None
+    if (
+        day_loop is None
+        or execute_binding_events.get("day", ()) != (day_loop.target,)
+    ):
+        record("execute-day-binding")
+
+    execute_parents = {
+        child: parent
+        for parent in ast.walk(execute_function)
+        if execute_function is not None
+        for child in ast.iter_child_nodes(parent)
+    }
+    day_tries = (
+        tuple(
+            statement for statement in day_loop.body
+            if isinstance(statement, ast.Try)
+        )
+        if day_loop is not None
+        else ()
+    )
+    day_try = day_tries[0] if len(day_tries) == 1 else None
+
+    def simple_assignment(name: str) -> ast.Assign | None:
+        matches = tuple(
+            node for node in direct_lexical_nodes(execute_function)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.targets[0].ctx, ast.Store)
+            and node.targets[0].id == name
+            and node.type_comment is None
+        ) if execute_function is not None else ()
+        return matches[0] if len(matches) == 1 else None
+
+    run_id_assignment = simple_assignment("run_id")
+    exact_run_id = False
+    if run_id_assignment is not None:
+        value = run_id_assignment.value
+        exact_run_id = (
+            execute_parents.get(run_id_assignment) is day_try
+            and isinstance(value, ast.IfExp)
+            and isinstance(value.test, ast.Name)
+            and value.test.id == "manifest"
+            and isinstance(value.body, ast.Call)
+            and isinstance(value.body.func, ast.Name)
+            and value.body.func.id == "str"
+            and len(value.body.args) == 1
+            and not value.body.keywords
+            and isinstance(value.body.args[0], ast.Subscript)
+            and isinstance(value.body.args[0].value, ast.Name)
+            and value.body.args[0].value.id == "manifest"
+            and isinstance(value.body.args[0].slice, ast.Constant)
+            and value.body.args[0].slice.value == "replay_run_id"
+            and isinstance(value.orelse, ast.JoinedStr)
+        )
+
+    lineage_assignments = {"run_id": run_id_assignment}
+    for lineage_name in (
+        "dataset_digest",
+        "configuration_digest",
+        "frame_count",
+    ):
+        assignment = simple_assignment(lineage_name)
+        lineage_assignments[lineage_name] = assignment
+        value = assignment.value if assignment is not None else None
+        if not (
+            assignment is not None
+            and execute_parents.get(assignment) is day_try
+            and isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "get"
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "manifest"
+            and len(value.args) == 1
+            and isinstance(value.args[0], ast.Constant)
+            and value.args[0].value == lineage_name
+            and not value.keywords
+        ):
+            lineage_assignments[lineage_name] = None
+    if (
+        not exact_run_id
+        or any(
+            assignment is None
+            or execute_binding_events.get(name, ())
+            != (assignment.targets[0],)
+            for name, assignment in lineage_assignments.items()
+        )
+    ):
+        record("execute-lineage-binding")
 
     top_level_main = [
         node for node in tree.body
@@ -531,37 +868,122 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         for child in ast.iter_child_nodes(parent)
     }
 
-    def main_lexical_nodes(node: ast.AST) -> tuple[ast.AST, ...]:
-        result = []
-
-        def visit(item: ast.AST) -> None:
-            if item is not node and isinstance(item, (
-                ast.AsyncFunctionDef,
-                ast.ClassDef,
-                ast.FunctionDef,
-                ast.Lambda,
-            )):
-                result.append(item)
-                return
-            result.append(item)
-            if isinstance(item, (
-                ast.DictComp,
-                ast.GeneratorExp,
-                ast.ListComp,
-                ast.SetComp,
-            )):
-                return
-            for child in ast.iter_child_nodes(item):
-                visit(child)
-
-        visit(node)
-        return tuple(result)
-
     main_nodes = (
-        main_lexical_nodes(main_function)
+        direct_lexical_nodes(main_function)
         if main_function is not None
         else ()
     )
+    main_binding_events = (
+        lexical_binding_events(main_function)
+        if main_function is not None
+        else {}
+    )
+    if (
+        pinned_execute_assignment is None
+        or main_binding_events.get("output", ())
+        != (pinned_execute_assignment.targets[0],)
+    ):
+        record("main-output-binding")
+
+    exact_output_use = False
+    if main_function is not None and pinned_execute_assignment is not None:
+        output_index = main_function.body.index(pinned_execute_assignment)
+        print_statement = (
+            main_function.body[output_index + 1]
+            if output_index + 1 < len(main_function.body)
+            else None
+        )
+        return_statement = (
+            main_function.body[output_index + 2]
+            if output_index + 2 < len(main_function.body)
+            else None
+        )
+        print_call = (
+            print_statement.value
+            if isinstance(print_statement, ast.Expr)
+            else None
+        )
+        dumps_call = (
+            print_call.args[0]
+            if isinstance(print_call, ast.Call) and len(print_call.args) == 1
+            else None
+        )
+        print_output_load = (
+            dumps_call.args[0]
+            if isinstance(dumps_call, ast.Call) and len(dumps_call.args) == 1
+            else None
+        )
+        status_expression = (
+            return_statement.value
+            if isinstance(return_statement, ast.Return)
+            else None
+        )
+        status_compare = (
+            status_expression.test
+            if isinstance(status_expression, ast.IfExp)
+            else None
+        )
+        status_subscript = (
+            status_compare.left
+            if isinstance(status_compare, ast.Compare)
+            else None
+        )
+        status_output_load = (
+            status_subscript.value
+            if isinstance(status_subscript, ast.Subscript)
+            else None
+        )
+        dumps_keywords = {
+            keyword.arg: keyword.value
+            for keyword in dumps_call.keywords
+            if keyword.arg is not None
+        } if isinstance(dumps_call, ast.Call) else {}
+        separators = dumps_keywords.get("separators")
+        exact_output_use = (
+            output_index + 3 == len(main_function.body)
+            and isinstance(print_call, ast.Call)
+            and isinstance(print_call.func, ast.Name)
+            and print_call.func.id == "print"
+            and not print_call.keywords
+            and isinstance(dumps_call, ast.Call)
+            and isinstance(dumps_call.func, ast.Attribute)
+            and dumps_call.func.attr == "dumps"
+            and isinstance(dumps_call.func.value, ast.Name)
+            and dumps_call.func.value.id == "json"
+            and set(dumps_keywords) == {"separators", "sort_keys"}
+            and isinstance(dumps_keywords.get("sort_keys"), ast.Constant)
+            and dumps_keywords["sort_keys"].value is True
+            and isinstance(separators, ast.Tuple)
+            and [
+                element.value
+                for element in separators.elts
+                if isinstance(element, ast.Constant)
+            ] == [",", ":"]
+            and isinstance(print_output_load, ast.Name)
+            and isinstance(print_output_load.ctx, ast.Load)
+            and print_output_load.id == "output"
+            and isinstance(status_expression, ast.IfExp)
+            and isinstance(status_expression.body, ast.Constant)
+            and status_expression.body.value == 1
+            and isinstance(status_expression.orelse, ast.Constant)
+            and status_expression.orelse.value == 0
+            and isinstance(status_compare, ast.Compare)
+            and len(status_compare.ops) == 1
+            and isinstance(status_compare.ops[0], ast.Eq)
+            and len(status_compare.comparators) == 1
+            and isinstance(status_compare.comparators[0], ast.Constant)
+            and status_compare.comparators[0].value == "FAILED"
+            and isinstance(status_subscript, ast.Subscript)
+            and isinstance(status_subscript.slice, ast.Constant)
+            and status_subscript.slice.value == "overall_status"
+            and isinstance(status_output_load, ast.Name)
+            and isinstance(status_output_load.ctx, ast.Load)
+            and status_output_load.id == "output"
+            and direct_lexical_name_loads(main_function, "output")
+            == (print_output_load, status_output_load)
+        )
+    if not exact_output_use:
+        record("main-output-use")
     days_assignments = [
         node for node in main_nodes
         if isinstance(node, ast.Assign)
@@ -615,19 +1037,32 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
         pinned_days_assignment is not None
         and pinned_execute_assignment is not None
     ):
-        selection_end = getattr(
-            pinned_days_assignment,
-            "end_lineno",
-            pinned_days_assignment.lineno,
+        selection_end = (
+            getattr(
+                pinned_days_assignment,
+                "end_lineno",
+                pinned_days_assignment.lineno,
+            ),
+            getattr(pinned_days_assignment, "end_col_offset", 0),
         )
-        execute_line = pinned_execute_assignment.lineno
-        if selection_end >= execute_line:
+        execute_start = (
+            pinned_execute_assignment.lineno,
+            pinned_execute_assignment.col_offset,
+        )
+        if selection_end >= execute_start:
             record("days-selection-shape")
         else:
+            def is_between_selection_and_execute(node: ast.AST) -> bool:
+                return (
+                    hasattr(node, "lineno")
+                    and selection_end
+                    < (node.lineno, getattr(node, "col_offset", 0))
+                    < execute_start
+                )
+
             between_nodes = tuple(
                 node for node in main_nodes
-                if hasattr(node, "lineno")
-                and selection_end < node.lineno < execute_line
+                if is_between_selection_and_execute(node)
             )
             aliases = {"days"}
             aliases_changed = True
@@ -690,87 +1125,10 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
                 "update",
             }
 
-            def target_binds_days(target: ast.AST | None) -> bool:
-                if isinstance(target, ast.Name):
-                    return target.id == "days"
-                if isinstance(target, (ast.List, ast.Tuple)):
-                    return any(target_binds_days(item) for item in target.elts)
-                if isinstance(target, ast.Starred):
-                    return target_binds_days(target.value)
-                return False
-
-            def import_binds_days(node: ast.Import | ast.ImportFrom) -> bool:
-                return any(
-                    (
-                        alias.asname
-                        or (
-                            alias.name.split(".", 1)[0]
-                            if isinstance(node, ast.Import)
-                            else alias.name
-                        )
-                    ) == "days"
-                    for alias in node.names
-                )
-
-            def pattern_binds_days(pattern: ast.AST) -> bool:
-                return any(
-                    (
-                        isinstance(item, (ast.MatchAs, ast.MatchStar))
-                        and item.name == "days"
-                    )
-                    or (
-                        isinstance(item, ast.MatchMapping)
-                        and item.rest == "days"
-                    )
-                    for item in ast.walk(pattern)
-                )
-
             days_rebound = any(
-                (
-                    isinstance(node, (ast.For, ast.AsyncFor))
-                    and target_binds_days(node.target)
-                )
-                or (
-                    isinstance(node, (ast.With, ast.AsyncWith))
-                    and any(
-                        target_binds_days(item.optional_vars)
-                        for item in node.items
-                    )
-                )
-                or (
-                    isinstance(node, (ast.Import, ast.ImportFrom))
-                    and import_binds_days(node)
-                )
-                or (
-                    isinstance(node, (
-                        ast.AsyncFunctionDef,
-                        ast.ClassDef,
-                        ast.FunctionDef,
-                    ))
-                    and node.name == "days"
-                )
-                or (
-                    isinstance(node, ast.ExceptHandler)
-                    and (
-                        node.name == "days"
-                        or (
-                            isinstance(node.name, ast.Name)
-                            and node.name.id == "days"
-                        )
-                    )
-                )
-                or (
-                    isinstance(node, (ast.Global, ast.Nonlocal))
-                    and "days" in node.names
-                )
-                or (
-                    isinstance(node, ast.Match)
-                    and any(
-                        pattern_binds_days(case.pattern)
-                        for case in node.cases
-                    )
-                )
-                for node in between_nodes
+                event is not pinned_days_assignment.targets[0]
+                and is_between_selection_and_execute(event)
+                for event in main_binding_events.get("days", ())
             )
             days_mutated = any(
                 (
@@ -807,6 +1165,18 @@ def execute_integrity_violations(tree: ast.Module) -> tuple[str, ...]:
                     and node.func.id in {"delattr", "setattr"}
                     and node.args
                     and alias_root(node.args[0]) in aliases
+                )
+                or (
+                    isinstance(node, (ast.For, ast.AsyncFor))
+                    and mutates_days_target(node.target)
+                )
+                or (
+                    isinstance(node, (ast.With, ast.AsyncWith))
+                    and any(
+                        mutates_days_target(item.optional_vars)
+                        for item in node.items
+                        if item.optional_vars is not None
+                    )
                 )
                 for node in between_nodes
             )
@@ -1285,6 +1655,8 @@ def sensitive_module_reexports(
             "classmethod": "builtins.classmethod",
             "filter": "builtins.filter",
             "map": "builtins.map",
+            "max": "builtins.max",
+            "min": "builtins.min",
             "object": "builtins.object",
             "setattr": "builtins.setattr",
             "sorted": "builtins.sorted",
@@ -1864,6 +2236,11 @@ def sensitive_module_reexports(
         targets = set()
         scope = enclosing_callable(call)
         for class_node in resolve_class_expression(call.func, scope):
+            for allocator in resolve_class_methods(class_node, "__new__"):
+                targets.add((
+                    allocator,
+                    2 if method_descriptor_kind(allocator) == "class" else 1,
+                ))
             for initializer in resolve_class_methods(class_node, "__init__"):
                 targets.add((
                     initializer,
@@ -2170,6 +2547,57 @@ def sensitive_module_reexports(
             }
         return variants
 
+    def contains_direct_higher_order_input(
+            node: ast.AST,
+            scope: ast.AST | None,
+    ) -> bool:
+        if isinstance(node, ast.Call):
+            return any(
+                local_callable in tracked_return_callables
+                for local_callable, _ in local_call_targets(node)
+            )
+        if isinstance(node, (ast.Attribute, ast.Subscript)):
+            return contains_direct_higher_order_input(node.value, scope)
+        if isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+            return any(
+                contains_direct_higher_order_input(item, scope)
+                for item in node.elts
+            )
+        if isinstance(node, ast.Dict):
+            return any(
+                contains_direct_higher_order_input(item, scope)
+                for item in (*node.keys, *node.values)
+                if item is not None
+            )
+        if isinstance(node, (ast.NamedExpr, ast.Starred)):
+            return contains_direct_higher_order_input(node.value, scope)
+        if isinstance(node, ast.IfExp):
+            return (
+                contains_direct_higher_order_input(node.body, scope)
+                or contains_direct_higher_order_input(node.orelse, scope)
+            )
+        return contains_passed_tracked_binding(node, scope)
+
+    def additional_higher_order_kind(call: ast.Call) -> str | None:
+        origins = import_origin_names(call.func)
+        if "builtins.min" in origins:
+            return "min"
+        if "builtins.max" in origins:
+            return "max"
+        if "functools.reduce" in origins:
+            return "reduce"
+        if (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "sort"
+            and resolve_literal_sequences(
+                call.func.value,
+                enclosing_callable(call),
+            )
+        ):
+            return "list-sort"
+        return None
+
+    forced_higher_order_findings: set[ast.Call] = set()
     changed = True
     while changed:
         changed = False
@@ -2227,9 +2655,14 @@ def sensitive_module_reexports(
                     kwarg,
                     defaults,
                 ) = callable_parameter_bindings(local_callable)
+                receiver_names = {
+                    parameter.arg
+                    for parameter in positional[:int(bound_receiver)]
+                }
                 newly_tracked = {
                     parameter.arg
                     for parameter, default in defaults
+                    if parameter.arg not in receiver_names
                     if contains_passed_tracked_binding(
                         default,
                         callable_parents[local_callable],
@@ -2266,12 +2699,15 @@ def sensitive_module_reexports(
                             if not (
                                 bound_receiver
                                 and positional
-                                and name == positional[0].arg
+                                and name in receiver_names
                             )
                         )
                         if kwarg is not None:
                             newly_tracked.add(kwarg.arg)
-                    elif keyword.arg in named:
+                    elif (
+                        keyword.arg in named
+                        and keyword.arg not in receiver_names
+                    ):
                         newly_tracked.add(named[keyword.arg].arg)
                     elif kwarg is not None:
                         newly_tracked.add(kwarg.arg)
@@ -2286,6 +2722,26 @@ def sensitive_module_reexports(
             and higher_order_builtin_kind(node) is not None
         ):
             kind = higher_order_builtin_kind(call)
+            if (
+                kind == "sorted"
+                and any(
+                    keyword.arg is None
+                    and not resolve_literal_mappings(
+                        keyword.value,
+                        enclosing_callable(call),
+                    )
+                    for keyword in call.keywords
+                )
+                and any(
+                    len(normalized_args) == 1
+                    and contains_direct_higher_order_input(
+                        normalized_args[0],
+                        enclosing_callable(call),
+                    )
+                    for normalized_args in normalized_higher_order_args(call)
+                )
+            ):
+                forced_higher_order_findings.add(call)
             for normalized_args in normalized_higher_order_args(call):
                 if kind == "sorted":
                     callback_variants = normalized_sorted_key_values(call)
@@ -2349,6 +2805,88 @@ def sensitive_module_reexports(
                         if not newly_tracked.issubset(local_bindings):
                             local_bindings.update(newly_tracked)
                             changed = True
+
+        for call in (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and additional_higher_order_kind(node) is not None
+        ):
+            kind = additional_higher_order_kind(call)
+            scope = enclosing_callable(call)
+            unresolved_keywords = any(
+                keyword.arg is None
+                and not resolve_literal_mappings(keyword.value, scope)
+                for keyword in call.keywords
+            )
+            for normalized_args in normalized_higher_order_args(call):
+                if kind == "list-sort":
+                    carriers = (call.func.value,)
+                elif kind == "reduce":
+                    carriers = normalized_args[1:3]
+                else:
+                    carriers = normalized_args
+                has_tracked_carrier = any(
+                    contains_direct_higher_order_input(carrier, scope)
+                    for carrier in carriers
+                )
+                if has_tracked_carrier and unresolved_keywords:
+                    forced_higher_order_findings.add(call)
+
+                if kind == "reduce":
+                    if len(normalized_args) < 2:
+                        continue
+                    callback_expressions = {normalized_args[0]}
+                    tracked_parameter_indexes = set()
+                    if contains_direct_higher_order_input(
+                        normalized_args[1], scope,
+                    ):
+                        tracked_parameter_indexes.update((0, 1))
+                    if (
+                        len(normalized_args) >= 3
+                        and contains_direct_higher_order_input(
+                            normalized_args[2], scope,
+                        )
+                    ):
+                        tracked_parameter_indexes.add(0)
+                else:
+                    callback_variants = normalized_sorted_key_values(call)
+                    callback_expressions = {
+                        variant[0]
+                        for variant in callback_variants
+                        if len(variant) == 1
+                    }
+                    tracked_parameter_indexes = {0} if has_tracked_carrier else set()
+                if (
+                    not callback_expressions
+                    or not tracked_parameter_indexes
+                ):
+                    continue
+                callback_targets = set().union(*(
+                    resolve_callable_expression(expression, scope)
+                    for expression in callback_expressions
+                ))
+                for local_callable, bound_receiver in callback_targets:
+                    positional, _, vararg, _, _ = callable_parameter_bindings(
+                        local_callable
+                    )
+                    available = positional[int(bound_receiver):]
+                    newly_tracked = {
+                        available[index].arg
+                        for index in tracked_parameter_indexes
+                        if index < len(available)
+                    }
+                    if (
+                        vararg is not None
+                        and any(
+                            index >= len(available)
+                            for index in tracked_parameter_indexes
+                        )
+                    ):
+                        newly_tracked.add(vararg.arg)
+                    local_bindings = scoped_tracked_bindings[local_callable]
+                    if not newly_tracked.issubset(local_bindings):
+                        local_bindings.update(newly_tracked)
+                        changed = True
 
         for local_callable in callable_nodes:
             if isinstance(local_callable, ast.Lambda):
@@ -2623,7 +3161,9 @@ def sensitive_module_reexports(
 
     findings = []
     for node in ast.walk(tree):
-        if (
+        if node in forced_higher_order_findings:
+            findings.append(node)
+        elif (
             isinstance(node, ast.Attribute)
             and contains_tracked_binding(
                 node.value,
@@ -3365,6 +3905,36 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "kwargs = {'key': invoke}\n"
                 "sorted([p], **kwargs)\n"
             ),
+            "sorted-unresolved-key-mapping": (
+                "kwargs = options()\n"
+                "sorted([p], **kwargs)\n"
+            ),
+            "generic-min-key": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "min([p], key=invoke)\n"
+            ),
+            "generic-list-sort-key": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "items = [p]\n"
+                "items.sort(key=invoke)\n"
+            ),
+            "generic-reduce-callback": (
+                "from functools import reduce\n"
+                "def invoke(left, right):\n"
+                "    right.os.fork()\n"
+                "reduce(invoke, [p])\n"
+            ),
+            "reduce-initializer": (
+                "from functools import reduce\n"
+                "def invoke(left, right):\n"
+                "    left.os.fork()\n"
+                "reduce(invoke, [None], p)\n"
+            ),
+            "generic-unresolved-keywords": (
+                "min([p], **options())\n"
+            ),
         }
         for path, source in positive_sources.items():
             with self.subTest(path=path):
@@ -3471,6 +4041,42 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "def sorted(values, **kwargs):\n"
                 "    return values\n"
                 "sorted([p], **{'key': invoke})\n"
+            ),
+            "generic-nested-discard": (
+                "def discard(value):\n"
+                "    return None\n"
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "min(discard(p), key=invoke)\n"
+            ),
+            "shadowed-min": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "def min(values, *, key):\n"
+                "    return None\n"
+                "min([p], key=invoke)\n"
+            ),
+            "safe-generic-input": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "min([None], key=invoke)\n"
+            ),
+            "safe-unresolved-keywords-input": "min([None], **options())\n",
+            "min-optional-callback-context": (
+                "def invoke(value, context=None):\n"
+                "    context.os.fork()\n"
+                "min([p], key=invoke)\n"
+            ),
+            "min-positional-callable-is-data": (
+                "def invoke(value):\n"
+                "    value.os.fork()\n"
+                "min(p, invoke)\n"
+            ),
+            "reduce-initializer-does-not-taint-right": (
+                "from functools import reduce\n"
+                "def invoke(left, right):\n"
+                "    right.os.fork()\n"
+                "reduce(invoke, [None], p)\n"
             ),
         }
         for path, source in negative_sources.items():
@@ -3651,6 +4257,53 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "    pass\n"
                 "Holder(p)\n"
             ),
+            "constructor-new-store": (
+                "class Holder:\n"
+                "    def __new__(cls, value):\n"
+                "        cls.module = value\n"
+                "        return object.__new__(cls)\n"
+                "Holder(p)\n"
+            ),
+            "constructor-new-inherited-alias": (
+                "class Base:\n"
+                "    def __new__(cls, value):\n"
+                "        value.os.fork()\n"
+                "        return object.__new__(cls)\n"
+                "class Holder(Base):\n"
+                "    pass\n"
+                "Constructor = Holder\n"
+                "Constructor(p)\n"
+            ),
+            "constructor-new-keyword": (
+                "class Holder:\n"
+                "    def __new__(cls, value):\n"
+                "        value.os.fork()\n"
+                "        return object.__new__(cls)\n"
+                "Holder(value=p)\n"
+            ),
+            "constructor-new-star": (
+                "class Holder:\n"
+                "    def __new__(cls, value):\n"
+                "        value.os.fork()\n"
+                "        return object.__new__(cls)\n"
+                "Holder(*(p,))\n"
+            ),
+            "constructor-static-new": (
+                "class Holder:\n"
+                "    @staticmethod\n"
+                "    def __new__(cls, value):\n"
+                "        cls.module = value\n"
+                "        return object.__new__(cls)\n"
+                "Holder(p)\n"
+            ),
+            "constructor-classmethod-new": (
+                "class Holder:\n"
+                "    @classmethod\n"
+                "    def __new__(bound_cls, passed_cls, value):\n"
+                "        bound_cls.module = value\n"
+                "        return object.__new__(passed_cls)\n"
+                "Holder(p)\n"
+            ),
         }
         for escape, source in positive_sources.items():
             with self.subTest(escape=escape):
@@ -3756,6 +4409,38 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "Holder(p)\n"
             ),
             "unresolved-external-constructor": "External(p)\n",
+            "constructor-new-receiver-only": (
+                "class Holder:\n"
+                "    def __new__(cls, value):\n"
+                "        cls.module = cls\n"
+                "        return object.__new__(cls)\n"
+                "Holder(p)\n"
+            ),
+            "constructor-classmethod-new-receivers-only": (
+                "class Holder:\n"
+                "    @classmethod\n"
+                "    def __new__(bound_cls, passed_cls, value):\n"
+                "        bound_cls.module = passed_cls\n"
+                "        return object.__new__(passed_cls)\n"
+                "Holder(p)\n"
+            ),
+            "constructor-new-safe-override": (
+                "class Base:\n"
+                "    def __new__(cls, value):\n"
+                "        cls.module = value\n"
+                "        return object.__new__(cls)\n"
+                "class Holder(Base):\n"
+                "    def __new__(cls, value):\n"
+                "        return object.__new__(cls)\n"
+                "Holder(p)\n"
+            ),
+            "constructor-new-local-only": (
+                "class Holder:\n"
+                "    def __new__(cls, value):\n"
+                "        local = value\n"
+                "        return object.__new__(cls)\n"
+                "Holder(p)\n"
+            ),
             "insert-star-tracked-index": "items.insert(*(p, 'safe'))\n",
             "legitimate-mutators": (
                 "items.append('safe')\n"
@@ -3785,7 +4470,21 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "existing=_existing_manifests):\n"
             "    execute_count = len(days)\n"
             "    _execute_result = None\n"
-            "    return {\"count\": execute_count}\n"
+            "    for day in days:\n"
+            "        try:\n"
+            "            manifest = {\"replay_run_id\": \"known\", "
+            "\"dataset_digest\": \"d\", \"configuration_digest\": \"c\", "
+            "\"frame_count\": 1}\n"
+            "            run_id = str(manifest[\"replay_run_id\"]) if manifest "
+            "else f\"h2d-{day.isoformat()}\"\n"
+            "            dataset_digest = manifest.get(\"dataset_digest\")\n"
+            "            configuration_digest = "
+            "manifest.get(\"configuration_digest\")\n"
+            "            frame_count = manifest.get(\"frame_count\")\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "    return {\"count\": execute_count, "
+            "\"overall_status\": \"COMPLETED\"}\n"
             "class Executor:\n    pass\n"
             "def main(argv=None):\n"
             "    args = type(\"Args\", (), {\"dates\": (), \"start\": None, "
@@ -3802,7 +4501,9 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "        parser.error(str(error))\n"
             "    output = execute(days, "
             "continue_on_failure=args.continue_on_failure)\n"
-            "    return output\n"
+            "    print(json.dumps(output, sort_keys=True, "
+            "separators=(\",\", \":\")))\n"
+            "    return 1 if output[\"overall_status\"] == \"FAILED\" else 0\n"
             "if __name__ == '__main__':\n"
             "    raise SystemExit(main())\n"
         )
@@ -4015,6 +4716,195 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 ),
                 "days-selection-mutation",
             ),
+            "days-comprehension-named-expression": (
+                valid_source.replace(
+                    exact_call,
+                    "    changed = [(days := ()) for _ in ()]\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-function-default": (
+                valid_source.replace(
+                    exact_call,
+                    "    def helper(value=(days := ())):\n"
+                    "        return value\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-function-decorator": (
+                valid_source.replace(
+                    exact_call,
+                    "    @(days := decorate)\n"
+                    "    def helper():\n"
+                    "        pass\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-runtime-function-annotation": (
+                valid_source.replace(
+                    exact_call,
+                    "    def helper(value: (days := object)):\n"
+                    "        return value\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-lambda-default": (
+                valid_source.replace(
+                    exact_call,
+                    "    helper = lambda value=(days := ()): value\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-class-base": (
+                valid_source.replace(
+                    exact_call,
+                    "    class Helper((days := Base)):\n"
+                    "        pass\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-class-decorator": (
+                valid_source.replace(
+                    exact_call,
+                    "    @(days := decorate)\n"
+                    "    class Helper:\n"
+                    "        pass\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "days-class-keyword": (
+                valid_source.replace(
+                    exact_call,
+                    "    class Helper(metaclass=(days := Meta)):\n"
+                    "        pass\n"
+                    + exact_call,
+                    1,
+                ),
+                "days-selection-mutation",
+            ),
+            "run-json-rebinding": (
+                valid_source.replace(
+                    "    execute_count = len(days)\n",
+                    "    run_json = None\n"
+                    "    execute_count = len(days)\n",
+                    1,
+                ),
+                "execute-dispatch-binding",
+            ),
+            "day-rebinding": (
+                valid_source.replace(
+                    "    return {\"count\": execute_count, ",
+                    "    day = None\n"
+                    "    return {\"count\": execute_count, ",
+                    1,
+                ),
+                "execute-day-binding",
+            ),
+            "day-comprehension-named-expression": (
+                valid_source.replace(
+                    "    return {\"count\": execute_count, ",
+                    "    changed = [(day := None) for _ in ()]\n"
+                    "    return {\"count\": execute_count, ",
+                    1,
+                ),
+                "execute-day-binding",
+            ),
+            "run-id-rebinding": (
+                valid_source.replace(
+                    "            dataset_digest = manifest.get",
+                    "            run_id = 'changed'\n"
+                    "            dataset_digest = manifest.get",
+                    1,
+                ),
+                "execute-lineage-binding",
+            ),
+            "run-id-function-default": (
+                valid_source.replace(
+                    "            dataset_digest = manifest.get",
+                    "            def helper(value=(run_id := 'changed')):\n"
+                    "                return value\n"
+                    "            dataset_digest = manifest.get",
+                    1,
+                ),
+                "execute-lineage-binding",
+            ),
+            "dataset-digest-rebinding": (
+                valid_source.replace(
+                    "            configuration_digest = ",
+                    "            dataset_digest = None\n"
+                    "            configuration_digest = ",
+                    1,
+                ),
+                "execute-lineage-binding",
+            ),
+            "configuration-digest-rebinding": (
+                valid_source.replace(
+                    "            frame_count = manifest.get",
+                    "            configuration_digest = None\n"
+                    "            frame_count = manifest.get",
+                    1,
+                ),
+                "execute-lineage-binding",
+            ),
+            "frame-count-rebinding": (
+                valid_source.replace(
+                    "        except Exception:\n",
+                    "            frame_count = 0\n"
+                    "        except Exception:\n",
+                    1,
+                ),
+                "execute-lineage-binding",
+            ),
+            "output-rebinding": (
+                valid_source.replace(
+                    "    print(json.dumps(output, sort_keys=True, ",
+                    "    output = {}\n"
+                    "    print(json.dumps(output, sort_keys=True, ",
+                    1,
+                ),
+                "main-output-binding",
+            ),
+            "output-extra-load": (
+                valid_source.replace(
+                    "    print(json.dumps(output, sort_keys=True, ",
+                    "    inspected = output\n"
+                    "    print(json.dumps(output, sort_keys=True, ",
+                    1,
+                ),
+                "main-output-use",
+            ),
+            "output-print-replacement": (
+                valid_source.replace(
+                    "print(json.dumps(output, sort_keys=True, "
+                    "separators=(\",\", \":\")))",
+                    "print('{}')",
+                    1,
+                ),
+                "main-output-use",
+            ),
+            "output-status-replacement": (
+                valid_source.replace(
+                    "return 1 if output[\"overall_status\"] "
+                    "== \"FAILED\" else 0",
+                    "return 0",
+                    1,
+                ),
+                "main-output-use",
+            ),
             "extra-default": (
                 valid_source.replace(
                     "continue_on_failure, run_json=",
@@ -4189,27 +5079,33 @@ class H2D2FreezeContractTests(unittest.TestCase):
             ),
             "execute-generator": (
                 valid_source.replace(
-                    "    return {\"count\": execute_count}\n",
+                    "    return {\"count\": execute_count, "
+                    "\"overall_status\": \"COMPLETED\"}\n",
                     "    if False:\n        yield None\n"
-                    "    return {\"count\": execute_count}\n",
+                    "    return {\"count\": execute_count, "
+                    "\"overall_status\": \"COMPLETED\"}\n",
                     1,
                 ),
                 "execute-generator",
             ),
             "execute-yield-from": (
                 valid_source.replace(
-                    "    return {\"count\": execute_count}\n",
+                    "    return {\"count\": execute_count, "
+                    "\"overall_status\": \"COMPLETED\"}\n",
                     "    if False:\n        yield from ()\n"
-                    "    return {\"count\": execute_count}\n",
+                    "    return {\"count\": execute_count, "
+                    "\"overall_status\": \"COMPLETED\"}\n",
                     1,
                 ),
                 "execute-generator",
             ),
             "main-generator": (
                 valid_source.replace(
-                    "    return output\n",
+                    "    return 1 if output[\"overall_status\"] "
+                    "== \"FAILED\" else 0\n",
                     "    if False:\n        yield output\n"
-                    "    return output\n",
+                    "    return 1 if output[\"overall_status\"] "
+                    "== \"FAILED\" else 0\n",
                     1,
                 ),
                 "main-generator",
@@ -4322,6 +5218,13 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "    match None:\n"
             "        case other:\n"
             "            pass\n",
+            "    def nested_output():\n"
+            "        output = None\n"
+            "        return output\n",
+            "    shadowed_output = [output for output in ()]\n",
+            "    class Nested:\n"
+            "        days = ()\n",
+            "    nested_lambda = lambda: (days := ())\n",
         ):
             with self.subTest(safe_days_read=safe_read.strip()):
                 self.assertFalse(
@@ -4333,6 +5236,37 @@ class H2D2FreezeContractTests(unittest.TestCase):
                         )
                     )),
                 )
+
+        safe_execute_shadows = valid_source.replace(
+            "    return {\"count\": execute_count, ",
+            "    def nested_bindings(run_json, day, run_id, dataset_digest, "
+            "configuration_digest, frame_count):\n"
+            "        return None\n"
+            "    shadows = [None for run_json in () for day in () "
+            "for run_id in () for dataset_digest in () "
+            "for configuration_digest in () for frame_count in ()]\n"
+            "    return {\"count\": execute_count, ",
+            1,
+        )
+        self.assertFalse(
+            execute_integrity_violations(ast.parse(safe_execute_shadows)),
+            "nested and comprehension-target shadows must remain local",
+        )
+
+        deferred_annotation_shadow = (
+            "from __future__ import annotations\n"
+            + valid_source.replace(
+                exact_call,
+                "    def helper(value: (days := object)):\n"
+                "        return value\n"
+                + exact_call,
+                1,
+            )
+        )
+        self.assertFalse(
+            execute_integrity_violations(ast.parse(deferred_annotation_shadow)),
+            "deferred annotations must not create runtime binding events",
+        )
 
     def test_baselines_are_two_read_only_certified_complete_sessions(self):
         payload = json.loads(
