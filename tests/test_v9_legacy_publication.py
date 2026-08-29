@@ -141,3 +141,28 @@ def test_cohort_metric_reader_is_fair_bounded_and_read_only():
     assert "INSERT INTO atom_v9_internal.legacy_evidence_publications" not in sql
     assert "UPDATE atom_v9_internal.legacy_evidence_publications" not in sql
     assert "DELETE FROM atom_v9_internal.legacy_evidence_publications" not in sql
+
+
+def test_cohort_metric_reader_falls_back_before_applying_the_window_limit():
+    sql = (
+        ROOT / "migrations" /
+        "024_fix_cohort_metric_proof_fallback.sql"
+    ).read_text()
+    normalized = " ".join(sql.split())
+    timely = "p.commit_observed_at<to_timestamp(f.maturity_epoch)"
+    assert normalized.count(timely) == 2
+    assert normalized.count("LIMIT v_limit + 1") == 2
+    first_limit = normalized.index("LIMIT v_limit + 1")
+    second_limit = normalized.index("LIMIT v_limit + 1", first_limit + 1)
+    first_timing = normalized.index(timely)
+    second_timing = normalized.index(timely, first_timing + 1)
+    assert first_timing < first_limit
+    assert second_timing < second_limit
+    assert "CREATE OR REPLACE FUNCTION" in normalized
+    assert "SECURITY DEFINER" in sql
+    assert "SET search_path=pg_catalog" in sql
+    assert "OWNER TO atom_v9_proof_owner" in sql
+    assert "TO atom_v9_v4_runtime" in sql
+    assert "INSERT INTO atom_v9_internal.legacy_evidence_publications" not in sql
+    assert "UPDATE atom_v9_internal.legacy_evidence_publications" not in sql
+    assert "DELETE FROM atom_v9_internal.legacy_evidence_publications" not in sql
