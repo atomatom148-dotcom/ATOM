@@ -8,7 +8,7 @@
   "ordered_content_hash_contract": {
     "algorithm": "sha256_utf8_newline_join_v1",
     "row_value": "stored lowercase content_sha256",
-    "separator": "\\n",
+    "separator": "\n",
     "trailing_separator": false,
     "forecast_order": ["cutoff_at", "quant_id", "horizon"],
     "outcome_order": ["cutoff_at", "horizon"]

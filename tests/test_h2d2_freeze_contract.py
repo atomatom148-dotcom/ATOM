@@ -29,7 +29,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
             {
                 "algorithm": "sha256_utf8_newline_join_v1",
                 "row_value": "stored lowercase content_sha256",
-                "separator": "\\n",
+                "separator": "\n",
                 "trailing_separator": False,
                 "forecast_order": ["cutoff_at", "quant_id", "horizon"],
                 "outcome_order": ["cutoff_at", "horizon"],
@@ -82,16 +82,22 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 imported.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module)
-        for forbidden in (
+        for forbidden_package in (
             "asyncio",
             "concurrent",
-            "concurrent.futures",
             "multiprocessing",
             "queue",
             "threading",
         ):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, imported)
+            with self.subTest(forbidden_package=forbidden_package):
+                self.assertFalse(
+                    any(
+                        imported_name == forbidden_package
+                        or imported_name.startswith(f"{forbidden_package}.")
+                        for imported_name in imported
+                    ),
+                    f"forbidden parallel package imported: {forbidden_package}",
+                )
         string_constants = {
             node.value for node in ast.walk(tree)
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
