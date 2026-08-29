@@ -577,15 +577,21 @@ class H2D2FreezeContractTests(unittest.TestCase):
                             star_imports.add(node.module or ".")
                 self.assertFalse(
                     imported_roots.intersection({
+                        "_imp",
                         "_thread",
                         "asyncio",
                         "concurrent",
                         "dask",
+                        "importlib",
                         "joblib",
                         "multiprocessing",
+                        "pkgutil",
                         "queue",
                         "ray",
+                        "runpy",
+                        "sys",
                         "threading",
+                        "zipimport",
                     }),
                     f"parallel package imported by {relative_path}",
                 )
