@@ -114,3 +114,30 @@ def test_effective_observation_reader_is_sparse_exact_and_read_only():
     assert "INSERT INTO atom_v9_internal.legacy_evidence_publications" not in sql
     assert "UPDATE atom_v9_internal.legacy_evidence_publications" not in sql
     assert "DELETE FROM atom_v9_internal.legacy_evidence_publications" not in sql
+
+
+def test_cohort_metric_reader_is_fair_bounded_and_read_only():
+    sql = (
+        ROOT / "migrations" /
+        "023_add_cohort_metric_publication_reader.sql"
+    ).read_text()
+    normalized = " ".join(sql.split())
+    assert "read_legacy_evidence_publications_for_cohorts" in sql
+    assert "jsonb_array_length" in sql
+    assert "> 256" in sql
+    assert "LEAST(GREATEST(p_per_cohort_limit, 0), 256)" in sql
+    assert "PARTITION BY c.quant_id, c.formula_version" in normalized
+    assert "ORDER BY f.cutoff_epoch DESC, f.forecast_id DESC" in normalized
+    assert "LIMIT v_limit + 1" in normalized
+    assert "r.ordinal<=v_limit" in normalized
+    assert normalized.count(
+        "f.created_epoch<=extract(epoch FROM p_as_of)"
+    ) == 2
+    assert "p.commit_observed_at<=p_as_of" in normalized
+    assert "SECURITY DEFINER" in sql
+    assert "SET search_path=pg_catalog" in sql
+    assert "OWNER TO atom_v9_proof_owner" in sql
+    assert "TO atom_v9_v4_runtime" in sql
+    assert "INSERT INTO atom_v9_internal.legacy_evidence_publications" not in sql
+    assert "UPDATE atom_v9_internal.legacy_evidence_publications" not in sql
+    assert "DELETE FROM atom_v9_internal.legacy_evidence_publications" not in sql

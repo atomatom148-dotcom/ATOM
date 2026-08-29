@@ -12,8 +12,32 @@ from typing import Protocol, Sequence
 HORIZONS = ("30S", "1M", "5M", "15M", "30M", "1H")
 HORIZON_SECONDS = (30, 60, 300, 900, 1800, 3600)
 MIN_EFFECTIVE_N = 20
+PHASE_E_COHORT_WINDOW_LIMIT = 256
 DATA_SCHEMA_VERSION = "atom-market-input-v1"
 SOURCE_SPEC_VERSION = "alpaca-market-data-v1"
+
+
+def _canonical_phase_e_cohort_specs(*, volatility: bool) -> str:
+    """Return the bounded canonical cohorts displayed by the live dashboard."""
+
+    # Imported lazily because v9_production imports this evidence module.
+    from .v9_production import FORMULA_VERSION_MAP
+
+    quant_ids = (
+        ("q3_volatility",) if volatility else
+        tuple(quant_id for quant_id in FORMULA_VERSION_MAP
+              if quant_id != "q3_volatility")
+    )
+    return json.dumps([
+        {
+            "quant_id": quant_id,
+            "formula_version": FORMULA_VERSION_MAP[quant_id],
+            "symbol": "COIN",
+            "horizon": horizon,
+        }
+        for quant_id in quant_ids
+        for horizon in HORIZONS
+    ], sort_keys=True, separators=(",", ":"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +91,8 @@ class PhaseECohortMetrics:
     bias_bps: float | None
     effective_n: int
     eligible: bool
-    evidence_window: str = "MOST_RECENT_GLOBAL"
-    evidence_window_limit: int = 65536
+    evidence_window: str = "MOST_RECENT_PER_COHORT"
+    evidence_window_limit: int = PHASE_E_COHORT_WINDOW_LIMIT
     evidence_window_truncated: bool = False
 
 
@@ -406,8 +430,9 @@ class PostgresEvidenceStore:
                     """
                     WITH forecast_proofs AS MATERIALIZED (
                         SELECT *
-                        FROM atom_v9_internal.read_legacy_evidence_publications(
-                            'DIRECTIONAL_FORECAST', to_timestamp(%s), 65536
+                        FROM atom_v9_internal.read_legacy_evidence_publications_for_cohorts(
+                            'DIRECTIONAL_FORECAST', to_timestamp(%s), %s::jsonb,
+                            256
                         )
                     ),
                     outcome_proofs AS MATERIALIZED (
@@ -479,7 +504,11 @@ class PostgresEvidenceStore:
                                  WHEN '30M' THEN 5 WHEN '1H' THEN 6
                              END
                     """,
-                    (as_of_epoch,) * 16,
+                    (
+                        as_of_epoch,
+                        _canonical_phase_e_cohort_specs(volatility=False),
+                        *((as_of_epoch,) * 15),
+                    ),
                 )
                 rows = cursor.fetchall()
                 cohort_specs = json.dumps([
@@ -554,8 +583,9 @@ class PostgresEvidenceStore:
                     """
                     WITH forecast_proofs AS MATERIALIZED (
                         SELECT *
-                        FROM atom_v9_internal.read_legacy_evidence_publications(
-                            'VOLATILITY_FORECAST', to_timestamp(%s), 65536
+                        FROM atom_v9_internal.read_legacy_evidence_publications_for_cohorts(
+                            'VOLATILITY_FORECAST', to_timestamp(%s), %s::jsonb,
+                            256
                         )
                     ),
                     outcome_proofs AS MATERIALIZED (
@@ -620,7 +650,11 @@ class PostgresEvidenceStore:
                                  WHEN '30M' THEN 5 WHEN '1H' THEN 6
                              END
                     """,
-                    (as_of_epoch,) * 14,
+                    (
+                        as_of_epoch,
+                        _canonical_phase_e_cohort_specs(volatility=True),
+                        *((as_of_epoch,) * 13),
+                    ),
                 )
                 rows = cursor.fetchall()
                 cohort_specs = json.dumps([
