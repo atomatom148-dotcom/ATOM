@@ -26,7 +26,8 @@ canary must add and verify them before it can dispatch two dates.
 
 1. One coordinator owns the complete, ascending, unique date plan and the
    final ordered receipt. Workers cannot enqueue, split, or reassign work.
-2. One worker process exclusively owns one date from claim through validated
+2. One guardian exclusively owns one date from claim through terminal cleanup;
+   its single worker process owns that date's full stage chain through validated
    receipt. The job key is the ISO date. Only distinct dates may coexist.
 3. Exactly one coordinator may be active. Before any preflight query or worker
    creation, it opens exactly one dedicated, session-pinned,
@@ -36,32 +37,98 @@ canary must add and verify them before it can dispatch two dates.
    False, null, or error stops before workers. A distributed queue, lease
    expiry, abandoned-worker reassignment, and more than two workers are not
    authorized.
-4. The coordinator retains that physical control session for the complete
-   canary. While either worker is active, its parent wait loop must check
-   `SELECT pg_backend_pid()` at an interval of at most five seconds; an error
-   or PID change requires immediate termination and collection of both worker
-   processes and permanent canary failure. No worker may use or inherit the
-   control connection. After a successful acquisition, a `finally` path calls
-   `SELECT pg_advisory_unlock(8098937340306602170)` exactly once and closes the
-   session; a false result or error is a control failure. Session closure is
-   only the release backstop, not the normal release path.
-5. The later canary is capped at exactly two worker processes and the two dates
+4. After acquiring the coordinator lock, the same session must acquire both
+   date-fence locks exclusively before creating any workload process:
+   `pg_try_advisory_lock(-5133988379539764595)` for `2026-06-15` and
+   `pg_try_advisory_lock(8459531074882316998)` for `2026-07-22`. Failure to
+   acquire either releases every acquired date fence exactly once and stops.
+   After acquiring both, it contacts the two exact, configured durable host
+   supervisors pinned by the canary configuration digest. Each supervisor must
+   attest a monotonic record version, terminal receipt identity, `CLEAN`, the
+   prior worker and guardian reaped, and its fixed workload cgroup at
+   `populated 0`; a missing, stale, malformed, unreachable, or nonterminal
+   attestation stops. Each supervisor serializes admission and atomically
+   compare-and-swaps that exact attested `CLEAN` version and terminal receipt
+   to a fsynced `CLAIMING` generation record containing the next monotonic
+   version, date, generation ID, commit, coordinator OS PID and database
+   backend PID, host identity, and fixed cgroup path. A false compare-and-swap,
+   stale version, or generation mismatch stops; every later transition is
+   conditional on the exact predecessor version and generation. If fewer than
+   two compare-and-swaps succeed, no fence handoff or guardian creation occurs
+   and each partial claim must complete terminal cleanup before a retry. Only
+   after both records are durable may the supervisors
+   create exactly two claim-only date guardians outside the coordinator and
+   workload failure domains. The coordinator unlocks each exclusive date fence
+   exactly once only so the corresponding guardian can claim it in shared
+   mode. No worker, stage, or provider call may begin during this handoff.
+5. Each guardian must run on a Linux host with delegated cgroup v2 support for
+   `cgroup.freeze`, `cgroup.kill`, and the `populated` field in
+   `cgroup.events`; missing or unverified support stops before claim. The
+   guardian opens its own session-pinned, read-only fence connection, acquires
+   its date key with `pg_try_advisory_lock_shared`, verifies its own backend
+   ownership through `pg_locks`, and verifies that the exact recorded
+   coordinator backend PID still owns `8098937340306602170`. It also opens a
+   `pidfd` for the exact coordinator OS PID and a close-on-exec liveness pipe
+   whose write end is owned only by the coordinator. The supervisor must then
+   atomically transition and fsync its durable generation record from
+   `CLAIMING` to `ACTIVE`. Only then may the guardian return a claim receipt.
+   Both claim receipts are required before either guardian may create its
+   single worker and issue a start signal. The generation record is independent
+   of PostgreSQL sessions; only the fixed supervisor may change it, and any
+   `CLAIMING`, `ACTIVE`, `CLEANING`, or unknown state blocks replacement
+   admission.
+6. The coordinator retains its physical control session for the complete
+   canary. Its wait loop checks `SELECT pg_backend_pid()`, and each guardian
+   checks both its own shared fence ownership and the exact coordinator lock
+   owner, at an interval of at most five seconds. Coordinator `pidfd`
+   readability, liveness-pipe EOF, error, PID drift, lock loss, or any control
+   or fence-connection loss permanently fails the canary. The supervisor keeps
+   the durable state nonterminal and fsyncs `CLEANING`; the guardian must then
+   freeze its dedicated workload cgroup, invoke `cgroup.kill`, reap its worker,
+   and wait until `cgroup.events` reports `populated 0`. If the guardian exits
+   early, the persistent supervisor performs the same cleanup and reaps it.
+   Only after that ordered cleanup may the guardian unlock or close its shared
+   fence connection. Each stage has a dedicated process group inside that
+   cgroup, and every worker, launcher, stage, and descendant must remain in the
+   same no-escape cgroup. A parent-death signal or process-group kill alone is
+   not accepted as proof of containment. No guardian, worker, or descendant
+   may use or inherit the coordinator connection or liveness-pipe write end.
+7. A guardian holds its shared date fence from claim through terminal cleanup
+   on success and every failure path while that database session exists. On
+   normal completion it validates the final receipt, waits for worker exit,
+   reaps the worker, and proves the workload cgroup is empty before it releases
+   the shared fence exactly once and exits. After reaping the guardian and
+   independently reproving `populated 0`, the supervisor atomically persists
+   and fsyncs the terminal cleanup receipt and changes its generation state to
+   `CLEAN` as the last operation. The coordinator retains the global advisory
+   lock until both supervisors attest those terminal receipts. On every path
+   after successful acquisition, only then does the coordinator release
+   `8098937340306602170` exactly once in `finally` and close its session. False
+   unlock, early guardian death, incomplete reaping, a nonempty cgroup,
+   nonterminal supervisor state, or connection error is a control failure;
+   connection closure is only a backstop. Every replacement must repeat both
+   supervisor checks in step 4, so it cannot begin while any prior workload
+   cgroup remains populated even after a database restart or failover drops all
+   three advisory-lock sessions.
+8. The later canary is capped at exactly two worker processes and the two dates
    frozen below. Completion order cannot change receipt order.
-6. For a date with no manifest, the run ID is `h2d-YYYY-MM-DD`. If exactly one
+9. For a date with no manifest, the run ID is `h2d-YYYY-MM-DD`. If exactly one
    certified manifest already exists, its immutable run ID is reused. More
    than one manifest for a date is a permanent failure.
-7. Each database-owning stage uses its own bounded connection/transaction.
-   No worker may hold a database lock while waiting on another worker or on
-   provider/network I/O. The two-date canary permits at most two replay-workload
-   database connections at once, plus the one dedicated coordinator control
-   connection.
+10. Each database-owning stage uses its own bounded connection/transaction.
+   No worker may hold a row, table, or transaction lock while waiting on
+   another worker or provider/network I/O; its guardian's frozen shared
+   date-fence advisory lock is the sole exception. The canary permits at most
+   two replay-workload, two guardian-fence, and one coordinator-control
+   database connections at once.
 
-The fixed coordinator advisory lock enforces single ownership across processes
-and hosts connected to the evidence database. Database primary keys and
-existing per-run advisory locks remain the final row-integrity barrier; they do
-not replace the coordinator/date-claim law. Manifest content includes
-performance fields, so two simultaneous H1 writers for one date can safely
-conflict even when their mathematics matches.
+The fixed coordinator advisory lock enforces fast-path single ownership across
+processes and hosts connected to the evidence database. The durable supervisor
+generation records are the independent admission fence when database sessions
+all disappear. Database primary keys and existing per-run advisory locks remain
+the final row-integrity barrier; they do not replace the coordinator/date-claim
+law. Manifest content includes performance fields, so two simultaneous H1
+writers for one date can safely conflict even when their mathematics matches.
 
 ## Stage, retry, and failure contract
 
@@ -178,6 +245,25 @@ receipt correlation, zero duplicate rows/identities, no database lock wait or
 timeout, and bounded resource use. Any mismatch stops the project at the
 sequential runtime. Compute sizing, scaled replay, and production scheduling
 remain separate, later decisions.
+
+Before the parity run, an integration test must send abrupt `SIGKILL` to the
+coordinator while both stage process groups are active. It must prove both
+guardians survive coordinator death long enough to freeze and kill their
+cgroups; zero surviving descendant PIDs; `populated 0`; worker reaping before
+shared-fence release; and that a replacement coordinator cannot acquire both
+exclusive date fences until that ordered cleanup is complete. A separate
+normal-completion test must prove the coordinator lock remains held until both
+supervisors have persisted terminal cleanup receipts. Separate fault tests must
+kill a guardian and must restart or fail over PostgreSQL so all three
+advisory-lock sessions drop while both workers are active. In each case an
+immediate replacement attempt must remain blocked by nonterminal durable state
+until both workers and guardians are reaped, both cgroups report `populated 0`,
+and both terminal receipts are fsynced. A two-coordinator failover race test
+must prove the versioned compare-and-swaps allow only one generation to obtain
+both supervisor claims; a split or partial claim starts no guardian. Unsupported
+cgroup, `pidfd`, durable state, or supervisor semantics, an unreachable
+supervisor, an orphan PID, early fence release, a nonempty cgroup, or any
+old/new generation overlap permanently fails H2-D-3.
 
 ## Explicit non-goals
 

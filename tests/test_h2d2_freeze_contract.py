@@ -15,6 +15,60 @@ BASELINES = ROOT / "docs" / "h2-d2-canary-baselines.json"
 Q10_AUDIT = ROOT / "docs" / "audits" / "h2d-2026-07-22-q10-options-vol.md"
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 HEX_40 = re.compile(r"^[0-9a-f]{40}$")
+SENSITIVE_MODULE_ROOTS = {
+    "_imp",
+    "_posixsubprocess",
+    "_thread",
+    "asyncio",
+    "builtins",
+    "concurrent",
+    "ctypes",
+    "dask",
+    "importlib",
+    "joblib",
+    "multiprocessing",
+    "nt",
+    "os",
+    "pkgutil",
+    "posix",
+    "pty",
+    "queue",
+    "ray",
+    "runpy",
+    "subprocess",
+    "sys",
+    "threading",
+    "zipimport",
+}
+FORBIDDEN_STAGE_IMPORT_ROOTS = SENSITIVE_MODULE_ROOTS - {
+    "os",
+    "subprocess",
+    "sys",
+}
+DANGEROUS_INTROSPECTION_ATTRIBUTES = {
+    "__bases__",
+    "__class__",
+    "__dict__",
+    "__getattribute__",
+    "__globals__",
+    "__mro__",
+    "__self__",
+    "__subclasses__",
+}
+EXPECTED_INTROSPECTION_CALL_COUNTS = {
+    "quant/historical_evidence.py": 1,
+    "quant/historical_evidence_verifier.py": 1,
+    "quant/historical_replay_h1.py": 6,
+    "quant/v9_v1_contract.py": 3,
+    "quant/v9_v2d_evidence_state.py": 1,
+    "quant/v9_v3_synthesis.py": 2,
+    "quant/v9_v4a_evidence.py": 8,
+}
+ALLOWED_DYNAMIC_GETATTR_NAMES = {
+    "quant/historical_replay_h1.py": {"attribute", "name"},
+    "quant/v9_v1_contract.py": {"name"},
+    "quant/v9_v2d_evidence_state.py": {"name"},
+}
 BASELINE_BUNDLE_SHA256 = "0f6f714d74b516e7966cc1bdc56478e85491b7c31805129a86e06ab3a462de87"
 SEQUENTIAL_RUNTIME_SOURCE_SHA256 = {
     "quant/__init__.py":
@@ -83,6 +137,14 @@ def canonical_source_sha256(source: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def is_sensitive_import_name(name: str) -> bool:
+    root = name.split(".")[0]
+    return (
+        root in SENSITIVE_MODULE_ROOTS
+        or root.lstrip("_") in SENSITIVE_MODULE_ROOTS
+    )
+
+
 def local_runtime_dependencies(relative_path: str, tree: ast.AST) -> set[str]:
     module_parts = Path(relative_path).with_suffix("").parts
     package_parts = module_parts[:-1]
@@ -130,6 +192,40 @@ def local_runtime_dependencies(relative_path: str, tree: ast.AST) -> set[str]:
         if (ROOT / initializer).is_file():
             dependencies.add(initializer.as_posix())
     return dependencies
+
+
+def sensitive_module_reexports(
+        tree: ast.AST,
+        module_aliases: dict[str, str],
+) -> tuple[ast.AST, ...]:
+    def imported_root(node: ast.AST) -> str | None:
+        while isinstance(node, ast.Attribute):
+            node = node.value
+        if isinstance(node, ast.Name) and node.id in module_aliases:
+            return node.id
+        return None
+
+    findings = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and imported_root(node) is not None
+            and (
+                is_sensitive_import_name(node.attr)
+                or node.attr.startswith("_")
+            )
+        ):
+            findings.append(node)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"delattr", "getattr", "setattr", "vars"}
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in module_aliases
+        ):
+            findings.append(node)
+    return tuple(findings)
 
 
 class H2D2FreezeContractTests(unittest.TestCase):
@@ -387,11 +483,22 @@ class H2D2FreezeContractTests(unittest.TestCase):
         )
         direct_process_imports = {
             item for item in direct_imports
-            if item[0].split(".")[0] in {"os", "subprocess", "sys"}
+            if (
+                is_sensitive_import_name(item[0])
+                or is_sensitive_import_name(item[1])
+            )
         }
         self.assertFalse(
             direct_process_imports,
             f"direct OS/process imports are forbidden: {direct_process_imports}",
+        )
+        reexported_process_modules = sensitive_module_reexports(
+            tree,
+            module_aliases,
+        )
+        self.assertFalse(
+            reexported_process_modules,
+            "process/concurrency modules re-exported by allowed imports",
         )
         qualified_references = set()
         for node in ast.walk(tree):
@@ -409,22 +516,20 @@ class H2D2FreezeContractTests(unittest.TestCase):
             for parent in ast.walk(tree)
             for child in ast.iter_child_nodes(parent)
         }
-        bare_process_module_loads = tuple(
+        bare_imported_module_loads = tuple(
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)
-            and module_aliases.get(node.id) in {"os", "subprocess", "sys"}
+            and node.id in module_aliases
             and not (
                 isinstance(parents.get(node), ast.Attribute)
                 and parents[node].value is node
-                and (module_aliases[node.id], parents[node].attr)
-                in allowed_process_references
             )
         )
         self.assertFalse(
-            bare_process_module_loads,
-            "bare OS/process module loads are forbidden",
+            bare_imported_module_loads,
+            "imported module objects cannot be aliased, contained, or passed",
         )
         process_references = {
             item for item in qualified_references
@@ -478,7 +583,66 @@ class H2D2FreezeContractTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "_run_json"
         )
         self.assertEqual(len(run_json_functions), 1)
-        self.assertIn(subprocess_run_call, tuple(ast.walk(run_json_functions[0])))
+        run_json_function = run_json_functions[0]
+        self.assertIn(subprocess_run_call, tuple(ast.walk(run_json_function)))
+        self.assertFalse(run_json_function.decorator_list)
+        self.assertFalse(run_json_function.args.defaults)
+        self.assertFalse(run_json_function.args.kw_defaults)
+        self.assertEqual(
+            [argument.arg for argument in run_json_function.args.args],
+            ["command", "stage"],
+        )
+        self.assertIsInstance(run_json_function.body[0], ast.Assign)
+        first_statement = run_json_function.body[0]
+        self.assertEqual(len(first_statement.targets), 1)
+        self.assertIsInstance(first_statement.targets[0], ast.Name)
+        self.assertEqual(first_statement.targets[0].id, "completed")
+        self.assertIs(first_statement.value, subprocess_run_call)
+        command_loads = tuple(
+            node
+            for node in ast.walk(run_json_function)
+            if isinstance(node, ast.Name)
+            and node.id == "command"
+            and isinstance(node.ctx, ast.Load)
+        )
+        self.assertEqual(
+            command_loads,
+            (subprocess_run_call.args[0],),
+            "_run_json must pass its untouched command parameter exactly once",
+        )
+        command_writes = tuple(
+            node
+            for node in ast.walk(run_json_function)
+            if isinstance(node, ast.Name)
+            and node.id == "command"
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+        )
+        self.assertFalse(
+            command_writes,
+            "_run_json cannot rebind or mutate its command parameter",
+        )
+        indirect_command_namespace_access = tuple(
+            node
+            for node in ast.walk(run_json_function)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in {"globals", "locals", "vars"}
+        )
+        self.assertFalse(
+            indirect_command_namespace_access,
+            "_run_json cannot access command through a dynamic namespace",
+        )
+        dispatcher_or_subprocess_writes = tuple(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+            and node.id in {"_run_json", "subprocess"}
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+        )
+        self.assertFalse(
+            dispatcher_or_subprocess_writes,
+            "the dispatcher and subprocess binding are immutable",
+        )
         stage_dispatches = tuple(
             node
             for node in ast.walk(tree)
@@ -553,7 +717,18 @@ class H2D2FreezeContractTests(unittest.TestCase):
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id in {"__import__", "compile", "eval", "exec"}
+            and node.func.id in {
+                "__import__",
+                "compile",
+                "delattr",
+                "eval",
+                "exec",
+                "getattr",
+                "globals",
+                "locals",
+                "setattr",
+                "vars",
+            }
         }
         self.assertFalse(
             dynamic_calls,
@@ -576,7 +751,10 @@ class H2D2FreezeContractTests(unittest.TestCase):
             )
             or (
                 isinstance(node, ast.Attribute)
-                and node.attr in {"__builtins__", "__import__"}
+                and node.attr in (
+                    {"__builtins__", "__import__"}
+                    | DANGEROUS_INTROSPECTION_ATTRIBUTES
+                )
             )
             or (
                 isinstance(node, ast.Constant)
@@ -677,28 +855,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
                         if any(alias.name == "*" for alias in node.names):
                             star_imports.add(node.module or ".")
                 self.assertFalse(
-                    imported_roots.intersection({
-                        "_imp",
-                        "_posixsubprocess",
-                        "_thread",
-                        "asyncio",
-                        "builtins",
-                        "concurrent",
-                        "ctypes",
-                        "dask",
-                        "importlib",
-                        "joblib",
-                        "multiprocessing",
-                        "nt",
-                        "pkgutil",
-                        "posix",
-                        "pty",
-                        "queue",
-                        "ray",
-                        "runpy",
-                        "threading",
-                        "zipimport",
-                    }),
+                    imported_roots.intersection(FORBIDDEN_STAGE_IMPORT_ROOTS),
                     f"parallel package imported by {relative_path}",
                 )
                 self.assertFalse(
@@ -708,11 +865,22 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 direct_process_imports = {
                     item
                     for item in direct_imports
-                    if item[0].split(".")[0] in {"os", "subprocess", "sys"}
+                    if (
+                        is_sensitive_import_name(item[0])
+                        or is_sensitive_import_name(item[1])
+                    )
                 }
                 self.assertFalse(
                     direct_process_imports,
                     f"direct process import in {relative_path}",
+                )
+                reexported_process_modules = sensitive_module_reexports(
+                    tree,
+                    module_aliases,
+                )
+                self.assertFalse(
+                    reexported_process_modules,
+                    f"process module re-export in {relative_path}",
                 )
                 async_nodes = tuple(
                     node
@@ -731,12 +899,52 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     for node in ast.walk(tree)
                     if isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Name)
-                    and node.func.id in {"__import__", "compile", "eval", "exec"}
+                    and (
+                        node.func.id in {
+                            "__import__", "compile", "eval", "exec", "globals", "locals",
+                        }
+                        or (node.func.id == "vars" and not node.args)
+                    )
                 }
                 self.assertFalse(
                     dynamic_calls,
                     f"dynamic execution in {relative_path}: {dynamic_calls}",
                 )
+                introspection_calls = tuple(
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"delattr", "getattr", "setattr", "vars"}
+                )
+                self.assertEqual(
+                    len(introspection_calls),
+                    EXPECTED_INTROSPECTION_CALL_COUNTS.get(relative_path, 0),
+                    f"introspection call drift in {relative_path}",
+                )
+                for call in introspection_calls:
+                    self.assertFalse(call.keywords)
+                    if call.func.id == "vars":
+                        self.assertEqual(relative_path, "quant/v9_v4a_evidence.py")
+                        self.assertEqual(len(call.args), 1)
+                        self.assertIsInstance(call.args[0], ast.Name)
+                        self.assertEqual(call.args[0].id, "value")
+                        continue
+                    self.assertEqual(call.func.id, "getattr")
+                    self.assertIn(len(call.args), {2, 3})
+                    attribute_name = call.args[1]
+                    if isinstance(attribute_name, ast.Constant):
+                        self.assertIsInstance(attribute_name.value, str)
+                        self.assertNotIn(
+                            attribute_name.value,
+                            DANGEROUS_INTROSPECTION_ATTRIBUTES,
+                        )
+                    else:
+                        self.assertIsInstance(attribute_name, ast.Name)
+                        self.assertIn(
+                            attribute_name.id,
+                            ALLOWED_DYNAMIC_GETATTR_NAMES.get(relative_path, set()),
+                        )
                 dangerous_builtin_names = {
                     "__builtins__",
                     "__import__",
@@ -754,7 +962,10 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     )
                     or (
                         isinstance(node, ast.Attribute)
-                        and node.attr in {"__builtins__", "__import__"}
+                        and node.attr in (
+                            {"__builtins__", "__import__"}
+                            | DANGEROUS_INTROSPECTION_ATTRIBUTES
+                        )
                     )
                     or (
                         isinstance(node, ast.Constant)
@@ -801,21 +1012,15 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     for node in ast.walk(tree)
                     if isinstance(node, ast.Name)
                     and isinstance(node.ctx, ast.Load)
-                    and module_aliases.get(node.id) in {
-                        "os",
-                        "subprocess",
-                        "sys",
-                    }
+                    and node.id in module_aliases
                     and not (
                         isinstance(parents.get(node), ast.Attribute)
                         and parents[node].value is node
-                        and (module_aliases[node.id], parents[node].attr)
-                        in allowed_references
                     )
                 )
                 self.assertFalse(
                     bare_module_loads,
-                    f"bare process module load in {relative_path}",
+                    f"imported module object escapes in {relative_path}",
                 )
                 dynamic_module_access = tuple(
                     node
@@ -911,9 +1116,31 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "exactly two worker processes",
             "non-transaction-pooled control connection",
             "`SELECT pg_try_advisory_lock(8098937340306602170)` exactly once",
-            "`SELECT pg_backend_pid()` at an interval of at most five seconds",
-            "immediate termination and collection of both worker processes",
-            "`SELECT pg_advisory_unlock(8098937340306602170)` exactly once",
+            "`pg_try_advisory_lock(-5133988379539764595)` for `2026-06-15`",
+            "`pg_try_advisory_lock(8459531074882316998)` for `2026-07-22`",
+            "exactly two claim-only date guardians outside",
+            "`cgroup.freeze`, `cgroup.kill`",
+            "`cgroup.events` reports `populated 0`",
+            "opens a `pidfd` for the exact coordinator OS PID",
+            "generation record is independent of PostgreSQL sessions",
+            "`CLAIMING`, `ACTIVE`, `CLEANING`, or unknown state blocks replacement",
+            "atomically compare-and-swaps that exact attested `CLEAN` version",
+            "every later transition is conditional on the exact predecessor version and generation",
+            "`pg_try_advisory_lock_shared`",
+            "Both claim receipts are required before either guardian may create its single worker",
+            "`SELECT pg_backend_pid()`",
+            "at an interval of at most five seconds",
+            "reap its worker",
+            "A parent-death signal or process-group kill alone is not accepted",
+            "After reaping the guardian and independently reproving `populated 0`",
+            "Every replacement must repeat both supervisor checks in step 4",
+            "release `8098937340306602170` exactly once in `finally`",
+            "database restart or failover drops all three advisory-lock sessions",
+            "restart or fail over PostgreSQL so all three advisory-lock sessions drop",
+            "two-coordinator failover race test",
+            "only one generation to obtain both supervisor claims",
+            "zero surviving descendant PIDs",
+            "any old/new generation overlap permanently fails H2-D-3",
             "Every stage receipt must return the claimed historical date and run ID",
             "outcome_count = frame_count × 6",
             "canonical SHA-256 over all 72 metric objects",
