@@ -202,7 +202,12 @@ class _UrlLibHttp:
                 return _UrlLibResponse(response.status, body)
         except HTTPError as error:
             # Never read or retain an error body; it may contain credentials.
-            return _UrlLibResponse(error.code, b"")
+            status_code = error.code
+            try:
+                error.close()
+            except Exception:
+                pass
+            return _UrlLibResponse(status_code, b"")
 
 
 def _json_string_end(text: str, start: int) -> int:
@@ -220,6 +225,43 @@ def _json_string_end(text: str, start: int) -> int:
     raise SchwabProtocolError("schwab_invalid_json")
 
 
+def _json_container_close(
+    stack: list[str], character: str, index: int,
+) -> int | None:
+    if character != stack.pop():
+        raise SchwabProtocolError("schwab_invalid_json")
+    if stack:
+        return None
+    return index + 1
+
+
+def _json_container_end(text: str, start: int) -> int:
+    stack = ["]" if text[start] == "[" else "}"]
+    index = start + 1
+    while index < len(text):
+        character = text[index]
+        if character == '"':
+            index = _json_string_end(text, index)
+            continue
+        if character in "[{":
+            stack.append("]" if character == "[" else "}")
+        elif character in "]}":
+            end = _json_container_close(stack, character, index)
+            if end is not None:
+                return end
+        index += 1
+    raise SchwabProtocolError("schwab_invalid_json")
+
+
+def _json_scalar_end(text: str, start: int) -> int:
+    index = start
+    while index < len(text) and text[index] not in ",}]":
+        index += 1
+    if not text[start:index].strip():
+        raise SchwabProtocolError("schwab_invalid_json")
+    return index
+
+
 def _json_value_end(text: str, start: int) -> int:
     if start >= len(text):
         raise SchwabProtocolError("schwab_invalid_json")
@@ -227,28 +269,8 @@ def _json_value_end(text: str, start: int) -> int:
     if first == '"':
         return _json_string_end(text, start)
     if first in "[{":
-        stack = ["]" if first == "[" else "}"]
-        index = start + 1
-        while index < len(text):
-            character = text[index]
-            if character == '"':
-                index = _json_string_end(text, index)
-                continue
-            if character in "[{":
-                stack.append("]" if character == "[" else "}")
-            elif character in "]}":
-                if not stack or character != stack.pop():
-                    raise SchwabProtocolError("schwab_invalid_json")
-                if not stack:
-                    return index + 1
-            index += 1
-        raise SchwabProtocolError("schwab_invalid_json")
-    index = start
-    while index < len(text) and text[index] not in ",}]":
-        index += 1
-    if not text[start:index].strip():
-        raise SchwabProtocolError("schwab_invalid_json")
-    return index
+        return _json_container_end(text, start)
+    return _json_scalar_end(text, start)
 
 
 def _skip_json_space(text: str, index: int) -> int:
@@ -303,9 +325,7 @@ def _json_array_values(text: str, start: int):
         raise SchwabProtocolError("schwab_invalid_json")
 
 
-def _select_streamer_info_json(body: bytes) -> Mapping[str, str]:
-    """Decode only the five frozen strings, lexically skipping every other value."""
-
+def _decode_json_document(body: bytes) -> tuple[str, int]:
     try:
         text = body.decode("utf-8")
     except UnicodeError:
@@ -314,7 +334,10 @@ def _select_streamer_info_json(body: bytes) -> Mapping[str, str]:
     root_end = _json_value_end(text, root_start)
     if _skip_json_space(text, root_end) != len(text):
         raise SchwabProtocolError("schwab_invalid_json")
+    return text, root_start
 
+
+def _streamer_info_slice(text: str, root_start: int) -> tuple[int, int]:
     streamer_slice: tuple[int, int] | None = None
     for raw_key, value_start, value_end in _json_object_members(text, root_start):
         if raw_key == '"streamerInfo"':
@@ -323,17 +346,23 @@ def _select_streamer_info_json(body: bytes) -> Mapping[str, str]:
             streamer_slice = (value_start, value_end)
     if streamer_slice is None:
         raise SchwabProtocolError("schwab_streamer_info_invalid")
+    return streamer_slice
 
+
+def _first_streamer_info_slice(text: str, array_start: int) -> tuple[int, int]:
     first_info: tuple[int, int] | None = None
-    for position, item_slice in enumerate(_json_array_values(text, streamer_slice[0])):
+    for position, item_slice in enumerate(_json_array_values(text, array_start)):
         if position == 0:
             first_info = item_slice
     if first_info is None or text[first_info[0]] != "{":
         raise SchwabProtocolError("schwab_streamer_info_invalid")
+    return first_info
 
+
+def _decode_streamer_info_fields(text: str, object_start: int) -> dict[str, str]:
     wanted = {json.dumps(field): field for field in _STREAMER_INFO_FIELDS}
     selected: dict[str, str] = {}
-    for raw_key, value_start, value_end in _json_object_members(text, first_info[0]):
+    for raw_key, value_start, value_end in _json_object_members(text, object_start):
         field_name = wanted.get(raw_key)
         if field_name is None:
             continue
@@ -349,6 +378,15 @@ def _select_streamer_info_json(body: bytes) -> Mapping[str, str]:
     if set(selected) != set(_STREAMER_INFO_FIELDS):
         raise SchwabProtocolError("schwab_streamer_info_invalid")
     return selected
+
+
+def _select_streamer_info_json(body: bytes) -> Mapping[str, str]:
+    """Decode only the five frozen strings, lexically skipping every other value."""
+
+    text, root_start = _decode_json_document(body)
+    streamer_slice = _streamer_info_slice(text, root_start)
+    first_info = _first_streamer_info_slice(text, streamer_slice[0])
+    return _decode_streamer_info_fields(text, first_info[0])
 
 
 def _require_https_url(value: str, *, callback: bool = False) -> str:
@@ -777,16 +815,22 @@ def validate_command_ack(
         raise SchwabProtocolError("schwab_stream_ack_invalid")
     row = rows[0]
     content = row.get("content")
+    code_value = content.get("code") if isinstance(content, Mapping) else None
     if (
         str(row.get("requestid")) != str(request_id)
         or str(row.get("service") or "").upper() != service
         or str(row.get("command") or "").upper() != command
         or not isinstance(content, Mapping)
-        or isinstance(content.get("code"), bool)
+        or isinstance(code_value, bool)
+        or not isinstance(code_value, (int, float, str))
+    ):
+        raise SchwabProtocolError("schwab_stream_ack_invalid")
+    if isinstance(code_value, float) and (
+        not math.isfinite(code_value) or not code_value.is_integer()
     ):
         raise SchwabProtocolError("schwab_stream_ack_invalid")
     try:
-        code = int(content.get("code"))
+        code = int(code_value)
     except (TypeError, ValueError):
         raise SchwabProtocolError("schwab_stream_ack_invalid") from None
     if code != 0:
@@ -808,6 +852,27 @@ def _decode_stream_message(raw: Any) -> Mapping[str, Any]:
     if not isinstance(payload, Mapping):
         raise SchwabProtocolError("schwab_stream_message_invalid")
     return payload
+
+
+def _level2_row_contents(row: object):
+    if not isinstance(row, Mapping):
+        return
+    if str(row.get("service") or "").upper() != LEVEL2_SERVICE:
+        return
+    content_rows = row.get("content")
+    if not isinstance(content_rows, list):
+        return
+    for content in content_rows:
+        if isinstance(content, Mapping):
+            yield content
+
+
+def _level2_contents(message: Mapping[str, Any]):
+    data_rows = message.get("data")
+    if not isinstance(data_rows, list):
+        return
+    for row in data_rows:
+        yield from _level2_row_contents(row)
 
 
 def _is_timeout(error: Exception) -> bool:
@@ -900,72 +965,95 @@ class SchwabMarketWorker:
 
     def run(self) -> bool:
         self._set_status("STARTING", "NONE")
-        try:
-            acquired = bool(self._lease.acquire(self._owner_token, self._lease_ttl))
-        except Exception:
-            acquired = False
-        if not acquired:
+        if not self._acquire_lease():
             self._set_status("STOPPED", "LEASE_UNAVAILABLE")
             return False
 
         try:
-            with self._lease_lock:
-                self._owned = True
-                self._next_renewal = float(self._clock()) + self._lease_renew_interval
-            self._start_ndx_loop()
-            backoff = self._reconnect_min
-            while not self._stop_event.is_set() and self._owned_now():
-                try:
-                    self._renew_if_due(force=True)
-                    self._connect_and_stream()
-                    backoff = self._reconnect_min
-                except SchwabLeaseLost:
-                    self._set_status("LEASE_LOST", "LEASE_RENEWAL_FAILED")
-                    break
-                except _WorkerStopped:
-                    break
-                except SchwabAuthorizationError:
-                    if not self._set_reconnecting_if_owned("AUTHORIZATION_UNAVAILABLE"):
-                        self._set_status("LEASE_LOST", "LEASE_RENEWAL_FAILED")
-                        break
-                except SchwabProtocolError:
-                    if not self._set_reconnecting_if_owned("PROTOCOL_REJECTED"):
-                        self._set_status("LEASE_LOST", "LEASE_RENEWAL_FAILED")
-                        break
-                except Exception:
-                    if not self._set_reconnecting_if_owned("TRANSPORT_UNAVAILABLE"):
-                        self._set_status("LEASE_LOST", "LEASE_RENEWAL_FAILED")
-                        break
-                finally:
-                    self._close_socket()
-
-                if self._stop_event.is_set() or not self._owned_now():
-                    break
-                try:
-                    self._renew_if_due(force=True)
-                except SchwabLeaseLost:
-                    self._set_status("LEASE_LOST", "LEASE_RENEWAL_FAILED")
-                    break
-                if self._stop_event.wait(backoff):
-                    break
-                backoff = min(self._reconnect_max, max(self._reconnect_min, backoff * 2.0))
+            self._begin_owned_run()
+            self._run_stream_loop()
         finally:
-            self._close_socket()
-            with self._lease_lock:
-                release_owned = self._owned
-                self._owned = False
-                lease_lost = self._lease_lost
-            if release_owned:
-                try:
-                    self._lease.release(self._owner_token)
-                except Exception:
-                    pass
+            lease_lost = self._release_owned_lease()
 
         if lease_lost:
             self._set_status("LEASE_LOST", "LEASE_RENEWAL_FAILED")
             return False
         self._set_status("STOPPED", "STOP_REQUESTED")
         return True
+
+    def _acquire_lease(self) -> bool:
+        try:
+            return bool(self._lease.acquire(self._owner_token, self._lease_ttl))
+        except Exception:
+            return False
+
+    def _begin_owned_run(self) -> None:
+        with self._lease_lock:
+            self._owned = True
+            self._next_renewal = float(self._clock()) + self._lease_renew_interval
+        self._start_ndx_loop()
+
+    def _run_stream_loop(self) -> None:
+        backoff = self._reconnect_min
+        while not self._stop_event.is_set() and self._owned_now():
+            keep_running, reset_backoff = self._run_stream_cycle()
+            if reset_backoff:
+                backoff = self._reconnect_min
+            if not keep_running or not self._wait_before_reconnect(backoff):
+                break
+            backoff = min(
+                self._reconnect_max,
+                max(self._reconnect_min, backoff * 2.0),
+            )
+
+    def _run_stream_cycle(self) -> tuple[bool, bool]:
+        try:
+            self._renew_if_due(force=True)
+            self._connect_and_stream()
+            outcome = (True, True)
+        except SchwabLeaseLost:
+            self._set_status("LEASE_LOST", "LEASE_RENEWAL_FAILED")
+            outcome = (False, False)
+        except _WorkerStopped:
+            outcome = (False, False)
+        except SchwabAuthorizationError:
+            outcome = self._handle_stream_failure("AUTHORIZATION_UNAVAILABLE")
+        except SchwabProtocolError:
+            outcome = self._handle_stream_failure("PROTOCOL_REJECTED")
+        except Exception:
+            outcome = self._handle_stream_failure("TRANSPORT_UNAVAILABLE")
+        finally:
+            self._close_socket()
+        return outcome
+
+    def _handle_stream_failure(self, reason: str) -> tuple[bool, bool]:
+        if self._set_reconnecting_if_owned(reason):
+            return True, False
+        self._set_status("LEASE_LOST", "LEASE_RENEWAL_FAILED")
+        return False, False
+
+    def _wait_before_reconnect(self, backoff: float) -> bool:
+        if self._stop_event.is_set() or not self._owned_now():
+            return False
+        try:
+            self._renew_if_due(force=True)
+        except SchwabLeaseLost:
+            self._set_status("LEASE_LOST", "LEASE_RENEWAL_FAILED")
+            return False
+        return not self._stop_event.wait(backoff)
+
+    def _release_owned_lease(self) -> bool:
+        self._close_socket()
+        with self._lease_lock:
+            release_owned = self._owned
+            self._owned = False
+            lease_lost = self._lease_lost
+        if release_owned:
+            try:
+                self._lease.release(self._owner_token)
+            except Exception:
+                pass
+        return lease_lost
 
     def _set_status(self, status: str, reason: str) -> None:
         if status not in _SAFE_STATUSES or reason not in _SAFE_REASONS:
@@ -1124,7 +1212,12 @@ class SchwabMarketWorker:
                 separators=(",", ":"),
             )
         )
-        self._await_ack(request_id="0", service="ADMIN", command="LOGIN")
+        self._await_ack(
+            stream,
+            request_id="0",
+            service="ADMIN",
+            command="LOGIN",
+        )
         self._send_with_lease(
             stream,
             json.dumps(
@@ -1135,7 +1228,12 @@ class SchwabMarketWorker:
                 separators=(",", ":"),
             )
         )
-        self._await_ack(request_id="2", service=LEVEL2_SERVICE, command="SUBS")
+        self._await_ack(
+            stream,
+            request_id="2",
+            service=LEVEL2_SERVICE,
+            command="SUBS",
+        )
         self._set_status("STREAMING", "NONE")
 
         while not self._stop_event.is_set():
@@ -1150,13 +1248,20 @@ class SchwabMarketWorker:
             message = _decode_stream_message(raw)
             self._publish_book_rows(message)
 
-    def _await_ack(self, *, request_id: str, service: str, command: str) -> None:
+    def _await_ack(
+        self,
+        stream: Any,
+        *,
+        request_id: str,
+        service: str,
+        command: str,
+    ) -> None:
         for _ in range(64):
             if self._stop_event.is_set():
                 raise SchwabTransportError("schwab_stream_stopped")
             self._renew_if_due()
             try:
-                message = _decode_stream_message(self._active_socket.recv())
+                message = _decode_stream_message(stream.recv())
             except Exception as error:
                 if _is_timeout(error):
                     self._renew_if_due(force=True)
@@ -1176,30 +1281,20 @@ class SchwabMarketWorker:
         raise SchwabProtocolError("schwab_stream_ack_timeout")
 
     def _publish_book_rows(self, message: Mapping[str, Any]) -> None:
-        data_rows = message.get("data")
-        if not isinstance(data_rows, list):
+        for content in _level2_contents(message):
+            self._publish_book_content(content)
+
+    def _publish_book_content(self, content: Mapping[str, Any]) -> None:
+        try:
+            snapshot = schwab_market_bus.normalize_nasdaq_book(
+                content,
+                received_at_epoch=float(self._clock()),
+            )
+            self._publish_with_lease(self._bus.publish_book, snapshot)
+        except SchwabLeaseLost:
+            raise
+        except Exception:
             return
-        for row in data_rows:
-            if not isinstance(row, Mapping):
-                continue
-            if str(row.get("service") or "").upper() != LEVEL2_SERVICE:
-                continue
-            content_rows = row.get("content")
-            if not isinstance(content_rows, list):
-                continue
-            for content in content_rows:
-                if not isinstance(content, Mapping):
-                    continue
-                try:
-                    snapshot = schwab_market_bus.normalize_nasdaq_book(
-                        content,
-                        received_at_epoch=float(self._clock()),
-                    )
-                    self._publish_with_lease(self._bus.publish_book, snapshot)
-                except SchwabLeaseLost:
-                    raise
-                except Exception:
-                    continue
 
     def _close_socket(self) -> None:
         with self._socket_lock:

@@ -686,12 +686,25 @@ class OAuthBoundaryTests(unittest.TestCase):
             with self.assertRaises(SchwabProtocolError):
                 _UrlLibHttp().request("GET", "https://example.test")
 
+        class ErrorBody:
+            def __init__(self) -> None:
+                self.closed = False
+                self.read_calls = 0
+
+            def read(self, *_args: object) -> bytes:
+                self.read_calls += 1
+                return b"secret-error-body"
+
+            def close(self) -> None:
+                self.closed = True
+
+        error_body = ErrorBody()
         redirect = HTTPError(
             "https://example.test",
             307,
             "redirect rejected",
             None,
-            None,
+            error_body,
         )
         with patch(
             "quant.schwab_market_worker.build_opener",
@@ -700,6 +713,8 @@ class OAuthBoundaryTests(unittest.TestCase):
             rejected = _UrlLibHttp().request("GET", "https://example.test")
         self.assertEqual(rejected.status_code, 307)
         self.assertEqual(rejected._body, b"")
+        self.assertTrue(error_body.closed)
+        self.assertEqual(error_body.read_calls, 0)
 
     def test_stream_protocol_rejects_invalid_ack_and_frames(self) -> None:
         valid_ack = {
@@ -747,6 +762,26 @@ class OAuthBoundaryTests(unittest.TestCase):
                         "service": "ADMIN",
                         "command": "LOGIN",
                         "content": {"code": "bad"},
+                    }
+                ]
+            },
+            {
+                "response": [
+                    {
+                        "requestid": "0",
+                        "service": "ADMIN",
+                        "command": "LOGIN",
+                        "content": {"code": 0.5},
+                    }
+                ]
+            },
+            {
+                "response": [
+                    {
+                        "requestid": "0",
+                        "service": "ADMIN",
+                        "command": "LOGIN",
+                        "content": {"code": float("inf")},
                     }
                 ]
             },
@@ -1013,6 +1048,32 @@ class StoppingEvent:
 
 
 class WorkerLeaseAndStreamTests(unittest.TestCase):
+    def test_ack_uses_pinned_stream_after_active_slot_is_cleared(self) -> None:
+        clock = MutableClock(1_700_000_001.0)
+        worker = SchwabMarketWorker(
+            bus=FakeBus(),
+            oauth=FakeOAuth(),
+            lease=ScriptedLease(),
+            websocket_factory=SocketFactory(error=AssertionError("unused")),
+            stop_event=threading.Event(),
+            clock=clock,
+            owner_token="owner-one",
+        )
+        pinned_stream = ScriptedSocket((ack("ADMIN", "LOGIN", "0"),))
+        with worker._lease_lock:
+            worker._owned = True
+            worker._next_renewal = clock.now + 15.0
+        worker._active_socket = None
+
+        worker._await_ack(
+            pinned_stream,
+            request_id="0",
+            service="ADMIN",
+            command="LOGIN",
+        )
+
+        self.assertEqual(list(pinned_stream.frames), [])
+
     def test_clock_failure_after_acquire_releases_once_and_clears_ownership(self) -> None:
         class FailingClock:
             def __call__(self) -> float:

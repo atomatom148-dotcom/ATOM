@@ -96,7 +96,10 @@ class TransientSink(Protocol):
 def _number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError:
+        return None
     return result if math.isfinite(result) else None
 
 

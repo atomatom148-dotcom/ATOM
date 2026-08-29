@@ -199,6 +199,7 @@ class SchwabMarketNormalizationTests(unittest.TestCase):
             ndx_payload(last=-1.0, mark=None, bid=None, ask=None),
             ndx_payload(last=math.nan, mark=None, bid=None, ask=None),
             ndx_payload(last=math.inf, mark=None, bid=None, ask=None),
+            ndx_payload(last=10**400, mark=None, bid=None, ask=None),
             ndx_payload(
                 trade_ms=True,
                 mark=None,
