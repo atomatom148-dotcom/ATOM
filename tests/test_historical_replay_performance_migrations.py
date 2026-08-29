@@ -5,7 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 STATS_MIGRATION = ROOT / "supabase" / "migrations" / (
-    "20260829124422_tune_historical_replay_statistics.sql"
+    "20260829125932_tune_historical_replay_statistics.sql"
 )
 INDEX_MIGRATION = ROOT / "migrations" / (
     "025_index_historical_replay_scoring.sql"
