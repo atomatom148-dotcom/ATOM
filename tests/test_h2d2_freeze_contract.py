@@ -152,9 +152,13 @@ def reject_duplicate_json_object_pairs(
 
 def is_sensitive_import_name(name: str) -> bool:
     root = name.split(".")[0]
+    leaf = name.rsplit(".", 1)[-1]
     return (
         root in SENSITIVE_MODULE_ROOTS
         or root.lstrip("_") in SENSITIVE_MODULE_ROOTS
+        or leaf.lstrip("_").startswith(("Thread", "Fork", "Process"))
+        or leaf.lstrip("_") == "Pool"
+        or leaf.lstrip("_").endswith(("Pool", "Executor"))
     )
 
 
@@ -213,12 +217,159 @@ def sensitive_module_reexports(
 ) -> tuple[ast.AST, ...]:
     tracked_bindings = set(module_aliases)
 
+    local_callables: dict[
+        str,
+        list[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda],
+    ] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            local_callables.setdefault(node.name, []).append(node)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            value = node.value
+            if not isinstance(value, ast.Lambda):
+                continue
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    local_callables.setdefault(target.id, []).append(value)
+
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    callable_nodes = {
+        local_callable
+        for definitions in local_callables.values()
+        for local_callable in definitions
+    } | {
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Lambda)
+    }
+
+    def local_call_targets(
+            call: ast.Call,
+    ) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda, ...]:
+        if isinstance(call.func, ast.Name):
+            return tuple(local_callables.get(call.func.id, ()))
+        if isinstance(call.func, ast.Lambda):
+            return (call.func,)
+        return ()
+
+    def enclosing_callable(node: ast.AST) -> ast.AST | None:
+        parent = parents.get(node)
+        while parent is not None and parent not in callable_nodes:
+            parent = parents.get(parent)
+        return parent
+
+    callable_parents = {
+        local_callable: enclosing_callable(local_callable)
+        for local_callable in callable_nodes
+    }
+    scoped_tracked_bindings = {
+        local_callable: set()
+        for local_callable in callable_nodes
+    }
+    tracked_return_callables: set[ast.AST] = set()
+
     def target_names(node: ast.AST) -> set[str]:
         if isinstance(node, ast.Name):
             return {node.id}
         if isinstance(node, (ast.List, ast.Tuple)):
             return set().union(*(target_names(item) for item in node.elts))
         return set()
+
+    def contains_tracked_binding(
+            node: ast.AST,
+            scope: ast.AST | None = None,
+    ) -> bool:
+        active_bindings = set(tracked_bindings)
+        while scope is not None:
+            active_bindings.update(scoped_tracked_bindings[scope])
+            scope = callable_parents[scope]
+        return any(
+            isinstance(item, ast.Name)
+            and isinstance(item.ctx, ast.Load)
+            and item.id in active_bindings
+            for item in ast.walk(node)
+        )
+
+    def contains_passed_tracked_binding(
+            node: ast.AST,
+            scope: ast.AST | None,
+    ) -> bool:
+        callable_references = {
+            item
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            for item in ast.walk(call.func)
+        }
+        active_bindings = set(tracked_bindings)
+        while scope is not None:
+            active_bindings.update(scoped_tracked_bindings[scope])
+            scope = callable_parents[scope]
+        return any(
+            isinstance(item, ast.Name)
+            and isinstance(item.ctx, ast.Load)
+            and item.id in active_bindings
+            and item not in callable_references
+            for item in ast.walk(node)
+        )
+
+    def contains_assignment_tracked_binding(
+            node: ast.AST,
+            scope: ast.AST | None,
+    ) -> bool:
+        direct_local_return = (
+            isinstance(node, ast.Call)
+            and any(
+                local_callable in tracked_return_callables
+                for local_callable in local_call_targets(node)
+            )
+        )
+        return direct_local_return or (
+            not any(isinstance(item, ast.Call) for item in ast.walk(node))
+            and contains_tracked_binding(node, scope)
+        )
+
+    def callable_parameter_bindings(
+            node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    ) -> tuple[
+        list[ast.arg],
+        dict[str, ast.arg],
+        ast.arg | None,
+        ast.arg | None,
+        tuple[tuple[ast.arg, ast.expr], ...],
+    ]:
+        arguments = node.args
+        positional = arguments.posonlyargs + arguments.args
+        named = {
+            argument.arg: argument
+            for argument in positional + arguments.kwonlyargs
+        }
+        defaults = tuple(zip(
+            positional[-len(arguments.defaults):],
+            arguments.defaults,
+        )) if arguments.defaults else ()
+        defaults += tuple(
+            (argument, default)
+            for argument, default in zip(
+                arguments.kwonlyargs,
+                arguments.kw_defaults,
+            )
+            if default is not None
+        )
+        return (
+            positional,
+            named,
+            arguments.vararg,
+            arguments.kwarg,
+            defaults,
+        )
 
     changed = True
     while changed:
@@ -237,33 +388,111 @@ def sensitive_module_reexports(
                 targets = [node.target]
             if (
                 value is None
-                or any(isinstance(item, ast.Call) for item in ast.walk(value))
-                or not any(
-                    isinstance(item, ast.Name)
-                    and isinstance(item.ctx, ast.Load)
-                    and item.id in tracked_bindings
-                    for item in ast.walk(value)
+                or not contains_assignment_tracked_binding(
+                    value,
+                    enclosing_callable(node),
                 )
             ):
                 continue
             new_names = set().union(*(target_names(target) for target in targets))
-            if not new_names.issubset(tracked_bindings):
-                tracked_bindings.update(new_names)
+            scope = enclosing_callable(node)
+            scope_bindings = (
+                tracked_bindings
+                if scope is None
+                else scoped_tracked_bindings[scope]
+            )
+            if not new_names.issubset(scope_bindings):
+                scope_bindings.update(new_names)
                 changed = True
 
-    def contains_tracked_binding(node: ast.AST) -> bool:
-        return any(
-            isinstance(item, ast.Name)
-            and isinstance(item.ctx, ast.Load)
-            and item.id in tracked_bindings
-            for item in ast.walk(node)
-        )
+        for call in (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and local_call_targets(node)
+        ):
+            for local_callable in local_call_targets(call):
+                (
+                    positional,
+                    named,
+                    vararg,
+                    kwarg,
+                    defaults,
+                ) = callable_parameter_bindings(local_callable)
+                newly_tracked = {
+                    parameter.arg
+                    for parameter, default in defaults
+                    if contains_passed_tracked_binding(
+                        default,
+                        callable_parents[local_callable],
+                    )
+                }
+                for index, argument in enumerate(call.args):
+                    if not contains_passed_tracked_binding(
+                        argument,
+                        enclosing_callable(call),
+                    ):
+                        continue
+                    if isinstance(argument, ast.Starred):
+                        newly_tracked.update(
+                            parameter.arg for parameter in positional
+                        )
+                        if vararg is not None:
+                            newly_tracked.add(vararg.arg)
+                    elif index < len(positional):
+                        newly_tracked.add(positional[index].arg)
+                    elif vararg is not None:
+                        newly_tracked.add(vararg.arg)
+                for keyword in call.keywords:
+                    if not contains_passed_tracked_binding(
+                        keyword.value,
+                        enclosing_callable(call),
+                    ):
+                        continue
+                    if keyword.arg is None:
+                        newly_tracked.update(named)
+                        if kwarg is not None:
+                            newly_tracked.add(kwarg.arg)
+                    elif keyword.arg in named:
+                        newly_tracked.add(named[keyword.arg].arg)
+                    elif kwarg is not None:
+                        newly_tracked.add(kwarg.arg)
+                local_bindings = scoped_tracked_bindings[local_callable]
+                if not newly_tracked.issubset(local_bindings):
+                    local_bindings.update(newly_tracked)
+                    changed = True
+
+        for local_callable in callable_nodes:
+            if isinstance(local_callable, ast.Lambda):
+                returned_values = (local_callable.body,)
+            else:
+                returned_values = tuple(
+                    node.value
+                    for node in ast.walk(local_callable)
+                    if isinstance(node, ast.Return)
+                    and node.value is not None
+                    and enclosing_callable(node) is local_callable
+                )
+            if (
+                local_callable not in tracked_return_callables
+                and any(
+                    contains_assignment_tracked_binding(
+                        returned_value,
+                        local_callable,
+                    )
+                    for returned_value in returned_values
+                )
+            ):
+                tracked_return_callables.add(local_callable)
+                changed = True
 
     findings = []
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Attribute)
-            and contains_tracked_binding(node.value)
+            and contains_tracked_binding(
+                node.value,
+                enclosing_callable(node),
+            )
             and (
                 is_sensitive_import_name(node.attr)
                 or node.attr.startswith("_")
@@ -275,7 +504,10 @@ def sensitive_module_reexports(
             and isinstance(node.func, ast.Name)
             and node.func.id in {"delattr", "getattr", "setattr", "vars"}
             and node.args
-            and contains_tracked_binding(node.args[0])
+            and contains_tracked_binding(
+                node.args[0],
+                enclosing_callable(node),
+            )
         ):
             findings.append(node)
     return tuple(findings)
@@ -289,17 +521,118 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 object_pairs_hook=reject_duplicate_json_object_pairs,
             )
 
-        for source in (
-            "from pathlib import posixpath as p\np.os.fork()\n",
-            "from pathlib import posixpath as p\nq = p\nq.os.fork()\n",
-            "from pathlib import posixpath as p\nq = [p]\nq[0].os.fork()\n",
+        for source, imported_name in (
+            (
+                "from pathlib import posixpath as p\np.os.fork()\n",
+                "pathlib.posixpath",
+            ),
+            (
+                "from pathlib import posixpath as p\nq = p\nq.os.fork()\n",
+                "pathlib.posixpath",
+            ),
+            (
+                "from pathlib import posixpath as p\nq = [p]\nq[0].os.fork()\n",
+                "pathlib.posixpath",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "def invoke(value):\n    value.os.fork()\n"
+                    "invoke(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "def invoke(*, value):\n    value.os.fork()\n"
+                    "invoke(value=p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "def invoke(value=p):\n    value.os.fork()\n"
+                    "invoke()\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "def invoke(*, value=p):\n    value.os.fork()\n"
+                    "invoke()\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "def identity(value):\n    return value\n"
+                    "q = identity(p)\nq.os.fork()\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "(lambda value: value.os.fork())(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
         ):
             with self.subTest(source=source):
                 self.assertTrue(
                     sensitive_module_reexports(
                         ast.parse(source),
-                        {"p": "pathlib.posixpath"},
+                        {"p": imported_name},
                     )
+                )
+
+        for imported_name in (
+            "Thread",
+            "ThreadPoolExecutor",
+            "ThreadingHTTPServer",
+            "ThreadingMixIn",
+            "Fork",
+            "ForkingTCPServer",
+            "ForkingMixIn",
+            "Process",
+            "ProcessPoolExecutor",
+            "Pool",
+            "WorkerPool",
+            "Executor",
+            "CustomExecutor",
+            "http.server.ThreadingHTTPServer",
+            "socketserver.ForkingMixIn",
+        ):
+            with self.subTest(imported_name=imported_name):
+                self.assertTrue(is_sensitive_import_name(imported_name))
+        self.assertFalse(is_sensitive_import_name("http.server"))
+        self.assertFalse(is_sensitive_import_name("PoolsideMetric"))
+
+        for source, bindings in (
+            (
+                "from http import server as s\ns.ThreadingHTTPServer\n",
+                {"s": "http.server"},
+            ),
+            (
+                "import socketserver as s\ns.ForkingMixIn\n",
+                {"s": "socketserver"},
+            ),
+            (
+                "from helpers import runtime as r\nr.ProcessPoolExecutor\n",
+                {"r": "helpers.runtime"},
+            ),
+            (
+                "import executor_tools as e\ne.CustomExecutor\n",
+                {"e": "executor_tools"},
+            ),
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(
+                    sensitive_module_reexports(ast.parse(source), bindings)
                 )
 
     def test_baselines_are_two_read_only_certified_complete_sessions(self):
@@ -742,6 +1075,27 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "H2C_RESOLVE": "quant.historical_outcomes",
             "H2C_SCORE": "quant.historical_outcomes",
         }
+        expected_stage_commands = {
+            "H1": (
+                "[py, '-m', 'quant.historical_replay_h1', day.isoformat(), "
+                "'--run-id', run_id, '--max-interior-gap-seconds', '5', "
+                "'--persist-certified']"
+            ),
+            "H2B": (
+                "[py, '-m', 'quant.historical_evidence_verifier', run_id, "
+                "'--dataset-digest', dataset_digest, '--configuration-digest', "
+                "configuration_digest, '--frame-count', str(frame_count)]"
+            ),
+            "H2C_RESOLVE": (
+                "[py, '-m', 'quant.historical_outcomes', 'resolve-outcomes', "
+                "run_id, '--dataset-digest', dataset_digest, "
+                "'--configuration-digest', configuration_digest, "
+                "'--frame-count', str(frame_count)]"
+            ),
+            "H2C_SCORE": (
+                "[py, '-m', 'quant.historical_outcomes', 'score', run_id]"
+            ),
+        }
         observed_stage_modules = {}
         for dispatch in stage_dispatches:
             self.assertEqual(len(dispatch.args), 2)
@@ -755,6 +1109,16 @@ class H2D2FreezeContractTests(unittest.TestCase):
             self.assertEqual(command.elts[1].value, "-m")
             self.assertIsInstance(command.elts[2], ast.Constant)
             self.assertIsInstance(stage, ast.Constant)
+            self.assertIn(stage.value, expected_stage_commands)
+            expected_command = ast.parse(
+                expected_stage_commands[stage.value],
+                mode="eval",
+            ).body
+            self.assertEqual(
+                ast.dump(command, include_attributes=False),
+                ast.dump(expected_command, include_attributes=False),
+                f"{stage.value} command and selectors must remain exact",
+            )
             observed_stage_modules[stage.value] = command.elts[2].value
         self.assertEqual(observed_stage_modules, expected_stage_modules)
         run_json_loads = tuple(
@@ -891,6 +1255,89 @@ class H2D2FreezeContractTests(unittest.TestCase):
             and node.iter.id == "days"
         )
         self.assertEqual(len(day_loops), 1)
+        day_loop = day_loops[0]
+        execute_function = execute_functions[0]
+        self.assertIn(day_loop, tuple(ast.walk(execute_function)))
+        self.assertIs(
+            parents.get(day_loop),
+            execute_function,
+            "the per-day loop must remain in execute's direct body",
+        )
+        day_tries = tuple(
+            statement
+            for statement in day_loop.body
+            if isinstance(statement, ast.Try)
+        )
+        self.assertEqual(len(day_tries), 1)
+        day_try = day_tries[0]
+        expected_dispatch_order = (
+            "H1",
+            "H2B",
+            "H2C_RESOLVE",
+            "H2C_SCORE",
+        )
+        ordered_dispatches = tuple(
+            sorted(stage_dispatches, key=lambda node: (node.lineno, node.col_offset))
+        )
+        self.assertEqual(
+            tuple(dispatch.args[1].value for dispatch in ordered_dispatches),
+            expected_dispatch_order,
+            "the per-day stage dispatch order is frozen",
+        )
+        expected_result_names = {
+            "H1": "h1",
+            "H2B": "verified",
+            "H2C_RESOLVE": "outcome",
+            "H2C_SCORE": "scoring",
+        }
+        dispatch_carriers = []
+        for dispatch in ordered_dispatches:
+            stage = dispatch.args[1].value
+            assignment = parents.get(dispatch)
+            self.assertIsInstance(
+                assignment,
+                ast.Assign,
+                f"{stage} must remain a direct assignment dispatch",
+            )
+            self.assertIs(assignment.value, dispatch)
+            self.assertEqual(len(assignment.targets), 1)
+            self.assertIsInstance(assignment.targets[0], ast.Name)
+            self.assertEqual(assignment.targets[0].id, expected_result_names[stage])
+            if stage == "H1":
+                known_guard = parents.get(assignment)
+                self.assertIsInstance(known_guard, ast.If)
+                self.assertIn(assignment, known_guard.body)
+                self.assertFalse(known_guard.orelse)
+                self.assertIsInstance(known_guard.test, ast.UnaryOp)
+                self.assertIsInstance(known_guard.test.op, ast.Not)
+                self.assertIsInstance(known_guard.test.operand, ast.Name)
+                self.assertEqual(known_guard.test.operand.id, "known")
+                self.assertIs(parents.get(known_guard), day_try)
+                dispatch_carriers.append(known_guard)
+            else:
+                self.assertIs(
+                    parents.get(assignment),
+                    day_try,
+                    f"{stage} cannot move into a lambda or control-flow branch",
+                )
+                dispatch_carriers.append(assignment)
+        self.assertEqual(
+            tuple(day_try.body.index(carrier) for carrier in dispatch_carriers),
+            tuple(sorted(day_try.body.index(carrier) for carrier in dispatch_carriers)),
+            "stage dispatch carriers must remain in straight-line source order",
+        )
+        self.assertEqual(
+            {
+                node
+                for carrier in dispatch_carriers
+                for node in ast.walk(carrier)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "run_json"
+            },
+            set(stage_dispatches),
+            "no alternate stage dispatch may exist outside the frozen day path",
+        )
         string_constants = {
             node.value for node in ast.walk(tree)
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
