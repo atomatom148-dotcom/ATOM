@@ -21,9 +21,6 @@ SNAPSHOT_TTL_SECONDS = 15
 MAX_TTL_SECONDS = 86_400
 MAX_AGE_SECONDS = 10.0
 
-if not 0 < SNAPSHOT_TTL_SECONDS <= MAX_TTL_SECONDS:
-    raise RuntimeError("Schwab snapshot TTL must be bounded")
-
 
 class MarketDataError(ValueError):
     """Base rejection raised by the isolated market-data boundary."""
