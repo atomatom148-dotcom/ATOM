@@ -235,8 +235,10 @@ def lexical_import_origins(
         *,
         include_from_imports: bool = False,
         propagate_aliases: bool = False,
+        fallback_origins: dict[str, str] | None = None,
 ) -> tuple[dict[ast.AST, ast.AST], object]:
     """Resolve import bindings without leaking aliases across lexical scopes."""
+    fallback_origins = fallback_origins or {}
     parents = {
         child: parent
         for parent in ast.walk(tree)
@@ -442,7 +444,8 @@ def lexical_import_origins(
                 return frozenset(import_origins[scope].get(node.id, ()))
             parent = scope_parents[scope]
             if parent is None:
-                return frozenset()
+                fallback = fallback_origins.get(node.id)
+                return frozenset((fallback,)) if fallback else frozenset()
             scope = parent
 
     def expression_origins(node: ast.AST) -> set[str]:
@@ -502,6 +505,10 @@ def sensitive_module_reexports(
         tree,
         include_from_imports=True,
         propagate_aliases=True,
+        fallback_origins={
+            "classmethod": "builtins.classmethod",
+            "staticmethod": "builtins.staticmethod",
+        },
     )
 
     def import_origin_names(node: ast.AST) -> set[str]:
@@ -795,6 +802,52 @@ def sensitive_module_reexports(
         ast.ClassDef,
         dict[str, set[ast.FunctionDef | ast.AsyncFunctionDef]],
     ] = {class_node: {} for class_node in class_nodes}
+    class_member_names = {class_node: set() for class_node in class_nodes}
+
+    def enclosing_class_namespace(node: ast.AST) -> ast.ClassDef | None:
+        parent = parents.get(node)
+        while parent is not None:
+            if isinstance(parent, ast.ClassDef):
+                return parent
+            if parent in callable_nodes:
+                return None
+            parent = parents.get(parent)
+        return None
+
+    for node in ast.walk(tree):
+        class_node = enclosing_class_namespace(node)
+        if class_node is None:
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            class_member_names[class_node].add(node.name)
+        elif isinstance(node, ast.Assign):
+            class_member_names[class_node].update(set().union(*(
+                target_names(target) for target in node.targets
+            )))
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            class_member_names[class_node].update(target_names(node.target))
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            class_member_names[class_node].update(target_names(node.target))
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    class_member_names[class_node].update(
+                        target_names(item.optional_vars)
+                    )
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            class_member_names[class_node].add(node.name)
+        elif isinstance(node, ast.Import):
+            class_member_names[class_node].update(
+                alias.asname or alias.name.split(".")[0]
+                for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            class_member_names[class_node].update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name != "*"
+            )
+
     for class_node in class_nodes:
         for statement in class_node.body:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -803,16 +856,51 @@ def sensitive_module_reexports(
                     set(),
                 ).add(statement)
 
+    class_bases: dict[ast.ClassDef, tuple[ast.ClassDef, ...]] = {}
+    for class_node in class_nodes:
+        bases = []
+        for base_expression in class_node.bases:
+            resolved_bases = sorted(
+                resolve_class_expression(
+                    base_expression,
+                    enclosing_callable(class_node),
+                ),
+                key=lambda item: (item.lineno, item.col_offset),
+            )
+            for base in resolved_bases:
+                if base not in bases:
+                    bases.append(base)
+        class_bases[class_node] = tuple(bases)
+
+    def find_class_methods(
+            class_node: ast.ClassDef,
+            method_name: str,
+            visited: frozenset[ast.ClassDef] = frozenset(),
+    ) -> tuple[bool, set[ast.FunctionDef | ast.AsyncFunctionDef]]:
+        if class_node in visited:
+            return False, set()
+        if method_name in class_member_names[class_node]:
+            return True, set(class_methods[class_node].get(method_name, ()))
+        visited = visited | {class_node}
+        for base in class_bases[class_node]:
+            found, inherited = find_class_methods(base, method_name, visited)
+            if found:
+                return True, inherited
+        return False, set()
+
+    def resolve_class_methods(
+            class_node: ast.ClassDef,
+            method_name: str,
+    ) -> set[ast.FunctionDef | ast.AsyncFunctionDef]:
+        return find_class_methods(class_node, method_name)[1]
+
     def method_descriptor_kind(
             method: ast.FunctionDef | ast.AsyncFunctionDef,
     ) -> str:
         decorator_names = {
-            decorator.id
-            if isinstance(decorator, ast.Name)
-            else decorator.attr
-            if isinstance(decorator, ast.Attribute)
-            else ""
+            origin.rsplit(".", 1)[-1]
             for decorator in method.decorator_list
+            for origin in import_origin_names(decorator)
         }
         if "staticmethod" in decorator_names:
             return "static"
@@ -826,13 +914,13 @@ def sensitive_module_reexports(
     ) -> set[tuple[ast.FunctionDef | ast.AsyncFunctionDef, bool]]:
         resolved = set()
         for class_node in resolve_class_expression(node.value, scope):
-            for method in class_methods[class_node].get(node.attr, ()):
+            for method in resolve_class_methods(class_node, node.attr):
                 resolved.add((
                     method,
                     method_descriptor_kind(method) == "class",
                 ))
         for class_node in resolve_instance_expression(node.value, scope):
-            for method in class_methods[class_node].get(node.attr, ()):
+            for method in resolve_class_methods(class_node, node.attr):
                 resolved.add((
                     method,
                     method_descriptor_kind(method) != "static",
@@ -1297,6 +1385,50 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 ),
                 "shutil.fnmatch",
             ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "class Base:\n"
+                    "    def invoke(self, value):\n        value.os.fork()\n"
+                    "class Middle(Base):\n    pass\n"
+                    "class Runner(Middle):\n    pass\n"
+                    "Runner().invoke(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "class Base:\n"
+                    "    @classmethod\n"
+                    "    def invoke(cls, value):\n        value.os.fork()\n"
+                    "class Runner(Base):\n    pass\n"
+                    "Runner.invoke(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "cm = classmethod\nalias = cm\n"
+                    "class Runner:\n"
+                    "    @alias\n"
+                    "    def invoke(cls, value):\n        value.os.fork()\n"
+                    "Runner.invoke(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "class Runner:\n"
+                    "    sm = staticmethod\n    alias = sm\n"
+                    "    @alias\n"
+                    "    def invoke(value):\n        value.os.fork()\n"
+                    "Runner().invoke(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
         ):
             with self.subTest(source=source):
                 self.assertTrue(
@@ -1335,6 +1467,52 @@ class H2D2FreezeContractTests(unittest.TestCase):
             ),
             "a bound receiver must not be tainted by the first explicit argument",
         )
+
+        for safe_source in (
+            (
+                "from shutil import fnmatch as p\n"
+                "class Base:\n"
+                "    def invoke(self, value):\n        value.os.fork()\n"
+                "class Runner(Base):\n"
+                "    def invoke(self, value):\n        return value\n"
+                "Runner().invoke(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "class Base:\n"
+                "    def invoke(self, value):\n        value.os.fork()\n"
+                "class Runner(Base):\n"
+                "    invoke = lambda self, value: value\n"
+                "Runner().invoke(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "cm = classmethod\n"
+                "def outer():\n"
+                "    cm = lambda function: function\n"
+                "    class Runner:\n"
+                "        @cm\n"
+                "        def invoke(self, value):\n            value.os.fork()\n"
+                "    Runner.invoke(p)\n"
+                "outer()\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "classmethod = lambda function: function\n"
+                "class Runner:\n"
+                "    @classmethod\n"
+                "    def invoke(self, value):\n        value.os.fork()\n"
+                "Runner.invoke(p)\n"
+            ),
+        ):
+            with self.subTest(safe_source=safe_source):
+                self.assertFalse(
+                    sensitive_module_reexports(
+                        ast.parse(safe_source),
+                        {"p": "shutil.fnmatch"},
+                    ),
+                    "a lexical shadow or local override must block inherited provenance",
+                )
 
         for imported_name in (
             "Thread",
