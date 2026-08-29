@@ -15,22 +15,121 @@ BASELINES = ROOT / "docs" / "h2-d2-canary-baselines.json"
 Q10_AUDIT = ROOT / "docs" / "audits" / "h2d-2026-07-22-q10-options-vol.md"
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 HEX_40 = re.compile(r"^[0-9a-f]{40}$")
-BASELINE_BUNDLE_SHA256 = "b24e42145bc0020edfadbb0f989ebc25f1edcfc80876454fa79ae7ce88f42ab6"
+BASELINE_BUNDLE_SHA256 = "0f6f714d74b516e7966cc1bdc56478e85491b7c31805129a86e06ab3a462de87"
 SEQUENTIAL_RUNTIME_SOURCE_SHA256 = {
+    "quant/__init__.py":
+        "cc01c7d624cc73967522ab474ab1b0f94485c4e7c1116dba2813892874b608ae",
     "quant/historical_batch_h2d.py":
         "a4c9b42829b463c3d919caceea7e0252ad7062bae0d713120c17eeb7ee529683",
-    "quant/historical_replay_h1.py":
-        "0b8958d704973f031096fd541d2306b6d751c81f136470ff08d074874ae0cb10",
+    "quant/historical_evidence.py":
+        "e1f2616072203d7f193e566e92ab5b2fc452a4a7e61a6e5bf196d0e17b923f26",
     "quant/historical_evidence_verifier.py":
         "75bc9690b45b7b6e1278a88c587de3593436cb1ef6f9d5796872cdbf828c9709",
     "quant/historical_outcomes.py":
         "89397df5816d9f2a8909d5912ffb9b6820be9341a961222e666c59f7684b6797",
+    "quant/historical_replay.py":
+        "b810d0f0384483f81d131c1032f85d772ad70e9747c4f788c005088961e5a5da",
+    "quant/historical_replay_h1.py":
+        "0b8958d704973f031096fd541d2306b6d751c81f136470ff08d074874ae0cb10",
+    "quant/history.py":
+        "c42db3ea440f0c393b0180c7008943b75c298944a3a714aa22bfd18e84b06387",
+    "quant/models.py":
+        "9cc46919af3f99df65729390090fdf9e9eb263d97d8b49c5f49ff2e16ee8d409",
+    "quant/q10_options_vol.py":
+        "727b14f617e4130c5671e9370c1abaa365cb579d9091702363cc8de5a07bd1e1",
+    "quant/q11_regime.py":
+        "c5369859515b0bd6b9958e75efe77379320985cede5c51bce105bc7fdd672a64",
+    "quant/q12_event_session.py":
+        "02b6eea28a559a5a50772102aa23d195dcb8091156b06ddef8e68c8552a8f2dd",
+    "quant/q1_momentum.py":
+        "2ff8812102d97cde88ad8176b70b23d10ea09e735138c85a636921505d8d565a",
+    "quant/q2_mean_reversion.py":
+        "557ff124d453e4341192301caeafafb1ce374e7e7029ff9a22606fc21cf538f3",
+    "quant/q3_volatility.py":
+        "d1846b4cf8c2d59ca9874ce9b282717aef951a59a74e0277aad9f94201e755f3",
+    "quant/q4_stat_arb.py":
+        "bf05b0b2522a19a015303c993c62d2451d2b99416b0f8506d25407b69bd27b3b",
+    "quant/q5_microstructure.py":
+        "03dd9f79b8f0ede2df0ed53fd0a9a6d3dcf1c9e5642ec674a1f252e6cc531364",
+    "quant/q6_volume_liquidity.py":
+        "3daa7bc5264d07d100cf418854a144c830ad296bcf4d861cafed38d3883a3592",
+    "quant/q7_relative_value.py":
+        "f9c764f4109d403a9fbec9a6b87b5aab2cb81fe8f6f4d01f180e1493558c4fd4",
+    "quant/q8_cross_asset.py":
+        "42278ce758eb19daa4e92d98487480083ff29a9a75a96e315293020a53d4f51d",
+    "quant/q9_factor.py":
+        "af19189d37d62787adae391a71250c2c8eb6b518e2f0899d6fe5380145705244",
+    "quant/quote_history.py":
+        "ee8402f30e19a59c55a322f230ba1942e6aa54021af462698e8e59f96a1da11b",
+    "quant/v9_v1_contract.py":
+        "697b3c43ec8853f763022bcea1112b4e342584cc7cb0e59e8ac795d1ac45d057",
+    "quant/v9_v2a_dataset.py":
+        "78505b936eb52ae3b16acd1fa547dffe488b9354ae53c76c10fa683444c350ca",
+    "quant/v9_v2b_calibration.py":
+        "09aafcd8265b6e219d3bb022535fe6a116751366411cabe4a6014c95e9a2b860",
+    "quant/v9_v2c_covariance.py":
+        "bdaa327da0ab5ec9fd7438a8b65048ff12de884f911317584845fc2205eec826",
+    "quant/v9_v2d_evidence_state.py":
+        "a89ba9c0207ad2ff0546efd63017ea77ec808255b998d85e85862b1698c56308",
+    "quant/v9_v3_synthesis.py":
+        "f7117fd67c345ce300f5d8c83cf8e017ed6017aba00ea7b0f366873daa43f682",
+    "quant/v9_v4a_evidence.py":
+        "7a5ab089e73d3f460eb31f4e94207d53db90af74d985b963ddd171259638610f",
 }
 
 
 def canonical_source_sha256(source: str) -> str:
     normalized = source.rstrip("\n") + "\n"
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def local_runtime_dependencies(relative_path: str, tree: ast.AST) -> set[str]:
+    module_parts = Path(relative_path).with_suffix("").parts
+    package_parts = module_parts[:-1]
+    candidates = set()
+    package_candidates = {
+        package_parts[:depth]
+        for depth in range(1, len(package_parts) + 1)
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                parts = tuple(alias.name.split("."))
+                candidates.add(parts)
+        elif isinstance(node, ast.ImportFrom):
+            module_suffix = (
+                tuple((node.module or "").split("."))
+                if node.module
+                else ()
+            )
+            if node.level:
+                keep = len(package_parts) - (node.level - 1)
+                if keep < 0:
+                    continue
+                base = package_parts[:keep] + module_suffix
+            elif module_suffix:
+                base = module_suffix
+            else:
+                continue
+            candidates.add(base)
+            candidates.update(base + (alias.name,) for alias in node.names)
+
+    dependencies = set()
+    for parts in candidates:
+        if not parts:
+            continue
+        package_candidates.update(
+            parts[:depth]
+            for depth in range(1, len(parts) + 1)
+        )
+        candidate = Path(*parts).with_suffix(".py")
+        if (ROOT / candidate).is_file():
+            dependencies.add(candidate.as_posix())
+    for parts in package_candidates:
+        initializer = Path(*parts) / "__init__.py"
+        if (ROOT / initializer).is_file():
+            dependencies.add(initializer.as_posix())
+    return dependencies
 
 
 class H2D2FreezeContractTests(unittest.TestCase):
@@ -251,7 +350,9 @@ class H2D2FreezeContractTests(unittest.TestCase):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     imported.add(alias.name)
-                    module_aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+                    module_aliases[
+                        alias.asname or alias.name.split(".")[0]
+                    ] = alias.name.split(".")[0]
             elif isinstance(node, ast.ImportFrom):
                 if node.level:
                     relative_imports.add((node.level, node.module))
@@ -286,7 +387,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
         )
         direct_process_imports = {
             item for item in direct_imports
-            if item[0] in {"os", "subprocess", "sys"}
+            if item[0].split(".")[0] in {"os", "subprocess", "sys"}
         }
         self.assertFalse(
             direct_process_imports,
@@ -475,7 +576,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
             )
             or (
                 isinstance(node, ast.Attribute)
-                and node.attr in dangerous_builtin_names
+                and node.attr in {"__builtins__", "__import__"}
             )
             or (
                 isinstance(node, ast.Constant)
@@ -541,7 +642,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
             self.assertNotIn(forbidden_call, source)
         self.assertIn('H2D_VERSION = "H2-D-1"', source)
 
-    def test_every_executed_stage_module_is_frozen_and_sequential(self):
+    def test_complete_h1_runtime_closure_is_frozen_and_sequential(self):
         stage_sources = {
             path: digest
             for path, digest in SEQUENTIAL_RUNTIME_SOURCE_SHA256.items()
@@ -565,7 +666,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
                             imported_roots.add(alias.name.split(".")[0])
                             module_aliases[
                                 alias.asname or alias.name.split(".")[0]
-                            ] = alias.name
+                            ] = alias.name.split(".")[0]
                     elif isinstance(node, ast.ImportFrom):
                         if node.module:
                             imported_roots.add(node.module.split(".")[0])
@@ -578,18 +679,23 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 self.assertFalse(
                     imported_roots.intersection({
                         "_imp",
+                        "_posixsubprocess",
                         "_thread",
                         "asyncio",
+                        "builtins",
                         "concurrent",
+                        "ctypes",
                         "dask",
                         "importlib",
                         "joblib",
                         "multiprocessing",
+                        "nt",
                         "pkgutil",
+                        "posix",
+                        "pty",
                         "queue",
                         "ray",
                         "runpy",
-                        "sys",
                         "threading",
                         "zipimport",
                     }),
@@ -602,7 +708,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 direct_process_imports = {
                     item
                     for item in direct_imports
-                    if item[0].split(".")[0] in {"os", "subprocess"}
+                    if item[0].split(".")[0] in {"os", "subprocess", "sys"}
                 }
                 self.assertFalse(
                     direct_process_imports,
@@ -648,7 +754,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     )
                     or (
                         isinstance(node, ast.Attribute)
-                        and node.attr in dangerous_builtin_names
+                        and node.attr in {"__builtins__", "__import__"}
                     )
                     or (
                         isinstance(node, ast.Constant)
@@ -663,13 +769,22 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 allowed_references = {("os", "environ")}
                 if relative_path == "quant/historical_replay_h1.py":
                     allowed_references.add(("subprocess", "run"))
+                if relative_path in {
+                    "quant/v9_v2b_calibration.py",
+                    "quant/v9_v2c_covariance.py",
+                }:
+                    allowed_references.add(("sys", "float_info"))
                 qualified_references = {
                     (module_aliases[node.value.id], node.attr)
                     for node in ast.walk(tree)
                     if isinstance(node, ast.Attribute)
                     and isinstance(node.value, ast.Name)
                     and node.value.id in module_aliases
-                    and module_aliases[node.value.id] in {"os", "subprocess"}
+                    and module_aliases[node.value.id] in {
+                        "os",
+                        "subprocess",
+                        "sys",
+                    }
                 }
                 self.assertFalse(
                     qualified_references - allowed_references,
@@ -686,7 +801,11 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     for node in ast.walk(tree)
                     if isinstance(node, ast.Name)
                     and isinstance(node.ctx, ast.Load)
-                    and module_aliases.get(node.id) in {"os", "subprocess"}
+                    and module_aliases.get(node.id) in {
+                        "os",
+                        "subprocess",
+                        "sys",
+                    }
                     and not (
                         isinstance(parents.get(node), ast.Attribute)
                         and parents[node].value is node
@@ -707,7 +826,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     and node.args
                     and isinstance(node.args[0], ast.Name)
                     and module_aliases.get(node.args[0].id)
-                    in {"os", "subprocess"}
+                    in {"os", "subprocess", "sys"}
                 )
                 self.assertFalse(
                     dynamic_module_access,
@@ -769,12 +888,32 @@ class H2D2FreezeContractTests(unittest.TestCase):
                         )
                     )
 
+    def test_frozen_runtime_contains_complete_local_dependency_closure(self):
+        frozen_paths = set(SEQUENTIAL_RUNTIME_SOURCE_SHA256)
+        for relative_path in sorted(frozen_paths):
+            source = (ROOT / relative_path).read_text(encoding="utf-8")
+            dependencies = local_runtime_dependencies(
+                relative_path,
+                ast.parse(source),
+            )
+            with self.subTest(module=relative_path):
+                self.assertFalse(
+                    dependencies - frozen_paths,
+                    f"unfrozen local dependencies imported by {relative_path}: "
+                    f"{dependencies - frozen_paths}",
+                )
+
     def test_freeze_law_requires_exact_metric_and_receipt_correlation(self):
         law = " ".join(FREEZE.read_text(encoding="utf-8").split())
         for clause in (
             "parallel runtime disabled",
             "H1 → H2B → H2C_RESOLVE → H2C_SCORE",
             "exactly two worker processes",
+            "non-transaction-pooled control connection",
+            "`SELECT pg_try_advisory_lock(8098937340306602170)` exactly once",
+            "`SELECT pg_backend_pid()` at an interval of at most five seconds",
+            "immediate termination and collection of both worker processes",
+            "`SELECT pg_advisory_unlock(8098937340306602170)` exactly once",
             "Every stage receipt must return the claimed historical date and run ID",
             "outcome_count = frame_count × 6",
             "canonical SHA-256 over all 72 metric objects",
@@ -796,7 +935,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
         phases = " ".join(PHASES.read_text(encoding="utf-8").split())
         self.assertIn("two-date read-only Parallel Canary", root_law)
         self.assertIn("separately approved", root_law)
-        self.assertIn("all three executed stage source digests", root_law)
+        self.assertIn("complete local H1 runtime dependency closure", root_law)
         self.assertIn("exact 72-metric hash byte encoding", root_law)
         self.assertIn("H2-D-3 — Parallel Canary (not authorized)", phases)
         self.assertIn("No within-date concurrency or evidence writes", phases)

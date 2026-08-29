@@ -28,22 +28,40 @@ canary must add and verify them before it can dispatch two dates.
    final ordered receipt. Workers cannot enqueue, split, or reassign work.
 2. One worker process exclusively owns one date from claim through validated
    receipt. The job key is the ISO date. Only distinct dates may coexist.
-3. Exactly one coordinator may be active. A distributed queue, lease expiry,
-   abandoned-worker reassignment, and more than two workers are not authorized.
-4. The later canary is capped at exactly two worker processes and the two dates
+3. Exactly one coordinator may be active. Before any preflight query or worker
+   creation, it opens exactly one dedicated, session-pinned,
+   non-transaction-pooled control connection to the same evidence database,
+   enables `default_transaction_read_only`, records `pg_backend_pid()`, and
+   calls `SELECT pg_try_advisory_lock(8098937340306602170)` exactly once.
+   False, null, or error stops before workers. A distributed queue, lease
+   expiry, abandoned-worker reassignment, and more than two workers are not
+   authorized.
+4. The coordinator retains that physical control session for the complete
+   canary. While either worker is active, its parent wait loop must check
+   `SELECT pg_backend_pid()` at an interval of at most five seconds; an error
+   or PID change requires immediate termination and collection of both worker
+   processes and permanent canary failure. No worker may use or inherit the
+   control connection. After a successful acquisition, a `finally` path calls
+   `SELECT pg_advisory_unlock(8098937340306602170)` exactly once and closes the
+   session; a false result or error is a control failure. Session closure is
+   only the release backstop, not the normal release path.
+5. The later canary is capped at exactly two worker processes and the two dates
    frozen below. Completion order cannot change receipt order.
-5. For a date with no manifest, the run ID is `h2d-YYYY-MM-DD`. If exactly one
+6. For a date with no manifest, the run ID is `h2d-YYYY-MM-DD`. If exactly one
    certified manifest already exists, its immutable run ID is reused. More
    than one manifest for a date is a permanent failure.
-6. Each database-owning stage uses its own bounded connection/transaction.
+7. Each database-owning stage uses its own bounded connection/transaction.
    No worker may hold a database lock while waiting on another worker or on
    provider/network I/O. The two-date canary permits at most two replay-workload
-   database connections at once.
+   database connections at once, plus the one dedicated coordinator control
+   connection.
 
-The database primary keys and existing per-run advisory locks remain the final
-integrity barrier. They do not replace the single-coordinator/date-claim law:
-manifest content includes performance fields, so two simultaneous H1 writers
-for one date can safely conflict even when their mathematics matches.
+The fixed coordinator advisory lock enforces single ownership across processes
+and hosts connected to the evidence database. Database primary keys and
+existing per-run advisory locks remain the final row-integrity barrier; they do
+not replace the coordinator/date-claim law. Manifest content includes
+performance fields, so two simultaneous H1 writers for one date can safely
+conflict even when their mathematics matches.
 
 ## Stage, retry, and failure contract
 
@@ -132,7 +150,11 @@ diagnostics only.
 The read-only baseline bundle is
 `docs/h2-d2-canary-baselines.json`.
 Its canonical values and the SHA-256 source digests of the current H2-D-1
-orchestrator and all three executed stage modules are pinned by contract tests.
+orchestrator, entry stages, and complete local H1 replay/family dependency
+closure are pinned by contract tests. The closure test resolves every
+repository-local Python import recursively and includes every package
+initializer on each module path, so a newly imported local module or
+initializer cannot escape the digest and sequential-runtime guards.
 Source hashing reads UTF-8 text, removes all terminal LF characters, appends
 exactly one LF, and hashes those normalized bytes.
 Changing a digest or stage implementation requires a separately approved freeze

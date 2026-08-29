@@ -82,9 +82,12 @@ parallel flag, Render deployment, Supabase schema or compute change, replay
 write, or evidence mutation. After this freeze is merged, only a separately
 approved two-date read-only Parallel Canary may be implemented. Numerical,
 lineage, count, duplicate, or receipt-correlation drift stops promotion.
-The current H2-D-1 orchestrator and all three executed stage source digests,
-every frozen baseline value, and the exact 72-metric hash byte encoding are
-pinned; a merely well-formed replacement digest is not accepted.
+Cross-process and cross-host single-coordinator ownership must fail closed on
+the fixed session-level advisory-lock contract in `docs/h2-d2-freeze.md`.
+The current H2-D-1 orchestrator, entry stages, and complete local H1 runtime
+dependency closure source digests, every frozen baseline value, and the exact
+72-metric hash byte encoding are pinned; a merely well-formed replacement
+digest is not accepted.
 
 ## Forbidden until explicit freeze amendment
 
