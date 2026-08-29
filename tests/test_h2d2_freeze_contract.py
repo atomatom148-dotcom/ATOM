@@ -28,9 +28,11 @@ SENSITIVE_MODULE_ROOTS = {
     "joblib",
     "multiprocessing",
     "nt",
+    "ntpath",
     "os",
     "pkgutil",
     "posix",
+    "posixpath",
     "pty",
     "queue",
     "ray",
@@ -137,6 +139,17 @@ def canonical_source_sha256(source: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def reject_duplicate_json_object_pairs(
+        pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
 def is_sensitive_import_name(name: str) -> bool:
     root = name.split(".")[0]
     return (
@@ -198,18 +211,59 @@ def sensitive_module_reexports(
         tree: ast.AST,
         module_aliases: dict[str, str],
 ) -> tuple[ast.AST, ...]:
-    def imported_root(node: ast.AST) -> str | None:
-        while isinstance(node, ast.Attribute):
-            node = node.value
-        if isinstance(node, ast.Name) and node.id in module_aliases:
-            return node.id
-        return None
+    tracked_bindings = set(module_aliases)
+
+    def target_names(node: ast.AST) -> set[str]:
+        if isinstance(node, ast.Name):
+            return {node.id}
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return set().union(*(target_names(item) for item in node.elts))
+        return set()
+
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            value = None
+            targets = []
+            if isinstance(node, ast.Assign):
+                value = node.value
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                value = node.value
+                targets = [node.target]
+            elif isinstance(node, ast.NamedExpr):
+                value = node.value
+                targets = [node.target]
+            if (
+                value is None
+                or any(isinstance(item, ast.Call) for item in ast.walk(value))
+                or not any(
+                    isinstance(item, ast.Name)
+                    and isinstance(item.ctx, ast.Load)
+                    and item.id in tracked_bindings
+                    for item in ast.walk(value)
+                )
+            ):
+                continue
+            new_names = set().union(*(target_names(target) for target in targets))
+            if not new_names.issubset(tracked_bindings):
+                tracked_bindings.update(new_names)
+                changed = True
+
+    def contains_tracked_binding(node: ast.AST) -> bool:
+        return any(
+            isinstance(item, ast.Name)
+            and isinstance(item.ctx, ast.Load)
+            and item.id in tracked_bindings
+            for item in ast.walk(node)
+        )
 
     findings = []
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Attribute)
-            and imported_root(node) is not None
+            and contains_tracked_binding(node.value)
             and (
                 is_sensitive_import_name(node.attr)
                 or node.attr.startswith("_")
@@ -221,16 +275,38 @@ def sensitive_module_reexports(
             and isinstance(node.func, ast.Name)
             and node.func.id in {"delattr", "getattr", "setattr", "vars"}
             and node.args
-            and isinstance(node.args[0], ast.Name)
-            and node.args[0].id in module_aliases
+            and contains_tracked_binding(node.args[0])
         ):
             findings.append(node)
     return tuple(findings)
 
 
 class H2D2FreezeContractTests(unittest.TestCase):
+    def test_parser_and_reexport_guards_reject_ambiguous_inputs(self):
+        with self.assertRaisesRegex(ValueError, "duplicate JSON object key: limit"):
+            json.loads(
+                '{"limit":99,"limit":2}',
+                object_pairs_hook=reject_duplicate_json_object_pairs,
+            )
+
+        for source in (
+            "from pathlib import posixpath as p\np.os.fork()\n",
+            "from pathlib import posixpath as p\nq = p\nq.os.fork()\n",
+            "from pathlib import posixpath as p\nq = [p]\nq[0].os.fork()\n",
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(
+                    sensitive_module_reexports(
+                        ast.parse(source),
+                        {"p": "pathlib.posixpath"},
+                    )
+                )
+
     def test_baselines_are_two_read_only_certified_complete_sessions(self):
-        payload = json.loads(BASELINES.read_text(encoding="utf-8"))
+        payload = json.loads(
+            BASELINES.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_json_object_pairs,
+        )
         canonical_bundle = json.dumps(
             payload,
             sort_keys=True,
@@ -440,6 +516,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
         imported = set()
         direct_imports = set()
         module_aliases = {}
+        imported_bindings = {}
         star_imports = set()
         relative_imports = set()
         for node in ast.walk(tree):
@@ -449,6 +526,9 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     module_aliases[
                         alias.asname or alias.name.split(".")[0]
                     ] = alias.name.split(".")[0]
+                    imported_bindings[
+                        alias.asname or alias.name.split(".")[0]
+                    ] = alias.name
             elif isinstance(node, ast.ImportFrom):
                 if node.level:
                     relative_imports.add((node.level, node.module))
@@ -457,6 +537,11 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     direct_imports.update(
                         (node.module, alias.name) for alias in node.names
                     )
+                    imported_bindings.update({
+                        alias.asname or alias.name:
+                            f"{node.module}.{alias.name}"
+                        for alias in node.names
+                    })
                 if any(alias.name == "*" for alias in node.names):
                     star_imports.add(node.module or ".")
         self.assertEqual(
@@ -494,7 +579,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
         )
         reexported_process_modules = sensitive_module_reexports(
             tree,
-            module_aliases,
+            imported_bindings,
         )
         self.assertFalse(
             reexported_process_modules,
@@ -837,6 +922,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 imported_roots = set()
                 direct_imports = set()
                 module_aliases = {}
+                imported_bindings = {}
                 star_imports = set()
                 for node in ast.walk(tree):
                     if isinstance(node, ast.Import):
@@ -845,6 +931,9 @@ class H2D2FreezeContractTests(unittest.TestCase):
                             module_aliases[
                                 alias.asname or alias.name.split(".")[0]
                             ] = alias.name.split(".")[0]
+                            imported_bindings[
+                                alias.asname or alias.name.split(".")[0]
+                            ] = alias.name
                     elif isinstance(node, ast.ImportFrom):
                         if node.module:
                             imported_roots.add(node.module.split(".")[0])
@@ -852,6 +941,11 @@ class H2D2FreezeContractTests(unittest.TestCase):
                                 (node.module, alias.name)
                                 for alias in node.names
                             )
+                            imported_bindings.update({
+                                alias.asname or alias.name:
+                                    f"{node.module}.{alias.name}"
+                                for alias in node.names
+                            })
                         if any(alias.name == "*" for alias in node.names):
                             star_imports.add(node.module or ".")
                 self.assertFalse(
@@ -876,7 +970,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 )
                 reexported_process_modules = sensitive_module_reexports(
                     tree,
-                    module_aliases,
+                    imported_bindings,
                 )
                 self.assertFalse(
                     reexported_process_modules,
@@ -1126,6 +1220,11 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "`CLAIMING`, `ACTIVE`, `CLEANING`, or unknown state blocks replacement",
             "atomically compare-and-swaps that exact attested `CLEAN` version",
             "every later transition is conditional on the exact predecessor version and generation",
+            "pre-claim path requires no new terminal receipt",
+            "failure before the first supervisor compare-and-swap",
+            "every unchanged supervisor re-attests the exact prior `CLEAN` version",
+            "every exclusive date fence still held by its control session exactly once",
+            "must not be unlocked a second time",
             "`pg_try_advisory_lock_shared`",
             "Both claim receipts are required before either guardian may create its single worker",
             "`SELECT pg_backend_pid()`",

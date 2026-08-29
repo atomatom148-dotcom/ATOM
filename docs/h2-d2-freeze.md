@@ -41,8 +41,11 @@ canary must add and verify them before it can dispatch two dates.
    date-fence locks exclusively before creating any workload process:
    `pg_try_advisory_lock(-5133988379539764595)` for `2026-06-15` and
    `pg_try_advisory_lock(8459531074882316998)` for `2026-07-22`. Failure to
-   acquire either releases every acquired date fence exactly once and stops.
-   After acquiring both, it contacts the two exact, configured durable host
+   acquire either releases every acquired date fence exactly once, releases
+   the global coordinator lock exactly once in `finally`, and stops. This
+   pre-claim path requires no new terminal receipt because no supervisor
+   generation was changed. After acquiring both, it contacts the two exact,
+   configured durable host
    supervisors pinned by the canary configuration digest. Each supervisor must
    attest a monotonic record version, terminal receipt identity, `CLEAN`, the
    prior worker and guardian reaped, and its fixed workload cgroup at
@@ -55,7 +58,17 @@ canary must add and verify them before it can dispatch two dates.
    stale version, or generation mismatch stops; every later transition is
    conditional on the exact predecessor version and generation. If fewer than
    two compare-and-swaps succeed, no fence handoff or guardian creation occurs
-   and each partial claim must complete terminal cleanup before a retry. Only
+   and each partial claim must complete terminal cleanup before a retry. A
+   failure before the first supervisor compare-and-swap follows the same
+   pre-claim unlock path and requires no new terminal receipt. On any admission
+   failure after the first successful compare-and-swap but before both guardian
+   claim receipts, no worker may start. The coordinator retains the global lock
+   until every changed supervisor has fsynced terminal cleanup, every created
+   guardian has been reaped, and every unchanged supervisor re-attests the
+   exact prior `CLEAN` version. It then explicitly unlocks and verifies every
+   exclusive date fence still held by its control session exactly once before
+   unlocking the global coordinator lock. A date fence already handed to a
+   guardian must not be unlocked a second time. Only
    after both records are durable may the supervisors
    create exactly two claim-only date guardians outside the coordinator and
    workload failure domains. The coordinator unlocks each exclusive date fence
@@ -100,9 +113,11 @@ canary must add and verify them before it can dispatch two dates.
    the shared fence exactly once and exits. After reaping the guardian and
    independently reproving `populated 0`, the supervisor atomically persists
    and fsyncs the terminal cleanup receipt and changes its generation state to
-   `CLEAN` as the last operation. The coordinator retains the global advisory
-   lock until both supervisors attest those terminal receipts. On every path
-   after successful acquisition, only then does the coordinator release
+   `CLEAN` as the last operation. For a fully claimed generation, the
+   coordinator retains the global advisory lock until both supervisors attest
+   those terminal receipts. For a partial claim, it follows the terminal or
+   unchanged-version and date-fence release rule in step 4. Only then does the
+   coordinator release
    `8098937340306602170` exactly once in `finally` and close its session. False
    unlock, early guardian death, incomplete reaping, a nonempty cgroup,
    nonterminal supervisor state, or connection error is a control failure;
