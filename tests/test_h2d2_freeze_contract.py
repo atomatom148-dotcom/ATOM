@@ -70,6 +70,28 @@ EXECUTABLE_DESERIALIZER_FULL_IMPORT_NAMES = {
     "yaml.unsafe_load",
     "yaml.unsafe_load_all",
 }
+EXECUTABLE_CODE_CONSTRUCTOR_FULL_IMPORT_NAMES = {
+    "types.FunctionType",
+    "types.LambdaType",
+}
+EXECUTABLE_CODE_PAYLOAD_FULL_IMPORT_NAMES = {
+    "marshal.load",
+    "marshal.loads",
+}
+PROCESS_LAUNCH_WRAPPER_FULL_IMPORT_NAMES = {
+    "webbrowser.open",
+    "webbrowser.open_new",
+    "webbrowser.open_new_tab",
+    "webbrowser.BackgroundBrowser.open",
+    "webbrowser.BackgroundBrowser.open_new",
+    "webbrowser.BackgroundBrowser.open_new_tab",
+    "webbrowser.GenericBrowser.open",
+    "webbrowser.GenericBrowser.open_new",
+    "webbrowser.GenericBrowser.open_new_tab",
+    "webbrowser.get.open",
+    "webbrowser.get.open_new",
+    "webbrowser.get.open_new_tab",
+}
 FORBIDDEN_STAGE_IMPORT_ROOTS = SENSITIVE_MODULE_ROOTS - {
     "os",
     "subprocess",
@@ -9026,6 +9048,182 @@ def sensitive_module_reexports(
             return set()
         return set(resolve_import_origins(expression))
 
+    def executable_marshaled_code_constructor(call: ast.Call) -> bool:
+        scope = enclosing_callable(call)
+        if not EXECUTABLE_CODE_CONSTRUCTOR_FULL_IMPORT_NAMES.intersection(
+            flow_sensitive_import_origins(call.func, scope)
+        ):
+            return False
+
+        def finite_star_variants(
+                expression: ast.AST,
+                expression_scope: ast.AST | None,
+        ) -> tuple[tuple[tuple[ast.AST, ...], ...], bool]:
+            if isinstance(expression, ast.IfExp):
+                body, body_unknown = finite_star_variants(
+                    expression.body,
+                    expression_scope,
+                )
+                orelse, orelse_unknown = finite_star_variants(
+                    expression.orelse,
+                    expression_scope,
+                )
+                return body + orelse, body_unknown or orelse_unknown
+            resolved = flow_sensitive_literal_container(
+                expression,
+                expression_scope,
+            )
+            if resolved is None:
+                return (), True
+            container, container_scope = resolved
+            if isinstance(container, (ast.List, ast.Tuple)):
+                variants: tuple[tuple[ast.AST, ...], ...] = ((),)
+                for item in container.elts:
+                    if isinstance(item, ast.Starred):
+                        expanded, unknown = finite_star_variants(
+                            item.value,
+                            container_scope,
+                        )
+                        if unknown:
+                            return (), True
+                        variants = tuple(
+                            prefix + suffix
+                            for prefix in variants
+                            for suffix in expanded
+                        )
+                    else:
+                        variants = tuple(
+                            prefix + (item,)
+                            for prefix in variants
+                        )
+                return variants, False
+            if isinstance(container, ast.Dict):
+                keys = []
+                for key in container.keys:
+                    if key is None:
+                        return (), True
+                    keys.append(key)
+                return (tuple(keys),), False
+            return (), True
+
+        def finite_mapping_variants(
+                expression: ast.AST,
+                expression_scope: ast.AST | None,
+        ) -> tuple[tuple[dict[str, ast.AST], ...], bool]:
+            if isinstance(expression, ast.IfExp):
+                body, body_unknown = finite_mapping_variants(
+                    expression.body,
+                    expression_scope,
+                )
+                orelse, orelse_unknown = finite_mapping_variants(
+                    expression.orelse,
+                    expression_scope,
+                )
+                return body + orelse, body_unknown or orelse_unknown
+            resolved = flow_sensitive_literal_container(
+                expression,
+                expression_scope,
+            )
+            if resolved is None:
+                return (), True
+            container, container_scope = resolved
+            if not isinstance(container, ast.Dict):
+                return (), True
+            variants: tuple[dict[str, ast.AST], ...] = ({},)
+            for key, value in zip(container.keys, container.values):
+                if key is None:
+                    expanded, unknown = finite_mapping_variants(
+                        value,
+                        container_scope,
+                    )
+                    if unknown:
+                        return (), True
+                    variants = tuple(
+                        {**prefix, **suffix}
+                        for prefix in variants
+                        for suffix in expanded
+                    )
+                    continue
+                if not (
+                    isinstance(key, ast.Constant)
+                    and isinstance(key.value, str)
+                ):
+                    return (), True
+                variants = tuple(
+                    {**prefix, key.value: value}
+                    for prefix in variants
+                )
+            return variants, False
+
+        positional_variants: tuple[tuple[ast.AST, ...], ...] = ((),)
+        for argument in call.args:
+            if isinstance(argument, ast.Starred):
+                expanded, unknown = finite_star_variants(
+                    argument.value,
+                    scope,
+                )
+                if unknown:
+                    return True
+                positional_variants = tuple(
+                    prefix + suffix
+                    for prefix in positional_variants
+                    for suffix in expanded
+                )
+            else:
+                positional_variants = tuple(
+                    prefix + (argument,)
+                    for prefix in positional_variants
+                )
+
+        keyword_variants: tuple[dict[str, ast.AST], ...] = ({},)
+        duplicate_binding = False
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                expanded, unknown = finite_mapping_variants(
+                    keyword.value,
+                    scope,
+                )
+                if unknown:
+                    return True
+                duplicate_binding |= any(
+                    bool(set(prefix).intersection(suffix))
+                    for prefix in keyword_variants
+                    for suffix in expanded
+                )
+                keyword_variants = tuple(
+                    {**prefix, **suffix}
+                    for prefix in keyword_variants
+                    for suffix in expanded
+                )
+            else:
+                duplicate_binding |= any(
+                    keyword.arg in variant for variant in keyword_variants
+                )
+                keyword_variants = tuple(
+                    {**variant, keyword.arg: keyword.value}
+                    for variant in keyword_variants
+                )
+
+        if duplicate_binding:
+            return True
+        parameter_names = ("code", "globals", "name", "argdefs", "closure")
+        for positional in positional_variants:
+            for keywords in keyword_variants:
+                if len(positional) > len(parameter_names) or any(
+                    parameter_name in keywords
+                    for parameter_name in parameter_names[:len(positional)]
+                ):
+                    return True
+                code_value = positional[0] if positional else keywords.get("code")
+                if (
+                    code_value is not None
+                    and EXECUTABLE_CODE_PAYLOAD_FULL_IMPORT_NAMES.intersection(
+                        flow_sensitive_import_origins(code_value, scope)
+                    )
+                ):
+                    return True
+        return False
+
     findings = []
     for node in ast.walk(tree):
         if node in forced_higher_order_findings or node in forced_iterable_findings:
@@ -9051,6 +9249,18 @@ def sensitive_module_reexports(
         elif (
             isinstance(node, ast.Call)
             and EXECUTABLE_DESERIALIZER_FULL_IMPORT_NAMES.intersection(
+                flow_sensitive_import_origins(
+                    node.func,
+                    enclosing_callable(node),
+                )
+            )
+        ):
+            findings.append(node)
+        elif isinstance(node, ast.Call) and executable_marshaled_code_constructor(node):
+            findings.append(node)
+        elif (
+            isinstance(node, ast.Call)
+            and PROCESS_LAUNCH_WRAPPER_FULL_IMPORT_NAMES.intersection(
                 flow_sensitive_import_origins(
                     node.func,
                     enclosing_callable(node),
@@ -11161,6 +11371,216 @@ class H2D2FreezeContractTests(unittest.TestCase):
         )
         for source in deserializer_negatives:
             with self.subTest(safe_deserializer_shape=source.strip()):
+                self.assertFalse(
+                    sensitive_module_reexports(ast.parse(source), {}),
+                )
+
+        executable_code_positives = (
+            (
+                "import marshal\n"
+                "import types\n"
+                "types.FunctionType(marshal.loads(blob), {})()\n"
+            ),
+            (
+                "from marshal import loads as decode\n"
+                "from types import FunctionType as build\n"
+                "factory = build\n"
+                "load_code = decode\n"
+                "function = factory(load_code(blob), {})\n"
+                "function()\n"
+            ),
+            (
+                "from marshal import load as decode\n"
+                "from types import LambdaType as build\n"
+                "build(decode(stream), {})()\n"
+            ),
+            (
+                "import marshal as codec\n"
+                "import types as runtime\n"
+                "build = harmless\n"
+                "if enabled:\n"
+                "    build = runtime.FunctionType\n"
+                "build(codec.loads(blob), {})\n"
+            ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "types.FunctionType(code=marshal.loads(blob), globals={})()\n"
+            ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "types.FunctionType(*(marshal.loads(blob), {}))()\n"
+            ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "arguments = [marshal.loads(blob), {}]\n"
+                "types.FunctionType(*arguments)()\n"
+            ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "types.FunctionType(**{\n"
+                "    'code': marshal.loads(blob),\n"
+                "    'globals': {},\n"
+                "})()\n"
+            ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "types.FunctionType(\n"
+                "    *((marshal.loads(blob), {}) if enabled else (safe_code, {}))\n"
+                ")\n"
+            ),
+            (
+                "import types\n"
+                "types.FunctionType(*arguments)\n"
+            ),
+            (
+                "import types\n"
+                "types.FunctionType(**arguments)\n"
+            ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "types.FunctionType(\n"
+                "    safe_code, {}, code=marshal.loads(blob)\n"
+                ")\n"
+            ),
+            (
+                "import types\n"
+                "types.FunctionType(safe_code, {}, globals={})\n"
+            ),
+        )
+        for source in executable_code_positives:
+            with self.subTest(executable_marshaled_code=source.strip()):
+                self.assertTrue(
+                    sensitive_module_reexports(ast.parse(source), {}),
+                )
+
+        executable_code_negatives = (
+            "import marshal\nmarshal.loads(blob)\n",
+            (
+                "import marshal\n"
+                "import types\n"
+                "types.FunctionType(compile(source, 'safe', 'exec'), {})\n"
+            ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "decode = marshal.loads\n"
+                "decode = harmless\n"
+                "types.FunctionType(decode(blob), {})\n"
+            ),
+            (
+                "from marshal import loads as decode\n"
+                "from types import FunctionType as build\n"
+                "def run(decode):\n"
+                "    return build(decode(blob), {})\n"
+            ),
+            (
+                "from marshal import loads as decode\n"
+                "from types import FunctionType as build\n"
+                "def run(build):\n"
+                "    return build(decode(blob), {})\n"
+            ),
+            (
+                "import types\n"
+                "types.FunctionType(*(safe_code, {}))\n"
+            ),
+            (
+                "import types\n"
+                "arguments = [safe_code, {}]\n"
+                "types.FunctionType(*arguments)\n"
+            ),
+            (
+                "import types\n"
+                "types.FunctionType(**{'code': safe_code, 'globals': {}})\n"
+            ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "types.FunctionType(code=safe_code, globals={})\n"
+                "marshal.loads(blob)\n"
+            ),
+            (
+                "import types\n"
+                "types.FunctionType(safe_code, {}, name='safe')\n"
+            ),
+        )
+        for source in executable_code_negatives:
+            with self.subTest(safe_marshaled_shape=source.strip()):
+                self.assertFalse(
+                    sensitive_module_reexports(ast.parse(source), {}),
+                )
+
+        browser_launch_positives = (
+            "import webbrowser\nwebbrowser.open(url)\n",
+            "from webbrowser import open_new as launch\nlaunch(url)\n",
+            (
+                "import webbrowser as browser_api\n"
+                "launch = browser_api.open_new_tab\n"
+                "alias = launch\n"
+                "alias(url)\n"
+            ),
+            (
+                "import webbrowser\n"
+                "controller = webbrowser.get()\n"
+                "controller.open(url)\n"
+            ),
+            (
+                "from webbrowser import get as controller_for\n"
+                "controller = controller_for()\n"
+                "launch = controller.open_new\n"
+                "launch(url)\n"
+            ),
+            (
+                "import webbrowser\n"
+                "controller = webbrowser.BackgroundBrowser(command)\n"
+                "controller.open_new_tab(url)\n"
+            ),
+            (
+                "from webbrowser import GenericBrowser as Browser\n"
+                "controller = Browser(command)\n"
+                "launch = controller.open\n"
+                "launch(url)\n"
+            ),
+        )
+        for source in browser_launch_positives:
+            with self.subTest(browser_process_launch=source.strip()):
+                self.assertTrue(
+                    sensitive_module_reexports(ast.parse(source), {}),
+                )
+
+        browser_launch_negatives = (
+            "import webbrowser\nreference = webbrowser.open\n",
+            "import example\nexample.open_new_tab(url)\n",
+            (
+                "import webbrowser\n"
+                "launch = webbrowser.open\n"
+                "launch = harmless\n"
+                "launch(url)\n"
+            ),
+            (
+                "import webbrowser\n"
+                "def run(webbrowser):\n"
+                "    return webbrowser.open(url)\n"
+            ),
+            (
+                "from webbrowser import GenericBrowser as Browser\n"
+                "def run(Browser):\n"
+                "    return Browser(command).open(url)\n"
+            ),
+            (
+                "class GenericBrowser:\n"
+                "    def open(self, url):\n"
+                "        return False\n"
+                "GenericBrowser().open(url)\n"
+            ),
+        )
+        for source in browser_launch_negatives:
+            with self.subTest(safe_browser_shape=source.strip()):
                 self.assertFalse(
                     sensitive_module_reexports(ast.parse(source), {}),
                 )
