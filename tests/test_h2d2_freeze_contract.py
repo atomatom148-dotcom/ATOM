@@ -77,11 +77,18 @@ class H2D2FreezeContractTests(unittest.TestCase):
         source = BATCH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         imported = set()
+        direct_imports = set()
+        module_aliases = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                imported.update(alias.name for alias in node.names)
+                for alias in node.names:
+                    imported.add(alias.name)
+                    module_aliases[alias.asname or alias.name.split(".")[0]] = alias.name
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module)
+                direct_imports.update(
+                    (node.module, alias.name) for alias in node.names
+                )
         for forbidden_package in (
             "asyncio",
             "concurrent",
@@ -98,6 +105,38 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     ),
                     f"forbidden parallel package imported: {forbidden_package}",
                 )
+        qualified_calls = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+            ):
+                module_name = module_aliases.get(node.func.value.id)
+                if module_name:
+                    qualified_calls.add((module_name, node.func.attr))
+        forbidden_process_primitives = {
+            ("os", "fork"),
+            ("os", "forkpty"),
+            ("os", "posix_spawn"),
+            ("os", "posix_spawnp"),
+            ("os", "spawnl"),
+            ("os", "spawnle"),
+            ("os", "spawnlp"),
+            ("os", "spawnlpe"),
+            ("os", "spawnv"),
+            ("os", "spawnve"),
+            ("os", "spawnvp"),
+            ("os", "spawnvpe"),
+            ("subprocess", "Popen"),
+        }
+        process_violations = forbidden_process_primitives.intersection(
+            direct_imports | qualified_calls
+        )
+        self.assertFalse(
+            process_violations,
+            f"forbidden process primitive imported or called: {process_violations}",
+        )
         string_constants = {
             node.value for node in ast.walk(tree)
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
@@ -107,8 +146,6 @@ class H2D2FreezeContractTests(unittest.TestCase):
         for forbidden_call in (
             "ProcessPoolExecutor",
             "ThreadPoolExecutor",
-            "subprocess.Popen(",
-            "os.fork(",
             "asyncio.",
         ):
             self.assertNotIn(forbidden_call, source)
