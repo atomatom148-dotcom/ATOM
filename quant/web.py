@@ -468,7 +468,10 @@ def dashboard_page(data: dict[str, object]) -> bytes:
         ]),
         ("STATUS", [item["status"] for item in v9_accuracy]),
     )
-    phase_e_headers = ("FAMILY/HORIZON", "EFFECTIVE N", "ELIGIBLE", "ACC", "RMSE", "MAE", "BIAS", "COVERAGE")
+    phase_e_headers = (
+        "FAMILY/HORIZON", "PROOF N≤64", "N≥20", "DIR ACC",
+        "RMSE", "MAE", "BIAS", "COVERAGE",
+    )
     def phase_e_row(cohort: dict[str, object]) -> tuple[object, ...]:
         return (
             f"{cohort['family']} / {cohort['horizon']}",
@@ -1110,4 +1113,3 @@ def main(*, simulator_connection_factory: Callable | None = None,
 
 if __name__ == "__main__":
     main()
-
