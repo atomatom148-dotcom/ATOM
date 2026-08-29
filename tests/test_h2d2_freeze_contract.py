@@ -42,6 +42,14 @@ SENSITIVE_MODULE_ROOTS = {
     "threading",
     "zipimport",
 }
+KNOWN_CONCURRENCY_IMPORT_NAMES = {
+    "QueueListener",
+}
+KNOWN_CONCURRENCY_FULL_IMPORT_NAMES = {
+    "faulthandler.dump_traceback_later",
+    "logging.config.listen",
+    "pydoc._start_server",
+}
 FORBIDDEN_STAGE_IMPORT_ROOTS = SENSITIVE_MODULE_ROOTS - {
     "os",
     "subprocess",
@@ -153,12 +161,23 @@ def reject_duplicate_json_object_pairs(
 def is_sensitive_import_name(name: str) -> bool:
     root = name.split(".")[0]
     leaf = name.rsplit(".", 1)[-1]
+    public_leaf = leaf.lstrip("_")
     return (
         root in SENSITIVE_MODULE_ROOTS
         or root.lstrip("_") in SENSITIVE_MODULE_ROOTS
-        or leaf.lstrip("_").startswith(("Thread", "Fork", "Process"))
-        or leaf.lstrip("_") == "Pool"
-        or leaf.lstrip("_").endswith(("Pool", "Executor"))
+        or name in KNOWN_CONCURRENCY_FULL_IMPORT_NAMES
+        or public_leaf in KNOWN_CONCURRENCY_IMPORT_NAMES
+        or public_leaf.startswith(("Thread", "Fork", "Process"))
+        or public_leaf == "Pool"
+        or public_leaf.endswith(("Pool", "Executor"))
+    )
+
+
+def is_sensitive_from_import(module: str, imported_name: str) -> bool:
+    return (
+        is_sensitive_import_name(module)
+        or is_sensitive_import_name(imported_name)
+        or is_sensitive_import_name(f"{module}.{imported_name}")
     )
 
 
@@ -216,26 +235,38 @@ def sensitive_module_reexports(
         module_aliases: dict[str, str],
 ) -> tuple[ast.AST, ...]:
     tracked_bindings = set(module_aliases)
+    import_binding_origins: dict[str, set[str]] = {}
+    for import_node in ast.walk(tree):
+        if isinstance(import_node, ast.Import):
+            for alias in import_node.names:
+                binding = alias.asname or alias.name.split(".")[0]
+                origin = alias.name if alias.asname else alias.name.split(".")[0]
+                import_binding_origins.setdefault(binding, set()).add(origin)
+        elif (
+            isinstance(import_node, ast.ImportFrom)
+            and import_node.level == 0
+            and import_node.module
+        ):
+            for alias in import_node.names:
+                if alias.name == "*":
+                    continue
+                binding = alias.asname or alias.name
+                import_binding_origins.setdefault(binding, set()).add(
+                    f"{import_node.module}.{alias.name}"
+                )
 
-    local_callables: dict[
-        str,
-        list[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda],
-    ] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            local_callables.setdefault(node.name, []).append(node)
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
-            value = node.value
-            if not isinstance(value, ast.Lambda):
-                continue
-            targets = (
-                node.targets
-                if isinstance(node, ast.Assign)
-                else [node.target]
-            )
-            for target in targets:
-                if isinstance(target, ast.Name):
-                    local_callables.setdefault(target.id, []).append(value)
+    def qualified_import_attribute_names(node: ast.Attribute) -> set[str]:
+        attributes = []
+        cursor: ast.AST = node
+        while isinstance(cursor, ast.Attribute):
+            attributes.append(cursor.attr)
+            cursor = cursor.value
+        if not isinstance(cursor, ast.Name):
+            return set()
+        return {
+            ".".join((origin, *reversed(attributes)))
+            for origin in import_binding_origins.get(cursor.id, ())
+        }
 
     parents = {
         child: parent
@@ -243,22 +274,12 @@ def sensitive_module_reexports(
         for child in ast.iter_child_nodes(parent)
     }
     callable_nodes = {
-        local_callable
-        for definitions in local_callables.values()
-        for local_callable in definitions
-    } | {
         node for node in ast.walk(tree)
-        if isinstance(node, ast.Lambda)
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
+        )
     }
-
-    def local_call_targets(
-            call: ast.Call,
-    ) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda, ...]:
-        if isinstance(call.func, ast.Name):
-            return tuple(local_callables.get(call.func.id, ()))
-        if isinstance(call.func, ast.Lambda):
-            return (call.func,)
-        return ()
 
     def enclosing_callable(node: ast.AST) -> ast.AST | None:
         parent = parents.get(node)
@@ -282,6 +303,162 @@ def sensitive_module_reexports(
         if isinstance(node, (ast.List, ast.Tuple)):
             return set().union(*(target_names(item) for item in node.elts))
         return set()
+
+    def is_in_unmodeled_class_namespace(node: ast.AST) -> bool:
+        parent = parents.get(node)
+        while parent is not None and parent not in callable_nodes:
+            if isinstance(parent, ast.ClassDef):
+                return True
+            parent = parents.get(parent)
+        return False
+
+    scopes: set[ast.AST | None] = {None, *callable_nodes}
+    scope_bound_names = {scope: set() for scope in scopes}
+    callable_bindings: dict[
+        ast.AST | None,
+        dict[
+            str,
+            set[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda],
+        ],
+    ] = {scope: {} for scope in scopes}
+
+    def bind_callable(
+            scope: ast.AST | None,
+            name: str,
+            local_callable: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    ) -> bool:
+        bindings = callable_bindings[scope].setdefault(name, set())
+        if local_callable in bindings:
+            return False
+        bindings.add(local_callable)
+        return True
+
+    for local_callable in callable_nodes:
+        arguments = local_callable.args
+        scope_bound_names[local_callable].update(
+            argument.arg
+            for argument in (
+                arguments.posonlyargs
+                + arguments.args
+                + arguments.kwonlyargs
+            )
+        )
+        if arguments.vararg is not None:
+            scope_bound_names[local_callable].add(arguments.vararg.arg)
+        if arguments.kwarg is not None:
+            scope_bound_names[local_callable].add(arguments.kwarg.arg)
+        if (
+            isinstance(local_callable, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not is_in_unmodeled_class_namespace(local_callable)
+        ):
+            definition_scope = callable_parents[local_callable]
+            scope_bound_names[definition_scope].add(local_callable.name)
+            bind_callable(
+                definition_scope,
+                local_callable.name,
+                local_callable,
+            )
+
+    alias_assignments = []
+    for node in ast.walk(tree):
+        if is_in_unmodeled_class_namespace(node):
+            continue
+        scope = enclosing_callable(node)
+        if isinstance(node, ast.Assign):
+            alias_assignments.append((scope, node.targets, node.value))
+            scope_bound_names[scope].update(
+                set().union(*(target_names(target) for target in node.targets))
+            )
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            if node.value is not None:
+                alias_assignments.append((scope, [node.target], node.value))
+            scope_bound_names[scope].update(target_names(node.target))
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            scope_bound_names[scope].update(target_names(node.target))
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    scope_bound_names[scope].update(
+                        target_names(item.optional_vars)
+                    )
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            scope_bound_names[scope].add(node.name)
+        elif isinstance(node, ast.Import):
+            scope_bound_names[scope].update(
+                alias.asname or alias.name.split(".")[0]
+                for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            scope_bound_names[scope].update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name != "*"
+            )
+        elif isinstance(node, ast.ClassDef):
+            scope_bound_names[scope].add(node.name)
+
+    def resolve_callable_name(
+            name: str,
+            scope: ast.AST | None,
+    ) -> set[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda]:
+        while True:
+            if name in scope_bound_names[scope]:
+                return set(callable_bindings[scope].get(name, ()))
+            if scope is None:
+                return set()
+            scope = callable_parents[scope]
+
+    def resolve_callable_expression(
+            node: ast.AST,
+            scope: ast.AST | None,
+    ) -> set[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda]:
+        if isinstance(node, ast.Name):
+            return resolve_callable_name(node.id, scope)
+        if isinstance(node, ast.Lambda):
+            return {node}
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return set().union(*(
+                resolve_callable_expression(item, scope)
+                for item in node.elts
+            )) if node.elts else set()
+        if isinstance(node, ast.Dict):
+            return set().union(*(
+                resolve_callable_expression(value, scope)
+                for value in node.values
+            )) if node.values else set()
+        if isinstance(node, (ast.Starred, ast.NamedExpr, ast.Subscript)):
+            return resolve_callable_expression(node.value, scope)
+        if isinstance(node, ast.IfExp):
+            return (
+                resolve_callable_expression(node.body, scope)
+                | resolve_callable_expression(node.orelse, scope)
+            )
+        return set()
+
+    aliases_changed = True
+    while aliases_changed:
+        aliases_changed = False
+        for scope, targets, value in alias_assignments:
+            resolved = resolve_callable_expression(value, scope)
+            if not resolved:
+                continue
+            for name in set().union(*(
+                target_names(target) for target in targets
+            )):
+                for local_callable in resolved:
+                    aliases_changed |= bind_callable(
+                        scope,
+                        name,
+                        local_callable,
+                    )
+
+    def local_call_targets(
+            call: ast.Call,
+    ) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda, ...]:
+        return tuple(resolve_callable_expression(
+            call.func,
+            enclosing_callable(call),
+        ))
 
     def contains_tracked_binding(
             node: ast.AST,
@@ -496,6 +673,10 @@ def sensitive_module_reexports(
             and (
                 is_sensitive_import_name(node.attr)
                 or node.attr.startswith("_")
+                or any(
+                    qualified_name in KNOWN_CONCURRENCY_FULL_IMPORT_NAMES
+                    for qualified_name in qualified_import_attribute_names(node)
+                )
             )
         ):
             findings.append(node)
@@ -581,6 +762,47 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 ),
                 "shutil.fnmatch",
             ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "def invoke(value):\n    value.os.fork()\n"
+                    "alias = invoke\nalias(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "def invoke(value):\n    value.os.fork()\n"
+                    "alias: object = invoke\nalias(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "def invoke(value):\n    value.os.fork()\n"
+                    "(alias := invoke)(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "def invoke(value):\n    value.os.fork()\n"
+                    "aliases = [invoke]\naliases[0](p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "def invoke(value):\n    value.os.fork()\n"
+                    "aliases = {\"invoke\": invoke}\n"
+                    "aliases[\"invoke\"](p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
         ):
             with self.subTest(source=source):
                 self.assertTrue(
@@ -589,6 +811,22 @@ class H2D2FreezeContractTests(unittest.TestCase):
                         {"p": imported_name},
                     )
                 )
+
+        shadowed_source = (
+            "from shutil import fnmatch as p\n"
+            "def invoke(value):\n    value.os.fork()\n"
+            "def run():\n"
+            "    invoke = lambda value: value\n"
+            "    invoke(p)\n"
+            "run()\n"
+        )
+        self.assertFalse(
+            sensitive_module_reexports(
+                ast.parse(shadowed_source),
+                {"p": "shutil.fnmatch"},
+            ),
+            "a local safe callable must shadow an outer helper with the same name",
+        )
 
         for imported_name in (
             "Thread",
@@ -604,6 +842,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "WorkerPool",
             "Executor",
             "CustomExecutor",
+            "QueueListener",
             "http.server.ThreadingHTTPServer",
             "socketserver.ForkingMixIn",
         ):
@@ -611,6 +850,54 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 self.assertTrue(is_sensitive_import_name(imported_name))
         self.assertFalse(is_sensitive_import_name("http.server"))
         self.assertFalse(is_sensitive_import_name("PoolsideMetric"))
+        self.assertFalse(is_sensitive_import_name("QueueHandler"))
+
+        queue_listener_source = (
+            "from logging.handlers import QueueListener\n"
+            "QueueListener(None).start()\n"
+        )
+        queue_listener_tree = ast.parse(queue_listener_source)
+        self.assertEqual(
+            {
+                (node.module, alias.name)
+                for node in ast.walk(queue_listener_tree)
+                if isinstance(node, ast.ImportFrom)
+                for alias in node.names
+                if is_sensitive_from_import(node.module or "", alias.name)
+            },
+            {("logging.handlers", "QueueListener")},
+        )
+
+        self.assertFalse(is_sensitive_import_name("listen"))
+        self.assertFalse(is_sensitive_from_import("example.config", "listen"))
+        for source, expected_import in (
+            (
+                "from logging.config import listen\nlisten().start()\n",
+                ("logging.config", "listen"),
+            ),
+            (
+                "from pydoc import _start_server\n"
+                "_start_server(None, None, 0)\n",
+                ("pydoc", "_start_server"),
+            ),
+            (
+                "from faulthandler import dump_traceback_later\n"
+                "dump_traceback_later(1)\n",
+                ("faulthandler", "dump_traceback_later"),
+            ),
+        ):
+            with self.subTest(source=source):
+                direct_imports = {
+                    (node.module, alias.name)
+                    for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.ImportFrom) and node.module
+                    for alias in node.names
+                    if is_sensitive_from_import(node.module, alias.name)
+                }
+                self.assertEqual(
+                    direct_imports,
+                    {expected_import},
+                )
 
         for source, bindings in (
             (
@@ -629,11 +916,43 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "import executor_tools as e\ne.CustomExecutor\n",
                 {"e": "executor_tools"},
             ),
+            (
+                "from logging import handlers as h\n"
+                "h.QueueListener(None).start()\n",
+                {"h": "logging.handlers"},
+            ),
+            (
+                "import logging.config as c\nc.listen().start()\n",
+                {"c": "logging.config"},
+            ),
+            (
+                "import logging\nlogging.config.listen().start()\n",
+                {"logging": "logging"},
+            ),
+            (
+                "import pydoc as p\np._start_server(None, None, 0)\n",
+                {"p": "pydoc"},
+            ),
+            (
+                "import faulthandler as f\n"
+                "f.dump_traceback_later(1)\n",
+                {"f": "faulthandler"},
+            ),
         ):
             with self.subTest(source=source):
                 self.assertTrue(
                     sensitive_module_reexports(ast.parse(source), bindings)
                 )
+
+        generic_listen_source = (
+            "import example.config as c\nc.listen()\n"
+        )
+        self.assertFalse(
+            sensitive_module_reexports(
+                ast.parse(generic_listen_source),
+                {"c": "example.config"},
+            )
+        )
 
     def test_baselines_are_two_read_only_certified_complete_sessions(self):
         payload = json.loads(
@@ -901,10 +1220,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
         )
         direct_process_imports = {
             item for item in direct_imports
-            if (
-                is_sensitive_import_name(item[0])
-                or is_sensitive_import_name(item[1])
-            )
+            if is_sensitive_from_import(*item)
         }
         self.assertFalse(
             direct_process_imports,
@@ -1054,12 +1370,12 @@ class H2D2FreezeContractTests(unittest.TestCase):
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.Name)
-            and node.id in {"_run_json", "subprocess"}
+            and node.id in {"_run_json", "subprocess", "sys"}
             and isinstance(node.ctx, (ast.Store, ast.Del))
         )
         self.assertFalse(
             dispatcher_or_subprocess_writes,
-            "the dispatcher and subprocess binding are immutable",
+            "the dispatcher, subprocess, and sys bindings are immutable",
         )
         stage_dispatches = tuple(
             node
@@ -1157,9 +1473,68 @@ class H2D2FreezeContractTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "execute"
         )
         self.assertEqual(len(execute_functions), 1)
+        execute_function = execute_functions[0]
         self.assertIn(
             run_json_default_loads[0],
-            tuple(ast.walk(execute_functions[0].args)),
+            tuple(ast.walk(execute_function.args)),
+        )
+        py_writes = tuple(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+            and node.id == "py"
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+        )
+        self.assertEqual(
+            len(py_writes),
+            1,
+            "the stage interpreter binding cannot be rebound or deleted",
+        )
+        py_initializer = parents.get(py_writes[0])
+        self.assertIsInstance(py_initializer, ast.Assign)
+        self.assertEqual(py_initializer.targets, [py_writes[0]])
+        self.assertIs(parents.get(py_initializer), execute_function)
+        self.assertIsInstance(py_initializer.value, ast.Attribute)
+        self.assertIsInstance(py_initializer.value.value, ast.Name)
+        self.assertEqual(py_initializer.value.value.id, "sys")
+        self.assertEqual(py_initializer.value.attr, "executable")
+        self.assertIsInstance(py_initializer.value.ctx, ast.Load)
+        sys_executable_references = tuple(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+            and node.attr == "executable"
+        )
+        self.assertEqual(sys_executable_references, (py_initializer.value,))
+        py_loads = tuple(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+            and node.id == "py"
+            and isinstance(node.ctx, ast.Load)
+        )
+        self.assertEqual(len(py_loads), 4)
+        self.assertEqual(
+            set(py_loads),
+            {dispatch.args[0].elts[0] for dispatch in stage_dispatches},
+            "py may only select the interpreter for the four frozen commands",
+        )
+        self.assertFalse(
+            tuple(
+                node
+                for node in ast.walk(tree)
+                if (
+                    isinstance(node, ast.arg)
+                    and node.arg == "py"
+                )
+                or (
+                    isinstance(node, (ast.Global, ast.Nonlocal))
+                    and "py" in node.names
+                )
+            ),
+            "py cannot be introduced through an argument or scope declaration",
         )
         dynamic_calls = {
             node.func.id
@@ -1256,12 +1631,16 @@ class H2D2FreezeContractTests(unittest.TestCase):
         )
         self.assertEqual(len(day_loops), 1)
         day_loop = day_loops[0]
-        execute_function = execute_functions[0]
         self.assertIn(day_loop, tuple(ast.walk(execute_function)))
         self.assertIs(
             parents.get(day_loop),
             execute_function,
             "the per-day loop must remain in execute's direct body",
+        )
+        self.assertLess(
+            execute_function.body.index(py_initializer),
+            execute_function.body.index(day_loop),
+            "the immutable interpreter must be selected before the per-day loop",
         )
         day_tries = tuple(
             statement
@@ -1321,11 +1700,140 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     f"{stage} cannot move into a lambda or control-flow branch",
                 )
                 dispatch_carriers.append(assignment)
+        dispatch_carrier_positions = tuple(
+            day_try.body.index(carrier) for carrier in dispatch_carriers
+        )
         self.assertEqual(
-            tuple(day_try.body.index(carrier) for carrier in dispatch_carriers),
-            tuple(sorted(day_try.body.index(carrier) for carrier in dispatch_carriers)),
+            dispatch_carrier_positions,
+            tuple(sorted(dispatch_carrier_positions)),
             "stage dispatch carriers must remain in straight-line source order",
         )
+        expected_interstage_guards = (
+            (
+                (
+                    "h1.get('execution_stage') != 'REPLAY_COMPLETE' or "
+                    "h1.get('data_status') != 'CERTIFIED'",
+                    "StageFailure('H1', 'NOT_CERTIFIED', h1)",
+                ),
+                (
+                    "not isinstance(dataset_digest, str) or "
+                    "not isinstance(configuration_digest, str) or "
+                    "isinstance(frame_count, bool) or "
+                    "not isinstance(frame_count, int) or frame_count < 1",
+                    "StageFailure('MANIFEST', 'INVALID_SESSION_LINEAGE')",
+                ),
+            ),
+            (
+                (
+                    "verified.get('verification_status') != 'VERIFIED' or "
+                    "verified.get('manifest_count') != 1 or "
+                    "verified.get('frame_count') != frame_count or "
+                    "verified.get('forecast_count') != expected_forecasts or "
+                    "verified.get('quant_count') != 12 or "
+                    "verified.get('horizon_count') != 6 or "
+                    "verified.get('dataset_digest') != dataset_digest or "
+                    "verified.get('configuration_digest') != configuration_digest",
+                    "StageFailure('H2B', 'VERIFIED_RECEIPT_MISMATCH', verified)",
+                ),
+            ),
+            (),
+        )
+        expected_guard_containers = (
+            (dispatch_carriers[0], day_try),
+            (day_try,),
+            (),
+        )
+        for pair_index, expected_guards in enumerate(expected_interstage_guards):
+            first = dispatch_carrier_positions[pair_index]
+            second = dispatch_carrier_positions[pair_index + 1]
+            region_nodes = tuple(
+                node
+                for statement in day_try.body[first:second]
+                for node in ast.walk(statement)
+            )
+            unexpected_terminators = tuple(
+                node
+                for node in region_nodes
+                if isinstance(
+                    node,
+                    (
+                        ast.Assert,
+                        ast.Break,
+                        ast.Continue,
+                        ast.Return,
+                        ast.Yield,
+                        ast.YieldFrom,
+                    ),
+                )
+            )
+            self.assertFalse(
+                unexpected_terminators,
+                "terminating control flow cannot skip a later stage dispatch",
+            )
+            early_exit_calls = tuple(
+                node
+                for node in region_nodes
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in {"exit", "quit"}
+            )
+            self.assertFalse(
+                early_exit_calls,
+                "exit or quit cannot skip a later stage dispatch",
+            )
+            raises = tuple(
+                sorted(
+                    (node for node in region_nodes if isinstance(node, ast.Raise)),
+                    key=lambda node: (node.lineno, node.col_offset),
+                )
+            )
+            self.assertEqual(
+                len(raises),
+                len(expected_guards),
+                "no new raise may skip a later stage dispatch",
+            )
+            observed_guards = []
+            for raise_index, raise_node in enumerate(raises):
+                guard = parents.get(raise_node)
+                self.assertIsInstance(guard, ast.If)
+                self.assertEqual(guard.body, [raise_node])
+                self.assertFalse(guard.orelse)
+                expected_container = expected_guard_containers[pair_index][raise_index]
+                self.assertIs(parents.get(guard), expected_container)
+                self.assertIn(guard, expected_container.body)
+                self.assertIsNotNone(raise_node.exc)
+                self.assertIsNone(raise_node.cause)
+                self.assertLess(
+                    (
+                        ordered_dispatches[pair_index].lineno,
+                        ordered_dispatches[pair_index].col_offset,
+                    ),
+                    (raise_node.lineno, raise_node.col_offset),
+                    "receipt validation can terminate only after its stage dispatch",
+                )
+                observed_guards.append(
+                    (
+                        ast.dump(guard.test, include_attributes=False),
+                        ast.dump(raise_node.exc, include_attributes=False),
+                    )
+                )
+            self.assertEqual(
+                tuple(observed_guards),
+                tuple(
+                    (
+                        ast.dump(
+                            ast.parse(test_source, mode="eval").body,
+                            include_attributes=False,
+                        ),
+                        ast.dump(
+                            ast.parse(exception_source, mode="eval").body,
+                            include_attributes=False,
+                        ),
+                    )
+                    for test_source, exception_source in expected_guards
+                ),
+                "only the exact frozen receipt-validation raises may separate stages",
+            )
         self.assertEqual(
             {
                 node
@@ -1406,10 +1914,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 direct_process_imports = {
                     item
                     for item in direct_imports
-                    if (
-                        is_sensitive_import_name(item[0])
-                        or is_sensitive_import_name(item[1])
-                    )
+                    if is_sensitive_from_import(*item)
                 }
                 self.assertFalse(
                     direct_process_imports,
