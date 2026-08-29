@@ -36,7 +36,17 @@ canary must add and verify them before it can dispatch two dates.
    calls `SELECT pg_try_advisory_lock(8098937340306602170)` exactly once.
    False, null, or error stops before workers. A distributed queue, lease
    expiry, abandoned-worker reassignment, and more than two workers are not
-   authorized.
+   authorized. This PostgreSQL advisory lock remains database-wide and is the
+   cross-process and cross-host single-coordinator exclusion, including against
+   an accidentally started contender on another host. Cross-host lock scope
+   does not authorize cross-host execution. Before it can be accepted as the
+   winning coordinator or acquire either date fence, the lock holder must prove
+   that it runs on the one configured Linux execution host and in the one PID
+   namespace identity pinned for that generation. Host identity is the
+   configured machine identity plus Linux boot ID; PID-namespace identity is
+   the device/inode identity of `/proc/self/ns/pid`. A missing, stale,
+   unverifiable, or mismatched identity releases the global lock exactly once
+   in `finally` and stops before supervisor admission.
 4. After acquiring the coordinator lock, the same session must acquire both
    date-fence locks exclusively before creating any workload process:
    `pg_try_advisory_lock(-5133988379539764595)` for `2026-06-15` and
@@ -53,14 +63,24 @@ canary must add and verify them before it can dispatch two dates.
    attestation stops. Each supervisor serializes admission and atomically
    compare-and-swaps that exact attested `CLEAN` version and terminal receipt
    to a fsynced `CLAIMING` generation record containing the next monotonic
-   version, date, generation ID, commit, coordinator OS PID and database
-   backend PID, host identity, and fixed cgroup path. A false compare-and-swap,
+   version, date, generation ID, commit, coordinator OS PID, coordinator
+   procfs start-time ticks, database backend PID, host identity, and fixed
+   cgroup path. A false compare-and-swap,
    stale version, or generation mismatch stops; every later transition is
    conditional on the exact predecessor version and generation. If fewer than
    two compare-and-swaps succeed, no fence handoff or guardian creation occurs
    and each partial claim must complete terminal cleanup before a retry. A
    failure before the first supervisor compare-and-swap follows the same
-   pre-claim unlock path and requires no new terminal receipt. On any admission
+   pre-claim unlock path and requires no new terminal receipt. Both fixed
+   supervisors must run on that same configured Linux execution host and PID
+   namespace as the winning coordinator. Here, independently supervised means
+   separate durable OS processes and process/service failure domains, not
+   separate hosts: each supervisor has its own fixed service identity,
+   lifecycle, admission serialization, generation record, and workload cgroup.
+   Each attestation and generation record must bind the configured host
+   identity, current Linux boot ID, PID-namespace device/inode identity, and
+   supervisor service identity; any cross-host or cross-namespace combination
+   fails closed. On any admission
    failure after the first successful compare-and-swap but before both guardian
    claim receipts, no worker may start. The coordinator retains the global lock
    until every changed supervisor has fsynced terminal cleanup, every created
@@ -68,21 +88,49 @@ canary must add and verify them before it can dispatch two dates.
    exact prior `CLEAN` version. It then explicitly unlocks and verifies every
    exclusive date fence still held by its control session exactly once before
    unlocking the global coordinator lock. A date fence already handed to a
-   guardian must not be unlocked a second time. Only
-   after both records are durable may the supervisors
-   create exactly two claim-only date guardians outside the coordinator and
-   workload failure domains. The coordinator unlocks each exclusive date fence
-   exactly once only so the corresponding guardian can claim it in shared
-   mode. No worker, stage, or provider call may begin during this handoff.
+   guardian must not be unlocked a second time. Only after both records are
+   durable may the supervisors create exactly two claim-only date guardians
+   outside the coordinator's process/service failure domain but on the same
+   configured host and in the same PID namespace. The coordinator creates one
+   distinct liveness pipe per guardian with `pipe2(O_CLOEXEC)`. The assigned
+   read end reaches only the exact generation/date guardian, either directly
+   over an authenticated local Unix-domain `SOCK_SEQPACKET` socket using
+   `SCM_RIGHTS` after `SO_PEERCRED` and generation verification, or through
+   exact allowlisted pre-spawn inheritance into that guardian. For the latter,
+   only the assigned read descriptor may have close-on-exec cleared across the
+   guardian exec boundary. The coordinator remains the sole write-end owner for
+   both pipes; each exact guardian becomes the sole read-end owner for its pipe.
+   The coordinator closes every read-end copy after verified delivery, and each
+   supervisor closes every temporary pipe-descriptor copy immediately after
+   verified guardian handoff. The other guardian, every worker, and every
+   descendant must inherit neither end. Ambiguous peer identity, duplicate or
+   cross-generation delivery, a leaked descriptor copy, or inability to prove
+   this final custody stops admission. The coordinator unlocks each exclusive
+   date fence exactly once only so the corresponding guardian can claim it in
+   shared mode. No worker, stage, or provider call may begin during this
+   handoff.
 5. Each guardian must run on a Linux host with delegated cgroup v2 support for
    `cgroup.freeze`, `cgroup.kill`, and the `populated` field in
    `cgroup.events`; missing or unverified support stops before claim. The
    guardian opens its own session-pinned, read-only fence connection, acquires
    its date key with `pg_try_advisory_lock_shared`, verifies its own backend
    ownership through `pg_locks`, and verifies that the exact recorded
-   coordinator backend PID still owns `8098937340306602170`. It also opens a
-   `pidfd` for the exact coordinator OS PID and a close-on-exec liveness pipe
-   whose write end is owned only by the coordinator. The supervisor must then
+   coordinator backend PID still owns `8098937340306602170`. Before accepting
+   its pipe or opening a process handle, it must independently attest the same
+   configured host identity, Linux boot ID, and PID-namespace device/inode as
+   the coordinator, both supervisors, the other guardian, and every process
+   assigned to either worker cgroup. It then opens a `pidfd` for the exact
+   coordinator OS PID: it calls `pidfd_open()` for the exact recorded
+   coordinator OS PID, verifies its procfs start-time ticks against the
+   generation record, and requires the resulting `pidfd` to be initially
+   non-readable. Same-host and same-PID-namespace placement is what makes this
+   local process identity check feasible; remote-PID interpretation is
+   forbidden. Unsupported `pidfd_open()`, an invisible or already-dead PID,
+   process-identity drift, or a host or PID-namespace identity that is missing,
+   stale, unverifiable, or mismatched fails closed before claim. The guardian
+   also verifies that it is the sole read-end owner of its assigned
+   close-on-exec liveness pipe and that the coordinator is its sole write-end
+   owner. The supervisor must then
    atomically transition and fsync its durable generation record from
    `CLAIMING` to `ACTIVE`. Only then may the guardian return a claim receipt.
    Both claim receipts are required before either guardian may create its
@@ -103,9 +151,10 @@ canary must add and verify them before it can dispatch two dates.
    Only after that ordered cleanup may the guardian unlock or close its shared
    fence connection. Each stage has a dedicated process group inside that
    cgroup, and every worker, launcher, stage, and descendant must remain in the
-   same no-escape cgroup. A parent-death signal or process-group kill alone is
-   not accepted as proof of containment. No guardian, worker, or descendant
-   may use or inherit the coordinator connection or liveness-pipe write end.
+   same no-escape cgroup and the generation's pinned PID namespace. A
+   parent-death signal or process-group kill alone is not accepted as proof of
+   containment. No guardian, worker, or descendant may use or inherit the
+   coordinator connection or liveness-pipe write end.
 7. A guardian holds its shared date fence from claim through terminal cleanup
    on success and every failure path while that database session exists. On
    normal completion it validates the final receipt, waits for worker exit,
@@ -138,12 +187,16 @@ canary must add and verify them before it can dispatch two dates.
    database connections at once.
 
 The fixed coordinator advisory lock enforces fast-path single ownership across
-processes and hosts connected to the evidence database. The durable supervisor
-generation records are the independent admission fence when database sessions
-all disappear. Database primary keys and existing per-run advisory locks remain
-the final row-integrity barrier; they do not replace the coordinator/date-claim
-law. Manifest content includes performance fields, so two simultaneous H1
-writers for one date can safely conflict even when their mathematics matches.
+processes and hosts connected to the evidence database. The selected execution
+topology remains deliberately local: the winning coordinator, two independently
+durable supervisor processes, two guardians, and both worker process trees are
+one configured Linux host/one PID namespace per generation. The durable
+supervisor generation records are the independent admission fence when database
+sessions all disappear. Database primary keys and existing per-run advisory
+locks remain the final row-integrity barrier; they do not replace the
+coordinator/date-claim law. Manifest content includes performance fields, so two
+simultaneous H1 writers for one date can safely conflict even when their
+mathematics matches.
 
 ## Stage, retry, and failure contract
 
@@ -279,6 +332,16 @@ both supervisor claims; a split or partial claim starts no guardian. Unsupported
 cgroup, `pidfd`, durable state, or supervisor semantics, an unreachable
 supervisor, an orphan PID, early fence release, a nonempty cgroup, or any
 old/new generation overlap permanently fails H2-D-3.
+
+A separate topology and descriptor-custody test must try a foreign host, a
+foreign PID namespace, a stale Linux boot identity, a failed `pidfd_open()`, a
+misdelivered read end, and a leaked supervisor/read/write descriptor copy. Each
+case must fail before worker start. The success case must inspect the live
+processes and descriptor tables and prove one configured Linux execution host,
+one PID namespace identity, one coordinator-owned write end per pipe, one
+corresponding guardian-owned read end, no supervisor pipe copy, and no inherited
+worker or descendant pipe end. Passing these tests belongs only to a separately
+approved H2-D-3 implementation; H2-D-2 still authorizes no runtime.
 
 ## Explicit non-goals
 

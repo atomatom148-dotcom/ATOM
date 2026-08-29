@@ -230,55 +230,321 @@ def local_runtime_dependencies(relative_path: str, tree: ast.AST) -> set[str]:
     return dependencies
 
 
-def sensitive_module_reexports(
-        tree: ast.AST,
-        module_aliases: dict[str, str],
-) -> tuple[ast.AST, ...]:
-    tracked_bindings = set(module_aliases)
-    import_binding_origins: dict[str, set[str]] = {}
-    for import_node in ast.walk(tree):
-        if isinstance(import_node, ast.Import):
-            for alias in import_node.names:
-                binding = alias.asname or alias.name.split(".")[0]
-                origin = alias.name if alias.asname else alias.name.split(".")[0]
-                import_binding_origins.setdefault(binding, set()).add(origin)
-        elif (
-            isinstance(import_node, ast.ImportFrom)
-            and import_node.level == 0
-            and import_node.module
-        ):
-            for alias in import_node.names:
-                if alias.name == "*":
-                    continue
-                binding = alias.asname or alias.name
-                import_binding_origins.setdefault(binding, set()).add(
-                    f"{import_node.module}.{alias.name}"
-                )
-
-    def qualified_import_attribute_names(node: ast.Attribute) -> set[str]:
-        attributes = []
-        cursor: ast.AST = node
-        while isinstance(cursor, ast.Attribute):
-            attributes.append(cursor.attr)
-            cursor = cursor.value
-        if not isinstance(cursor, ast.Name):
-            return set()
-        return {
-            ".".join((origin, *reversed(attributes)))
-            for origin in import_binding_origins.get(cursor.id, ())
-        }
-
+def lexical_import_origins(
+        tree: ast.Module,
+        *,
+        include_from_imports: bool = False,
+        propagate_aliases: bool = False,
+) -> tuple[dict[ast.AST, ast.AST], object]:
+    """Resolve import bindings without leaking aliases across lexical scopes."""
     parents = {
         child: parent
         for parent in ast.walk(tree)
         for child in ast.iter_child_nodes(parent)
     }
+    scope_parents: dict[ast.AST, ast.AST | None] = {tree: None}
+    node_scopes: dict[ast.AST, ast.AST] = {}
+    raw_bound_names: dict[ast.AST, set[str]] = {tree: set()}
+    global_names: dict[ast.AST, set[str]] = {tree: set()}
+    nonlocal_names: dict[ast.AST, set[str]] = {tree: set()}
+    binding_events: list[tuple[ast.AST, str, str | None]] = []
+    alias_events: list[tuple[ast.AST, list[ast.AST], ast.AST]] = []
+
+    def new_scope(scope: ast.AST, parent: ast.AST) -> None:
+        if isinstance(scope, (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.Lambda,
+            ast.ListComp,
+            ast.SetComp,
+            ast.DictComp,
+            ast.GeneratorExp,
+        )):
+            while isinstance(parent, ast.ClassDef):
+                outer = scope_parents[parent]
+                if outer is None:
+                    break
+                parent = outer
+        scope_parents[scope] = parent
+        raw_bound_names[scope] = set()
+        global_names[scope] = set()
+        nonlocal_names[scope] = set()
+
+    def bind(scope: ast.AST, name: str, origin: str | None = None) -> None:
+        raw_bound_names[scope].add(name)
+        binding_events.append((scope, name, origin))
+
+    def target_names(node: ast.AST) -> set[str]:
+        if isinstance(node, ast.Name):
+            return {node.id}
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return set().union(*(
+                target_names(item) for item in node.elts
+            )) if node.elts else set()
+        return set()
+
+    def visit_arguments_outer(arguments: ast.arguments, scope: ast.AST) -> None:
+        for default in arguments.defaults:
+            visit(default, scope)
+        for default in arguments.kw_defaults:
+            if default is not None:
+                visit(default, scope)
+        for argument in (
+            arguments.posonlyargs
+            + arguments.args
+            + arguments.kwonlyargs
+        ):
+            if argument.annotation is not None:
+                visit(argument.annotation, scope)
+        if arguments.vararg is not None and arguments.vararg.annotation is not None:
+            visit(arguments.vararg.annotation, scope)
+        if arguments.kwarg is not None and arguments.kwarg.annotation is not None:
+            visit(arguments.kwarg.annotation, scope)
+
+    def bind_arguments(arguments: ast.arguments, scope: ast.AST) -> None:
+        for argument in (
+            arguments.posonlyargs
+            + arguments.args
+            + arguments.kwonlyargs
+        ):
+            bind(scope, argument.arg)
+        if arguments.vararg is not None:
+            bind(scope, arguments.vararg.arg)
+        if arguments.kwarg is not None:
+            bind(scope, arguments.kwarg.arg)
+
+    def visit_comprehension(node: ast.AST, scope: ast.AST) -> None:
+        generators = node.generators
+        new_scope(node, scope)
+        visit(generators[0].iter, scope)
+        for index, generator in enumerate(generators):
+            if index:
+                visit(generator.iter, node)
+            visit(generator.target, node)
+            for condition in generator.ifs:
+                visit(condition, node)
+        if isinstance(node, ast.DictComp):
+            visit(node.key, node)
+            visit(node.value, node)
+        else:
+            visit(node.elt, node)
+
+    def visit(node: ast.AST, scope: ast.AST) -> None:
+        node_scopes[node] = scope
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bind(scope, node.name)
+            for decorator in node.decorator_list:
+                visit(decorator, scope)
+            visit_arguments_outer(node.args, scope)
+            if node.returns is not None:
+                visit(node.returns, scope)
+            new_scope(node, scope)
+            bind_arguments(node.args, node)
+            for statement in node.body:
+                visit(statement, node)
+            return
+        if isinstance(node, ast.Lambda):
+            visit_arguments_outer(node.args, scope)
+            new_scope(node, scope)
+            bind_arguments(node.args, node)
+            visit(node.body, node)
+            return
+        if isinstance(node, ast.ClassDef):
+            bind(scope, node.name)
+            for decorator in node.decorator_list:
+                visit(decorator, scope)
+            for base in node.bases:
+                visit(base, scope)
+            for keyword in node.keywords:
+                visit(keyword.value, scope)
+            new_scope(node, scope)
+            for statement in node.body:
+                visit(statement, node)
+            return
+        if isinstance(node, (
+            ast.ListComp,
+            ast.SetComp,
+            ast.DictComp,
+            ast.GeneratorExp,
+        )):
+            visit_comprehension(node, scope)
+            return
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                origin = alias.name if alias.asname else alias.name.split(".")[0]
+                bind(scope, name, origin)
+            return
+        if isinstance(node, ast.ImportFrom):
+            if include_from_imports and node.level == 0 and node.module:
+                for alias in node.names:
+                    if alias.name != "*":
+                        bind(
+                            scope,
+                            alias.asname or alias.name,
+                            f"{node.module}.{alias.name}",
+                        )
+            else:
+                for alias in node.names:
+                    if alias.name != "*":
+                        bind(scope, alias.asname or alias.name)
+            return
+        if isinstance(node, ast.Global):
+            global_names[scope].update(node.names)
+            return
+        if isinstance(node, ast.Nonlocal):
+            nonlocal_names[scope].update(node.names)
+            return
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            bind(scope, node.name)
+        if isinstance(node, ast.Assign):
+            alias_events.append((scope, node.targets, node.value))
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            if node.value is not None:
+                alias_events.append((scope, [node.target], node.value))
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bind(scope, node.id)
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    for statement in tree.body:
+        visit(statement, tree)
+
+    def nonlocal_scope(scope: ast.AST, name: str) -> ast.AST:
+        parent = scope_parents[scope]
+        while parent is not None and parent is not tree:
+            if name in raw_bound_names[parent]:
+                return parent
+            parent = scope_parents[parent]
+        return tree
+
+    def binding_scope(scope: ast.AST, name: str) -> ast.AST:
+        if scope is not tree and name in global_names[scope]:
+            return tree
+        if scope is not tree and name in nonlocal_names[scope]:
+            return nonlocal_scope(scope, name)
+        return scope
+
+    bound_names = {scope: set() for scope in scope_parents}
+    import_origins: dict[ast.AST, dict[str, set[str]]] = {
+        scope: {} for scope in scope_parents
+    }
+    for scope, name, origin in binding_events:
+        target_scope = binding_scope(scope, name)
+        bound_names[target_scope].add(name)
+        if origin is not None:
+            import_origins[target_scope].setdefault(name, set()).add(origin)
+
+    def resolve(node: ast.Name) -> frozenset[str]:
+        scope = binding_scope(node_scopes[node], node.id)
+        while True:
+            if node.id in bound_names[scope]:
+                return frozenset(import_origins[scope].get(node.id, ()))
+            parent = scope_parents[scope]
+            if parent is None:
+                return frozenset()
+            scope = parent
+
+    def expression_origins(node: ast.AST) -> set[str]:
+        if isinstance(node, ast.Name):
+            return set(resolve(node))
+        if isinstance(node, ast.Attribute):
+            return {
+                f"{origin}.{node.attr}"
+                for origin in expression_origins(node.value)
+            }
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return set().union(*(
+                expression_origins(item) for item in node.elts
+            )) if node.elts else set()
+        if isinstance(node, ast.Dict):
+            items = [*node.keys, *node.values]
+            return set().union(*(
+                expression_origins(item)
+                for item in items
+                if item is not None
+            )) if items else set()
+        if isinstance(node, (ast.Starred, ast.NamedExpr, ast.Subscript)):
+            return expression_origins(node.value)
+        if isinstance(node, ast.IfExp):
+            return (
+                expression_origins(node.body)
+                | expression_origins(node.orelse)
+            )
+        return set()
+
+    if propagate_aliases:
+        changed = True
+        while changed:
+            changed = False
+            for scope, targets, value in alias_events:
+                origins = expression_origins(value)
+                if not origins:
+                    continue
+                for name in set().union(*(
+                    target_names(target) for target in targets
+                )):
+                    target_scope = binding_scope(scope, name)
+                    known = import_origins[target_scope].setdefault(name, set())
+                    if not origins.issubset(known):
+                        known.update(origins)
+                        changed = True
+
+    return parents, resolve
+
+
+def sensitive_module_reexports(
+        tree: ast.AST,
+        module_aliases: dict[str, str],
+) -> tuple[ast.AST, ...]:
+    tracked_bindings = set(module_aliases)
+    parents, resolve_import_origins = lexical_import_origins(
+        tree,
+        include_from_imports=True,
+        propagate_aliases=True,
+    )
+
+    def import_origin_names(node: ast.AST) -> set[str]:
+        if isinstance(node, ast.Name):
+            return set(resolve_import_origins(node))
+        if isinstance(node, ast.Attribute):
+            return {
+                f"{origin}.{node.attr}"
+                for origin in import_origin_names(node.value)
+            }
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return set().union(*(
+                import_origin_names(item) for item in node.elts
+            )) if node.elts else set()
+        if isinstance(node, ast.Dict):
+            items = [*node.keys, *node.values]
+            return set().union(*(
+                import_origin_names(item)
+                for item in items
+                if item is not None
+            )) if items else set()
+        if isinstance(node, (ast.Starred, ast.NamedExpr, ast.Subscript)):
+            return import_origin_names(node.value)
+        if isinstance(node, ast.IfExp):
+            return (
+                import_origin_names(node.body)
+                | import_origin_names(node.orelse)
+            )
+        return set()
+
+    def qualified_import_attribute_names(node: ast.Attribute) -> set[str]:
+        return import_origin_names(node)
+
     callable_nodes = {
         node for node in ast.walk(tree)
         if isinstance(
             node,
             (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
         )
+    }
+    class_nodes = {
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
     }
 
     def enclosing_callable(node: ast.AST) -> ast.AST | None:
@@ -318,7 +584,10 @@ def sensitive_module_reexports(
         ast.AST | None,
         dict[
             str,
-            set[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda],
+            set[tuple[
+                ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+                bool,
+            ]],
         ],
     ] = {scope: {} for scope in scopes}
 
@@ -326,11 +595,13 @@ def sensitive_module_reexports(
             scope: ast.AST | None,
             name: str,
             local_callable: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+            bound_receiver: bool = False,
     ) -> bool:
         bindings = callable_bindings[scope].setdefault(name, set())
-        if local_callable in bindings:
+        target = (local_callable, bound_receiver)
+        if target in bindings:
             return False
-        bindings.add(local_callable)
+        bindings.add(target)
         return True
 
     for local_callable in callable_nodes:
@@ -397,10 +668,184 @@ def sensitive_module_reexports(
         elif isinstance(node, ast.ClassDef):
             scope_bound_names[scope].add(node.name)
 
+    class_bindings: dict[ast.AST | None, dict[str, set[ast.ClassDef]]] = {
+        scope: {} for scope in scopes
+    }
+    instance_bindings: dict[ast.AST | None, dict[str, set[ast.ClassDef]]] = {
+        scope: {} for scope in scopes
+    }
+
+    def bind_class_value(
+            bindings_by_scope: dict[
+                ast.AST | None,
+                dict[str, set[ast.ClassDef]],
+            ],
+            scope: ast.AST | None,
+            name: str,
+            class_node: ast.ClassDef,
+    ) -> bool:
+        bindings = bindings_by_scope[scope].setdefault(name, set())
+        if class_node in bindings:
+            return False
+        bindings.add(class_node)
+        return True
+
+    for class_node in class_nodes:
+        if is_in_unmodeled_class_namespace(class_node):
+            continue
+        bind_class_value(
+            class_bindings,
+            enclosing_callable(class_node),
+            class_node.name,
+            class_node,
+        )
+
+    def resolve_scoped_classes(
+            name: str,
+            scope: ast.AST | None,
+            bindings_by_scope: dict[
+                ast.AST | None,
+                dict[str, set[ast.ClassDef]],
+            ],
+    ) -> set[ast.ClassDef]:
+        while True:
+            if name in scope_bound_names[scope]:
+                return set(bindings_by_scope[scope].get(name, ()))
+            if scope is None:
+                return set()
+            scope = callable_parents[scope]
+
+    def resolve_class_expression(
+            node: ast.AST,
+            scope: ast.AST | None,
+    ) -> set[ast.ClassDef]:
+        if isinstance(node, ast.Name):
+            return resolve_scoped_classes(node.id, scope, class_bindings)
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return set().union(*(
+                resolve_class_expression(item, scope)
+                for item in node.elts
+            )) if node.elts else set()
+        if isinstance(node, ast.Dict):
+            return set().union(*(
+                resolve_class_expression(value, scope)
+                for value in node.values
+            )) if node.values else set()
+        if isinstance(node, (ast.Starred, ast.NamedExpr, ast.Subscript)):
+            return resolve_class_expression(node.value, scope)
+        if isinstance(node, ast.IfExp):
+            return (
+                resolve_class_expression(node.body, scope)
+                | resolve_class_expression(node.orelse, scope)
+            )
+        return set()
+
+    def resolve_instance_expression(
+            node: ast.AST,
+            scope: ast.AST | None,
+    ) -> set[ast.ClassDef]:
+        if isinstance(node, ast.Name):
+            return resolve_scoped_classes(node.id, scope, instance_bindings)
+        if isinstance(node, ast.Call):
+            return resolve_class_expression(node.func, scope)
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return set().union(*(
+                resolve_instance_expression(item, scope)
+                for item in node.elts
+            )) if node.elts else set()
+        if isinstance(node, ast.Dict):
+            return set().union(*(
+                resolve_instance_expression(value, scope)
+                for value in node.values
+            )) if node.values else set()
+        if isinstance(node, (ast.Starred, ast.NamedExpr, ast.Subscript)):
+            return resolve_instance_expression(node.value, scope)
+        if isinstance(node, ast.IfExp):
+            return (
+                resolve_instance_expression(node.body, scope)
+                | resolve_instance_expression(node.orelse, scope)
+            )
+        return set()
+
+    class_aliases_changed = True
+    while class_aliases_changed:
+        class_aliases_changed = False
+        for scope, targets, value in alias_assignments:
+            names = set().union(*(
+                target_names(target) for target in targets
+            ))
+            for class_node in resolve_class_expression(value, scope):
+                for name in names:
+                    class_aliases_changed |= bind_class_value(
+                        class_bindings,
+                        scope,
+                        name,
+                        class_node,
+                    )
+            for class_node in resolve_instance_expression(value, scope):
+                for name in names:
+                    class_aliases_changed |= bind_class_value(
+                        instance_bindings,
+                        scope,
+                        name,
+                        class_node,
+                    )
+
+    class_methods: dict[
+        ast.ClassDef,
+        dict[str, set[ast.FunctionDef | ast.AsyncFunctionDef]],
+    ] = {class_node: {} for class_node in class_nodes}
+    for class_node in class_nodes:
+        for statement in class_node.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                class_methods[class_node].setdefault(
+                    statement.name,
+                    set(),
+                ).add(statement)
+
+    def method_descriptor_kind(
+            method: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> str:
+        decorator_names = {
+            decorator.id
+            if isinstance(decorator, ast.Name)
+            else decorator.attr
+            if isinstance(decorator, ast.Attribute)
+            else ""
+            for decorator in method.decorator_list
+        }
+        if "staticmethod" in decorator_names:
+            return "static"
+        if "classmethod" in decorator_names:
+            return "class"
+        return "instance"
+
+    def resolve_method_attribute(
+            node: ast.Attribute,
+            scope: ast.AST | None,
+    ) -> set[tuple[ast.FunctionDef | ast.AsyncFunctionDef, bool]]:
+        resolved = set()
+        for class_node in resolve_class_expression(node.value, scope):
+            for method in class_methods[class_node].get(node.attr, ()):
+                resolved.add((
+                    method,
+                    method_descriptor_kind(method) == "class",
+                ))
+        for class_node in resolve_instance_expression(node.value, scope):
+            for method in class_methods[class_node].get(node.attr, ()):
+                resolved.add((
+                    method,
+                    method_descriptor_kind(method) != "static",
+                ))
+        return resolved
+
     def resolve_callable_name(
             name: str,
             scope: ast.AST | None,
-    ) -> set[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda]:
+    ) -> set[tuple[
+        ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+        bool,
+    ]]:
         while True:
             if name in scope_bound_names[scope]:
                 return set(callable_bindings[scope].get(name, ()))
@@ -411,11 +856,16 @@ def sensitive_module_reexports(
     def resolve_callable_expression(
             node: ast.AST,
             scope: ast.AST | None,
-    ) -> set[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda]:
+    ) -> set[tuple[
+        ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+        bool,
+    ]]:
         if isinstance(node, ast.Name):
             return resolve_callable_name(node.id, scope)
         if isinstance(node, ast.Lambda):
-            return {node}
+            return {(node, False)}
+        if isinstance(node, ast.Attribute):
+            return set(resolve_method_attribute(node, scope))
         if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
             return set().union(*(
                 resolve_callable_expression(item, scope)
@@ -445,16 +895,20 @@ def sensitive_module_reexports(
             for name in set().union(*(
                 target_names(target) for target in targets
             )):
-                for local_callable in resolved:
+                for local_callable, bound_receiver in resolved:
                     aliases_changed |= bind_callable(
                         scope,
                         name,
                         local_callable,
+                        bound_receiver,
                     )
 
     def local_call_targets(
             call: ast.Call,
-    ) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda, ...]:
+    ) -> tuple[tuple[
+        ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+        bool,
+    ], ...]:
         return tuple(resolve_callable_expression(
             call.func,
             enclosing_callable(call),
@@ -505,7 +959,7 @@ def sensitive_module_reexports(
             isinstance(node, ast.Call)
             and any(
                 local_callable in tracked_return_callables
-                for local_callable in local_call_targets(node)
+                for local_callable, _ in local_call_targets(node)
             )
         )
         return direct_local_return or (
@@ -587,7 +1041,7 @@ def sensitive_module_reexports(
             if isinstance(node, ast.Call)
             and local_call_targets(node)
         ):
-            for local_callable in local_call_targets(call):
+            for local_callable, bound_receiver in local_call_targets(call):
                 (
                     positional,
                     named,
@@ -611,12 +1065,15 @@ def sensitive_module_reexports(
                         continue
                     if isinstance(argument, ast.Starred):
                         newly_tracked.update(
-                            parameter.arg for parameter in positional
+                            parameter.arg
+                            for parameter in positional[int(bound_receiver):]
                         )
                         if vararg is not None:
                             newly_tracked.add(vararg.arg)
-                    elif index < len(positional):
-                        newly_tracked.add(positional[index].arg)
+                    elif index + int(bound_receiver) < len(positional):
+                        newly_tracked.add(
+                            positional[index + int(bound_receiver)].arg
+                        )
                     elif vararg is not None:
                         newly_tracked.add(vararg.arg)
                 for keyword in call.keywords:
@@ -626,7 +1083,14 @@ def sensitive_module_reexports(
                     ):
                         continue
                     if keyword.arg is None:
-                        newly_tracked.update(named)
+                        newly_tracked.update(
+                            name for name in named
+                            if not (
+                                bound_receiver
+                                and positional
+                                and name == positional[0].arg
+                            )
+                        )
                         if kwarg is not None:
                             newly_tracked.add(kwarg.arg)
                     elif keyword.arg in named:
@@ -803,6 +1267,36 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 ),
                 "shutil.fnmatch",
             ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "class Runner:\n"
+                    "    @staticmethod\n"
+                    "    def invoke(value):\n        value.os.fork()\n"
+                    "Runner.invoke(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "class Runner:\n"
+                    "    @classmethod\n"
+                    "    def invoke(cls, value):\n        value.os.fork()\n"
+                    "Runner.invoke(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
+            (
+                (
+                    "from shutil import fnmatch as p\n"
+                    "class Runner:\n"
+                    "    def invoke(self, value):\n        value.os.fork()\n"
+                    "runner = Runner()\n"
+                    "alias = runner.invoke\nalias(p)\n"
+                ),
+                "shutil.fnmatch",
+            ),
         ):
             with self.subTest(source=source):
                 self.assertTrue(
@@ -826,6 +1320,20 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 {"p": "shutil.fnmatch"},
             ),
             "a local safe callable must shadow an outer helper with the same name",
+        )
+
+        receiver_source = (
+            "from shutil import fnmatch as p\n"
+            "class Runner:\n"
+            "    def invoke(self, value):\n        self.os.fork()\n"
+            "Runner().invoke(p)\n"
+        )
+        self.assertFalse(
+            sensitive_module_reexports(
+                ast.parse(receiver_source),
+                {"p": "shutil.fnmatch"},
+            ),
+            "a bound receiver must not be tainted by the first explicit argument",
         )
 
         for imported_name in (
@@ -930,6 +1438,30 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 {"logging": "logging"},
             ),
             (
+                "import logging.config\n"
+                "cfg = logging.config\n"
+                "cfg.listen().start()\n",
+                {"logging": "logging.config"},
+            ),
+            (
+                "import logging\n"
+                "module = logging\nconfig = module.config\n"
+                "alias = config\nalias.listen().start()\n",
+                {"logging": "logging"},
+            ),
+            (
+                "import logging.config\n"
+                "configs = [logging.config]\n"
+                "cfg = configs[0]\ncfg.listen().start()\n",
+                {"logging": "logging.config"},
+            ),
+            (
+                "import logging.config\n"
+                "configs = {'active': logging.config}\n"
+                "configs['active'].listen().start()\n",
+                {"logging": "logging.config"},
+            ),
+            (
                 "import pydoc as p\np._start_server(None, None, 0)\n",
                 {"p": "pydoc"},
             ),
@@ -945,13 +1477,70 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 )
 
         generic_listen_source = (
-            "import example.config as c\nc.listen()\n"
+            "import example.config\n"
+            "configs = [example.config]\n"
+            "cfg = configs[0]\ncfg.listen()\n"
         )
         self.assertFalse(
             sensitive_module_reexports(
                 ast.parse(generic_listen_source),
-                {"c": "example.config"},
+                {"example": "example.config"},
             )
+        )
+
+        lexical_shadow_source = (
+            "import os\n"
+            "os.fork()\n"
+            "def harmless():\n"
+            "    import math as os\n"
+            "    return os.sqrt(4)\n"
+        )
+        lexical_shadow_tree = ast.parse(lexical_shadow_source)
+        _, resolve_shadowed_import = lexical_import_origins(lexical_shadow_tree)
+        shadowed_references = {
+            node.attr: resolve_shadowed_import(node.value)
+            for node in ast.walk(lexical_shadow_tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+        }
+        self.assertEqual(
+            shadowed_references,
+            {"fork": frozenset({"os"}), "sqrt": frozenset({"math"})},
+        )
+        parameter_shadow_source = (
+            "import os\n"
+            "def harmless(os):\n"
+            "    return os.fork()\n"
+        )
+        parameter_shadow_tree = ast.parse(parameter_shadow_source)
+        _, resolve_parameter_shadow = lexical_import_origins(
+            parameter_shadow_tree
+        )
+        shadowed_fork = next(
+            node
+            for node in ast.walk(parameter_shadow_tree)
+            if isinstance(node, ast.Attribute) and node.attr == "fork"
+        )
+        self.assertEqual(
+            resolve_parameter_shadow(shadowed_fork.value),
+            frozenset(),
+            "a local parameter must safely shadow the imported module",
+        )
+
+        scoped_listen_source = (
+            "def harmless():\n"
+            "    import example.config as cfg\n"
+            "    return cfg.listen()\n"
+            "def unrelated():\n"
+            "    import logging.config as cfg\n"
+            "    return None\n"
+        )
+        self.assertFalse(
+            sensitive_module_reexports(
+                ast.parse(scoped_listen_source),
+                {"cfg": "logging.config"},
+            ),
+            "full-path concurrency origins cannot leak across functions",
         )
 
     def test_baselines_are_two_read_only_certified_complete_sessions(self):
@@ -1167,7 +1756,6 @@ class H2D2FreezeContractTests(unittest.TestCase):
         tree = ast.parse(source)
         imported = set()
         direct_imports = set()
-        module_aliases = {}
         imported_bindings = {}
         star_imports = set()
         relative_imports = set()
@@ -1175,9 +1763,6 @@ class H2D2FreezeContractTests(unittest.TestCase):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     imported.add(alias.name)
-                    module_aliases[
-                        alias.asname or alias.name.split(".")[0]
-                    ] = alias.name.split(".")[0]
                     imported_bindings[
                         alias.asname or alias.name.split(".")[0]
                     ] = alias.name
@@ -1234,28 +1819,25 @@ class H2D2FreezeContractTests(unittest.TestCase):
             reexported_process_modules,
             "process/concurrency modules re-exported by allowed imports",
         )
+        parents, resolve_module_imports = lexical_import_origins(tree)
         qualified_references = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-                module_name = module_aliases.get(node.value.id)
-                if module_name:
-                    qualified_references.add((module_name, node.attr))
+                qualified_references.update(
+                    (origin.split(".")[0], node.attr)
+                    for origin in resolve_module_imports(node.value)
+                )
         allowed_process_references = {
             ("os", "environ"),
             ("subprocess", "run"),
             ("sys", "executable"),
-        }
-        parents = {
-            child: parent
-            for parent in ast.walk(tree)
-            for child in ast.iter_child_nodes(parent)
         }
         bare_imported_module_loads = tuple(
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)
-            and node.id in module_aliases
+            and resolve_module_imports(node)
             and not (
                 isinstance(parents.get(node), ast.Attribute)
                 and parents[node].value is node
@@ -1279,7 +1861,10 @@ class H2D2FreezeContractTests(unittest.TestCase):
             for node in ast.walk(tree)
             if isinstance(node, ast.Attribute)
             and isinstance(node.value, ast.Name)
-            and module_aliases.get(node.value.id) == "subprocess"
+            and "subprocess" in {
+                origin.split(".")[0]
+                for origin in resolve_module_imports(node.value)
+            }
             and node.attr == "run"
         )
         self.assertEqual(len(subprocess_run_references), 1)
@@ -1598,7 +2183,10 @@ class H2D2FreezeContractTests(unittest.TestCase):
             and node.func.id in {"getattr", "vars"}
             and node.args
             and isinstance(node.args[0], ast.Name)
-            and module_aliases.get(node.args[0].id) in {"os", "subprocess", "sys"}
+            and {
+                origin.split(".")[0]
+                for origin in resolve_module_imports(node.args[0])
+            }.intersection({"os", "subprocess", "sys"})
         }
         self.assertFalse(
             dynamic_module_access,
@@ -1876,16 +2464,12 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 tree = ast.parse(source)
                 imported_roots = set()
                 direct_imports = set()
-                module_aliases = {}
                 imported_bindings = {}
                 star_imports = set()
                 for node in ast.walk(tree):
                     if isinstance(node, ast.Import):
                         for alias in node.names:
                             imported_roots.add(alias.name.split(".")[0])
-                            module_aliases[
-                                alias.asname or alias.name.split(".")[0]
-                            ] = alias.name.split(".")[0]
                             imported_bindings[
                                 alias.asname or alias.name.split(".")[0]
                             ] = alias.name
@@ -1928,6 +2512,7 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     reexported_process_modules,
                     f"process module re-export in {relative_path}",
                 )
+                parents, resolve_module_imports = lexical_import_origins(tree)
                 async_nodes = tuple(
                     node
                     for node in ast.walk(tree)
@@ -2032,33 +2617,24 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 }:
                     allowed_references.add(("sys", "float_info"))
                 qualified_references = {
-                    (module_aliases[node.value.id], node.attr)
+                    (origin.split(".")[0], node.attr)
                     for node in ast.walk(tree)
                     if isinstance(node, ast.Attribute)
                     and isinstance(node.value, ast.Name)
-                    and node.value.id in module_aliases
-                    and module_aliases[node.value.id] in {
-                        "os",
-                        "subprocess",
-                        "sys",
-                    }
+                    for origin in resolve_module_imports(node.value)
+                    if origin.split(".")[0] in {"os", "subprocess", "sys"}
                 }
                 self.assertFalse(
                     qualified_references - allowed_references,
                     f"process reference in {relative_path}: "
                     f"{qualified_references - allowed_references}",
                 )
-                parents = {
-                    child: parent
-                    for parent in ast.walk(tree)
-                    for child in ast.iter_child_nodes(parent)
-                }
                 bare_module_loads = tuple(
                     node
                     for node in ast.walk(tree)
                     if isinstance(node, ast.Name)
                     and isinstance(node.ctx, ast.Load)
-                    and node.id in module_aliases
+                    and resolve_module_imports(node)
                     and not (
                         isinstance(parents.get(node), ast.Attribute)
                         and parents[node].value is node
@@ -2076,8 +2652,10 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     and node.func.id in {"getattr", "vars"}
                     and node.args
                     and isinstance(node.args[0], ast.Name)
-                    and module_aliases.get(node.args[0].id)
-                    in {"os", "subprocess", "sys"}
+                    and {
+                        origin.split(".")[0]
+                        for origin in resolve_module_imports(node.args[0])
+                    }.intersection({"os", "subprocess", "sys"})
                 )
                 self.assertFalse(
                     dynamic_module_access,
@@ -2099,7 +2677,10 @@ class H2D2FreezeContractTests(unittest.TestCase):
                     for node in ast.walk(tree)
                     if isinstance(node, ast.Attribute)
                     and isinstance(node.value, ast.Name)
-                    and module_aliases.get(node.value.id) == "subprocess"
+                    and "subprocess" in {
+                        origin.split(".")[0]
+                        for origin in resolve_module_imports(node.value)
+                    }
                     and node.attr == "run"
                 )
                 expected_runs = int(
@@ -2162,12 +2743,26 @@ class H2D2FreezeContractTests(unittest.TestCase):
             "exactly two worker processes",
             "non-transaction-pooled control connection",
             "`SELECT pg_try_advisory_lock(8098937340306602170)` exactly once",
+            "cross-process and cross-host single-coordinator exclusion",
+            "one configured Linux execution host and in the one PID namespace identity",
+            "device/inode identity of `/proc/self/ns/pid`",
             "`pg_try_advisory_lock(-5133988379539764595)` for `2026-06-15`",
             "`pg_try_advisory_lock(8459531074882316998)` for `2026-07-22`",
+            "separate durable OS processes and process/service failure domains, not separate hosts",
             "exactly two claim-only date guardians outside",
+            "`pipe2(O_CLOEXEC)`",
+            "authenticated local Unix-domain `SOCK_SEQPACKET` socket using `SCM_RIGHTS`",
+            "after `SO_PEERCRED` and generation verification",
+            "exact allowlisted pre-spawn inheritance into that guardian",
+            "coordinator remains the sole write-end owner",
+            "exact guardian becomes the sole read-end owner",
+            "supervisor closes every temporary pipe-descriptor copy",
             "`cgroup.freeze`, `cgroup.kill`",
             "`cgroup.events` reports `populated 0`",
             "opens a `pidfd` for the exact coordinator OS PID",
+            "calls `pidfd_open()` for the exact recorded coordinator OS PID",
+            "verifies its procfs start-time ticks against the generation record",
+            "host or PID-namespace identity that is missing, stale, unverifiable, or mismatched fails closed",
             "generation record is independent of PostgreSQL sessions",
             "`CLAIMING`, `ACTIVE`, `CLEANING`, or unknown state blocks replacement",
             "atomically compare-and-swaps that exact attested `CLEAN` version",
@@ -2215,6 +2810,9 @@ class H2D2FreezeContractTests(unittest.TestCase):
         self.assertIn("separately approved", root_law)
         self.assertIn("complete local H1 runtime dependency closure", root_law)
         self.assertIn("exact 72-metric hash byte encoding", root_law)
+        self.assertIn("one configured Linux execution host and one PID namespace identity", root_law)
+        self.assertIn("not separate hosts", root_law)
+        self.assertIn("H2-D-2 is a design freeze only", root_law)
         self.assertIn("H2-D-3 — Parallel Canary (not authorized)", phases)
         self.assertIn("No within-date concurrency or evidence writes", phases)
 
