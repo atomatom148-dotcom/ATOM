@@ -316,6 +316,62 @@ class SchwabMarketNormalizationTests(unittest.TestCase):
 
 
 class SchwabMarketBusTests(unittest.TestCase):
+    def test_publication_boundary_rejects_forged_snapshots(self) -> None:
+        with self.assertRaises(TypeError):
+            MarketBus(sink=RecordingSink(), clock=None)  # type: ignore[arg-type]
+
+        valid_ndx = normalized_ndx()
+        valid_book = normalized_book()
+        bus = MarketBus(sink=RecordingSink(), clock=lambda: NOW)
+        invalid_ndx = (
+            object(),
+            replace(valid_ndx, price=0.0),
+            replace(valid_ndx, provider_epoch=0.0),
+            replace(valid_ndx, received_at_epoch=0.0),
+            replace(valid_ndx, quote_time_epoch=math.nan),
+            replace(valid_ndx, provider_epoch=valid_ndx.provider_epoch + 2.0),
+        )
+        for snapshot in invalid_ndx:
+            with self.subTest(kind="ndx", snapshot=snapshot):
+                with self.assertRaises(MarketDataInvalidError):
+                    bus.publish_ndx(snapshot, owner_token="owner")  # type: ignore[arg-type]
+
+        invalid_books = (
+            object(),
+            replace(valid_book, provider_epoch=0.0),
+            replace(valid_book, received_at_epoch=0.0),
+            replace(valid_book, source_sequence=True),
+            replace(valid_book, bids=valid_book.bids[:2]),
+            replace(
+                valid_book,
+                bids=(
+                    replace(valid_book.bids[0], price=0.0),
+                    *valid_book.bids[1:],
+                ),
+            ),
+            replace(valid_book, bids=tuple(reversed(valid_book.bids))),
+            replace(valid_book, asks=tuple(reversed(valid_book.asks))),
+        )
+        for snapshot in invalid_books:
+            with self.subTest(kind="book", snapshot=snapshot):
+                with self.assertRaises(MarketDataInvalidError):
+                    bus.publish_book(snapshot, owner_token="owner")  # type: ignore[arg-type]
+
+        for publisher, snapshot in (
+            (bus.publish_ndx, valid_ndx),
+            (bus.publish_book, valid_book),
+        ):
+            with self.subTest(kind="owner_token", publisher=publisher.__name__):
+                with self.assertRaises(MarketDataInvalidError):
+                    publisher(snapshot, owner_token="")  # type: ignore[arg-type]
+
+        invalid_clock_bus = MarketBus(
+            sink=RecordingSink(),
+            clock=lambda: math.nan,
+        )
+        with self.assertRaises(MarketDataInvalidError):
+            invalid_clock_bus.publish_ndx(valid_ndx, owner_token="owner")
+
     def test_owner_token_has_one_publication_source(self) -> None:
         sink = RecordingSink()
         bus = MarketBus(sink=sink, clock=lambda: NOW)

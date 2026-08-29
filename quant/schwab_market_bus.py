@@ -8,7 +8,7 @@ publishes short-lived, lease-fenced JSON snapshots through an injected sink.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
 import math
 import threading
@@ -89,6 +89,8 @@ class TransientSink(Protocol):
         owner_token: str,
     ) -> bool:
         """Atomically validate ``owner_token`` and commit the whole value."""
+
+        ...
 
 
 def _number(value: object) -> float | None:
@@ -207,7 +209,7 @@ def _book_level(raw: object) -> BookLevel | None:
 
 def _book_side(raw: object, *, reverse: bool) -> tuple[BookLevel, ...]:
     rows = raw if isinstance(raw, list) else []
-    levels = tuple(
+    levels = (
         level
         for level in (_book_level(item) for item in rows)
         if level is not None
@@ -432,7 +434,14 @@ class MarketBus:
             ):
                 return False
             next_sequence = self._book_source_sequence + 1
-            publication = replace(snapshot, source_sequence=next_sequence)
+            publication = BookSnapshot(
+                symbol=snapshot.symbol,
+                provider_epoch=snapshot.provider_epoch,
+                received_at_epoch=snapshot.received_at_epoch,
+                bids=snapshot.bids,
+                asks=snapshot.asks,
+                source_sequence=next_sequence,
+            )
             committed = self._sink.publish(
                 BOOK_KEY,
                 _book_payload(publication),

@@ -11,24 +11,30 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 from collections import deque
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 
 from quant.schwab_market_worker import (
+    MAX_RESPONSE_BYTES,
     SCHWAB_AUTHORIZE_URL,
     SCHWAB_NDX_QUOTES_URL,
     SCHWAB_TOKEN_URL,
     SCHWAB_USER_PREFERENCE_URL,
     OAuthTokenSet,
     _NoRedirect,
+    _UrlLibHttp,
     _UrlLibResponse,
+    _decode_stream_message,
     _default_websocket_factory,
     SchwabAuthorizationError,
     SchwabProtocolError,
+    SchwabTransportError,
     SchwabMarketWorker,
     SchwabOAuthSession,
     build_book_subscription,
     build_login_request,
     main,
+    validate_command_ack,
     worker_enabled,
 )
 
@@ -246,6 +252,52 @@ class OAuthBoundaryTests(unittest.TestCase):
             session.handle_callback(code="auth-code", state="plaintext-state")
         self.assertEqual(http.calls, [])
 
+    def test_callback_url_is_bound_to_redirect_code_and_state(self) -> None:
+        store = MemoryOAuthStore()
+        http = ScriptedHTTP(
+            FakeResponse(
+                200,
+                {
+                    "access_token": "access-one",
+                    "refresh_token": "refresh-one",
+                    "expires_in": 1_800,
+                },
+            )
+        )
+        session = oauth_session(
+            store=store,
+            http=http,
+            clock=MutableClock(1_000.0),
+        )
+        session.authorize_url()
+
+        invalid_callbacks = (
+            "https://atom.example/other?code=auth-code&state=plaintext-state",
+            "https://atom.example/schwab/callback?code=other&state=plaintext-state",
+            "https://atom.example/schwab/callback?code=auth-code&state=other",
+        )
+        for callback_url in invalid_callbacks:
+            with self.subTest(callback_url=callback_url):
+                with self.assertRaises(SchwabAuthorizationError):
+                    session.handle_callback(
+                        code="auth-code",
+                        state="plaintext-state",
+                        callback_url=callback_url,
+                    )
+        self.assertEqual(store.consumed_state_calls, [])
+        self.assertEqual(http.calls, [])
+
+        tokens = session.handle_callback(
+            code="auth-code",
+            state="plaintext-state",
+            callback_url=(
+                "https://atom.example/schwab/callback"
+                "?code=auth-code&state=plaintext-state"
+            ),
+        )
+        self.assertEqual(tokens.access_token, "access-one")
+        self.assertEqual(len(http.calls), 1)
+
     def test_callback_cas_does_not_overwrite_token_changed_during_exchange(self) -> None:
         clock = MutableClock(1_000.0)
         store = MemoryOAuthStore()
@@ -326,6 +378,50 @@ class OAuthBoundaryTests(unittest.TestCase):
         self.assertIsInstance(headers, dict)
         self.assertEqual(headers.get("Authorization"), f"Basic {expected_basic}")
         self.assertEqual(headers.get("Content-Type"), "application/x-www-form-urlencoded")
+
+    def test_refresh_cas_uses_only_fresh_winner(self) -> None:
+        winners = (
+            (OAuthTokenSet("winner", "winner-refresh", 9_000.0), "winner"),
+            (OAuthTokenSet("stale", "stale-refresh", 1_001.0), None),
+        )
+        for winner, expected_access in winners:
+            with self.subTest(expected_access=expected_access):
+                initial = OAuthTokenSet("old", "old-refresh", 1_001.0)
+                store = MemoryOAuthStore(initial)
+
+                class RacingHTTP(ScriptedHTTP):
+                    def request(
+                        self,
+                        method: str,
+                        url: str,
+                        **kwargs: object,
+                    ) -> FakeResponse:
+                        store.tokens = winner
+                        return super().request(method, url, **kwargs)
+
+                http = RacingHTTP(
+                    FakeResponse(
+                        200,
+                        {
+                            "access_token": "candidate",
+                            "refresh_token": "candidate-refresh",
+                            "expires_in": 1_800,
+                        },
+                    )
+                )
+                session = oauth_session(
+                    store=store,
+                    http=http,
+                    clock=MutableClock(1_000.0),
+                )
+
+                if expected_access is None:
+                    with self.assertRaises(SchwabAuthorizationError):
+                        session.access_token()
+                else:
+                    self.assertEqual(session.access_token(), expected_access)
+                self.assertEqual(store.tokens, winner)
+                self.assertEqual(len(http.calls), 1)
 
     def test_ndx_get_retries_one_401_after_one_refresh(self) -> None:
         store = MemoryOAuthStore(
@@ -528,6 +624,164 @@ class OAuthBoundaryTests(unittest.TestCase):
             enable_multithread=True,
             redirect_limit=0,
         )
+
+    def test_stdlib_http_transport_bounds_and_discards_bodies(self) -> None:
+        class OpenedResponse:
+            def __init__(self, body: bytes, status: int = 200) -> None:
+                self.body = body
+                self.status = status
+                self.read_limits: list[int] = []
+
+            def __enter__(self) -> OpenedResponse:
+                return self
+
+            def __exit__(self, *_args: object) -> bool:
+                return False
+
+            def read(self, limit: int) -> bytes:
+                self.read_limits.append(limit)
+                return self.body
+
+        class Opener:
+            def __init__(self, result: OpenedResponse | Exception) -> None:
+                self.result = result
+                self.calls: list[tuple[object, object]] = []
+
+            def open(self, request: object, timeout: object = None) -> OpenedResponse:
+                self.calls.append((request, timeout))
+                if isinstance(self.result, Exception):
+                    raise self.result
+                return self.result
+
+        opened = OpenedResponse(b'{"ok":true}', status=201)
+        opener = Opener(opened)
+        with patch(
+            "quant.schwab_market_worker.build_opener",
+            return_value=opener,
+        ):
+            response = _UrlLibHttp().request(
+                "get",
+                "https://example.test/path?prior=1",
+                headers={"X-Test": "value"},
+                data={"form": "value"},
+                params={"symbols": "$NDX"},
+                timeout=3.0,
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json(), {"ok": True})
+        self.assertEqual(response._body, b"")
+        self.assertEqual(opened.read_limits, [MAX_RESPONSE_BYTES + 1])
+        request, timeout = opener.calls[0]
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(request.data, b"form=value")
+        self.assertIn("symbols=%24NDX", request.full_url)
+        self.assertEqual(timeout, 3.0)
+
+        oversized = OpenedResponse(b"x" * (MAX_RESPONSE_BYTES + 1))
+        with patch(
+            "quant.schwab_market_worker.build_opener",
+            return_value=Opener(oversized),
+        ):
+            with self.assertRaises(SchwabProtocolError):
+                _UrlLibHttp().request("GET", "https://example.test")
+
+        redirect = HTTPError(
+            "https://example.test",
+            307,
+            "redirect rejected",
+            None,
+            None,
+        )
+        with patch(
+            "quant.schwab_market_worker.build_opener",
+            return_value=Opener(redirect),
+        ):
+            rejected = _UrlLibHttp().request("GET", "https://example.test")
+        self.assertEqual(rejected.status_code, 307)
+        self.assertEqual(rejected._body, b"")
+
+    def test_stream_protocol_rejects_invalid_ack_and_frames(self) -> None:
+        valid_ack = {
+            "response": [
+                {
+                    "requestid": "0",
+                    "service": "ADMIN",
+                    "command": "LOGIN",
+                    "content": {"code": 0},
+                }
+            ]
+        }
+        validate_command_ack(
+            valid_ack,
+            request_id="0",
+            service="ADMIN",
+            command="LOGIN",
+        )
+        invalid_acks = (
+            {},
+            {
+                "response": [
+                    {
+                        "requestid": "9",
+                        "service": "ADMIN",
+                        "command": "LOGIN",
+                        "content": {"code": 0},
+                    }
+                ]
+            },
+            {
+                "response": [
+                    {
+                        "requestid": "0",
+                        "service": "ADMIN",
+                        "command": "LOGIN",
+                        "content": {"code": True},
+                    }
+                ]
+            },
+            {
+                "response": [
+                    {
+                        "requestid": "0",
+                        "service": "ADMIN",
+                        "command": "LOGIN",
+                        "content": {"code": "bad"},
+                    }
+                ]
+            },
+            {
+                "response": [
+                    {
+                        "requestid": "0",
+                        "service": "ADMIN",
+                        "command": "LOGIN",
+                        "content": {"code": 7},
+                    }
+                ]
+            },
+        )
+        for invalid_ack in invalid_acks:
+            with self.subTest(invalid_ack=invalid_ack):
+                with self.assertRaises(SchwabProtocolError):
+                    validate_command_ack(
+                        invalid_ack,
+                        request_id="0",
+                        service="ADMIN",
+                        command="LOGIN",
+                    )
+
+        self.assertEqual(_decode_stream_message(b'{"data":[]}'), {"data": []})
+        invalid_frames = (
+            (b"\xff", SchwabProtocolError),
+            ("", SchwabTransportError),
+            ("{", SchwabProtocolError),
+            ("[]", SchwabProtocolError),
+        )
+        for frame, error_type in invalid_frames:
+            with self.subTest(frame=frame):
+                with self.assertRaises(error_type):
+                    _decode_stream_message(frame)
 
     def test_http_surface_contains_only_authorized_s1_endpoints(self) -> None:
         store = MemoryOAuthStore(
