@@ -46,12 +46,16 @@ This exception authorizes only:
 
 - OAuth authorization and token refresh needed for market-data access;
 - `/trader/v1/userPreference` solely to obtain streamer connection metadata;
+  account fields unavoidably returned in that envelope may cross the transport
+  boundary only and must be discarded without parsing or retention;
 - read-only NDX quotes and COIN `NASDAQ_BOOK` fields `0,1,2,3`;
 - bounded reconnect, freshness, deduplication, health, and causal timestamp checks;
 - transient publication under an `atom:v9:schwab:*` namespace.
 
-It does not authorize account, balance, position, transaction, order, cancel,
-replace, execution, or broker-control reads or writes. Secrets and tokens are
+It does not authorize any account-data request or use, nor any balance,
+position, transaction, order, cancel, replace, execution, or broker-control
+read or write. Account fields incidentally returned by `userPreference` must
+not be parsed, retained, logged, published, or used. Secrets and tokens are
 never published with market data.
 
 NDX may enter only the existing independent NDX benchmark/display seam. Schwab
