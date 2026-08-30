@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
+import math
 import os
 import time
 from typing import Callable
@@ -275,7 +276,9 @@ class HistoricalEvidenceVerifier:
         )
 
 
-def verify_from_environment(replay_run_id: str, **expected: str | None) -> VerificationReceipt:
+def verify_from_environment(replay_run_id: str, *,
+                            statement_timeout_seconds: float | None = None,
+                            **expected: str | None) -> VerificationReceipt:
     """Connect only through the dedicated H2 database URL; never log its value."""
     database_url = os.environ.get("HISTORICAL_EVIDENCE_DATABASE_URL")
     if not database_url:
@@ -283,6 +286,16 @@ def verify_from_environment(replay_run_id: str, **expected: str | None) -> Verif
     import psycopg
     with psycopg.connect(database_url) as connection:
         connection.read_only = True
+        if statement_timeout_seconds is not None:
+            if (not math.isfinite(statement_timeout_seconds) or
+                    statement_timeout_seconds <= 0):
+                raise ValueError("statement_timeout_seconds must be positive and finite")
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT set_config('statement_timeout',%s,true)",
+                (f"{max(1, int(statement_timeout_seconds * 1_000))}ms",),
+            )
+            cursor.close()
         return HistoricalEvidenceVerifier(connection).verify(replay_run_id, **expected)
 
 

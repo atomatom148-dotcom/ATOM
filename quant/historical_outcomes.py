@@ -326,16 +326,23 @@ OUTCOME_VERIFICATION_COLUMNS = (
 
 
 def verify_outcomes(connection, replay_run_id: str, *,
-                    fetch_size: int = DEFAULT_BATCH_SIZE) -> OutcomeVerificationReceipt:
+                    fetch_size: int = DEFAULT_BATCH_SIZE,
+                    statement_timeout_seconds: float | None = None) -> OutcomeVerificationReceipt:
     """Rehash immutable outcomes and return their frozen read-only receipt."""
     if not replay_run_id or len(replay_run_id) > 128:
         raise ValueError("replay_run_id must contain 1..128 characters")
     if isinstance(fetch_size, bool) or not isinstance(fetch_size, int) or fetch_size < 1:
         raise ValueError("fetch_size must be a positive integer")
+    if (statement_timeout_seconds is not None and
+            (not math.isfinite(statement_timeout_seconds) or
+             statement_timeout_seconds <= 0)):
+        raise ValueError("statement_timeout_seconds must be positive and finite")
+    timeout = (SCORING_STATEMENT_TIMEOUT if statement_timeout_seconds is None else
+               f"{max(1, int(statement_timeout_seconds * 1_000))}ms")
     setup = connection.cursor()
-    setup.execute(f"SET LOCAL statement_timeout = '{SCORING_STATEMENT_TIMEOUT}'")
+    setup.execute("SELECT set_config('statement_timeout',%s,true)", (timeout,))
     setup.close()
-    cursor = connection.cursor(name="atom_h2c_outcomes")
+    cursor = connection.cursor(name="atom_h2c_outcomes", binary=True)
     cursor.itersize = fetch_size
     cursor.execute(
         "SELECT " + ",".join(OUTCOME_VERIFICATION_COLUMNS) + " "
@@ -467,11 +474,16 @@ def _connect(environment_variable: str, expected_role: str):
     return connection
 
 
-def verify_outcomes_from_environment(replay_run_id: str) -> OutcomeVerificationReceipt:
+def verify_outcomes_from_environment(
+        replay_run_id: str, *,
+        statement_timeout_seconds: float | None = None) -> OutcomeVerificationReceipt:
     with _connect("HISTORICAL_SCORE_DATABASE_URL",
                   "atom_historical_score_reader") as connection:
         connection.read_only = True
-        return verify_outcomes(connection, replay_run_id)
+        return verify_outcomes(
+            connection, replay_run_id,
+            statement_timeout_seconds=statement_timeout_seconds,
+        )
 
 
 def score_from_environment(replay_run_id: str) -> ScoringReceipt:

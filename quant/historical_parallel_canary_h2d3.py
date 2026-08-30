@@ -158,8 +158,19 @@ def _observed_evidence_snapshot(h2b, outcomes) -> dict:
     }
 
 
-def read_evidence_snapshot(day: str) -> dict:
+def read_evidence_snapshot(
+        day: str, timeout_seconds: float = DEFAULT_DATE_TIMEOUT_SECONDS) -> dict:
     """Read and verify the post-canary evidence state without running V9."""
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive and finite")
+    deadline = time.monotonic() + timeout_seconds
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise CanaryFailure("H2D3_POST_SNAPSHOT_TIMEOUT")
+        return value
+
     _, baselines = _baseline_bundle()
     if day not in baselines:
         raise CanaryFailure("H2D3_DATE_NOT_FROZEN")
@@ -172,13 +183,17 @@ def read_evidence_snapshot(day: str) -> dict:
         expected_dataset_digest=baseline["dataset_digest"],
         expected_configuration_digest=baseline["configuration_digest"],
         expected_frame_count=baseline["frame_count"],
+        statement_timeout_seconds=remaining(),
     )
     _require_equal(h2b.verification_status, "VERIFIED", "H2D3_POST_H2B_REJECTED")
     _require_equal(h2b.reason_codes, (), "H2D3_POST_H2B_REASON_CODES")
-    outcomes = verify_outcomes_from_environment(baseline["replay_run_id"])
+    outcomes = verify_outcomes_from_environment(
+        baseline["replay_run_id"], statement_timeout_seconds=remaining(),
+    )
     observed = _observed_evidence_snapshot(h2b, outcomes)
     _require_equal(observed, _frozen_evidence_snapshot(baseline),
                    "H2D3_POST_EVIDENCE_SNAPSHOT_DRIFT")
+    remaining()
     return observed
 
 
@@ -396,7 +411,7 @@ def run_isolated(dates: tuple[str, ...], *, timeout_seconds: float,
 def execute_canary(*, date_timeout_seconds: float = DEFAULT_DATE_TIMEOUT_SECONDS,
                    canary_timeout_seconds: float = DEFAULT_CANARY_TIMEOUT_SECONDS,
                    isolated_runner: Callable[..., tuple[list[dict], list[dict]]] = run_isolated,
-                   snapshot_reader: Callable[[str], dict] | None = None) -> dict:
+                   snapshot_reader: Callable[[str, float], dict] | None = None) -> dict:
     if (not math.isfinite(date_timeout_seconds) or date_timeout_seconds <= 0 or
             not math.isfinite(canary_timeout_seconds) or canary_timeout_seconds <= 0):
         raise ValueError("timeouts must be positive and finite")
@@ -428,9 +443,12 @@ def execute_canary(*, date_timeout_seconds: float = DEFAULT_DATE_TIMEOUT_SECONDS
 
     post_snapshots = []
     for control in controls:
-        if canary_timeout_seconds - (time.monotonic() - started) <= 0:
+        remaining = canary_timeout_seconds - (time.monotonic() - started)
+        if remaining <= 0:
             raise CanaryFailure("H2D3_CANARY_TIMEOUT")
-        observed = snapshot_reader(control["historical_session"])
+        observed = snapshot_reader(control["historical_session"], remaining)
+        if time.monotonic() - started >= canary_timeout_seconds:
+            raise CanaryFailure("H2D3_CANARY_TIMEOUT")
         _require_equal(observed, control["evidence_snapshot"],
                        f"H2D3_POST_EVIDENCE_DRIFT:{control['historical_session']}")
         post_snapshots.append(observed)

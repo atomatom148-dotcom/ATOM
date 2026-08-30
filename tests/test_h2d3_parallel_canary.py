@@ -101,8 +101,11 @@ class _Connection:
     def __init__(self, rows):
         self.setup = _Cursor(())
         self.stream = _Cursor(rows)
+        self.binary = None
 
-    def cursor(self, name=None):
+    def cursor(self, name=None, binary=False):
+        if name:
+            self.binary = binary
         return self.stream if name else self.setup
 
 
@@ -142,6 +145,7 @@ def test_read_only_outcome_receipt_streams_all_rows_in_frozen_order():
     assert receipt.outcome_ordered_content_sha256 == hashlib.sha256(
         "\n".join(hashes).encode(),
     ).hexdigest()
+    assert connection.binary is True
     sql = connection.stream.executed[0][0]
     assert "convert_to(horizon,'UTF8')" in sql
     assert all(word not in sql.upper() for word in ("INSERT", "UPDATE", "DELETE", "LOCK"))
@@ -169,14 +173,18 @@ def _receipt(day):
 
 def test_canary_runs_controls_one_at_a_time_then_exactly_two_and_orders_receipt():
     calls = []
+    snapshot_timeouts = []
     def runner(dates, *, timeout_seconds):
         calls.append((dates, timeout_seconds))
         return ([_receipt(day) for day in dates],
                 [{"historical_session": day, "exit_code": 0, "peak_rss_kib": 10}
                  for day in dates])
+    def snapshot_reader(day, timeout_seconds):
+        snapshot_timeouts.append(timeout_seconds)
+        return _receipt(day)["evidence_snapshot"]
+
     result = execute_canary(date_timeout_seconds=10, canary_timeout_seconds=30,
-                            isolated_runner=runner,
-                            snapshot_reader=lambda day: _receipt(day)["evidence_snapshot"])
+                            isolated_runner=runner, snapshot_reader=snapshot_reader)
     assert [call[0] for call in calls] == [
         (FROZEN_DATES[0],), (FROZEN_DATES[1],), FROZEN_DATES,
     ]
@@ -184,6 +192,7 @@ def test_canary_runs_controls_one_at_a_time_then_exactly_two_and_orders_receipt(
     assert result["historical_sessions"] == list(FROZEN_DATES)
     assert result["worker_limit"] == 2
     assert result["read_only"] is True and result["evidence_writes"] == 0
+    assert len(snapshot_timeouts) == 2 and all(value > 0 for value in snapshot_timeouts)
 
 
 def test_canary_fails_on_any_parallel_parity_drift():
@@ -330,8 +339,20 @@ def test_read_only_date_builds_complete_frozen_projection(monkeypatch):
         classmethod(lambda cls: object()),
     )
     monkeypatch.setattr(h1_module, "run_h1_session", lambda **_kwargs: h1)
-    monkeypatch.setattr(verifier_module, "verify_from_environment", lambda *_a, **_k: h2b)
-    monkeypatch.setattr(outcomes_module, "verify_outcomes_from_environment", lambda *_a: outcomes)
+    snapshot_timeouts = {}
+
+    def fake_verify(*_args, **kwargs):
+        if "statement_timeout_seconds" in kwargs:
+            snapshot_timeouts["h2b"] = kwargs["statement_timeout_seconds"]
+        return h2b
+
+    def fake_outcomes(*_args, **kwargs):
+        if "statement_timeout_seconds" in kwargs:
+            snapshot_timeouts["h2c"] = kwargs["statement_timeout_seconds"]
+        return outcomes
+
+    monkeypatch.setattr(verifier_module, "verify_from_environment", fake_verify)
+    monkeypatch.setattr(outcomes_module, "verify_outcomes_from_environment", fake_outcomes)
     monkeypatch.setattr(outcomes_module, "score_from_environment", lambda *_a: scoring)
     monkeypatch.setattr(
         canary,
@@ -350,7 +371,10 @@ def test_read_only_date_builds_complete_frozen_projection(monkeypatch):
     assert receipt["pre_post_unchanged"] is True
     assert receipt["h1"]["quote_counts"] == (("COIN", 1), ("QQQ", 1))
     assert "timings" not in receipt["h1"]
-    assert canary.read_evidence_snapshot(baseline["historical_session"]) == receipt["evidence_snapshot"]
+    assert canary.read_evidence_snapshot(
+        baseline["historical_session"], timeout_seconds=1,
+    ) == receipt["evidence_snapshot"]
+    assert snapshot_timeouts["h2b"] > 0 and snapshot_timeouts["h2c"] > 0
 
 
 def test_canary_rejects_post_run_evidence_drift():
@@ -362,7 +386,27 @@ def test_canary_rejects_post_run_evidence_drift():
     with pytest.raises(CanaryFailure, match="POST_EVIDENCE_DRIFT"):
         execute_canary(
             isolated_runner=runner,
-            snapshot_reader=lambda day: {"historical_session": day, "changed": True},
+            snapshot_reader=lambda day, _timeout: {
+                "historical_session": day, "changed": True,
+            },
+        )
+
+
+def test_canary_deadline_covers_post_run_snapshot():
+    def runner(dates, *, timeout_seconds):
+        return ([_receipt(day) for day in dates],
+                [{"historical_session": day, "exit_code": 0, "peak_rss_kib": 10}
+                 for day in dates])
+
+    def slow_snapshot(day, _timeout):
+        time.sleep(0.06)
+        return _receipt(day)["evidence_snapshot"]
+
+    with pytest.raises(CanaryFailure, match="CANARY_TIMEOUT"):
+        execute_canary(
+            canary_timeout_seconds=0.05,
+            isolated_runner=runner,
+            snapshot_reader=slow_snapshot,
         )
 
 
