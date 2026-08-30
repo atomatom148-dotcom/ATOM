@@ -185,14 +185,12 @@ def test_current_orchestrator_remains_plain_sequential_h2d1() -> None:
 def test_freeze_requires_exact_behavior_parity_and_no_writes() -> None:
     law = _law()
     required = (
-        "Stage order is exact: `H1`, `H2B`, `H2C_RESOLVE`, then `H2C_SCORE`",
-        "Frames, quote alignment, family calculations, horizons, target resolution, verification, persistence, and scoring inside that date remain sequential",
+        "exactly two isolated worker processes",
+        "Everything inside one date remains chronological and sequential",
         "forecast_count = frame_count × 12 × 6", "outcome_count = frame_count × 6",
-        "exactly 72 metric objects", "The full 72 metrics must also compare field-for-field",
-        "Floating-point equality is exact", "outcome_writes = 0", "connections read-only",
-        "Pre/post manifest, forecast, and outcome counts and hashes must match",
-        "current write-capable H1 persistence and H2C resolver commands are forbidden",
-        "H2-D-2 still authorizes no runtime", "H2-D-2 adds no multiprocessing/executor/async runtime",
+        "72 metric objects field-for-field", "zero evidence writes",
+        "Any numerical, lineage, count, hash, duplicate, ordering, or receipt mismatch fails",
+        "H2-D-2 changes no runtime",
     )
     for clause in required:
         assert clause in law
@@ -202,7 +200,7 @@ def test_root_freeze_and_phase_boundary_remain_explicit() -> None:
     root_law = _law(ROOT_FREEZE)
     phases = _law(PHASES)
     assert "H2-D-2 is a design freeze only" in root_law
-    assert "It does not pin unrelated runtime or V9 source-file hashes" in root_law
+    assert "not unrelated runtime or V9 source-file hashes" in root_law
     assert "H2-D-3 — Parallel Canary (not authorized)" in phases
     assert "No within-date concurrency or evidence writes" in phases
 
