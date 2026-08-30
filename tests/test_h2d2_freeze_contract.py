@@ -3031,6 +3031,7 @@ return receipt
     function_tail_violation = (
         observed_function_receipt_tail != expected_function_receipt_tail
     )
+    day_loop_orelse_violation = bool(day_loop.orelse)
     day_tries = tuple(
         statement for statement in day_loop.body
         if isinstance(statement, ast.Try)
@@ -3061,6 +3062,8 @@ return receipt
     violations = []
     if function_tail_violation:
         violations.append("h2c-score-function-receipt-tail")
+    if day_loop_orelse_violation:
+        violations.append("h2c-score-day-loop-orelse")
     if observed_tail != expected_tail:
         violations.append("h2c-score-receipt-tail")
     if day_try.orelse or day_try.finalbody:
@@ -9105,9 +9108,14 @@ def sensitive_module_reexports(
 
         def has_executable_code_payload_provenance(
                 expression: ast.AST,
+                expression_scope: ast.AST | None = scope,
+                seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
         ) -> bool:
-            origins = flow_sensitive_import_origins(expression, scope)
-            return any(
+            origins = flow_sensitive_import_origins(
+                expression,
+                expression_scope,
+            )
+            if any(
                 origin in EXECUTABLE_CODE_PAYLOAD_FULL_IMPORT_NAMES
                 or any(
                     re.fullmatch(
@@ -9117,7 +9125,151 @@ def sensitive_module_reexports(
                     for payload_origin in EXECUTABLE_CODE_PAYLOAD_FULL_IMPORT_NAMES
                 )
                 for origin in origins
-            )
+            ):
+                return True
+            if isinstance(expression, (ast.NamedExpr, ast.Starred)):
+                return has_executable_code_payload_provenance(
+                    expression.value,
+                    expression_scope,
+                    seen,
+                )
+            if isinstance(expression, ast.IfExp):
+                return (
+                    has_executable_code_payload_provenance(
+                        expression.body, expression_scope, seen
+                    )
+                    or has_executable_code_payload_provenance(
+                        expression.orelse, expression_scope, seen
+                    )
+                )
+            if isinstance(expression, ast.Subscript):
+                return has_executable_code_payload_provenance(
+                    expression.value,
+                    expression_scope,
+                    seen,
+                )
+            if isinstance(expression, (ast.List, ast.Tuple, ast.Set)):
+                return any(
+                    has_executable_code_payload_provenance(
+                        item, expression_scope, seen
+                    )
+                    for item in expression.elts
+                )
+            if isinstance(expression, ast.Dict):
+                return any(
+                    has_executable_code_payload_provenance(
+                        item, expression_scope, seen
+                    )
+                    for item in (*expression.keys, *expression.values)
+                    if item is not None
+                )
+            if isinstance(expression, ast.Call):
+                return any(
+                    has_executable_code_payload_provenance(
+                        argument.value if isinstance(argument, ast.Starred) else argument,
+                        expression_scope,
+                        seen,
+                    )
+                    for argument in expression.args
+                ) or any(
+                    has_executable_code_payload_provenance(
+                        keyword.value,
+                        expression_scope,
+                        seen,
+                    )
+                    for keyword in expression.keywords
+                )
+            if not isinstance(expression, ast.Name):
+                return False
+
+            lookup_scope = expression_scope
+            while True:
+                if (
+                    lookup_scope is not None
+                    and expression.id in scope_global_names[lookup_scope]
+                ):
+                    lookup_scope = None
+                elif (
+                    lookup_scope is not None
+                    and expression.id in scope_nonlocal_names[lookup_scope]
+                ):
+                    lookup_scope = callable_parents[lookup_scope]
+                    continue
+                if expression.id in scope_bound_names[lookup_scope]:
+                    break
+                if lookup_scope is None:
+                    return False
+                lookup_scope = callable_parents[lookup_scope]
+            alias_key = (lookup_scope, expression.id)
+            if alias_key in seen:
+                return False
+            container = tree if lookup_scope is None else lookup_scope
+            candidate_body = container.body if hasattr(container, "body") else []
+            body = candidate_body if isinstance(candidate_body, list) else []
+            direct_child: ast.AST = expression
+            while (
+                parents.get(direct_child) is not container
+                and parents.get(direct_child) is not None
+            ):
+                direct_child = parents[direct_child]
+            before_index = body.index(direct_child) if direct_child in body else len(body)
+            for statement in reversed(body[:before_index]):
+                assigned = None
+                destructured_source = None
+                is_binding = False
+                if isinstance(statement, ast.Assign):
+                    for target in statement.targets:
+                        assigned = assigned_value_for_name(
+                            target,
+                            statement.value,
+                            expression.id,
+                        )
+                        if assigned is not None:
+                            is_binding = True
+                            break
+                        if expression.id in target_names(target):
+                            is_binding = True
+                            destructured_source = statement.value
+                            break
+                elif isinstance(statement, ast.AnnAssign):
+                    is_binding = expression.id in target_names(statement.target)
+                    assigned = statement.value if is_binding else None
+                elif isinstance(statement, (ast.AugAssign, ast.Delete)):
+                    targets = (
+                        statement.targets
+                        if isinstance(statement, ast.Delete)
+                        else [statement.target]
+                    )
+                    is_binding = any(
+                        expression.id in target_names(target)
+                        for target in targets
+                    )
+                elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    is_binding = statement.name == expression.id
+                elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                    is_binding = any(
+                        (
+                            alias.asname
+                            or (
+                                alias.name
+                                if isinstance(statement, ast.ImportFrom)
+                                else alias.name.split(".", 1)[0]
+                            )
+                        ) == expression.id
+                        for alias in statement.names
+                    )
+                if not is_binding:
+                    continue
+                source = assigned if assigned is not None else destructured_source
+                return (
+                    source is not None
+                    and has_executable_code_payload_provenance(
+                        source,
+                        lookup_scope,
+                        seen | {alias_key},
+                    )
+                )
+            return False
 
         def finite_star_variants(
                 expression: ast.AST,
@@ -9298,10 +9450,19 @@ def sensitive_module_reexports(
                 expression_scope: ast.AST | None,
                 seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
         ) -> bool:
-            if isinstance(expression, ast.Constant):
-                return isinstance(expression.value, str)
+            try:
+                literal_value = ast.literal_eval(expression)
+            except (ValueError, TypeError):
+                literal_value = None
+                is_literal = False
+            else:
+                is_literal = True
+            if is_literal:
+                return isinstance(literal_value, str)
             if isinstance(expression, ast.JoinedStr):
                 return True
+            if isinstance(expression, ast.Lambda):
+                return False
             if isinstance(expression, (ast.NamedExpr, ast.Starred)):
                 return is_executable_string(
                     expression.value,
@@ -9313,13 +9474,23 @@ def sensitive_module_reexports(
                     is_executable_string(expression.body, expression_scope, seen)
                     or is_executable_string(expression.orelse, expression_scope, seen)
                 )
-            if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
-                return (
-                    is_executable_string(expression.left, expression_scope, seen)
-                    or is_executable_string(expression.right, expression_scope, seen)
-                )
-            if not isinstance(expression, ast.Name):
+            if isinstance(expression, ast.Name) and resolve_callable_expression(
+                expression,
+                expression_scope,
+            ):
                 return False
+            if isinstance(expression, ast.Attribute):
+                return not bool(
+                    resolve_callable_expression(expression, expression_scope)
+                    or flow_sensitive_import_origins(
+                        expression,
+                        expression_scope,
+                    )
+                )
+            if isinstance(expression, (ast.Call, ast.BinOp, ast.BoolOp)):
+                return True
+            if not isinstance(expression, ast.Name):
+                return True
 
             lookup_scope = expression_scope
             while True:
@@ -9337,7 +9508,7 @@ def sensitive_module_reexports(
                 if expression.id in scope_bound_names[lookup_scope]:
                     break
                 if lookup_scope is None:
-                    return False
+                    return not bool(resolve_import_origins(expression))
                 lookup_scope = callable_parents[lookup_scope]
             alias_key = (lookup_scope, expression.id)
             if alias_key in seen:
@@ -9396,15 +9567,21 @@ def sensitive_module_reexports(
                     )
                 if not is_binding:
                     continue
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return False
+                if isinstance(statement, ast.Import):
+                    return False
+                if isinstance(statement, ast.ImportFrom):
+                    return False
                 return (
-                    assigned is not None
-                    and is_executable_string(
+                    assigned is None
+                    or is_executable_string(
                         assigned,
                         lookup_scope,
                         seen | {alias_key},
                     )
                 )
-            return False
+            return True
 
         positional, unresolved_starred = normalized_positional_values(call)
         candidate_values = list(positional[:2])
@@ -11717,6 +11894,31 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "transformed = transform()\n"
                 "build(transformed, {})\n"
             ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "types.FunctionType(marshal.loads(blob)[0], {})()\n"
+            ),
+            (
+                "import marshal\n"
+                "from types import LambdaType\n"
+                "payload = marshal.loads(blob)\n"
+                "code = payload[1:][0]\n"
+                "LambdaType(code, {})()\n"
+            ),
+            (
+                "from marshal import loads\n"
+                "from types import FunctionType\n"
+                "code, metadata = loads(blob)\n"
+                "FunctionType(code, {})()\n"
+            ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "payload = marshal.loads(blob)\n"
+                "code = extract(payload)\n"
+                "types.FunctionType(code, {})\n"
+            ),
         )
         for source in executable_code_positives:
             with self.subTest(executable_marshaled_code=source.strip()):
@@ -11784,6 +11986,13 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "code = marshal.loads(blob)\n"
                 "code = safe_code\n"
                 "types.FunctionType(code.replace(), {})\n"
+            ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "payload = marshal.loads(blob)\n"
+                "payload = (safe_code,)\n"
+                "types.FunctionType(payload[0], {})\n"
             ),
         )
         for source in executable_code_negatives:
@@ -11931,6 +12140,19 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "options = {'number': 1, **inner}\n"
                 "repeat(**options)\n"
             ),
+            "import timeit\ntimeit.timeit('danger()' * count)\n",
+            "import timeit\ntimeit.repeat('{}'.format(command))\n",
+            "import timeit\ntimeit.timeit(';'.join(commands))\n",
+            (
+                "from timeit import Timer\n"
+                "statement = transform(source)\n"
+                "Timer(statement)\n"
+            ),
+            (
+                "import timeit\n"
+                "def run(statement):\n"
+                "    return timeit.timeit(statement)\n"
+            ),
         )
         for source in string_execution_positives:
             with self.subTest(attribute_string_execution=source.strip()):
@@ -11939,9 +12161,22 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 )
 
         string_execution_negatives = (
-            "import timeit\ntimeit.timeit(callback)\n",
-            "import timeit\ntimeit.repeat(stmt=callback, setup=callback)\n",
-            "from timeit import Timer\nTimer(callback).timeit()\n",
+            (
+                "import timeit\n"
+                "callback = lambda: None\n"
+                "timeit.timeit(callback)\n"
+            ),
+            (
+                "import timeit\n"
+                "def callback():\n"
+                "    return None\n"
+                "timeit.repeat(stmt=callback, setup=callback)\n"
+            ),
+            (
+                "from timeit import Timer\n"
+                "callback = lambda: None\n"
+                "Timer(callback).timeit()\n"
+            ),
             "import example\nexample.timeit('danger()')\n",
             (
                 "import timeit\n"
@@ -11961,15 +12196,20 @@ class H2D2FreezeContractTests(unittest.TestCase):
             ),
             (
                 "import timeit\n"
+                "callback = lambda: None\n"
+                "setup_callback = lambda: None\n"
                 "options = {'stmt': callback, 'setup': setup_callback}\n"
                 "timeit.timeit(**options)\n"
             ),
             (
                 "from timeit import Timer\n"
+                "callback = lambda: None\n"
                 "callbacks = {'stmt': callback}\n"
                 "options = {'number': 1, **callbacks}\n"
                 "Timer(**options)\n"
             ),
+            "import timeit\ntimeit.timeit(123)\n",
+            "import timeit\ntimeit.repeat(stmt=b'not source')\n",
         )
         for source in string_execution_negatives:
             with self.subTest(safe_string_execution_shape=source.strip()):
@@ -14760,6 +15000,20 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "    return receipt\n\n\ndef main",
                 "    return receipt\n"
                 "    receipt[\"overall_status\"] = \"FAILED\"\n\n\ndef main",
+                1,
+            ),
+            "day-loop-else-receipt-mutation": source.replace(
+                function_receipt_tail_source,
+                "    else:\n"
+                "        receipt[\"failed\"].clear()\n"
+                + function_receipt_tail_source,
+                1,
+            ),
+            "day-loop-else-receipt-replacement": source.replace(
+                function_receipt_tail_source,
+                "    else:\n"
+                "        receipt = dict(receipt)\n"
+                + function_receipt_tail_source,
                 1,
             ),
             "deleted-guard": source.replace(guard_source, "", 1),
