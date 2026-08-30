@@ -136,6 +136,8 @@ EXECUTION_WRAPPER_FULL_IMPORT_NAMES = {
     "profile.Profile.runctx",
     "profile.run",
     "profile.runctx",
+    "trace.Trace.run",
+    "trace.Trace.runctx",
 }
 CONFIG_FACTORY_EXECUTION_FULL_IMPORT_NAMES = {
     "logging.config.dictConfig",
@@ -4385,6 +4387,9 @@ def sensitive_module_reexports(
     tracked_return_callables: set[ast.AST] = set()
     tracked_yield_callables: set[ast.AST] = set()
     tracked_generator_receive_targets: set[ast.Name] = set()
+    tracked_generator_receive_expressions: set[ast.Yield | ast.YieldFrom] = set()
+    tracked_generator_receive_loads: set[ast.Name] = set()
+    throw_synthetic_constructors: dict[ast.Call, ast.Call] = {}
     tracked_exception_handler_payloads: dict[
         ast.ExceptHandler,
         set[
@@ -5197,6 +5202,8 @@ def sensitive_module_reexports(
             return False
 
         def is_tracked_name(item: ast.Name) -> bool:
+            if item in tracked_generator_receive_loads:
+                return True
             if is_tracked_handler_name(item):
                 return True
             if is_safely_overwritten_in_loop(item):
@@ -5375,6 +5382,11 @@ def sensitive_module_reexports(
             node: ast.AST,
             scope: ast.AST | None,
     ) -> bool:
+        if any(
+            item in tracked_generator_receive_expressions
+            for item in ast.walk(node)
+        ):
+            return True
         callable_references = {
             item
             for call in ast.walk(node)
@@ -5393,6 +5405,11 @@ def sensitive_module_reexports(
             node: ast.AST,
             scope: ast.AST | None,
     ) -> bool:
+        if any(
+            item in tracked_generator_receive_expressions
+            for item in ast.walk(node)
+        ):
+            return True
         def contains_local_tracked_return(item: ast.AST) -> bool:
             if isinstance(item, ast.Call):
                 return any(
@@ -5422,6 +5439,13 @@ def sensitive_module_reexports(
         return contains_local_tracked_return(node) or (
             not any(isinstance(item, ast.Call) for item in ast.walk(node))
             and contains_tracked_binding(node, scope)
+        )
+
+    def contains_generator_receive_provenance(node: ast.AST) -> bool:
+        return any(
+            item in tracked_generator_receive_expressions
+            or item in tracked_generator_receive_loads
+            for item in ast.walk(node)
         )
 
     def callable_parameter_bindings(
@@ -7436,6 +7460,30 @@ def sensitive_module_reexports(
             return "CLOSED"
         return "UNCERTAIN"
 
+    def injected_exception_handlers(
+            yielded: ast.Yield | ast.YieldFrom,
+            raised_type: ast.AST,
+            local_generator: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[ast.ExceptHandler, ...]:
+        child: ast.AST = yielded
+        parent = parents.get(child)
+        while parent is not None and parent is not local_generator:
+            if isinstance(parent, (ast.Try, ast.TryStar)) and child in parent.body:
+                matches = tuple(
+                    handler
+                    for handler in parent.handlers
+                    if exception_handler_matches(
+                        raised_type,
+                        handler.type,
+                        local_generator,
+                    )
+                )
+                if matches:
+                    return matches[:1]
+            child = parent
+            parent = parents.get(child)
+        return ()
+
     changed = True
     while changed:
         changed = False
@@ -7560,6 +7608,109 @@ def sensitive_module_reexports(
             if update_loop_provenance(loop):
                 changed = True
 
+        for context_node in (
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.With, ast.AsyncWith))
+        ):
+            context_scope = enclosing_callable(context_node)
+            for item in context_node.items:
+                if (
+                    item.optional_vars is None
+                    or not contains_generator_receive_provenance(
+                        item.context_expr
+                    )
+                ):
+                    continue
+                new_names = target_names(item.optional_vars)
+                local_bindings = (
+                    tracked_bindings
+                    if context_scope is None
+                    else scoped_tracked_bindings[context_scope]
+                )
+                if not new_names.issubset(local_bindings):
+                    local_bindings.update(new_names)
+                    changed = True
+
+        for match_node in (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Match)
+            and contains_generator_receive_provenance(node.subject)
+        ):
+            capture_names = {
+                name
+                for case in match_node.cases
+                for pattern in ast.walk(case.pattern)
+                for name in (
+                    pattern.name
+                    if isinstance(pattern, (ast.MatchAs, ast.MatchStar))
+                    else pattern.rest
+                    if isinstance(pattern, ast.MatchMapping)
+                    else None,
+                )
+                if name is not None
+            }
+            match_scope = enclosing_callable(match_node)
+            local_bindings = (
+                tracked_bindings
+                if match_scope is None
+                else scoped_tracked_bindings[match_scope]
+            )
+            if not capture_names.issubset(local_bindings):
+                local_bindings.update(capture_names)
+                changed = True
+            new_loads = {
+                item
+                for case in match_node.cases
+                for statement in case.body
+                for item in ast.walk(statement)
+                if isinstance(item, ast.Name)
+                and isinstance(item.ctx, ast.Load)
+                and item.id in capture_names
+                and enclosing_callable(item) is match_scope
+            }
+            if not new_loads.issubset(tracked_generator_receive_loads):
+                tracked_generator_receive_loads.update(new_loads)
+                changed = True
+
+        for comprehension in (
+            node for node in ast.walk(tree)
+            if isinstance(node, (
+                ast.DictComp,
+                ast.GeneratorExp,
+                ast.ListComp,
+                ast.SetComp,
+            ))
+        ):
+            comprehension_scope = enclosing_callable(comprehension)
+            for generator in comprehension.generators:
+                if not contains_generator_receive_provenance(generator.iter):
+                    continue
+                new_names = target_names(generator.target)
+                local_bindings = (
+                    tracked_bindings
+                    if comprehension_scope is None
+                    else scoped_tracked_bindings[comprehension_scope]
+                )
+                if not new_names.issubset(local_bindings):
+                    local_bindings.update(new_names)
+                    changed = True
+                new_loads = {
+                    item
+                    for expression in (
+                        (comprehension.key, comprehension.value)
+                        if isinstance(comprehension, ast.DictComp)
+                        else (comprehension.elt,)
+                    )
+                    for item in ast.walk(expression)
+                    if isinstance(item, ast.Name)
+                    and isinstance(item.ctx, ast.Load)
+                    and item.id in new_names
+                    and enclosing_callable(item) is comprehension_scope
+                }
+                if not new_loads.issubset(tracked_generator_receive_loads):
+                    tracked_generator_receive_loads.update(new_loads)
+                    changed = True
+
         for send_call in (
             node for node in ast.walk(tree)
             if isinstance(node, ast.Call)
@@ -7577,6 +7728,14 @@ def sensitive_module_reexports(
                 send_call.func.value,
                 enclosing_callable(send_call),
             ):
+                receive_expressions = set(own_yield_nodes(local_generator))
+                if not receive_expressions.issubset(
+                    tracked_generator_receive_expressions
+                ):
+                    tracked_generator_receive_expressions.update(
+                        receive_expressions
+                    )
+                    changed = True
                 new_targets = generator_receive_target_nodes(local_generator)
                 new_names = {target.id for target in new_targets}
                 local_bindings = scoped_tracked_bindings[local_generator]
@@ -7586,6 +7745,88 @@ def sensitive_module_reexports(
                 if not new_names.issubset(local_bindings):
                     local_bindings.update(new_names)
                     changed = True
+
+        for throw_call in (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "throw"
+            and node.args
+        ):
+            if generator_state_at_send(throw_call) in {"FRESH", "CLOSED"}:
+                continue
+            caller_scope = enclosing_callable(throw_call)
+            constructions, complete = resolve_local_generator_constructions(
+                throw_call.func.value,
+                caller_scope,
+            )
+            if not constructions:
+                continue
+            constructor_payloads: set[tuple[ast.Call, ast.AST | None]] = set()
+            if len(throw_call.args) == 1:
+                constructor_payloads.update(
+                    resolve_raised_exception_constructors(
+                        throw_call.args[0],
+                        caller_scope,
+                        (throw_call.lineno, throw_call.col_offset),
+                    )
+                )
+            else:
+                synthetic_constructor = throw_synthetic_constructors.get(
+                    throw_call
+                )
+                if synthetic_constructor is None:
+                    synthetic_constructor = ast.copy_location(
+                        ast.Call(
+                            func=throw_call.args[0],
+                            args=[throw_call.args[1]],
+                            keywords=[],
+                        ),
+                        throw_call,
+                    )
+                    throw_synthetic_constructors[throw_call] = synthetic_constructor
+                constructor_payloads.add((synthetic_constructor, caller_scope))
+            for construction in constructions:
+                for local_generator, _ in local_call_targets(construction):
+                    if not isinstance(
+                        local_generator,
+                        (ast.FunctionDef, ast.AsyncFunctionDef),
+                    ):
+                        continue
+                    for constructor, payload_scope in constructor_payloads:
+                        payload = (
+                            tuple(constructor.args),
+                            payload_scope,
+                            tuple(keyword.value for keyword in constructor.keywords),
+                        )
+                        if not any(
+                            contains_passed_tracked_binding(argument, payload_scope)
+                            for argument in payload[0] + payload[2]
+                        ):
+                            continue
+                        for yielded in own_yield_nodes(local_generator):
+                            for handler in injected_exception_handlers(
+                                yielded,
+                                constructor.func,
+                                local_generator,
+                            ):
+                                payloads = tracked_exception_handler_payloads.setdefault(
+                                    handler,
+                                    set(),
+                                )
+                                if payload not in payloads:
+                                    payloads.add(payload)
+                                    changed = True
+                                constructors = (
+                                    tracked_exception_handler_constructors.setdefault(
+                                        handler,
+                                        set(),
+                                    )
+                                )
+                                constructor_payload = (constructor, payload_scope)
+                                if constructor_payload not in constructors:
+                                    constructors.add(constructor_payload)
+                                    changed = True
 
         for call in (
             node for node in ast.walk(tree)
@@ -12700,6 +12941,13 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "execute('danger()')\n"
             ),
             "import profile\nprofile.Profile().runcall(callback)\n",
+            "import trace\ntrace.Trace().run('danger()')\n",
+            (
+                "from trace import Trace as Tracer\n"
+                "runner = Tracer()\n"
+                "execute = runner.runctx\n"
+                "execute('danger()', globals(), locals())\n"
+            ),
             (
                 "import logging.config\n"
                 "config = {'handlers': {'h': {'()': 'package.Factory'}}}\n"
@@ -12751,6 +12999,12 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "        return False\n"
                 "InteractiveConsole().push('safe')\n"
             ),
+            (
+                "class Trace:\n"
+                "    def run(self, source):\n"
+                "        return source\n"
+                "Trace().run('safe')\n"
+            ),
         )
         for source in exact_wrapper_negatives:
             with self.subTest(safe_execution_wrapper=source.strip()):
@@ -12778,6 +13032,70 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "right = receiver()\n"
                 "generator = left if enabled else right\n"
                 "generator.send(None)\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    for value in [(yield None)]:\n"
+                "        value.os.fork()\n"
+                "generator = receiver()\n"
+                "next(generator)\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def sink(value):\n"
+                "    value.os.fork()\n"
+                "def receiver():\n"
+                "    sink((yield None))\n"
+                "generator = receiver()\n"
+                "generator.send(None)\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    [(value.os.fork()) for value in [(yield None)]]\n"
+                "generator = receiver()\n"
+                "next(generator)\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    match (yield None):\n"
+                "        case value:\n"
+                "            value.os.fork()\n"
+                "generator = receiver()\n"
+                "next(generator)\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    with (yield None) as value:\n"
+                "        value.os.fork()\n"
+                "generator = receiver()\n"
+                "next(generator)\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    (value := (yield None))\n"
+                "    value.os.fork()\n"
+                "generator = receiver()\n"
+                "next(generator)\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    values = [(yield None)]\n"
+                "    values[0].os.fork()\n"
+                "generator = receiver()\n"
+                "next(generator)\n"
                 "generator.send(p)\n"
             ),
             (
@@ -12865,9 +13183,91 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "alias = harmless\n"
                 "alias.send(p)\n"
             ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    for value in [(yield None)]:\n"
+                "        value.os.fork()\n"
+                "generator = receiver()\n"
+                "generator.send(p)\n"
+            ),
         )
         for source in generator_send_negatives:
             with self.subTest(safe_generator_send=source.strip()):
+                self.assertFalse(
+                    sensitive_module_reexports(
+                        ast.parse(source),
+                        {"p": "shutil"},
+                    ),
+                )
+
+        generator_throw_positives = (
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    try:\n"
+                "        yield None\n"
+                "    except RuntimeError as error:\n"
+                "        error.args[0].os.fork()\n"
+                "generator = receiver()\n"
+                "next(generator)\n"
+                "failure = RuntimeError(p)\n"
+                "generator.throw(failure)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    try:\n"
+                "        yield None\n"
+                "    except RuntimeError as error:\n"
+                "        error.args[0].os.fork()\n"
+                "generator = receiver()\n"
+                "alias = generator\n"
+                "alias.send(None)\n"
+                "alias.throw(RuntimeError, p)\n"
+            ),
+        )
+        for source in generator_throw_positives:
+            with self.subTest(generator_throw_taint=source.strip()):
+                self.assertTrue(
+                    sensitive_module_reexports(
+                        ast.parse(source),
+                        {"p": "shutil"},
+                    ),
+                )
+
+        generator_throw_negatives = (
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    try:\n"
+                "        yield None\n"
+                "    except RuntimeError as error:\n"
+                "        error.args[0].os.fork()\n"
+                "generator = receiver()\n"
+                "generator.throw(RuntimeError, p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "class Local:\n"
+                "    def throw(self, *values):\n"
+                "        return None\n"
+                "Local().throw(RuntimeError, p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    try:\n"
+                "        yield None\n"
+                "    except ValueError as error:\n"
+                "        error.args[0].os.fork()\n"
+                "generator = receiver()\n"
+                "next(generator)\n"
+                "generator.throw(RuntimeError, p)\n"
+            ),
+        )
+        for source in generator_throw_negatives:
+            with self.subTest(safe_generator_throw=source.strip()):
                 self.assertFalse(
                     sensitive_module_reexports(
                         ast.parse(source),
