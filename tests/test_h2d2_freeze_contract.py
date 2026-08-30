@@ -92,6 +92,33 @@ PROCESS_LAUNCH_WRAPPER_FULL_IMPORT_NAMES = {
     "webbrowser.get.open_new",
     "webbrowser.get.open_new_tab",
 }
+for _browser_controller in (
+    "Chrome",
+    "Chromium",
+    "Elinks",
+    "Edge",
+    "Epiphany",
+    "Galeon",
+    "Grail",
+    "Konqueror",
+    "MacOSX",
+    "MacOSXOSAScript",
+    "Mozilla",
+    "Opera",
+    "UnixBrowser",
+    "WindowsDefault",
+):
+    PROCESS_LAUNCH_WRAPPER_FULL_IMPORT_NAMES.update({
+        f"webbrowser.{_browser_controller}.open",
+        f"webbrowser.{_browser_controller}.open_new",
+        f"webbrowser.{_browser_controller}.open_new_tab",
+    })
+del _browser_controller
+STRING_EXECUTION_FULL_IMPORT_NAMES = {
+    "timeit.Timer",
+    "timeit.repeat",
+    "timeit.timeit",
+}
 FORBIDDEN_STAGE_IMPORT_ROOTS = SENSITIVE_MODULE_ROOTS - {
     "os",
     "subprocess",
@@ -2985,6 +3012,25 @@ def frozen_receipt_tail():
     if len(day_loops) != 1:
         return ("h2c-score-receipt-day-loop",)
     day_loop = day_loops[0]
+    expected_function_receipt_tail = tuple(
+        ast.dump(statement, include_attributes=False)
+        for statement in ast.parse(
+            """
+receipt["peak_rss_kib"] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+receipt["overall_status"] = "FAILED" if receipt["failed"] else "COMPLETED"
+receipt["receipt_sha256"] = _digest(receipt)
+return receipt
+"""
+        ).body
+    )
+    day_loop_index = execute_function.body.index(day_loop)
+    observed_function_receipt_tail = tuple(
+        ast.dump(statement, include_attributes=False)
+        for statement in execute_function.body[day_loop_index + 1:]
+    )
+    function_tail_violation = (
+        observed_function_receipt_tail != expected_function_receipt_tail
+    )
     day_tries = tuple(
         statement for statement in day_loop.body
         if isinstance(statement, ast.Try)
@@ -3013,6 +3059,8 @@ def frozen_receipt_tail():
         for statement in day_try.body[score_index:]
     )
     violations = []
+    if function_tail_violation:
+        violations.append("h2c-score-function-receipt-tail")
     if observed_tail != expected_tail:
         violations.append("h2c-score-receipt-tail")
     if day_try.orelse or day_try.finalbody:
@@ -9055,6 +9103,22 @@ def sensitive_module_reexports(
         ):
             return False
 
+        def has_executable_code_payload_provenance(
+                expression: ast.AST,
+        ) -> bool:
+            origins = flow_sensitive_import_origins(expression, scope)
+            return any(
+                origin in EXECUTABLE_CODE_PAYLOAD_FULL_IMPORT_NAMES
+                or any(
+                    re.fullmatch(
+                        re.escape(payload_origin) + r"(?:\.replace)+",
+                        origin,
+                    )
+                    for payload_origin in EXECUTABLE_CODE_PAYLOAD_FULL_IMPORT_NAMES
+                )
+                for origin in origins
+            )
+
         def finite_star_variants(
                 expression: ast.AST,
                 expression_scope: ast.AST | None,
@@ -9217,12 +9281,191 @@ def sensitive_module_reexports(
                 code_value = positional[0] if positional else keywords.get("code")
                 if (
                     code_value is not None
-                    and EXECUTABLE_CODE_PAYLOAD_FULL_IMPORT_NAMES.intersection(
-                        flow_sensitive_import_origins(code_value, scope)
-                    )
+                    and has_executable_code_payload_provenance(code_value)
                 ):
                     return True
         return False
+
+    def string_execution_api_call(call: ast.Call) -> bool:
+        scope = enclosing_callable(call)
+        if not STRING_EXECUTION_FULL_IMPORT_NAMES.intersection(
+            flow_sensitive_import_origins(call.func, scope)
+        ):
+            return False
+
+        def is_executable_string(
+                expression: ast.AST,
+                expression_scope: ast.AST | None,
+                seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+        ) -> bool:
+            if isinstance(expression, ast.Constant):
+                return isinstance(expression.value, str)
+            if isinstance(expression, ast.JoinedStr):
+                return True
+            if isinstance(expression, (ast.NamedExpr, ast.Starred)):
+                return is_executable_string(
+                    expression.value,
+                    expression_scope,
+                    seen,
+                )
+            if isinstance(expression, ast.IfExp):
+                return (
+                    is_executable_string(expression.body, expression_scope, seen)
+                    or is_executable_string(expression.orelse, expression_scope, seen)
+                )
+            if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+                return (
+                    is_executable_string(expression.left, expression_scope, seen)
+                    or is_executable_string(expression.right, expression_scope, seen)
+                )
+            if not isinstance(expression, ast.Name):
+                return False
+
+            lookup_scope = expression_scope
+            while True:
+                if (
+                    lookup_scope is not None
+                    and expression.id in scope_global_names[lookup_scope]
+                ):
+                    lookup_scope = None
+                elif (
+                    lookup_scope is not None
+                    and expression.id in scope_nonlocal_names[lookup_scope]
+                ):
+                    lookup_scope = callable_parents[lookup_scope]
+                    continue
+                if expression.id in scope_bound_names[lookup_scope]:
+                    break
+                if lookup_scope is None:
+                    return False
+                lookup_scope = callable_parents[lookup_scope]
+            alias_key = (lookup_scope, expression.id)
+            if alias_key in seen:
+                return False
+            container = tree if lookup_scope is None else lookup_scope
+            candidate_body = container.body if hasattr(container, "body") else []
+            body = candidate_body if isinstance(candidate_body, list) else []
+            direct_child: ast.AST = expression
+            while (
+                parents.get(direct_child) is not container
+                and parents.get(direct_child) is not None
+            ):
+                direct_child = parents[direct_child]
+            before_index = body.index(direct_child) if direct_child in body else len(body)
+            for statement in reversed(body[:before_index]):
+                assigned = None
+                is_binding = False
+                if isinstance(statement, ast.Assign):
+                    for target in statement.targets:
+                        assigned = assigned_value_for_name(
+                            target,
+                            statement.value,
+                            expression.id,
+                        )
+                        if assigned is not None:
+                            is_binding = True
+                            break
+                        if expression.id in target_names(target):
+                            is_binding = True
+                elif isinstance(statement, ast.AnnAssign):
+                    is_binding = expression.id in target_names(statement.target)
+                    assigned = statement.value if is_binding else None
+                elif isinstance(statement, (ast.AugAssign, ast.Delete)):
+                    targets = (
+                        statement.targets
+                        if isinstance(statement, ast.Delete)
+                        else [statement.target]
+                    )
+                    is_binding = any(
+                        expression.id in target_names(target)
+                        for target in targets
+                    )
+                elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    is_binding = statement.name == expression.id
+                elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                    is_binding = any(
+                        (
+                            alias.asname
+                            or (
+                                alias.name
+                                if isinstance(statement, ast.ImportFrom)
+                                else alias.name.split(".", 1)[0]
+                            )
+                        ) == expression.id
+                        for alias in statement.names
+                    )
+                if not is_binding:
+                    continue
+                return (
+                    assigned is not None
+                    and is_executable_string(
+                        assigned,
+                        lookup_scope,
+                        seen | {alias_key},
+                    )
+                )
+            return False
+
+        positional, unresolved_starred = normalized_positional_values(call)
+        candidate_values = list(positional[:2])
+        candidate_values.extend(
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg in {"setup", "stmt"}
+        )
+        for keyword in call.keywords:
+            if keyword.arg is not None:
+                continue
+            def finite_mapping_string_state(
+                    expression: ast.AST,
+                    expression_scope: ast.AST | None,
+            ) -> tuple[bool, bool]:
+                if isinstance(expression, ast.IfExp):
+                    body_string, body_resolved = finite_mapping_string_state(
+                        expression.body,
+                        expression_scope,
+                    )
+                    else_string, else_resolved = finite_mapping_string_state(
+                        expression.orelse,
+                        expression_scope,
+                    )
+                    return (
+                        body_string or else_string,
+                        body_resolved and else_resolved,
+                    )
+                resolved = flow_sensitive_literal_container(
+                    expression,
+                    expression_scope,
+                )
+                if resolved is None or not isinstance(resolved[0], ast.Dict):
+                    return False, False
+                mapping, mapping_scope = resolved
+                for key, value in zip(mapping.keys, mapping.values):
+                    if key is None:
+                        nested_string, nested_resolved = finite_mapping_string_state(
+                            value,
+                            mapping_scope,
+                        )
+                        if nested_string or not nested_resolved:
+                            return nested_string, nested_resolved
+                    elif (
+                        isinstance(key, ast.Constant)
+                        and key.value in {"setup", "stmt"}
+                        and is_executable_string(value, mapping_scope)
+                    ):
+                        return True, True
+                return False, True
+
+            mapping_string, mapping_resolved = finite_mapping_string_state(
+                keyword.value,
+                scope,
+            )
+            if mapping_string or not mapping_resolved:
+                return True
+        return any(
+            is_executable_string(value, scope)
+            for value in (*candidate_values, *unresolved_starred)
+        )
 
     findings = []
     for node in ast.walk(tree):
@@ -9257,6 +9500,8 @@ def sensitive_module_reexports(
         ):
             findings.append(node)
         elif isinstance(node, ast.Call) and executable_marshaled_code_constructor(node):
+            findings.append(node)
+        elif isinstance(node, ast.Call) and string_execution_api_call(node):
             findings.append(node)
         elif (
             isinstance(node, ast.Call)
@@ -11452,6 +11697,26 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "import types\n"
                 "types.FunctionType(safe_code, {}, globals={})\n"
             ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "types.FunctionType(marshal.loads(blob).replace(), {})()\n"
+            ),
+            (
+                "import marshal\n"
+                "from types import LambdaType as build\n"
+                "code = marshal.loads(blob)\n"
+                "transformed = code.replace().replace()\n"
+                "build(transformed, {})()\n"
+            ),
+            (
+                "from marshal import loads as decode\n"
+                "from types import FunctionType as build\n"
+                "code = decode(blob)\n"
+                "transform = code.replace\n"
+                "transformed = transform()\n"
+                "build(transformed, {})\n"
+            ),
         )
         for source in executable_code_positives:
             with self.subTest(executable_marshaled_code=source.strip()):
@@ -11508,6 +11773,18 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "import types\n"
                 "types.FunctionType(safe_code, {}, name='safe')\n"
             ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "types.FunctionType(marshal.loads(blob).decode(), {})\n"
+            ),
+            (
+                "import marshal\n"
+                "import types\n"
+                "code = marshal.loads(blob)\n"
+                "code = safe_code\n"
+                "types.FunctionType(code.replace(), {})\n"
+            ),
         )
         for source in executable_code_negatives:
             with self.subTest(safe_marshaled_shape=source.strip()):
@@ -11546,6 +11823,27 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "launch = controller.open\n"
                 "launch(url)\n"
             ),
+            (
+                "import webbrowser\n"
+                "webbrowser.Mozilla(path).open(url)\n"
+            ),
+            (
+                "from webbrowser import Chrome as Browser\n"
+                "controller = Browser(path)\n"
+                "launch = controller.open_new_tab\n"
+                "launch(url)\n"
+            ),
+            (
+                "import webbrowser as browser_api\n"
+                "Controller = browser_api.Opera\n"
+                "Controller(path).open_new(url)\n"
+            ),
+            "import webbrowser\nwebbrowser.Edge(path).open(url)\n",
+            (
+                "from webbrowser import Epiphany as Browser\n"
+                "controller = Browser(path)\n"
+                "controller.open_new_tab(url)\n"
+            ),
         )
         for source in browser_launch_positives:
             with self.subTest(browser_process_launch=source.strip()):
@@ -11578,9 +11876,103 @@ class H2D2FreezeContractTests(unittest.TestCase):
                 "        return False\n"
                 "GenericBrowser().open(url)\n"
             ),
+            (
+                "import webbrowser\n"
+                "def run(Mozilla):\n"
+                "    return Mozilla(path).open(url)\n"
+            ),
+            (
+                "class Mozilla:\n"
+                "    def open(self, url):\n"
+                "        return False\n"
+                "Mozilla().open(url)\n"
+            ),
         )
         for source in browser_launch_negatives:
             with self.subTest(safe_browser_shape=source.strip()):
+                self.assertFalse(
+                    sensitive_module_reexports(ast.parse(source), {}),
+                )
+
+        string_execution_positives = (
+            "import timeit\ntimeit.timeit('danger()')\n",
+            "from timeit import repeat as run\nrun(stmt='danger()')\n",
+            (
+                "import timeit as timing\n"
+                "statement = 'danger()'\n"
+                "alias = statement\n"
+                "measure = timing.timeit\n"
+                "measure(alias)\n"
+            ),
+            "from timeit import Timer\nTimer('danger()').timeit()\n",
+            (
+                "import timeit\n"
+                "timeit.Timer(stmt=callback, setup='danger()')\n"
+            ),
+            (
+                "from timeit import Timer as Clock\n"
+                "factory = Clock\n"
+                "factory(**{'stmt': 'danger()', 'setup': callback})\n"
+            ),
+            (
+                "import timeit\n"
+                "timeit.timeit(**options)\n"
+            ),
+            (
+                "import timeit\n"
+                "timeit.timeit(**{\n"
+                "    'number': 1,\n"
+                "    **{'stmt': 'danger()'},\n"
+                "})\n"
+            ),
+            (
+                "from timeit import repeat\n"
+                "inner = {'stmt': 'danger()'}\n"
+                "options = {'number': 1, **inner}\n"
+                "repeat(**options)\n"
+            ),
+        )
+        for source in string_execution_positives:
+            with self.subTest(attribute_string_execution=source.strip()):
+                self.assertTrue(
+                    sensitive_module_reexports(ast.parse(source), {}),
+                )
+
+        string_execution_negatives = (
+            "import timeit\ntimeit.timeit(callback)\n",
+            "import timeit\ntimeit.repeat(stmt=callback, setup=callback)\n",
+            "from timeit import Timer\nTimer(callback).timeit()\n",
+            "import example\nexample.timeit('danger()')\n",
+            (
+                "import timeit\n"
+                "measure = timeit.timeit\n"
+                "measure = harmless\n"
+                "measure('danger()')\n"
+            ),
+            (
+                "import timeit\n"
+                "def run(timeit):\n"
+                "    return timeit.timeit('danger()')\n"
+            ),
+            (
+                "def timeit(statement):\n"
+                "    return statement\n"
+                "timeit('danger()')\n"
+            ),
+            (
+                "import timeit\n"
+                "options = {'stmt': callback, 'setup': setup_callback}\n"
+                "timeit.timeit(**options)\n"
+            ),
+            (
+                "from timeit import Timer\n"
+                "callbacks = {'stmt': callback}\n"
+                "options = {'number': 1, **callbacks}\n"
+                "Timer(**options)\n"
+            ),
+        )
+        for source in string_execution_negatives:
+            with self.subTest(safe_string_execution_shape=source.strip()):
                 self.assertFalse(
                     sensitive_module_reexports(ast.parse(source), {}),
                 )
@@ -14318,10 +14710,58 @@ class H2D2FreezeContractTests(unittest.TestCase):
         manifest_source = (
             "            manifest = manifests[0] if known else None\n"
         )
+        function_receipt_tail_source = (
+            "    receipt[\"peak_rss_kib\"] = "
+            "resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss\n"
+            "    receipt[\"overall_status\"] = "
+            "\"FAILED\" if receipt[\"failed\"] else \"COMPLETED\"\n"
+            "    receipt[\"receipt_sha256\"] = _digest(receipt)\n"
+            "    return receipt\n"
+        )
         self.assertIn(day_loop_source, source)
         self.assertIn(known_source, source)
         self.assertIn(manifest_source, source)
+        self.assertIn(function_receipt_tail_source, source)
         mutations = {
+            "function-tail-reordered": source.replace(
+                function_receipt_tail_source,
+                "    receipt[\"overall_status\"] = "
+                "\"FAILED\" if receipt[\"failed\"] else \"COMPLETED\"\n"
+                "    receipt[\"peak_rss_kib\"] = "
+                "resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss\n"
+                "    receipt[\"receipt_sha256\"] = _digest(receipt)\n"
+                "    return receipt\n",
+                1,
+            ),
+            "function-tail-status-forged": source.replace(
+                "    receipt[\"overall_status\"] = "
+                "\"FAILED\" if receipt[\"failed\"] else \"COMPLETED\"\n",
+                "    receipt[\"overall_status\"] = \"COMPLETED\"\n",
+                1,
+            ),
+            "function-tail-digest-replaced": source.replace(
+                "    receipt[\"receipt_sha256\"] = _digest(receipt)\n",
+                "    receipt[\"receipt_sha256\"] = forged_digest\n",
+                1,
+            ),
+            "function-tail-receipt-replaced": source.replace(
+                function_receipt_tail_source,
+                "    receipt = dict(receipt)\n" + function_receipt_tail_source,
+                1,
+            ),
+            "function-tail-receipt-alias-effect": source.replace(
+                function_receipt_tail_source,
+                "    final_receipt = receipt\n"
+                "    final_receipt[\"failed\"].clear()\n"
+                + function_receipt_tail_source,
+                1,
+            ),
+            "function-tail-after-return": source.replace(
+                "    return receipt\n\n\ndef main",
+                "    return receipt\n"
+                "    receipt[\"overall_status\"] = \"FAILED\"\n\n\ndef main",
+                1,
+            ),
             "deleted-guard": source.replace(guard_source, "", 1),
             "weakened-metric-count": source.replace(
                 "len(scoring.get(\"metrics\", ())) != 72",
