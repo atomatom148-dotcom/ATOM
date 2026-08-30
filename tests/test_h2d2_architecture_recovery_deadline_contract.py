@@ -57,7 +57,15 @@ def test_deadlines_survive_a_live_but_hung_guardian() -> None:
         "not a lease expiry and not authority for a new owner or generation",
         "within the pinned bounded takeover interval",
         "even while the guardian is alive and hung",
-        "kills and reaps the guardian only after `populated 0`",
+        "`prctl(PR_SET_CHILD_SUBREAPER, 1)`",
+        "`pidfd` signaling alone does not confer `waitid`/`waitpid` parentage",
+        "acquires the same date key in shared mode while the guardian still holds",
+        "terminate the hung guardian through its verified `pidfd`",
+        "reap the guardian through `waitid(P_PIDFD, ...)`",
+        "perform final `waitid`/`waitpid` reaping",
+        "Guardian-session closure is not accepted as final fence release",
+        "`populated 0` without wait-reaping is cleanup proof",
+        "guardian pidfd termination/reap → subreaper adoption → final worker wait-reap",
         "Wrong-generation, stale-version, reused-PID, replaced-cgroup",
     )
     for phrase in required:
