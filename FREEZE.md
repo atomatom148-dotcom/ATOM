@@ -82,23 +82,11 @@ parallel flag, Render deployment, Supabase schema or compute change, replay
 write, or evidence mutation. After this freeze is merged, only a separately
 approved two-date read-only Parallel Canary may be implemented. Numerical,
 lineage, count, duplicate, or receipt-correlation drift stops promotion.
-Cross-process and cross-host single-coordinator ownership must fail closed on
-the fixed coordinator/date-fence advisory locks. That database-wide exclusion
-does not authorize a distributed process tree: each admitted generation's
-winning coordinator, both fixed durable supervisors, both per-date guardians,
-and every process in both worker cgroups must run on one configured Linux
-execution host and one PID namespace identity. The supervisors are independent
-durable processes and process/service failure domains on that same host, not
-separate hosts. A host or PID-namespace mismatch, an unusable local `pidfd`, or
-incorrect liveness-pipe descriptor custody fails closed before worker start.
-Each guardian must retain its shared fence until its dedicated Linux cgroup is
-frozen, killed, reaped, and proven empty. Durable supervisor generation state
-must independently block replacement across database-session loss under
-`docs/h2-d2-freeze.md`.
-H2-D-2 pins the canary's numerical outputs, evidence identities, lineage,
-counts, receipt correlation, stage order, and exact 72-metric hash encoding.
-It does not pin unrelated runtime or V9 source-file hashes; harmless source
-edits remain possible, while any behavioral or numerical drift fails parity.
+The canary is limited to two ordinary isolated processes, one complete date per
+process, finite timeouts, read-only database access, zero evidence writes, and
+exact comparison with a sequential control. H2-D-2 pins behavior, numerical
+outputs, evidence identities, lineage, counts, receipt correlation, and the
+72-metric encoding—not unrelated runtime or V9 source-file hashes.
 
 ## Forbidden until explicit freeze amendment
 
