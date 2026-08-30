@@ -304,6 +304,87 @@ class ScoringReceipt:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class OutcomeVerificationReceipt:
+    replay_run_id: str
+    outcome_count: int
+    outcome_available_count: int
+    outcome_unavailable_count: int
+    outcome_ordered_content_sha256: str
+
+    def payload(self) -> dict[str, object]:
+        return asdict(self)
+
+
+OUTCOME_VERIFICATION_COLUMNS = (
+    "replay_run_id", "cutoff_at", "horizon", "actual_return_bps",
+    "availability_status", "unavailable_reason", "cutoff_midpoint_at",
+    "cutoff_midpoint", "target_midpoint_at", "target_midpoint",
+    "data_schema_version", "source_schema_version", "resolution_spec_version",
+    "outcome_source_dataset_digest", "resolved_at", "content_sha256",
+)
+
+
+def verify_outcomes(connection, replay_run_id: str, *,
+                    fetch_size: int = DEFAULT_BATCH_SIZE,
+                    statement_timeout_seconds: float | None = None) -> OutcomeVerificationReceipt:
+    """Rehash immutable outcomes and return their frozen read-only receipt."""
+    if not replay_run_id or len(replay_run_id) > 128:
+        raise ValueError("replay_run_id must contain 1..128 characters")
+    if isinstance(fetch_size, bool) or not isinstance(fetch_size, int) or fetch_size < 1:
+        raise ValueError("fetch_size must be a positive integer")
+    if (statement_timeout_seconds is not None and
+            (not math.isfinite(statement_timeout_seconds) or
+             statement_timeout_seconds <= 0)):
+        raise ValueError("statement_timeout_seconds must be positive and finite")
+    timeout = (SCORING_STATEMENT_TIMEOUT if statement_timeout_seconds is None else
+               f"{max(1, int(statement_timeout_seconds * 1_000))}ms")
+    setup = connection.cursor()
+    setup.execute("SELECT set_config('statement_timeout',%s,true)", (timeout,))
+    setup.close()
+    cursor = connection.cursor(name="atom_h2c_outcomes", binary=True)
+    cursor.itersize = fetch_size
+    cursor.execute(
+        "SELECT " + ",".join(OUTCOME_VERIFICATION_COLUMNS) + " "
+        "FROM public.atom_historical_replay_outcomes "
+        "WHERE replay_run_id=%s "
+        "ORDER BY cutoff_at ASC,convert_to(horizon,'UTF8') ASC",
+        (replay_run_id,),
+    )
+    digest = hashlib.sha256()
+    total = available = unavailable = 0
+    try:
+        while True:
+            batch = cursor.fetchmany(fetch_size)
+            if not batch:
+                break
+            for row in batch:
+                values = dict(zip(OUTCOME_VERIFICATION_COLUMNS, row, strict=True))
+                stored_hash = values.pop("content_sha256")
+                if (not isinstance(stored_hash, str) or len(stored_hash) != 64 or
+                        any(character not in "0123456789abcdef" for character in stored_hash)):
+                    raise RuntimeError("H2C_INVALID_OUTCOME_HASH")
+                try:
+                    outcome = HistoricalOutcome(**values)
+                except (TypeError, ValueError) as error:
+                    raise RuntimeError("H2C_INVALID_OUTCOME_PAYLOAD") from error
+                if outcome.replay_run_id != replay_run_id:
+                    raise RuntimeError("H2C_OUTCOME_REPLAY_ID_MISMATCH")
+                if outcome.content_sha256 != stored_hash:
+                    raise RuntimeError("H2C_OUTCOME_HASH_MISMATCH")
+                if total:
+                    digest.update(b"\n")
+                digest.update(stored_hash.encode("ascii"))
+                total += 1
+                available += outcome.availability_status == "AVAILABLE"
+                unavailable += outcome.availability_status == "UNAVAILABLE"
+    finally:
+        cursor.close()
+    return OutcomeVerificationReceipt(
+        replay_run_id, total, available, unavailable, digest.hexdigest(),
+    )
+
+
 def _sign(value: float) -> int:
     return (value > 0) - (value < 0)
 
@@ -381,6 +462,7 @@ def _connect(environment_variable: str, expected_role: str):
         raise RuntimeError(f"{environment_variable} is required")
     import psycopg
     connection = psycopg.connect(database_url)
+    connection.read_only = expected_role == "atom_historical_score_reader"
     cursor = connection.cursor()
     cursor.execute("SELECT current_user")
     role = cursor.fetchone()[0]
@@ -392,24 +474,48 @@ def _connect(environment_variable: str, expected_role: str):
     return connection
 
 
+def verify_outcomes_from_environment(
+        replay_run_id: str, *,
+        statement_timeout_seconds: float | None = None) -> OutcomeVerificationReceipt:
+    with _connect("HISTORICAL_SCORE_DATABASE_URL",
+                  "atom_historical_score_reader") as connection:
+        connection.read_only = True
+        return verify_outcomes(
+            connection, replay_run_id,
+            statement_timeout_seconds=statement_timeout_seconds,
+        )
+
+
+def score_from_environment(replay_run_id: str) -> ScoringReceipt:
+    with _connect("HISTORICAL_SCORE_DATABASE_URL",
+                  "atom_historical_score_reader") as connection:
+        connection.read_only = True
+        return score(connection, replay_run_id)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     resolve = commands.add_parser("resolve-outcomes", help="explicit H2-C write command")
     resolve.add_argument("replay_run_id"); resolve.add_argument("--dataset-digest", required=True)
     resolve.add_argument("--configuration-digest", required=True); resolve.add_argument("--frame-count", type=int, required=True)
+    verify = commands.add_parser("verify-outcomes", help="read-only immutable outcome receipt")
+    verify.add_argument("replay_run_id")
     scoring = commands.add_parser("score", help="read-only immutable scoring")
     scoring.add_argument("replay_run_id")
     args = parser.parse_args(); started = time.monotonic()
     environment_variable, expected_role = (
         ("HISTORICAL_SCORE_DATABASE_URL", "atom_historical_score_reader")
-        if args.command == "score" else
+        if args.command in {"score", "verify-outcomes"} else
         ("HISTORICAL_OUTCOME_DATABASE_URL", "atom_historical_outcome_resolver")
     )
     with _connect(environment_variable, expected_role) as connection:
         if args.command == "score":
             connection.read_only = True
             output = score(connection, args.replay_run_id).payload()
+        elif args.command == "verify-outcomes":
+            connection.read_only = True
+            output = verify_outcomes(connection, args.replay_run_id).payload()
         else:
             # Re-fetch the same frozen SIP session identified by the verified manifest.
             c = connection.cursor(); c.execute("SELECT historical_session FROM public.atom_historical_replay_runs WHERE replay_run_id=%s", (args.replay_run_id,)); session = c.fetchone(); c.close()

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
+import math
 import os
 import time
 from typing import Callable
@@ -56,6 +57,10 @@ class VerificationReceipt:
     stored_content_hash_summary: str
     verifier_version: str
     verified_at: str
+    git_commit: str | None = None
+    session_digest: str | None = None
+    manifest_content_sha256: str | None = None
+    forecast_ordered_content_sha256: str | None = None
 
     def payload(self) -> dict[str, object]:
         return asdict(self)
@@ -104,6 +109,9 @@ class HistoricalEvidenceVerifier:
         quants: set[str] = set()
         horizons: set[str] = set()
         artifact = hashlib.sha256()
+        ordered_forecasts = hashlib.sha256()
+        ordered_forecast_first = True
+        cutoff_hashes: dict[tuple[str, str], str] = {}
         manifest_cursor = self.connection.cursor()
         forecast_cursor = None
         try:
@@ -178,14 +186,22 @@ class HistoricalEvidenceVerifier:
                         if current_cutoff is None:
                             current_cutoff = row.cutoff_at
                         elif row.cutoff_at != current_cutoff:
+                            if set(cutoff_hashes) == SLOTS:
+                                for key in sorted(cutoff_hashes,
+                                                  key=lambda item: (item[0].encode(), item[1].encode())):
+                                    if not ordered_forecast_first:
+                                        ordered_forecasts.update(b"\n")
+                                    ordered_forecasts.update(cutoff_hashes[key].encode("ascii"))
+                                    ordered_forecast_first = False
                             cutoff_count += 1
                             if cutoff_slots != SLOTS:
                                 reasons.add("MISSING_OR_INVALID_SLOTS")
-                            current_cutoff, cutoff_slots = row.cutoff_at, set()
+                            current_cutoff, cutoff_slots, cutoff_hashes = row.cutoff_at, set(), {}
                         if identity == previous_identity or (row.quant_id, row.horizon) in cutoff_slots:
                             reasons.add("DUPLICATE_SLOT")
                         previous_identity = identity
                         cutoff_slots.add((row.quant_id, row.horizon))
+                        cutoff_hashes[(row.quant_id, row.horizon)] = stored_hash
                         quants.add(row.quant_id)
                         horizons.add(row.horizon)
                         unavailable += row.availability_status == "UNAVAILABLE" and row.expected_return_bps is None
@@ -216,6 +232,13 @@ class HistoricalEvidenceVerifier:
                     except Exception:
                         reasons.add("INVALID_FORECAST")
             if current_cutoff is not None:
+                if set(cutoff_hashes) == SLOTS:
+                    for key in sorted(cutoff_hashes,
+                                      key=lambda item: (item[0].encode(), item[1].encode())):
+                        if not ordered_forecast_first:
+                            ordered_forecasts.update(b"\n")
+                        ordered_forecasts.update(cutoff_hashes[key].encode("ascii"))
+                        ordered_forecast_first = False
                 cutoff_count += 1
                 if cutoff_slots != SLOTS:
                     reasons.add("MISSING_OR_INVALID_SLOTS")
@@ -246,10 +269,16 @@ class HistoricalEvidenceVerifier:
             manifest.dataset_digest if manifest else None,
             manifest.configuration_digest if manifest else None, digest, VERIFIER_VERSION,
             self.clock().astimezone(timezone.utc).isoformat(),
+            manifest.git_commit if manifest else None,
+            manifest.session_digest if manifest else None,
+            stored_manifest_hash if manifest else None,
+            ordered_forecasts.hexdigest(),
         )
 
 
-def verify_from_environment(replay_run_id: str, **expected: str | None) -> VerificationReceipt:
+def verify_from_environment(replay_run_id: str, *,
+                            statement_timeout_seconds: float | None = None,
+                            **expected: str | None) -> VerificationReceipt:
     """Connect only through the dedicated H2 database URL; never log its value."""
     database_url = os.environ.get("HISTORICAL_EVIDENCE_DATABASE_URL")
     if not database_url:
@@ -257,6 +286,16 @@ def verify_from_environment(replay_run_id: str, **expected: str | None) -> Verif
     import psycopg
     with psycopg.connect(database_url) as connection:
         connection.read_only = True
+        if statement_timeout_seconds is not None:
+            if (not math.isfinite(statement_timeout_seconds) or
+                    statement_timeout_seconds <= 0):
+                raise ValueError("statement_timeout_seconds must be positive and finite")
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT set_config('statement_timeout',%s,true)",
+                (f"{max(1, int(statement_timeout_seconds * 1_000))}ms",),
+            )
+            cursor.close()
         return HistoricalEvidenceVerifier(connection).verify(replay_run_id, **expected)
 
 
