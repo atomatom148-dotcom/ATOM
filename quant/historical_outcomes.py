@@ -316,9 +316,18 @@ class OutcomeVerificationReceipt:
         return asdict(self)
 
 
+OUTCOME_VERIFICATION_COLUMNS = (
+    "replay_run_id", "cutoff_at", "horizon", "actual_return_bps",
+    "availability_status", "unavailable_reason", "cutoff_midpoint_at",
+    "cutoff_midpoint", "target_midpoint_at", "target_midpoint",
+    "data_schema_version", "source_schema_version", "resolution_spec_version",
+    "outcome_source_dataset_digest", "resolved_at", "content_sha256",
+)
+
+
 def verify_outcomes(connection, replay_run_id: str, *,
                     fetch_size: int = DEFAULT_BATCH_SIZE) -> OutcomeVerificationReceipt:
-    """Stream the immutable outcomes and return their frozen read-only receipt."""
+    """Rehash immutable outcomes and return their frozen read-only receipt."""
     if not replay_run_id or len(replay_run_id) > 128:
         raise ValueError("replay_run_id must contain 1..128 characters")
     if isinstance(fetch_size, bool) or not isinstance(fetch_size, int) or fetch_size < 1:
@@ -329,7 +338,7 @@ def verify_outcomes(connection, replay_run_id: str, *,
     cursor = connection.cursor(name="atom_h2c_outcomes")
     cursor.itersize = fetch_size
     cursor.execute(
-        "SELECT availability_status,content_sha256 "
+        "SELECT " + ",".join(OUTCOME_VERIFICATION_COLUMNS) + " "
         "FROM public.atom_historical_replay_outcomes "
         "WHERE replay_run_id=%s "
         "ORDER BY cutoff_at ASC,convert_to(horizon,'UTF8') ASC",
@@ -342,18 +351,26 @@ def verify_outcomes(connection, replay_run_id: str, *,
             batch = cursor.fetchmany(fetch_size)
             if not batch:
                 break
-            for status, stored_hash in batch:
-                if status not in {"AVAILABLE", "UNAVAILABLE"}:
-                    raise RuntimeError("H2C_INVALID_OUTCOME_STATUS")
+            for row in batch:
+                values = dict(zip(OUTCOME_VERIFICATION_COLUMNS, row, strict=True))
+                stored_hash = values.pop("content_sha256")
                 if (not isinstance(stored_hash, str) or len(stored_hash) != 64 or
                         any(character not in "0123456789abcdef" for character in stored_hash)):
                     raise RuntimeError("H2C_INVALID_OUTCOME_HASH")
+                try:
+                    outcome = HistoricalOutcome(**values)
+                except (TypeError, ValueError) as error:
+                    raise RuntimeError("H2C_INVALID_OUTCOME_PAYLOAD") from error
+                if outcome.replay_run_id != replay_run_id:
+                    raise RuntimeError("H2C_OUTCOME_REPLAY_ID_MISMATCH")
+                if outcome.content_sha256 != stored_hash:
+                    raise RuntimeError("H2C_OUTCOME_HASH_MISMATCH")
                 if total:
                     digest.update(b"\n")
                 digest.update(stored_hash.encode("ascii"))
                 total += 1
-                available += status == "AVAILABLE"
-                unavailable += status == "UNAVAILABLE"
+                available += outcome.availability_status == "AVAILABLE"
+                unavailable += outcome.availability_status == "UNAVAILABLE"
     finally:
         cursor.close()
     return OutcomeVerificationReceipt(

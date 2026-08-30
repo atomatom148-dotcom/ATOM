@@ -20,6 +20,14 @@ FROZEN_DATES = ("2026-06-15", "2026-07-22")
 BASELINES = Path(__file__).resolve().parents[1] / "docs" / "h2-d2-canary-baselines.json"
 DEFAULT_DATE_TIMEOUT_SECONDS = 7_200.0
 DEFAULT_CANARY_TIMEOUT_SECONDS = 21_600.0
+SNAPSHOT_FIELDS = (
+    "historical_session", "replay_run_id", "git_commit", "dataset_digest",
+    "configuration_digest", "session_digest", "artifact_sha256",
+    "manifest_content_sha256", "forecast_ordered_content_sha256",
+    "outcome_ordered_content_sha256", "frame_count", "forecast_count",
+    "forecast_available_count", "forecast_unavailable_count", "outcome_count",
+    "outcome_available_count", "outcome_unavailable_count",
+)
 
 
 class CanaryFailure(RuntimeError):
@@ -122,6 +130,58 @@ def _fresh_forecast_hashes(rows) -> tuple[str, str]:
     return artifact.hexdigest(), ordered.hexdigest()
 
 
+def _frozen_evidence_snapshot(baseline: dict) -> dict:
+    return {field: baseline[field] for field in SNAPSHOT_FIELDS}
+
+
+def _observed_evidence_snapshot(h2b, outcomes) -> dict:
+    _require_equal(outcomes.replay_run_id, h2b.replay_run_id,
+                   "H2D3_EVIDENCE_RECEIPT_CORRELATION")
+    return {
+        "historical_session": h2b.historical_session,
+        "replay_run_id": h2b.replay_run_id,
+        "git_commit": h2b.git_commit,
+        "dataset_digest": h2b.dataset_digest,
+        "configuration_digest": h2b.configuration_digest,
+        "session_digest": h2b.session_digest,
+        "artifact_sha256": h2b.stored_content_hash_summary,
+        "manifest_content_sha256": h2b.manifest_content_sha256,
+        "forecast_ordered_content_sha256": h2b.forecast_ordered_content_sha256,
+        "outcome_ordered_content_sha256": outcomes.outcome_ordered_content_sha256,
+        "frame_count": h2b.frame_count,
+        "forecast_count": h2b.forecast_count,
+        "forecast_available_count": h2b.forecast_count - h2b.unavailable_null_count,
+        "forecast_unavailable_count": h2b.unavailable_null_count,
+        "outcome_count": outcomes.outcome_count,
+        "outcome_available_count": outcomes.outcome_available_count,
+        "outcome_unavailable_count": outcomes.outcome_unavailable_count,
+    }
+
+
+def read_evidence_snapshot(day: str) -> dict:
+    """Read and verify the post-canary evidence state without running V9."""
+    _, baselines = _baseline_bundle()
+    if day not in baselines:
+        raise CanaryFailure("H2D3_DATE_NOT_FROZEN")
+    baseline = baselines[day]
+    from .historical_evidence_verifier import verify_from_environment
+    from .historical_outcomes import verify_outcomes_from_environment
+
+    h2b = verify_from_environment(
+        baseline["replay_run_id"],
+        expected_dataset_digest=baseline["dataset_digest"],
+        expected_configuration_digest=baseline["configuration_digest"],
+        expected_frame_count=baseline["frame_count"],
+    )
+    _require_equal(h2b.verification_status, "VERIFIED", "H2D3_POST_H2B_REJECTED")
+    _require_equal(h2b.reason_codes, (), "H2D3_POST_H2B_REASON_CODES")
+    outcomes = verify_outcomes_from_environment(baseline["replay_run_id"])
+    observed = _observed_evidence_snapshot(h2b, outcomes)
+    _require_equal(observed, _frozen_evidence_snapshot(baseline),
+                   "H2D3_POST_EVIDENCE_SNAPSHOT_DRIFT")
+    return observed
+
+
 def run_read_only_date(day: str) -> dict:
     """Run H1/H2B/H2C verification/scoring in-process without persistence."""
     bundle, baselines = _baseline_bundle()
@@ -208,53 +268,15 @@ def run_read_only_date(day: str) -> dict:
         scoring.metrics, bundle["metric_hash_contract"],
     )
 
-    frozen_snapshot = {
-        field: baseline[field] for field in (
-            "git_commit", "dataset_digest", "configuration_digest", "session_digest",
-            "artifact_sha256", "manifest_content_sha256",
-            "forecast_ordered_content_sha256", "outcome_ordered_content_sha256",
-            "frame_count", "forecast_count", "forecast_available_count",
-            "forecast_unavailable_count", "outcome_count",
-            "outcome_available_count", "outcome_unavailable_count",
-        )
-    }
-    observed_snapshot = {
-        "git_commit": h2b.git_commit,
-        "dataset_digest": h2b.dataset_digest,
-        "configuration_digest": h2b.configuration_digest,
-        "session_digest": h2b.session_digest,
-        "artifact_sha256": h2b.stored_content_hash_summary,
-        "manifest_content_sha256": h2b.manifest_content_sha256,
-        "forecast_ordered_content_sha256": h2b.forecast_ordered_content_sha256,
-        "outcome_ordered_content_sha256": outcomes.outcome_ordered_content_sha256,
-        "frame_count": h2b.frame_count,
-        "forecast_count": h2b.forecast_count,
-        "forecast_available_count": h2b.forecast_count - h2b.unavailable_null_count,
-        "forecast_unavailable_count": h2b.unavailable_null_count,
-        "outcome_count": outcomes.outcome_count,
-        "outcome_available_count": outcomes.outcome_available_count,
-        "outcome_unavailable_count": outcomes.outcome_unavailable_count,
-    }
+    frozen_snapshot = _frozen_evidence_snapshot(baseline)
+    observed_snapshot = _observed_evidence_snapshot(h2b, outcomes)
     _require_equal(observed_snapshot, frozen_snapshot, "H2D3_EVIDENCE_SNAPSHOT_DRIFT")
 
-    h1_projection = {
-        "runner_version": h1.runner_version,
-        "evidence_origin": h1.evidence_origin,
-        "historical_session": h1.historical_session,
-        "replay_run_id": h1.replay_run_id,
-        "dataset_digest": h1.dataset_digest,
-        "configuration_digest": h1.configuration_digest,
-        "session_digest": h1.session_digest,
-        "execution_stage": h1.execution_stage,
-        "data_status": h1.data_status,
-        "data_reason_codes": list(h1.data_reason_codes),
-        "frame_count": h1.frame_count,
-        "persistence_writes": h1.persistence_writes,
-        "artifact_sha256": fresh_artifact_sha256,
-        "forecast_ordered_content_sha256": fresh_forecast_ordered_sha256,
-        "family_coverage": [asdict(row) for row in h1.family_coverage],
-        "resolution_coverage": [asdict(row) for row in h1.resolution_coverage],
-    }
+    h1_projection = h1.to_dict()
+    for performance_field in ("timings", "replay_factor", "projected_seconds"):
+        h1_projection.pop(performance_field, None)
+    h1_projection["artifact_sha256"] = fresh_artifact_sha256
+    h1_projection["forecast_ordered_content_sha256"] = fresh_forecast_ordered_sha256
     h2b_projection = h2b.payload()
     h2b_projection.pop("verified_at", None)
     projection = {
@@ -313,7 +335,8 @@ def run_isolated(dates: tuple[str, ...], *, timeout_seconds: float,
                  run_date: Callable[[str], dict] = run_read_only_date,
                  context=None) -> tuple[list[dict], list[dict]]:
     if (not dates or len(dates) > 2 or len(set(dates)) != len(dates) or
-            any(day not in FROZEN_DATES for day in dates)):
+            any(day not in FROZEN_DATES for day in dates) or
+            (len(dates) == 2 and dates != FROZEN_DATES)):
         raise ValueError("one or two unique dates are required")
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive and finite")
@@ -341,7 +364,12 @@ def run_isolated(dates: tuple[str, ...], *, timeout_seconds: float,
             for receive in ready:
                 day = receivers.pop(receive)
                 try:
-                    messages[day] = receive.recv()
+                    message = receive.recv()
+                    messages[day] = message
+                    if not message["ok"]:
+                        raise CanaryFailure(
+                            f"H2D3_WORKER_FAILED:{day}:{message['error']}:{message['message']}"
+                        )
                 except EOFError as error:
                     raise CanaryFailure(f"H2D3_WORKER_EOF:{day}") from error
                 finally:
@@ -354,10 +382,6 @@ def run_isolated(dates: tuple[str, ...], *, timeout_seconds: float,
         statuses = [{"historical_session": day, "exit_code": process.exitcode,
                      "peak_rss_kib": messages[day]["peak_rss_kib"]}
                     for day, process in zip(dates, processes, strict=True)]
-        for day in dates:
-            message = messages[day]
-            if not message["ok"]:
-                raise CanaryFailure(f"H2D3_WORKER_FAILED:{day}:{message['error']}:{message['message']}")
         if any(item["exit_code"] != 0 for item in statuses):
             raise CanaryFailure("H2D3_WORKER_EXIT_NONZERO")
         return [messages[day]["receipt"] for day in dates], statuses
@@ -371,11 +395,13 @@ def run_isolated(dates: tuple[str, ...], *, timeout_seconds: float,
 
 def execute_canary(*, date_timeout_seconds: float = DEFAULT_DATE_TIMEOUT_SECONDS,
                    canary_timeout_seconds: float = DEFAULT_CANARY_TIMEOUT_SECONDS,
-                   isolated_runner: Callable[..., tuple[list[dict], list[dict]]] = run_isolated) -> dict:
+                   isolated_runner: Callable[..., tuple[list[dict], list[dict]]] = run_isolated,
+                   snapshot_reader: Callable[[str], dict] | None = None) -> dict:
     if (not math.isfinite(date_timeout_seconds) or date_timeout_seconds <= 0 or
             not math.isfinite(canary_timeout_seconds) or canary_timeout_seconds <= 0):
         raise ValueError("timeouts must be positive and finite")
     started = time.monotonic()
+    snapshot_reader = snapshot_reader or read_evidence_snapshot
     controls = []
     control_statuses = []
     sequential_started = time.monotonic()
@@ -400,6 +426,18 @@ def execute_canary(*, date_timeout_seconds: float = DEFAULT_DATE_TIMEOUT_SECONDS
         if expected != actual:
             raise CanaryFailure(f"H2D3_PARITY_DRIFT:{expected['historical_session']}")
 
+    post_snapshots = []
+    for control in controls:
+        if canary_timeout_seconds - (time.monotonic() - started) <= 0:
+            raise CanaryFailure("H2D3_CANARY_TIMEOUT")
+        observed = snapshot_reader(control["historical_session"])
+        _require_equal(observed, control["evidence_snapshot"],
+                       f"H2D3_POST_EVIDENCE_DRIFT:{control['historical_session']}")
+        post_snapshots.append(observed)
+    snapshot_sha256 = [hashlib.sha256(json.dumps(
+        snapshot, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest() for snapshot in post_snapshots]
+
     return {
         "canary_version": H2D3_VERSION,
         "status": "PASSED",
@@ -413,6 +451,7 @@ def execute_canary(*, date_timeout_seconds: float = DEFAULT_DATE_TIMEOUT_SECONDS
         "parallel_seconds": round(parallel_seconds, 6),
         "speedup": None if parallel_seconds == 0 else sequential_seconds / parallel_seconds,
         "session_parity_sha256": [row["parity_sha256"] for row in parallel],
+        "evidence_snapshot_sha256": snapshot_sha256,
         "control_worker_statuses": control_statuses,
         "parallel_worker_statuses": parallel_statuses,
         "peak_worker_rss_kib": max(

@@ -1,6 +1,8 @@
 import hashlib
 import json
 import multiprocessing
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -10,7 +12,10 @@ import pytest
 from quant import historical_parallel_canary_h2d3 as canary
 from quant.historical_evidence_verifier import VerificationReceipt
 from quant.historical_outcomes import (
+    HistoricalOutcome,
+    OUTCOME_VERIFICATION_COLUMNS,
     OutcomeVerificationReceipt,
+    RESOLUTION_SPEC_VERSION,
     ScoreMetric,
     ScoringReceipt,
 )
@@ -101,13 +106,35 @@ class _Connection:
         return self.stream if name else self.setup
 
 
+def _stored_outcome(index, status):
+    cutoff = datetime(2026, 6, 15, 14, 30, tzinfo=timezone.utc) + timedelta(seconds=index)
+    available = status == "AVAILABLE"
+    outcome = HistoricalOutcome(
+        replay_run_id="frozen",
+        cutoff_at=cutoff,
+        horizon="30S",
+        actual_return_bps=1.0 if available else None,
+        availability_status=status,
+        unavailable_reason=None if available else "TARGET_OUTSIDE_SESSION",
+        cutoff_midpoint_at=cutoff,
+        cutoff_midpoint=100.0,
+        target_midpoint_at=cutoff + timedelta(seconds=30) if available else None,
+        target_midpoint=101.0 if available else None,
+        data_schema_version="test-data",
+        source_schema_version="test-source",
+        resolution_spec_version=RESOLUTION_SPEC_VERSION,
+        outcome_source_dataset_digest="d" * 64,
+        resolved_at=cutoff + timedelta(hours=1),
+    )
+    payload = outcome.payload()
+    return tuple(payload[field] for field in OUTCOME_VERIFICATION_COLUMNS)
+
+
 def test_read_only_outcome_receipt_streams_all_rows_in_frozen_order():
-    hashes = ["a" * 64, "b" * 64, "c" * 64]
-    connection = _Connection([
-        ("AVAILABLE", hashes[0]),
-        ("UNAVAILABLE", hashes[1]),
-        ("AVAILABLE", hashes[2]),
-    ])
+    rows = [_stored_outcome(0, "AVAILABLE"), _stored_outcome(1, "UNAVAILABLE"),
+            _stored_outcome(2, "AVAILABLE")]
+    hashes = [row[-1] for row in rows]
+    connection = _Connection(rows)
     receipt = verify_outcomes(connection, "frozen", fetch_size=2)
     assert receipt.outcome_count == 3
     assert receipt.outcome_available_count == 2
@@ -120,14 +147,24 @@ def test_read_only_outcome_receipt_streams_all_rows_in_frozen_order():
     assert all(word not in sql.upper() for word in ("INSERT", "UPDATE", "DELETE", "LOCK"))
 
 
-@pytest.mark.parametrize("row", [("BROKEN", "a" * 64), ("AVAILABLE", "A" * 64)])
-def test_read_only_outcome_receipt_rejects_malformed_rows(row):
+@pytest.mark.parametrize("field,value", [
+    ("availability_status", "BROKEN"),
+    ("content_sha256", "A" * 64),
+    ("actual_return_bps", 99.0),
+])
+def test_read_only_outcome_receipt_rejects_malformed_rows(field, value):
+    row = list(_stored_outcome(0, "AVAILABLE"))
+    row[OUTCOME_VERIFICATION_COLUMNS.index(field)] = value
     with pytest.raises(RuntimeError):
-        verify_outcomes(_Connection([row]), "frozen")
+        verify_outcomes(_Connection([tuple(row)]), "frozen")
 
 
 def _receipt(day):
-    return {"historical_session": day, "parity_sha256": day.replace("-", "")}
+    return {
+        "historical_session": day,
+        "parity_sha256": day.replace("-", ""),
+        "evidence_snapshot": {"historical_session": day},
+    }
 
 
 def test_canary_runs_controls_one_at_a_time_then_exactly_two_and_orders_receipt():
@@ -138,7 +175,8 @@ def test_canary_runs_controls_one_at_a_time_then_exactly_two_and_orders_receipt(
                 [{"historical_session": day, "exit_code": 0, "peak_rss_kib": 10}
                  for day in dates])
     result = execute_canary(date_timeout_seconds=10, canary_timeout_seconds=30,
-                            isolated_runner=runner)
+                            isolated_runner=runner,
+                            snapshot_reader=lambda day: _receipt(day)["evidence_snapshot"])
     assert [call[0] for call in calls] == [
         (FROZEN_DATES[0],), (FROZEN_DATES[1],), FROZEN_DATES,
     ]
@@ -167,11 +205,29 @@ def _hang(_day):
     return _receipt(_day)
 
 
+def _fail_or_hang(day):
+    if day == FROZEN_DATES[0]:
+        raise RuntimeError("failed")
+    time.sleep(5)
+    return _receipt(day)
+
+
 def test_worker_timeout_terminates_and_joins_the_process():
     started = time.monotonic()
     with pytest.raises(CanaryFailure, match="WORKER_TIMEOUT"):
         run_isolated((FROZEN_DATES[0],), timeout_seconds=0.05,
                      run_date=_hang, context=multiprocessing.get_context("fork"))
+    assert time.monotonic() - started < 2
+
+
+def test_worker_failure_stops_peer_immediately_and_reverse_pair_is_rejected():
+    with pytest.raises(ValueError):
+        run_isolated(tuple(reversed(FROZEN_DATES)), timeout_seconds=1,
+                     context=multiprocessing.get_context("fork"))
+    started = time.monotonic()
+    with pytest.raises(CanaryFailure, match="WORKER_FAILED"):
+        run_isolated(FROZEN_DATES, timeout_seconds=4, run_date=_fail_or_hang,
+                     context=multiprocessing.get_context("fork"))
     assert time.monotonic() - started < 2
 
 
@@ -211,6 +267,27 @@ def test_read_only_date_builds_complete_frozen_projection(monkeypatch):
         family_coverage=family_rows,
         resolution_coverage=resolution_rows,
     )
+    h1.to_dict = lambda: {
+        "runner_version": h1.runner_version,
+        "evidence_origin": h1.evidence_origin,
+        "historical_session": h1.historical_session,
+        "replay_run_id": h1.replay_run_id,
+        "dataset_digest": h1.dataset_digest,
+        "configuration_digest": h1.configuration_digest,
+        "session_digest": h1.session_digest,
+        "execution_stage": h1.execution_stage,
+        "data_status": h1.data_status,
+        "data_reason_codes": h1.data_reason_codes,
+        "frame_count": h1.frame_count,
+        "persistence_writes": h1.persistence_writes,
+        "family_coverage": tuple(asdict(row) for row in family_rows),
+        "resolution_coverage": tuple(asdict(row) for row in resolution_rows),
+        "quote_counts": (("COIN", 1), ("QQQ", 1)),
+        "frame_coverage": 1.0,
+        "timings": {"total_seconds": 1.0},
+        "replay_factor": 2.0,
+        "projected_seconds": (("1D", 1.0),),
+    }
     h2b = VerificationReceipt(
         baseline["replay_run_id"], baseline["historical_session"], "VERIFIED", (),
         1, baseline["frame_count"], baseline["forecast_count"],
@@ -271,6 +348,22 @@ def test_read_only_date_builds_complete_frozen_projection(monkeypatch):
     assert receipt["score"]["metric_sha256"]
     assert len(receipt["score"]["metrics"]) == 72
     assert receipt["pre_post_unchanged"] is True
+    assert receipt["h1"]["quote_counts"] == (("COIN", 1), ("QQQ", 1))
+    assert "timings" not in receipt["h1"]
+    assert canary.read_evidence_snapshot(baseline["historical_session"]) == receipt["evidence_snapshot"]
+
+
+def test_canary_rejects_post_run_evidence_drift():
+    def runner(dates, *, timeout_seconds):
+        return ([_receipt(day) for day in dates],
+                [{"historical_session": day, "exit_code": 0, "peak_rss_kib": 10}
+                 for day in dates])
+
+    with pytest.raises(CanaryFailure, match="POST_EVIDENCE_DRIFT"):
+        execute_canary(
+            isolated_runner=runner,
+            snapshot_reader=lambda day: {"historical_session": day, "changed": True},
+        )
 
 
 def test_fresh_forecast_hashes_use_byte_order_with_no_trailing_separator():
