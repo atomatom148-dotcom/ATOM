@@ -33,12 +33,32 @@ def test_stage_and_date_deadlines_are_finite_absolute_and_fail_closed() -> None:
         "positive finite whole-date deadline",
         "whole-date deadline is absolute",
         "Every provider/network/database call must have its own finite operation",
-        "independent monotonic watchdog",
+        "supervisor-owned out-of-guardian watchdog",
         "Deadline expiry irrevocably fails that generation",
         "same generation can never resume, restart, or be readmitted",
         "Expiration of the cleanup deadline does not authorize abandonment",
         "Separate deadline fault tests must hang provider I/O",
         "Normal completion uses the same bounded",
+    )
+    for phrase in required:
+        assert phrase in law
+
+
+def test_deadlines_survive_a_live_but_hung_guardian() -> None:
+    law = _law()
+    required = (
+        "deadline watchdog outside the guardian's process and failure domain",
+        "a guardian thread, callback, timer, or child is not",
+        "cgroup path plus filesystem device/inode identity",
+        "durably record the whole-date absolute deadline",
+        "a stage cannot launch before that acknowledgement",
+        "guardian itself",
+        "missed heartbeat or progress bound is a permanent control failure signal",
+        "not a lease expiry and not authority for a new owner or generation",
+        "within the pinned bounded takeover interval",
+        "even while the guardian is alive and hung",
+        "kills and reaps the guardian only after `populated 0`",
+        "Wrong-generation, stale-version, reused-PID, replaced-cgroup",
     )
     for phrase in required:
         assert phrase in law
