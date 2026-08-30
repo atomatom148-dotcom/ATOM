@@ -44,7 +44,7 @@ EXPECTED_SESSIONS = {
         "session_digest": "e35a1130ae7f6e12ea4783aebd7a988e7dcff0f659a179566193e62368e23627",
         "artifact_sha256": "1edb32a8f46a757637459dcfa348480df0968a6531f8590c3c784d0d4e9a9860",
         "manifest_content_sha256": "a9f5a0d1621a8e682ede3ff0d12c70cff7da79c474e008df9aa2d17652028a8d",
-        "forecast_ordered_content_sha256": "0417bed3adde008e26db5693e34e04a10633176595ecb61fa573bd6bc9c2473d",
+        "forecast_ordered_content_sha256": "4b570e1c9e35c9459b79145ab9f827e93484068d99207481df4a5c6aab43517f",
         "outcome_ordered_content_sha256": "e1f14e02922a2c58faea0447796fe33ba6950ca44659c72fc39f62babaefa1a9",
         "frame_count": 11229,
         "forecast_count": 808488,
@@ -62,7 +62,7 @@ EXPECTED_SESSIONS = {
         "session_digest": "cd687a7ab67d4f1a29c46780b37e4fb81562eb9eb28e1d43d367820299f1ab96",
         "artifact_sha256": "2145555052691e45880475198c9983e6816feba508015b14ebe23025cbe9931b",
         "manifest_content_sha256": "8f886e9c8a3b6245ddc143c31e16af081e6ace93dbafe1ecf27dd2077c5c7b0e",
-        "forecast_ordered_content_sha256": "1109ee48009e4bbf758d574f1e71e81d1486b6aef47d71c38fc34b37e2f78473",
+        "forecast_ordered_content_sha256": "aaad291213da2908caa12bc3568ac08f0bff5700ffd56dfdfafd8aea146c72c9",
         "outcome_ordered_content_sha256": "2ff12383dd8abbf8c16942ba8713c90312fd4863e8f4be2f4b49a81e0061e531",
         "db3_forecast_sha256": "413e3bacb29155e2c03ad666a47dd6ab42759015f75f68c9ecbff7d06b1494e1",
         "db3_outcome_sha256": "d3a820111a3a8a9f68a02f738fcb98b8c5bebc13e20336d46e47394a9632e532",
@@ -130,7 +130,12 @@ def test_ordered_content_hash_contract_is_exact() -> None:
         "forecast_order": ["cutoff_at", "quant_id", "horizon"],
         "outcome_order": ["cutoff_at", "horizon"],
         "bytewise_order_examples": {
-            "quant_id": ["q1", "q10", "q11", "q12", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9"],
+            "quant_id": [
+                "q10_options_vol", "q11_regime", "q12_event_session",
+                "q1_momentum", "q2_mean_reversion", "q3_volatility",
+                "q4_stat_arb", "q5_microstructure", "q6_volume_liquidity",
+                "q7_relative_value", "q8_cross_asset", "q9_factor",
+            ],
             "horizon": ["15M", "1H", "1M", "30M", "30S", "5M"],
         },
     }
