@@ -196,6 +196,7 @@ class PostgresV2StateBuilder:
                 def read_pages(*, volatility: bool) -> tuple[tuple, ...]:
                     """Read a stable snapshot without OFFSET or a history ceiling."""
 
+                    nonlocal pages_read
                     table = ("volatility_forecasts" if volatility else "forecasts")
                     outcome_table = ("volatility_forecast_outcomes" if volatility
                                      else "forecast_outcomes")
@@ -214,9 +215,7 @@ class PostgresV2StateBuilder:
                     while True:
                         key_predicate = ""
                         parameters: list[object] = [
-                            publication_kinds[0], publication_kinds[1],
                             DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, 5.0,
-                            state_as_of,
                         ]
                         if key is not None:
                             key_predicate = (
@@ -224,49 +223,79 @@ class PostgresV2StateBuilder:
                                 "> (%s, %s, %s)"
                             )
                             parameters.extend(key)
-                        parameters.append(V2_STATE_BUILD_EVIDENCE_PAGE_SIZE)
+                        parameters.extend((
+                            V2_STATE_BUILD_EVIDENCE_PAGE_SIZE,
+                            publication_kinds[0], publication_kinds[1],
+                            state_as_of,
+                        ))
                         cursor.execute(
                             f"""
-                    SELECT f.forecast_id, f.quant_id, f.formula_version,
-                           f.cycle_id, f.symbol, f.horizon, f.cutoff_epoch,
-                           f.maturity_epoch, {value}, f.created_epoch,
-                           f.data_schema_version, f.source_spec_version,
-                           {numerical_columns}
+                    WITH candidates AS MATERIALIZED (
+                        SELECT f.forecast_id, f.quant_id, f.formula_version,
+                               f.cycle_id, f.symbol, f.horizon, f.cutoff_epoch,
+                               f.maturity_epoch, {value}, f.created_epoch,
+                               f.data_schema_version, f.source_spec_version,
+                               {numerical_columns.rstrip(", ")}
+                        FROM public.{table} AS f
+                        JOIN public.{outcome_table} AS o USING (forecast_id)
+                        WHERE f.data_schema_version=%s
+                          AND f.source_spec_version=%s
+                          AND o.resolved_epoch >= f.maturity_epoch
+                          AND o.resolved_epoch <= f.maturity_epoch + %s
+                          {key_predicate}
+                        ORDER BY f.horizon, f.cutoff_epoch, f.forecast_id
+                        LIMIT %s
+                    ),
+                    forecast_proofs AS MATERIALIZED (
+                        SELECT record_id, commit_observed_at
+                        FROM atom_v9_internal
+                             .read_legacy_evidence_publications_for_records(
+                                 %s,
+                                 (SELECT to_timestamp(max(maturity_epoch))
+                                  FROM candidates),
+                                 ARRAY(SELECT forecast_id FROM candidates)
+                             )
+                    ),
+                    outcome_proofs AS MATERIALIZED (
+                        SELECT record_id, commit_observed_at
+                        FROM atom_v9_internal
+                             .read_legacy_evidence_publications_for_records(
+                                 %s, to_timestamp(%s),
+                                 ARRAY(SELECT forecast_id FROM candidates)
+                             )
+                    )
+                    SELECT f.*,
                            extract(epoch FROM fp.commit_observed_at),
                            extract(epoch FROM op.commit_observed_at)
-                    FROM public.{table} AS f
-                    JOIN public.{outcome_table} AS o USING (forecast_id)
-                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        %s, f.forecast_id
-                    ) AS fp ON true
-                    JOIN LATERAL atom_v9_internal.read_legacy_evidence_publication(
-                        %s, o.forecast_id
-                    ) AS op ON true
-                    WHERE f.data_schema_version=%s AND f.source_spec_version=%s
-                      AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
-                      AND o.resolved_epoch >= f.maturity_epoch
-                      AND o.resolved_epoch <= f.maturity_epoch + %s
-                      AND op.commit_observed_at<=to_timestamp(%s)
-                      {key_predicate}
+                    FROM candidates AS f
+                    LEFT JOIN forecast_proofs AS fp
+                      ON fp.record_id=f.forecast_id
+                     AND fp.commit_observed_at < to_timestamp(f.maturity_epoch)
+                    LEFT JOIN outcome_proofs AS op
+                      ON op.record_id=f.forecast_id
                     ORDER BY f.horizon, f.cutoff_epoch, f.forecast_id
-                    LIMIT %s
                     """,
                             tuple(parameters),
                         )
-                        page = tuple(cursor.fetchall())
-                        nonlocal pages_read
-                        if page:
-                            pages_read += 1
-                        result.extend(page)
-                        kind = "magnitude" if volatility else "directional"
-                        source_identities.extend(
-                            f"{kind}:{item[5]}:{float(item[6]).hex()}:{item[0]}"
-                            for item in page
+                        candidate_page = tuple(cursor.fetchall())
+                        page = tuple(
+                            row for row in candidate_page
+                            if row[-2] is not None and row[-1] is not None
                         )
-                        self.last_rows_materialized += len(page)
-                        if len(page) < V2_STATE_BUILD_EVIDENCE_PAGE_SIZE:
+                        if page:
+                            result.extend(page)
+                            kind = "magnitude" if volatility else "directional"
+                            source_identities.extend(
+                                f"{kind}:{item[5]}:{float(item[6]).hex()}:{item[0]}"
+                                for item in page
+                            )
+                            self.last_rows_materialized += len(page)
+                        if len(candidate_page) < V2_STATE_BUILD_EVIDENCE_PAGE_SIZE:
+                            pages_read += (
+                                len(result) + V2_STATE_BUILD_EVIDENCE_PAGE_SIZE - 1
+                            ) // V2_STATE_BUILD_EVIDENCE_PAGE_SIZE
                             return tuple(result)
-                        last = page[-1]
+                        last = candidate_page[-1]
                         next_key = (last[5], last[6], last[0])
                         if key is not None and next_key <= key:
                             raise RuntimeError("V2_EVIDENCE_PAGINATION_STALLED")
