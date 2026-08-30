@@ -8,6 +8,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from psycopg import OperationalError
 
 from quant import historical_parallel_canary_h2d3 as canary
 from quant.historical_evidence_verifier import VerificationReceipt
@@ -408,6 +409,56 @@ def test_canary_deadline_covers_post_run_snapshot():
             isolated_runner=runner,
             snapshot_reader=slow_snapshot,
         )
+
+
+def test_database_read_reconnects_after_transient_operational_error():
+    attempts = 0
+    delays = []
+
+    def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise OperationalError("network is unreachable")
+        return "verified"
+
+    assert canary._retry_database_read(
+        operation, sleeper=delays.append,
+    ) == "verified"
+    assert attempts == 3
+    assert delays == list(canary.DATABASE_RETRY_DELAYS_SECONDS)
+
+    attempts = 0
+
+    def unavailable():
+        nonlocal attempts
+        attempts += 1
+        raise OperationalError("network is unreachable")
+
+    with pytest.raises(OperationalError):
+        canary._retry_database_read(unavailable, sleeper=lambda _delay: None)
+    assert attempts == 3
+
+
+def test_database_read_retries_interrupted_receipt_then_fails_closed_on_other_drift():
+    interrupted = SimpleNamespace(
+        reason_codes=("DATABASE_INTERRUPTION_OR_PARTIAL_RETRIEVAL",),
+    )
+    mismatch = SimpleNamespace(reason_codes=("FORECAST_HASH_MISMATCH",))
+    receipts = iter((interrupted, mismatch))
+    delays = []
+    assert canary._retry_database_read(
+        lambda: next(receipts), retry_result=canary._database_interrupted,
+        sleeper=delays.append,
+    ) is mismatch
+    assert delays == [canary.DATABASE_RETRY_DELAYS_SECONDS[0]]
+    delays.clear()
+    with pytest.raises(CanaryFailure, match="parity"):
+        canary._retry_database_read(
+            lambda: (_ for _ in ()).throw(CanaryFailure("parity")),
+            sleeper=delays.append,
+        )
+    assert delays == []
 
 
 def test_fresh_forecast_hashes_use_byte_order_with_no_trailing_separator():

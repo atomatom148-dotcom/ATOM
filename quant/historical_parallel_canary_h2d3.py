@@ -20,6 +20,7 @@ FROZEN_DATES = ("2026-06-15", "2026-07-22")
 BASELINES = Path(__file__).resolve().parents[1] / "docs" / "h2-d2-canary-baselines.json"
 DEFAULT_DATE_TIMEOUT_SECONDS = 7_200.0
 DEFAULT_CANARY_TIMEOUT_SECONDS = 21_600.0
+DATABASE_RETRY_DELAYS_SECONDS = (1.0, 2.0)
 SNAPSHOT_FIELDS = (
     "historical_session", "replay_run_id", "git_commit", "dataset_digest",
     "configuration_digest", "session_digest", "artifact_sha256",
@@ -101,6 +102,34 @@ def _require_equal(actual: object, expected: object, reason: str) -> None:
         raise CanaryFailure(reason)
 
 
+def _database_interrupted(result: object) -> bool:
+    return "DATABASE_INTERRUPTION_OR_PARTIAL_RETRIEVAL" in getattr(
+        result, "reason_codes", (),
+    )
+
+
+def _retry_database_read(
+        operation: Callable[..., object], *args: object,
+        retry_result: Callable[[object], bool] | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        **kwargs: object) -> object:
+    """Retry only transient psycopg connection failures with a fresh call."""
+    from psycopg import OperationalError
+
+    for delay in (*DATABASE_RETRY_DELAYS_SECONDS, None):
+        try:
+            result = operation(*args, **kwargs)
+        except OperationalError:
+            if delay is None:
+                raise
+        else:
+            if retry_result is None or not retry_result(result):
+                return result
+            if delay is None:
+                return result
+        sleeper(delay)
+
+
 def _fresh_forecast_hashes(rows) -> tuple[str, str]:
     artifact = hashlib.sha256()
     ordered = hashlib.sha256()
@@ -178,8 +207,9 @@ def read_evidence_snapshot(
     from .historical_evidence_verifier import verify_from_environment
     from .historical_outcomes import verify_outcomes_from_environment
 
-    h2b = verify_from_environment(
-        baseline["replay_run_id"],
+    h2b = _retry_database_read(
+        verify_from_environment, baseline["replay_run_id"],
+        retry_result=_database_interrupted,
         expected_dataset_digest=baseline["dataset_digest"],
         expected_configuration_digest=baseline["configuration_digest"],
         expected_frame_count=baseline["frame_count"],
@@ -187,8 +217,9 @@ def read_evidence_snapshot(
     )
     _require_equal(h2b.verification_status, "VERIFIED", "H2D3_POST_H2B_REJECTED")
     _require_equal(h2b.reason_codes, (), "H2D3_POST_H2B_REASON_CODES")
-    outcomes = verify_outcomes_from_environment(
-        baseline["replay_run_id"], statement_timeout_seconds=remaining(),
+    outcomes = _retry_database_read(
+        verify_outcomes_from_environment, baseline["replay_run_id"],
+        statement_timeout_seconds=remaining(),
     )
     observed = _observed_evidence_snapshot(h2b, outcomes)
     _require_equal(observed, _frozen_evidence_snapshot(baseline),
@@ -246,8 +277,9 @@ def run_read_only_date(day: str) -> dict:
                    baseline["forecast_ordered_content_sha256"],
                    "H2D3_H1_FORECAST_ORDERED_HASH")
 
-    h2b = verify_from_environment(
-        baseline["replay_run_id"],
+    h2b = _retry_database_read(
+        verify_from_environment, baseline["replay_run_id"],
+        retry_result=_database_interrupted,
         expected_dataset_digest=baseline["dataset_digest"],
         expected_configuration_digest=baseline["configuration_digest"],
         expected_frame_count=baseline["frame_count"],
@@ -267,13 +299,14 @@ def run_read_only_date(day: str) -> dict:
                    baseline["forecast_ordered_content_sha256"],
                    "H2D3_FORECAST_ORDERED_CONTENT_HASH")
 
-    outcomes = verify_outcomes_from_environment(baseline["replay_run_id"])
+    outcomes = _retry_database_read(
+        verify_outcomes_from_environment, baseline["replay_run_id"])
     for field in ("outcome_count", "outcome_available_count",
                   "outcome_unavailable_count", "outcome_ordered_content_sha256"):
         _require_equal(getattr(outcomes, field), baseline[field],
                        f"H2D3_{field.upper()}_MISMATCH")
 
-    scoring = score_from_environment(baseline["replay_run_id"])
+    scoring = _retry_database_read(score_from_environment, baseline["replay_run_id"])
     _require_equal(scoring.dataset_digest, baseline["dataset_digest"], "H2D3_SCORE_DATASET")
     _require_equal(scoring.configuration_digest, baseline["configuration_digest"],
                    "H2D3_SCORE_CONFIGURATION")
