@@ -409,16 +409,12 @@ diagnostics only.
 
 The read-only baseline bundle is
 `docs/h2-d2-canary-baselines.json`.
-Its canonical values and the SHA-256 source digests of the current H2-D-1
-orchestrator, entry stages, and complete local H1 replay/family dependency
-closure are pinned by contract tests. The closure test resolves every
-repository-local Python import recursively and includes every package
-initializer on each module path, so a newly imported local module or
-initializer cannot escape the digest and sequential-runtime guards.
-Source hashing reads UTF-8 text, removes all terminal LF characters, appends
-exactly one LF, and hashes those normalized bytes.
-Changing a digest or stage implementation requires a separately approved freeze
-update; an arbitrary well-formed replacement hash is not accepted.
+Its canonical numerical, evidence, lineage, count, receipt-correlation, and
+metric-serialization values are pinned by focused contract tests. H2-D-2 does
+not pin source-file hashes for the H1 runtime, quant families, or V9 modules.
+Future harmless implementation edits therefore do not require a freeze update;
+changes that alter the frozen behavior or exact numerical parity still fail the
+canary gate.
 
 - `2026-06-15` exercises the legacy certified-manifest resume path with run ID
   `h2a-2026-06-15-persistence-v3`.
