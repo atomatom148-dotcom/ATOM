@@ -3,9 +3,18 @@ import json
 import multiprocessing
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
 import pytest
 
+from quant import historical_parallel_canary_h2d3 as canary
+from quant.historical_evidence_verifier import VerificationReceipt
+from quant.historical_outcomes import (
+    OutcomeVerificationReceipt,
+    ScoreMetric,
+    ScoringReceipt,
+)
+from quant.historical_replay_h1 import FamilyCoverage, ResolutionCoverage
 from quant.historical_outcomes import verify_outcomes
 from quant.historical_parallel_canary_h2d3 import (
     CanaryFailure,
@@ -164,3 +173,148 @@ def test_worker_timeout_terminates_and_joins_the_process():
         run_isolated((FROZEN_DATES[0],), timeout_seconds=0.05,
                      run_date=_hang, context=multiprocessing.get_context("fork"))
     assert time.monotonic() - started < 2
+
+
+def test_read_only_date_builds_complete_frozen_projection(monkeypatch):
+    bundle = json.loads(BASELINES.read_text())
+    baseline = bundle["sessions"][0]
+    family_rows = tuple(
+        FamilyCoverage(
+            quant_id=quant,
+            horizon=horizon,
+            total=baseline["frame_count"],
+            available=baseline["forecast_available_count"] if index == 0 else 0,
+            missing=baseline["forecast_unavailable_count"] if index == 0 else 0,
+        )
+        for index, (quant, horizon) in enumerate(
+            (q, h) for q in bundle["metric_hash_contract"]["quant_order"]
+            for h in bundle["metric_hash_contract"]["horizon_order"]
+        )
+    )
+    resolution_rows = tuple(
+        ResolutionCoverage(horizon, baseline["frame_count"], 0, 0, 0, 0, None, None)
+        for horizon in bundle["metric_hash_contract"]["horizon_order"]
+    )
+    h1 = SimpleNamespace(
+        runner_version="test-h1",
+        evidence_origin="historical_test",
+        historical_session=baseline["historical_session"],
+        replay_run_id=baseline["replay_run_id"],
+        dataset_digest=baseline["dataset_digest"],
+        configuration_digest=baseline["configuration_digest"],
+        session_digest=baseline["session_digest"],
+        execution_stage="REPLAY_COMPLETE",
+        data_status="CERTIFIED",
+        data_reason_codes=(),
+        frame_count=baseline["frame_count"],
+        persistence_writes=0,
+        family_coverage=family_rows,
+        resolution_coverage=resolution_rows,
+    )
+    h2b = VerificationReceipt(
+        baseline["replay_run_id"], baseline["historical_session"], "VERIFIED", (),
+        1, baseline["frame_count"], baseline["forecast_count"],
+        baseline["frame_count"], 12, 6, baseline["forecast_unavailable_count"],
+        baseline["forecast_count"], 0, baseline["dataset_digest"],
+        baseline["configuration_digest"], baseline["artifact_sha256"],
+        "test-h2b", "2026-08-30T00:00:00+00:00", baseline["git_commit"],
+        baseline["session_digest"], baseline["manifest_content_sha256"],
+        baseline["forecast_ordered_content_sha256"],
+    )
+    outcomes = OutcomeVerificationReceipt(
+        baseline["replay_run_id"], baseline["outcome_count"],
+        baseline["outcome_available_count"], baseline["outcome_unavailable_count"],
+        baseline["outcome_ordered_content_sha256"],
+    )
+    metrics = tuple(ScoreMetric(**row) for row in _metric_rows()[1])
+    scoring = ScoringReceipt(
+        baseline["replay_run_id"], baseline["dataset_digest"],
+        baseline["configuration_digest"], baseline["forecast_count"],
+        baseline["outcome_count"], metrics, "score-hash",
+    )
+
+    class Spool:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    import quant.historical_evidence as evidence_module
+    import quant.historical_evidence_verifier as verifier_module
+    import quant.historical_outcomes as outcomes_module
+    import quant.historical_replay as replay_module
+    import quant.historical_replay_h1 as h1_module
+
+    monkeypatch.setattr(evidence_module, "HistoricalEvidenceSpool", Spool)
+    monkeypatch.setattr(
+        replay_module.AlpacaHistoricalSipReader,
+        "from_environment",
+        classmethod(lambda cls: object()),
+    )
+    monkeypatch.setattr(h1_module, "run_h1_session", lambda **_kwargs: h1)
+    monkeypatch.setattr(verifier_module, "verify_from_environment", lambda *_a, **_k: h2b)
+    monkeypatch.setattr(outcomes_module, "verify_outcomes_from_environment", lambda *_a: outcomes)
+    monkeypatch.setattr(outcomes_module, "score_from_environment", lambda *_a: scoring)
+    monkeypatch.setattr(
+        canary,
+        "_fresh_forecast_hashes",
+        lambda _rows: (
+            baseline["artifact_sha256"],
+            baseline["forecast_ordered_content_sha256"],
+        ),
+    )
+
+    receipt = canary.run_read_only_date(baseline["historical_session"])
+    assert receipt["historical_session"] == baseline["historical_session"]
+    assert receipt["evidence_snapshot"]["manifest_content_sha256"] == baseline["manifest_content_sha256"]
+    assert receipt["score"]["metric_sha256"]
+    assert len(receipt["score"]["metrics"]) == 72
+    assert receipt["pre_post_unchanged"] is True
+
+
+def test_fresh_forecast_hashes_use_byte_order_with_no_trailing_separator():
+    rows = [
+        SimpleNamespace(cutoff_at=1, quant_id="q2", horizon="1M", content_sha256="b" * 64),
+        SimpleNamespace(cutoff_at=1, quant_id="q1", horizon="30S", content_sha256="a" * 64),
+        SimpleNamespace(cutoff_at=2, quant_id="q1", horizon="30S", content_sha256="c" * 64),
+    ]
+    artifact, ordered = canary._fresh_forecast_hashes(rows)
+    assert artifact == hashlib.sha256((("b" * 64) + ("a" * 64) + ("c" * 64)).encode()).hexdigest()
+    assert ordered == hashlib.sha256("\n".join(("a" * 64, "b" * 64, "c" * 64)).encode()).hexdigest()
+
+
+def test_worker_reports_success_failure_and_closes_sender():
+    class Sender:
+        def __init__(self):
+            self.messages = []
+            self.closed = False
+
+        def send(self, message):
+            self.messages.append(message)
+
+        def close(self):
+            self.closed = True
+
+    success = Sender()
+    canary._worker(success, FROZEN_DATES[0], lambda day: {"day": day})
+    assert success.closed and success.messages[0]["ok"] is True
+    assert success.messages[0]["peak_rss_kib"] > 0
+
+    failure = Sender()
+    canary._worker(failure, FROZEN_DATES[1], lambda _day: (_ for _ in ()).throw(ValueError("bad")))
+    assert failure.closed and failure.messages[0]["ok"] is False
+    assert failure.messages[0]["error"] == "ValueError"
+
+
+def test_canary_cli_emits_bounded_success_and_failure(monkeypatch, capsys):
+    monkeypatch.setattr(canary, "execute_canary", lambda **_kwargs: {"status": "PASSED"})
+    assert canary.main(()) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "PASSED"
+
+    def fail(**_kwargs):
+        raise CanaryFailure("blocked")
+
+    monkeypatch.setattr(canary, "execute_canary", fail)
+    assert canary.main(()) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "FAILED"
