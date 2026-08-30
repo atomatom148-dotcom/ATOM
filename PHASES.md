@@ -67,16 +67,15 @@ replay.
 
 ### H2-D-2 — Date-level parallel architecture freeze (current)
 
-Freeze whole-date process isolation, single-coordinator queue ownership,
-fail-closed retry and duplicate rules, exact parity fields, and two certified
-canary dates. This phase is documentation and contract tests only. Parallel
-execution remains disabled.
+Freeze whole-date process isolation, exactly two read-only workers, zero retry,
+exact parity fields, and two certified canary dates. This phase is documentation
+and contract tests only. Parallel execution remains disabled.
 
-### H2-D-3 — Parallel Canary (not authorized)
+### H2-D-3 — Parallel Canary (implementation authorized)
 
-After separate approval, run exactly two process-isolated date jobs under the
-H2-D-2 contract. No within-date concurrency or evidence writes. Exact parity is
-mandatory.
+Implement and run exactly two process-isolated date jobs under the H2-D-2
+contract. No within-date concurrency or evidence writes. Exact parity is
+mandatory. Passing does not enable scaled or scheduled replay.
 
 ### H2-D-4 — Compute decision (not authorized)
 

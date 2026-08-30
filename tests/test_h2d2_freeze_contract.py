@@ -201,7 +201,7 @@ def test_root_freeze_and_phase_boundary_remain_explicit() -> None:
     phases = _law(PHASES)
     assert "H2-D-2 is a design freeze only" in root_law
     assert "not unrelated runtime or V9 source-file hashes" in root_law
-    assert "H2-D-3 — Parallel Canary (not authorized)" in phases
+    assert "H2-D-3 — Parallel Canary (implementation authorized)" in phases
     assert "No within-date concurrency or evidence writes" in phases
 
 

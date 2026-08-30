@@ -56,6 +56,10 @@ class VerificationReceipt:
     stored_content_hash_summary: str
     verifier_version: str
     verified_at: str
+    git_commit: str | None = None
+    session_digest: str | None = None
+    manifest_content_sha256: str | None = None
+    forecast_ordered_content_sha256: str | None = None
 
     def payload(self) -> dict[str, object]:
         return asdict(self)
@@ -104,6 +108,9 @@ class HistoricalEvidenceVerifier:
         quants: set[str] = set()
         horizons: set[str] = set()
         artifact = hashlib.sha256()
+        ordered_forecasts = hashlib.sha256()
+        ordered_forecast_first = True
+        cutoff_hashes: dict[tuple[str, str], str] = {}
         manifest_cursor = self.connection.cursor()
         forecast_cursor = None
         try:
@@ -178,14 +185,22 @@ class HistoricalEvidenceVerifier:
                         if current_cutoff is None:
                             current_cutoff = row.cutoff_at
                         elif row.cutoff_at != current_cutoff:
+                            if set(cutoff_hashes) == SLOTS:
+                                for key in sorted(cutoff_hashes,
+                                                  key=lambda item: (item[0].encode(), item[1].encode())):
+                                    if not ordered_forecast_first:
+                                        ordered_forecasts.update(b"\n")
+                                    ordered_forecasts.update(cutoff_hashes[key].encode("ascii"))
+                                    ordered_forecast_first = False
                             cutoff_count += 1
                             if cutoff_slots != SLOTS:
                                 reasons.add("MISSING_OR_INVALID_SLOTS")
-                            current_cutoff, cutoff_slots = row.cutoff_at, set()
+                            current_cutoff, cutoff_slots, cutoff_hashes = row.cutoff_at, set(), {}
                         if identity == previous_identity or (row.quant_id, row.horizon) in cutoff_slots:
                             reasons.add("DUPLICATE_SLOT")
                         previous_identity = identity
                         cutoff_slots.add((row.quant_id, row.horizon))
+                        cutoff_hashes[(row.quant_id, row.horizon)] = stored_hash
                         quants.add(row.quant_id)
                         horizons.add(row.horizon)
                         unavailable += row.availability_status == "UNAVAILABLE" and row.expected_return_bps is None
@@ -216,6 +231,13 @@ class HistoricalEvidenceVerifier:
                     except Exception:
                         reasons.add("INVALID_FORECAST")
             if current_cutoff is not None:
+                if set(cutoff_hashes) == SLOTS:
+                    for key in sorted(cutoff_hashes,
+                                      key=lambda item: (item[0].encode(), item[1].encode())):
+                        if not ordered_forecast_first:
+                            ordered_forecasts.update(b"\n")
+                        ordered_forecasts.update(cutoff_hashes[key].encode("ascii"))
+                        ordered_forecast_first = False
                 cutoff_count += 1
                 if cutoff_slots != SLOTS:
                     reasons.add("MISSING_OR_INVALID_SLOTS")
@@ -246,6 +268,10 @@ class HistoricalEvidenceVerifier:
             manifest.dataset_digest if manifest else None,
             manifest.configuration_digest if manifest else None, digest, VERIFIER_VERSION,
             self.clock().astimezone(timezone.utc).isoformat(),
+            manifest.git_commit if manifest else None,
+            manifest.session_digest if manifest else None,
+            stored_manifest_hash if manifest else None,
+            ordered_forecasts.hexdigest(),
         )
 
 
