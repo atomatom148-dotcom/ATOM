@@ -119,6 +119,31 @@ STRING_EXECUTION_FULL_IMPORT_NAMES = {
     "timeit.repeat",
     "timeit.timeit",
 }
+EXECUTION_WRAPPER_FULL_IMPORT_NAMES = {
+    "cProfile.Profile.run",
+    "cProfile.Profile.runcall",
+    "cProfile.Profile.runctx",
+    "cProfile.run",
+    "cProfile.runctx",
+    "code.InteractiveConsole.push",
+    "code.InteractiveConsole.runcode",
+    "code.InteractiveConsole.runsource",
+    "code.InteractiveInterpreter.runcode",
+    "code.InteractiveInterpreter.runsource",
+    "code.interact",
+    "profile.Profile.run",
+    "profile.Profile.runcall",
+    "profile.Profile.runctx",
+    "profile.run",
+    "profile.runctx",
+}
+CONFIG_FACTORY_EXECUTION_FULL_IMPORT_NAMES = {
+    "logging.config.dictConfig",
+    "logging.config.fileConfig",
+}
+DYNAMIC_IMPORT_PATH_FULL_IMPORT_NAMES = {
+    "pydoc.locate",
+}
 FORBIDDEN_STAGE_IMPORT_ROOTS = SENSITIVE_MODULE_ROOTS - {
     "os",
     "subprocess",
@@ -4291,6 +4316,7 @@ def sensitive_module_reexports(
             "map": "builtins.map",
             "max": "builtins.max",
             "min": "builtins.min",
+            "next": "builtins.next",
             "object": "builtins.object",
             "setattr": "builtins.setattr",
             "sorted": "builtins.sorted",
@@ -4358,6 +4384,7 @@ def sensitive_module_reexports(
     }
     tracked_return_callables: set[ast.AST] = set()
     tracked_yield_callables: set[ast.AST] = set()
+    tracked_generator_receive_targets: set[ast.Name] = set()
     tracked_exception_handler_payloads: dict[
         ast.ExceptHandler,
         set[
@@ -5309,6 +5336,20 @@ def sensitive_module_reexports(
                                         for target in statement.targets
                                     )
                                 if writes:
+                                    if any(
+                                        target in tracked_generator_receive_targets
+                                        for target in (
+                                            statement.targets
+                                            if isinstance(statement, ast.Assign)
+                                            else [statement.target]
+                                            if isinstance(statement, ast.AnnAssign)
+                                            else []
+                                        )
+                                        for target in ast.walk(target)
+                                        if isinstance(target, ast.Name)
+                                        and target.id == item.id
+                                    ):
+                                        return True
                                     return bool(
                                         value is not None
                                         and contains_passed_tracked_binding(
@@ -7013,6 +7054,388 @@ def sensitive_module_reexports(
             handled &= bind_target(target)
         return handled, updated
 
+    def resolve_local_generator_instances(
+            expression: ast.AST,
+            scope: ast.AST | None,
+            seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> set[ast.FunctionDef | ast.AsyncFunctionDef]:
+        if isinstance(expression, ast.Call):
+            return {
+                local_callable
+                for local_callable, _ in local_call_targets(expression)
+                if isinstance(local_callable, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and own_yield_nodes(local_callable)
+            }
+        if isinstance(expression, (ast.NamedExpr, ast.Starred)):
+            return resolve_local_generator_instances(
+                expression.value,
+                scope,
+                seen,
+            )
+        if isinstance(expression, ast.IfExp):
+            return (
+                resolve_local_generator_instances(expression.body, scope, seen)
+                | resolve_local_generator_instances(expression.orelse, scope, seen)
+            )
+        if not isinstance(expression, ast.Name):
+            return set()
+
+        lookup_scope = scope
+        while True:
+            if (
+                lookup_scope is not None
+                and expression.id in scope_global_names[lookup_scope]
+            ):
+                lookup_scope = None
+            elif (
+                lookup_scope is not None
+                and expression.id in scope_nonlocal_names[lookup_scope]
+            ):
+                lookup_scope = callable_parents[lookup_scope]
+                continue
+            if expression.id in scope_bound_names[lookup_scope]:
+                break
+            if lookup_scope is None:
+                return set()
+            lookup_scope = callable_parents[lookup_scope]
+        alias_key = (lookup_scope, expression.id)
+        if alias_key in seen:
+            return set()
+        container = tree if lookup_scope is None else lookup_scope
+        candidate_body = container.body if hasattr(container, "body") else []
+        body = candidate_body if isinstance(candidate_body, list) else []
+        direct_child: ast.AST = expression
+        while (
+            parents.get(direct_child) is not container
+            and parents.get(direct_child) is not None
+        ):
+            direct_child = parents[direct_child]
+        before_index = body.index(direct_child) if direct_child in body else len(body)
+        for statement in reversed(body[:before_index]):
+            assigned_sources = []
+            binds_name = False
+            for candidate in ast.walk(statement):
+                if enclosing_callable(candidate) is not lookup_scope:
+                    continue
+                if isinstance(candidate, ast.Assign):
+                    for target in candidate.targets:
+                        assigned = assigned_value_for_name(
+                            target,
+                            candidate.value,
+                            expression.id,
+                        )
+                        if assigned is not None:
+                            binds_name = True
+                            assigned_sources.append(assigned)
+                        elif expression.id in target_names(target):
+                            binds_name = True
+                            assigned_sources.append(candidate.value)
+                elif isinstance(candidate, ast.AnnAssign):
+                    if expression.id in target_names(candidate.target):
+                        binds_name = True
+                        if candidate.value is not None:
+                            assigned_sources.append(candidate.value)
+                elif isinstance(candidate, (ast.AugAssign, ast.Delete)):
+                    targets = (
+                        candidate.targets
+                        if isinstance(candidate, ast.Delete)
+                        else [candidate.target]
+                    )
+                    binds_name |= any(
+                        expression.id in target_names(target)
+                        for target in targets
+                    )
+                elif isinstance(candidate, (ast.For, ast.AsyncFor)):
+                    binds_name |= expression.id in target_names(candidate.target)
+                elif isinstance(candidate, (ast.With, ast.AsyncWith)):
+                    binds_name |= any(
+                        item.optional_vars is not None
+                        and expression.id in target_names(item.optional_vars)
+                        for item in candidate.items
+                    )
+                elif isinstance(candidate, ast.ExceptHandler):
+                    binds_name |= candidate.name == expression.id
+            if not binds_name:
+                continue
+            return set().union(*(
+                resolve_local_generator_instances(
+                    source,
+                    lookup_scope,
+                    seen | {alias_key},
+                )
+                for source in assigned_sources
+            )) if assigned_sources else set()
+        return set()
+
+    def generator_receive_target_nodes(
+            local_generator: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[ast.Name]:
+        nodes = set()
+        for yielded in own_yield_nodes(local_generator):
+            owner: ast.AST = yielded
+            while (
+                not isinstance(owner, ast.stmt)
+                and parents.get(owner) is not None
+            ):
+                owner = parents[owner]
+            targets: tuple[ast.AST, ...] = ()
+            if isinstance(owner, ast.Assign) and any(
+                yielded is item for item in ast.walk(owner.value)
+            ):
+                targets = tuple(owner.targets)
+            elif (
+                isinstance(owner, ast.AnnAssign)
+                and owner.value is not None
+                and any(yielded is item for item in ast.walk(owner.value))
+            ):
+                targets = (owner.target,)
+            elif (
+                isinstance(owner, ast.AugAssign)
+                and any(yielded is item for item in ast.walk(owner.value))
+            ):
+                targets = (owner.target,)
+            nodes.update(
+                node
+                for target in targets
+                for node in ast.walk(target)
+                if isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Store)
+            )
+        return nodes
+
+    def resolve_local_generator_constructions(
+            expression: ast.AST,
+            scope: ast.AST | None,
+            seen: frozenset[tuple[ast.AST | None, str]] = frozenset(),
+    ) -> tuple[set[ast.Call], bool]:
+        if isinstance(expression, ast.Call):
+            is_generator = any(
+                isinstance(local_callable, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and own_yield_nodes(local_callable)
+                for local_callable, _ in local_call_targets(expression)
+            )
+            return ({expression}, True) if is_generator else (set(), False)
+        if isinstance(expression, (ast.NamedExpr, ast.Starred)):
+            return resolve_local_generator_constructions(
+                expression.value,
+                scope,
+                seen,
+            )
+        if isinstance(expression, ast.IfExp):
+            left, left_complete = resolve_local_generator_constructions(
+                expression.body,
+                scope,
+                seen,
+            )
+            right, right_complete = resolve_local_generator_constructions(
+                expression.orelse,
+                scope,
+                seen,
+            )
+            return left | right, left_complete and right_complete
+        if not isinstance(expression, ast.Name):
+            return set(), False
+
+        lookup_scope = scope
+        while True:
+            if (
+                lookup_scope is not None
+                and expression.id in scope_global_names[lookup_scope]
+            ):
+                lookup_scope = None
+            elif (
+                lookup_scope is not None
+                and expression.id in scope_nonlocal_names[lookup_scope]
+            ):
+                lookup_scope = callable_parents[lookup_scope]
+                continue
+            if expression.id in scope_bound_names[lookup_scope]:
+                break
+            if lookup_scope is None:
+                return set(), False
+            lookup_scope = callable_parents[lookup_scope]
+        alias_key = (lookup_scope, expression.id)
+        if alias_key in seen:
+            return set(), False
+        container = tree if lookup_scope is None else lookup_scope
+        candidate_body = container.body if hasattr(container, "body") else []
+        body = candidate_body if isinstance(candidate_body, list) else []
+        direct_child: ast.AST = expression
+        while (
+            parents.get(direct_child) is not container
+            and parents.get(direct_child) is not None
+        ):
+            direct_child = parents[direct_child]
+        before_index = body.index(direct_child) if direct_child in body else len(body)
+        for statement in reversed(body[:before_index]):
+            assigned_sources = []
+            binds_name = False
+            for candidate in ast.walk(statement):
+                if enclosing_callable(candidate) is not lookup_scope:
+                    continue
+                if isinstance(candidate, ast.Assign):
+                    for target in candidate.targets:
+                        assigned = assigned_value_for_name(
+                            target,
+                            candidate.value,
+                            expression.id,
+                        )
+                        if assigned is not None:
+                            binds_name = True
+                            assigned_sources.append(assigned)
+                        elif expression.id in target_names(target):
+                            binds_name = True
+                            assigned_sources.append(candidate.value)
+                elif isinstance(candidate, ast.AnnAssign):
+                    if expression.id in target_names(candidate.target):
+                        binds_name = True
+                        if candidate.value is not None:
+                            assigned_sources.append(candidate.value)
+                elif isinstance(candidate, (ast.AugAssign, ast.Delete)):
+                    targets = (
+                        candidate.targets
+                        if isinstance(candidate, ast.Delete)
+                        else [candidate.target]
+                    )
+                    binds_name |= any(
+                        expression.id in target_names(target)
+                        for target in targets
+                    )
+                elif isinstance(candidate, (ast.For, ast.AsyncFor)):
+                    binds_name |= expression.id in target_names(candidate.target)
+                elif isinstance(candidate, (ast.With, ast.AsyncWith)):
+                    binds_name |= any(
+                        item.optional_vars is not None
+                        and expression.id in target_names(item.optional_vars)
+                        for item in candidate.items
+                    )
+                elif isinstance(candidate, ast.ExceptHandler):
+                    binds_name |= candidate.name == expression.id
+            if not binds_name:
+                continue
+            if not assigned_sources:
+                return set(), False
+            resolved = [
+                resolve_local_generator_constructions(
+                    source,
+                    lookup_scope,
+                    seen | {alias_key},
+                )
+                for source in assigned_sources
+            ]
+            return (
+                set().union(*(items for items, _ in resolved)),
+                all(complete for _, complete in resolved),
+            )
+        return set(), False
+
+    def generator_state_at_send(send_call: ast.Call) -> str:
+        scope = enclosing_callable(send_call)
+        constructions, complete = resolve_local_generator_constructions(
+            send_call.func.value,
+            scope,
+        )
+        if not complete or not constructions:
+            return "UNCERTAIN"
+        container = tree if scope is None else scope
+        body = container.body if isinstance(getattr(container, "body", None), list) else []
+        send_statement: ast.AST = send_call
+        while (
+            parents.get(send_statement) is not container
+            and parents.get(send_statement) is not None
+        ):
+            send_statement = parents[send_statement]
+        if send_statement not in body:
+            return "UNCERTAIN"
+        send_index = body.index(send_statement)
+        states = []
+        for construction in constructions:
+            construction_statement: ast.AST = construction
+            while (
+                parents.get(construction_statement) is not container
+                and parents.get(construction_statement) is not None
+            ):
+                construction_statement = parents[construction_statement]
+            if construction_statement not in body:
+                states.append("UNCERTAIN")
+                continue
+            construction_index = body.index(construction_statement)
+            if construction_index >= send_index:
+                states.append("UNCERTAIN")
+                continue
+            state = "FRESH"
+            for statement in body[construction_index + 1:send_index]:
+                for candidate in (
+                    item for item in ast.walk(statement)
+                    if isinstance(item, ast.Call)
+                ):
+                    operation = None
+                    receiver = None
+                    if (
+                        isinstance(candidate.func, ast.Name)
+                        and "builtins.next" in import_origin_names(candidate.func)
+                        and candidate.args
+                    ):
+                        operation = "PRIMED"
+                        receiver = candidate.args[0]
+                    elif isinstance(candidate.func, ast.Attribute):
+                        receiver = candidate.func.value
+                        if candidate.func.attr == "__next__":
+                            operation = "PRIMED"
+                        elif candidate.func.attr == "send":
+                            if (
+                                candidate.args
+                                and isinstance(candidate.args[0], ast.Constant)
+                                and candidate.args[0].value is None
+                            ):
+                                operation = "PRIMED"
+                            else:
+                                operation = "UNCERTAIN"
+                        elif candidate.func.attr == "close":
+                            operation = "CLOSED"
+                    if receiver is not None and operation is not None:
+                        receiver_constructions, receiver_complete = (
+                            resolve_local_generator_constructions(
+                                receiver,
+                                enclosing_callable(candidate),
+                            )
+                        )
+                        if construction not in receiver_constructions:
+                            continue
+                        candidate_statement: ast.AST = candidate
+                        while (
+                            not isinstance(candidate_statement, ast.stmt)
+                            and parents.get(candidate_statement) is not None
+                        ):
+                            candidate_statement = parents[candidate_statement]
+                        direct_statement: ast.AST = candidate_statement
+                        while (
+                            parents.get(direct_statement) is not container
+                            and parents.get(direct_statement) is not None
+                        ):
+                            direct_statement = parents[direct_statement]
+                        if candidate_statement is not statement or not receiver_complete:
+                            state = "UNCERTAIN"
+                        elif operation == "CLOSED":
+                            state = "CLOSED"
+                        elif state != "CLOSED":
+                            state = operation
+                        continue
+                    if any(
+                        construction in resolve_local_generator_constructions(
+                            argument.value if isinstance(argument, ast.Starred) else argument,
+                            enclosing_callable(candidate),
+                        )[0]
+                        for argument in candidate.args
+                    ):
+                        state = "UNCERTAIN"
+            states.append(state)
+        if states and all(state == "FRESH" for state in states):
+            return "FRESH"
+        if states and all(state == "CLOSED" for state in states):
+            return "CLOSED"
+        return "UNCERTAIN"
+
     changed = True
     while changed:
         changed = False
@@ -7136,6 +7559,33 @@ def sensitive_module_reexports(
         ):
             if update_loop_provenance(loop):
                 changed = True
+
+        for send_call in (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "send"
+            and node.args
+            and contains_passed_tracked_binding(
+                node.args[0],
+                enclosing_callable(node),
+            )
+        ):
+            if generator_state_at_send(send_call) in {"FRESH", "CLOSED"}:
+                continue
+            for local_generator in resolve_local_generator_instances(
+                send_call.func.value,
+                enclosing_callable(send_call),
+            ):
+                new_targets = generator_receive_target_nodes(local_generator)
+                new_names = {target.id for target in new_targets}
+                local_bindings = scoped_tracked_bindings[local_generator]
+                if not new_targets.issubset(tracked_generator_receive_targets):
+                    tracked_generator_receive_targets.update(new_targets)
+                    changed = True
+                if not new_names.issubset(local_bindings):
+                    local_bindings.update(new_names)
+                    changed = True
 
         for call in (
             node for node in ast.walk(tree)
@@ -9682,6 +10132,20 @@ def sensitive_module_reexports(
             findings.append(node)
         elif (
             isinstance(node, ast.Call)
+            and (
+                EXECUTION_WRAPPER_FULL_IMPORT_NAMES
+                | CONFIG_FACTORY_EXECUTION_FULL_IMPORT_NAMES
+                | DYNAMIC_IMPORT_PATH_FULL_IMPORT_NAMES
+            ).intersection(
+                flow_sensitive_import_origins(
+                    node.func,
+                    enclosing_callable(node),
+                )
+            )
+        ):
+            findings.append(node)
+        elif (
+            isinstance(node, ast.Call)
             and PROCESS_LAUNCH_WRAPPER_FULL_IMPORT_NAMES.intersection(
                 flow_sensitive_import_origins(
                     node.func,
@@ -12215,6 +12679,200 @@ class H2D2FreezeContractTests(unittest.TestCase):
             with self.subTest(safe_string_execution_shape=source.strip()):
                 self.assertFalse(
                     sensitive_module_reexports(ast.parse(source), {}),
+                )
+
+        exact_wrapper_positives = (
+            "import code\ncode.InteractiveInterpreter().runsource('danger()')\n",
+            (
+                "from code import InteractiveConsole as Console\n"
+                "console = Console()\n"
+                "execute = console.push\n"
+                "execute('danger()')\n"
+            ),
+            "import code\ncode.InteractiveConsole().runcode(compiled)\n",
+            "import code\ncode.interact(local=namespace)\n",
+            "import profile\nprofile.run('danger()')\n",
+            "from cProfile import runctx\nrunctx('danger()', globals(), locals())\n",
+            (
+                "import cProfile\n"
+                "runner = cProfile.Profile()\n"
+                "execute = runner.run\n"
+                "execute('danger()')\n"
+            ),
+            "import profile\nprofile.Profile().runcall(callback)\n",
+            (
+                "import logging.config\n"
+                "config = {'handlers': {'h': {'()': 'package.Factory'}}}\n"
+                "logging.config.dictConfig(config)\n"
+            ),
+            (
+                "from logging.config import dictConfig as configure\n"
+                "factory = build_handler\n"
+                "config = {'handlers': {'h': {'()': factory}}}\n"
+                "alias = config\n"
+                "configure(alias)\n"
+            ),
+            "from logging.config import fileConfig\nfileConfig(path)\n",
+            "import pydoc\npydoc.locate('package.callable')\n",
+            (
+                "from pydoc import locate as resolve\n"
+                "alias = resolve\n"
+                "alias(path)\n"
+            ),
+        )
+        for source in exact_wrapper_positives:
+            with self.subTest(exact_execution_wrapper=source.strip()):
+                self.assertTrue(
+                    sensitive_module_reexports(ast.parse(source), {}),
+                )
+
+        exact_wrapper_negatives = (
+            "import logging\nlogging.info('safe')\n",
+            "import pydoc\npydoc.render_doc(object)\n",
+            (
+                "import code\n"
+                "def run(code):\n"
+                "    return code.InteractiveConsole().push('safe')\n"
+            ),
+            (
+                "import logging.config\n"
+                "configure = logging.config.dictConfig\n"
+                "configure = harmless\n"
+                "configure({'version': 1})\n"
+            ),
+            (
+                "def locate(path):\n"
+                "    return path\n"
+                "locate('package.callable')\n"
+            ),
+            (
+                "class InteractiveConsole:\n"
+                "    def push(self, source):\n"
+                "        return False\n"
+                "InteractiveConsole().push('safe')\n"
+            ),
+        )
+        for source in exact_wrapper_negatives:
+            with self.subTest(safe_execution_wrapper=source.strip()):
+                self.assertFalse(
+                    sensitive_module_reexports(ast.parse(source), {}),
+                )
+
+        generator_send_positives = (
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    value = yield None\n"
+                "    value.os.fork()\n"
+                "generator = receiver()\n"
+                "alias = generator\n"
+                "next(alias)\n"
+                "alias.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    value = yield None\n"
+                "    value.os.fork()\n"
+                "left = receiver()\n"
+                "right = receiver()\n"
+                "generator = left if enabled else right\n"
+                "generator.send(None)\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def inner():\n"
+                "    yield None\n"
+                "def outer():\n"
+                "    value = yield from inner()\n"
+                "    value.os.fork()\n"
+                "generator = outer()\n"
+                "generator.__next__()\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    value = yield None\n"
+                "    value.os.fork()\n"
+                "if enabled:\n"
+                "    generator = receiver()\n"
+                "else:\n"
+                "    generator = receiver()\n"
+                "if prime:\n"
+                "    next(generator)\n"
+                "generator.send(p)\n"
+            ),
+        )
+        for source in generator_send_positives:
+            with self.subTest(generator_send_taint=source.strip()):
+                self.assertTrue(
+                    sensitive_module_reexports(
+                        ast.parse(source),
+                        {"p": "shutil"},
+                    ),
+                )
+
+        generator_send_negatives = (
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    value = yield None\n"
+                "    value.os.fork()\n"
+                "generator = receiver()\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    yield p\n"
+                "    safe.os.fork()\n"
+                "generator = receiver()\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    value = yield None\n"
+                "    value.os.fork()\n"
+                "generator = receiver()\n"
+                "generator.send(None)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "class Local:\n"
+                "    def send(self, value):\n"
+                "        return None\n"
+                "Local().send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    value = yield None\n"
+                "    value.os.fork()\n"
+                "generator = receiver()\n"
+                "generator.close()\n"
+                "generator.send(p)\n"
+            ),
+            (
+                "from shutil import fnmatch as p\n"
+                "def receiver():\n"
+                "    value = yield None\n"
+                "    value.os.fork()\n"
+                "generator = receiver()\n"
+                "alias = generator\n"
+                "alias = harmless\n"
+                "alias.send(p)\n"
+            ),
+        )
+        for source in generator_send_negatives:
+            with self.subTest(safe_generator_send=source.strip()):
+                self.assertFalse(
+                    sensitive_module_reexports(
+                        ast.parse(source),
+                        {"p": "shutil"},
+                    ),
                 )
 
         prefix = "from shutil import fnmatch as p\n"
