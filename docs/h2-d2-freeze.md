@@ -183,8 +183,19 @@ canary must add and verify them before it can dispatch two dates.
    cgroup, and every worker, launcher, stage, and descendant must remain in the
    same no-escape cgroup and the generation's pinned PID namespace. A
    parent-death signal or process-group kill alone is not accepted as proof of
-   containment. No guardian, worker, or descendant may use or inherit the
-   coordinator connection or liveness-pipe write end.
+   containment. The fixed persistent supervisor must run a deadline watchdog
+   outside the guardian's process and failure domain; an independently
+   supervised out-of-guardian watchdog with the same fixed service identity is
+   acceptable, but a guardian thread, callback, timer, or child is not. Before
+   worker authorization, that watchdog opens the exact guardian `pidfd`,
+   verifies its procfs start-time ticks, and opens the generation's cgroup
+   directory. Immediately after the worker is spawned and before any stage may
+   start, it must also open the exact worker `pidfd` and verify that worker's
+   procfs start-time ticks. It binds the generation ID, supervisor record
+   version, host/boot/PID-namespace identity, and cgroup path plus filesystem
+   device/inode identity. Missing, stale, ambiguous, or changed identity fails
+   closed and leaves admission blocked. No guardian, worker, or descendant may
+   use or inherit the coordinator connection or liveness-pipe write end.
 7. A guardian holds its shared date fence from claim through terminal cleanup
    on success and every failure path while that database session exists. On
    normal completion it validates the final receipt, waits for worker exit,
@@ -241,16 +252,36 @@ mathematics matches.
   whole-date deadline always governs. A missing, zero, negative, non-finite,
   mutable, or unpinned deadline fails before either worker starts.
 - Every provider/network/database call must have its own finite operation
-  timeout no later than the governing stage/date deadline. The guardian's
-  independent monotonic watchdog must remain able to enforce the governing
-  deadline when a worker, provider SDK, database driver, launcher, process
-  group, or descendant deadlocks or ignores cancellation. Deadline expiry
+  timeout no later than the governing stage/date deadline. Before the worker
+  start authorization, the supervisor-owned out-of-guardian watchdog must
+  durably record the whole-date absolute deadline. Before each stage launch it
+  must durably record that stage identity and absolute deadline and acknowledge
+  them to the guardian; a stage cannot launch before that acknowledgement. The
+  watchdog uses its own monotonic clock and execution context and must remain
+  able to enforce those deadlines when the guardian itself, a worker, provider
+  SDK, database driver, launcher, process group, or descendant deadlocks or
+  ignores cancellation. Deadline expiry
   irrevocably fails that generation; the same generation can never resume,
-  restart, or be readmitted. The supervisor fsyncs `CLEANING`, the
-  guardian freezes the date cgroup, invokes `cgroup.kill`, reaps the entire
-  process tree, proves `populated 0`, releases the shared fence only afterward,
-  and the supervisor fsyncs the terminal deadline-failure receipt before its
-  final `CLEAN` transition. Normal completion uses the same bounded
+  restart, or be readmitted. Each guardian must publish authenticated,
+  monotonically sequenced heartbeat and stage-progress records at the pinned
+  finite interval. A missed heartbeat or progress bound is a permanent control
+  failure signal, not a lease expiry and not authority for a new owner or
+  generation. The persistent supervisor already owns cleanup authority: after
+  revalidating the exact generation, predecessor version, guardian `pidfd`, and
+  cgroup identity, it must within the pinned bounded takeover interval
+  compare-and-swap `ACTIVE` to fsynced `CLEANING`. Uncertain identity or a false
+  compare-and-swap fails closed with the durable state nonterminal and all
+  replacement admission blocked.
+
+  Once `CLEANING` is durable, the out-of-guardian watchdog enforces the cleanup
+  deadline even while the guardian is alive and hung. It freezes the exact
+  workload cgroup, invokes `cgroup.kill`, reaps the worker tree, and proves
+  `populated 0` before it signals the exact guardian through its `pidfd`, reaps
+  the guardian, and thereby permits the guardian-owned shared fence connection
+  to close. It then fsyncs the terminal deadline-failure receipt before the
+  supervisor's final `CLEAN` transition. No signal sent only by PID, cooperative
+  cancellation, guardian acknowledgement, or heartbeat age is cleanup proof.
+  Normal completion uses the same bounded
   kill-if-needed, reap, cgroup-empty, fence-release, and terminal-receipt path;
   it may not bypass cleanup merely because all four stage receipts validated.
 - Expiration of the cleanup deadline does not authorize abandonment or a
@@ -424,14 +455,23 @@ required before the restarted instance may perform the same recovery.
 
 Separate deadline fault tests must hang provider I/O, database I/O, a stage
 launcher, a stage child, and an uncooperative descendant, and must deadlock both
-before and after partial diagnostic output. They must exercise every named
-stage, the whole-date deadline, and normal completion. Each expiry must be
-irrevocably fail its generation with no same-generation restart, resumption,
+before and after partial diagnostic output. They must also hang a guardian
+while its worker remains live, stop guardian heartbeat and progress separately,
+and keep the guardian alive past stage, whole-date, and cleanup boundaries.
+They must exercise every named stage, the whole-date deadline, and normal
+completion. Each expiry must irrevocably fail its generation with no
+same-generation restart, resumption,
 readmission, or next-stage start and must prove the exact
 `CLEANING` → freeze → kill → full reap → `populated 0` → shared-fence release →
 terminal-receipt → `CLEAN` ordering. The normal case must prove the same bounded
 reap, empty-cgroup, fence-release, and terminal-receipt invariants without
-changing any mathematical or evidence hash.
+changing any mathematical or evidence hash. The hung-guardian cases must prove
+the supervisor-owned watchdog remains live outside the guardian, validates the
+exact generation and cgroup, wins the exact predecessor compare-and-swap,
+finishes cleanup while the guardian is still unresponsive, kills and reaps the
+guardian only after `populated 0`, and never treats heartbeat age as an
+ownership lease. Wrong-generation, stale-version, reused-PID, replaced-cgroup,
+and unverifiable-identity cases must remain nonterminal and block admission.
 
 ## Explicit non-goals
 
