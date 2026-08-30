@@ -1,0 +1,94 @@
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+FREEZE = ROOT / "docs" / "h2-d2-freeze.md"
+
+
+def _law() -> str:
+    return " ".join(FREEZE.read_text(encoding="utf-8").split())
+
+
+def test_claiming_has_supervisor_owned_pre_guardian_recovery() -> None:
+    law = _law()
+    required = (
+        "A fsynced `CLAIMING` record is supervisor-owned",
+        "monotonic heartbeat sequence",
+        "heartbeat age is never a lease",
+        "readability of an exact coordinator `pidfd`",
+        "absence of the recorded backend's global advisory-lock ownership",
+        "aborted-before-guardian receipt",
+        "creates no worker",
+        "no manual record edit, age-based reset",
+        "pre-guardian recovery fault test",
+    )
+    for phrase in required:
+        assert phrase in law
+
+
+def test_stage_and_date_deadlines_are_finite_absolute_and_fail_closed() -> None:
+    law = _law()
+    required = (
+        "positive finite monotonic-runtime deadline for each named stage",
+        "positive finite whole-date deadline",
+        "whole-date deadline is absolute",
+        "Every provider/network/database call must have its own finite operation",
+        "supervisor-owned out-of-guardian watchdog",
+        "Deadline expiry irrevocably fails that generation",
+        "same generation can never resume, restart, or be readmitted",
+        "Expiration of the cleanup deadline does not authorize abandonment",
+        "Separate deadline fault tests must hang provider I/O",
+        "Normal completion uses the same bounded",
+    )
+    for phrase in required:
+        assert phrase in law
+
+
+def test_deadlines_survive_a_live_but_hung_guardian() -> None:
+    law = _law()
+    required = (
+        "deadline watchdog outside the guardian's process and failure domain",
+        "a guardian thread, callback, timer, or child is not",
+        "cgroup path plus filesystem device/inode identity",
+        "durably record the whole-date absolute deadline",
+        "a stage cannot launch before that acknowledgement",
+        "guardian itself",
+        "missed heartbeat or progress bound is a permanent control failure signal",
+        "not a lease expiry and not authority for a new owner or generation",
+        "within the pinned bounded takeover interval",
+        "even while the guardian is alive and hung",
+        "`prctl(PR_SET_CHILD_SUBREAPER, 1)`",
+        "`pidfd` signaling alone does not confer `waitid`/`waitpid` parentage",
+        "acquires the same date key in shared mode while the guardian still holds",
+        "terminate the hung guardian through its verified `pidfd`",
+        "reap the guardian through `waitid(P_PIDFD, ...)`",
+        "perform final `waitid`/`waitpid` reaping",
+        "Guardian-session closure is not accepted as final fence release",
+        "`populated 0` without wait-reaping is cleanup proof",
+        "guardian pidfd termination/reap → subreaper adoption → final worker wait-reap",
+        "Wrong-generation, stale-version, reused-PID, replaced-cgroup",
+    )
+    for phrase in required:
+        assert phrase in law
+
+
+def test_failed_generation_and_operator_authorized_replay_are_distinct() -> None:
+    law = _law()
+    required = (
+        "Every failed generation is irrevocably terminal",
+        "There is no blind, timed, or automatic replay",
+        "authorize a separate new generation with a new generation ID",
+        "fresh supervisor compare-and-swap",
+        "complete admission from the beginning",
+        "new generation admission fails before worker start",
+        "does not alter, reopen, supersede, or continue the failed generation",
+    )
+    for phrase in required:
+        assert phrase in law
+    assert "the retry fails" not in law
+
+
+def test_architecture_change_remains_runtime_disabled() -> None:
+    law = _law()
+    assert "H2-D-2 still authorizes no runtime" in law
+    assert "H2-D-2 adds no multiprocessing/executor/async runtime" in law

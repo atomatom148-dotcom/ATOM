@@ -45,6 +45,53 @@ new Q5 version and evidence lineage. S3 is not authorized by S0.
 **Rule:** Only S1 becomes authorized after S0 is merged. Do not implement S2 or
 S3 early.
 
+## Historical replay performance phases
+
+### DB-0 — Baseline freeze (complete)
+
+Freeze the production replay counts, content hashes, query plans, health, and
+configuration before database work.
+
+### DB-1 — Statistics (complete)
+
+Keep append-only replay planner statistics current without touching evidence.
+
+### DB-2 — Scoring index (complete)
+
+Add only the approved concurrent index for the frozen scoring query shape.
+
+### DB-3 — Proof run (complete)
+
+Prove exact numerical parity and measure the optimized query on one certified
+replay.
+
+### H2-D-2 — Date-level parallel architecture freeze (current)
+
+Freeze whole-date process isolation, single-coordinator queue ownership,
+fail-closed retry and duplicate rules, exact parity fields, and two certified
+canary dates. This phase is documentation and contract tests only. Parallel
+execution remains disabled.
+
+### H2-D-3 — Parallel Canary (not authorized)
+
+After separate approval, run exactly two process-isolated date jobs under the
+H2-D-2 contract. No within-date concurrency or evidence writes. Exact parity is
+mandatory.
+
+### H2-D-4 — Compute decision (not authorized)
+
+Use canary CPU, memory, database, provider, and wall-time measurements to decide
+whether any Render or Supabase sizing change is justified.
+
+### H2-D-5 — Scaled replay (not authorized)
+
+Scale only after the canary and compute decision pass a separate freeze gate.
+
+### H2-D-6 — Production gate (not authorized)
+
+Require operational receipts, rollback, alerting, and numerical parity before
+any continuous replay workload.
+
 ## Paper simulator phases
 
 The simulator is an isolated downstream research path governed by `SIMULATION_FREEZE.md`. SIM-0A is documentation-only. Only SIM-1 becomes authorized after SIM-0A is merged, and no later phase may be implemented early.

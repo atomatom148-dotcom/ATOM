@@ -7,7 +7,7 @@ This was a read-only audit. No production command was run and no forecast or
 outcome was written, replaced, or deleted.
 
 The certified `h2d-2026-07-22` receipt contains 752,040 forecast slots
-(62,670 frames × 12 families × 6 horizons), 62,670 outcomes, and 72 score
+(10,445 frames × 12 families × 6 horizons), 62,670 outcomes, and 72 score
 records. The six `q10_options_vol` score records are the only records with
 `eligible_count = 0`, `resolved_count = 0`, and null accuracy/error metrics.
 
