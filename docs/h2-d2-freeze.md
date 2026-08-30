@@ -194,7 +194,14 @@ canary must add and verify them before it can dispatch two dates.
    procfs start-time ticks. It binds the generation ID, supervisor record
    version, host/boot/PID-namespace identity, and cgroup path plus filesystem
    device/inode identity. Missing, stale, ambiguous, or changed identity fails
-   closed and leaves admission blocked. No guardian, worker, or descendant may
+   closed and leaves admission blocked. Before it creates a guardian, each
+   fixed supervisor must call `prctl(PR_SET_CHILD_SUBREAPER, 1)`, verify the
+   setting through `PR_GET_CHILD_SUBREAPER`, and remain the guardian's living
+   ancestor for the generation. Missing subreaper support or ancestry proof
+   stops admission. This makes the hung guardian's worker tree adoptable and
+   waitable by that exact supervisor after guardian termination; `pidfd`
+   signaling alone does not confer `waitid`/`waitpid` parentage. No guardian,
+   worker, or descendant may
    use or inherit the coordinator connection or liveness-pipe write end.
 7. A guardian holds its shared date fence from claim through terminal cleanup
    on success and every failure path while that database session exists. On
@@ -225,7 +232,10 @@ canary must add and verify them before it can dispatch two dates.
    another worker or provider/network I/O; its guardian's frozen shared
    date-fence advisory lock is the sole exception. The canary permits at most
    two replay-workload, two guardian-fence, and one coordinator-control
-   database connections at once.
+   database connections at once during ordinary execution. A cleanup takeover
+   permits at most one additional shared cleanup-fence connection per date,
+   opened only after fsynced `CLEANING` and closed immediately after final reap
+   and `populated 0`; it cannot execute replay queries or outlive terminalization.
 
 The fixed coordinator advisory lock enforces fast-path single ownership across
 processes and hosts connected to the evidence database. The selected execution
@@ -274,13 +284,30 @@ mathematics matches.
   replacement admission blocked.
 
   Once `CLEANING` is durable, the out-of-guardian watchdog enforces the cleanup
-  deadline even while the guardian is alive and hung. It freezes the exact
-  workload cgroup, invokes `cgroup.kill`, reaps the worker tree, and proves
-  `populated 0` before it signals the exact guardian through its `pidfd`, reaps
-  the guardian, and thereby permits the guardian-owned shared fence connection
-  to close. It then fsyncs the terminal deadline-failure receipt before the
-  supervisor's final `CLEAN` transition. No signal sent only by PID, cooperative
-  cancellation, guardian acknowledgement, or heartbeat age is cleanup proof.
+  deadline even while the guardian is alive and hung. Before terminating that
+  guardian, the supervisor opens a dedicated session-pinned read-only cleanup
+  fence connection, acquires the same date key in shared mode while the
+  guardian still holds its shared fence, verifies its exact backend ownership
+  through `pg_locks`, and records that handoff in the generation. The cleanup
+  fence is not a new owner or generation; it only preserves the exclusion gap
+  when guardian death closes the guardian-owned session. Failure to acquire or
+  verify it leaves the workload frozen, the state nonterminal, and replacement
+  admission blocked.
+
+  With that cleanup fence held, the watchdog performs this exact order: freeze
+  the exact workload cgroup; signal and `cgroup.kill` the worker tree if needed;
+  terminate the hung guardian through its verified `pidfd`; reap the guardian
+  through `waitid(P_PIDFD, ...)`; require the configured persistent subreaper to
+  adopt the worker and descendants; perform final `waitid`/`waitpid` reaping of
+  every adopted generation process; prove no generation child remains and
+  `cgroup.events` reports `populated 0`; then unlock and verify the supervisor's
+  cleanup fence exactly once. Only after that ordered fence release may it
+  fsync the terminal deadline-failure receipt and perform the supervisor's
+  final `CLEAN` transition. Guardian-session closure is not accepted as final
+  fence release because the overlapping supervisor cleanup fence remains held.
+  A process that has exited but is not wait-reaped is not terminal cleanup. No
+  signal sent only by PID, cooperative cancellation, guardian acknowledgement,
+  heartbeat age, or `populated 0` without wait-reaping is cleanup proof.
   Normal completion uses the same bounded
   kill-if-needed, reap, cgroup-empty, fence-release, and terminal-receipt path;
   it may not bypass cleanup merely because all four stage receipts validated.
@@ -462,16 +489,23 @@ They must exercise every named stage, the whole-date deadline, and normal
 completion. Each expiry must irrevocably fail its generation with no
 same-generation restart, resumption,
 readmission, or next-stage start and must prove the exact
-`CLEANING` → freeze → kill → full reap → `populated 0` → shared-fence release →
-terminal-receipt → `CLEAN` ordering. The normal case must prove the same bounded
+`CLEANING` → overlapping cleanup-fence claim → freeze → worker kill → guardian
+pidfd termination/reap → subreaper adoption → final worker wait-reap →
+`populated 0` → cleanup-fence release → terminal-receipt → `CLEAN` ordering.
+The normal case must prove the same bounded
 reap, empty-cgroup, fence-release, and terminal-receipt invariants without
 changing any mathematical or evidence hash. The hung-guardian cases must prove
 the supervisor-owned watchdog remains live outside the guardian, validates the
 exact generation and cgroup, wins the exact predecessor compare-and-swap,
-finishes cleanup while the guardian is still unresponsive, kills and reaps the
-guardian only after `populated 0`, and never treats heartbeat age as an
-ownership lease. Wrong-generation, stale-version, reused-PID, replaced-cgroup,
-and unverifiable-identity cases must remain nonterminal and block admission.
+begins cleanup while the guardian is still unresponsive, proves the supervisor
+was configured as the guardian's subreaper before admission, acquires the
+overlapping cleanup fence before guardian termination, reaps the guardian so
+the worker tree becomes adoptable, wait-reaps every adopted process before
+`populated 0` and cleanup-fence release, and never treats heartbeat age as an
+ownership lease. It must prove guardian-session closure alone never opens the
+date fence. Wrong-generation, stale-version, reused-PID, replaced-cgroup,
+missing-parentage, failed-adoption, failed-wait-reap, and unverifiable-identity
+cases must remain nonterminal and block admission.
 
 ## Explicit non-goals
 
