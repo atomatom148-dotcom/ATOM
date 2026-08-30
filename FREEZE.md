@@ -95,10 +95,10 @@ Each guardian must retain its shared fence until its dedicated Linux cgroup is
 frozen, killed, reaped, and proven empty. Durable supervisor generation state
 must independently block replacement across database-session loss under
 `docs/h2-d2-freeze.md`.
-The current H2-D-1 orchestrator, entry stages, and complete local H1 runtime
-dependency closure source digests, every frozen baseline value, and the exact
-72-metric hash byte encoding are pinned; a merely well-formed replacement
-digest is not accepted.
+H2-D-2 pins the canary's numerical outputs, evidence identities, lineage,
+counts, receipt correlation, stage order, and exact 72-metric hash encoding.
+It does not pin unrelated runtime or V9 source-file hashes; harmless source
+edits remain possible, while any behavioral or numerical drift fails parity.
 
 ## Forbidden until explicit freeze amendment
 
