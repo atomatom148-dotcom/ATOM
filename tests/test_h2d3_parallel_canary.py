@@ -412,13 +412,13 @@ def test_canary_deadline_covers_post_run_snapshot():
 
 def test_fresh_forecast_hashes_use_byte_order_with_no_trailing_separator():
     rows = [
-        SimpleNamespace(cutoff_at=1, quant_id="q2", horizon="1M", content_sha256="b" * 64),
-        SimpleNamespace(cutoff_at=1, quant_id="q1", horizon="30S", content_sha256="a" * 64),
-        SimpleNamespace(cutoff_at=2, quant_id="q1", horizon="30S", content_sha256="c" * 64),
+        SimpleNamespace(cutoff_at=1, quant_id="q1_momentum", horizon="1M", content_sha256="a" * 64),
+        SimpleNamespace(cutoff_at=1, quant_id="q10_options_vol", horizon="1M", content_sha256="b" * 64),
+        SimpleNamespace(cutoff_at=2, quant_id="q1_momentum", horizon="30S", content_sha256="c" * 64),
     ]
     artifact, ordered = canary._fresh_forecast_hashes(rows)
-    assert artifact == hashlib.sha256((("b" * 64) + ("a" * 64) + ("c" * 64)).encode()).hexdigest()
-    assert ordered == hashlib.sha256("\n".join(("a" * 64, "b" * 64, "c" * 64)).encode()).hexdigest()
+    assert artifact == hashlib.sha256((("a" * 64) + ("b" * 64) + ("c" * 64)).encode()).hexdigest()
+    assert ordered == hashlib.sha256("\n".join(("b" * 64, "a" * 64, "c" * 64)).encode()).hexdigest()
 
 
 def test_worker_reports_success_failure_and_closes_sender():
