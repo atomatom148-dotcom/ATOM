@@ -65,22 +65,23 @@ Add only the approved concurrent index for the frozen scoring query shape.
 Prove exact numerical parity and measure the optimized query on one certified
 replay.
 
-### H2-D-2 — Date-level parallel architecture freeze (current)
+### H2-D-2 — Date-level parallel architecture freeze (complete)
 
 Freeze whole-date process isolation, exactly two read-only workers, zero retry,
 exact parity fields, and two certified canary dates. This phase is documentation
 and contract tests only. Parallel execution remains disabled.
 
-### H2-D-3 — Parallel Canary (implementation authorized)
+### H2-D-3 — Parallel Canary (complete)
 
 Implement and run exactly two process-isolated date jobs under the H2-D-2
 contract. No within-date concurrency or evidence writes. Exact parity is
 mandatory. Passing does not enable scaled or scheduled replay.
 
-### H2-D-4 — Compute decision (not authorized)
+### H2-D-4 — Compute decision (complete)
 
 Use canary CPU, memory, database, provider, and wall-time measurements to decide
-whether any Render or Supabase sizing change is justified.
+whether any Render or Supabase sizing change is justified. The recorded decision
+is to keep both tiers unchanged; see `docs/h2-d4-compute-decision.md`.
 
 ### H2-D-5 — Scaled replay (not authorized)
 
