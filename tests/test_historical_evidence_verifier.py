@@ -1,9 +1,11 @@
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -128,6 +130,125 @@ def test_valid_receipt_is_deterministic_and_complete():
     assert db.cursors[1].binary is True
     assert db.cursors[1].itersize == 17
     assert "CASE quant_id" in db.sql[1] and "CASE horizon" in db.sql[1]
+
+
+def test_score_reader_connector_rejects_role_drift(monkeypatch):
+    import sys
+    import quant.historical_evidence_verifier as verifier_module
+
+    class Cursor:
+        def execute(self, sql):
+            assert sql == "SELECT current_user"
+
+        def fetchone(self):
+            return ("wrong_role",)
+
+        def close(self):
+            pass
+
+    connection = SimpleNamespace(
+        cursor=lambda: Cursor(), read_only=False, closed=False,
+        close=lambda: setattr(connection, "closed", True),
+        commit=lambda: None,
+    )
+    monkeypatch.setenv("HISTORICAL_SCORE_DATABASE_URL", "postgresql://test")
+    monkeypatch.setitem(
+        sys.modules, "psycopg",
+        SimpleNamespace(connect=lambda _url: connection),
+    )
+    with pytest.raises(RuntimeError, match="H2B_DATABASE_ROLE_MISMATCH"):
+        verifier_module.connect_score_reader_from_environment()
+    assert connection.read_only is True
+    assert connection.closed is True
+
+
+def test_score_reader_connector_accepts_only_exact_role(monkeypatch):
+    import sys
+    import quant.historical_evidence_verifier as verifier_module
+
+    class Cursor:
+        def execute(self, _sql):
+            pass
+
+        def fetchone(self):
+            return (verifier_module.HISTORICAL_SCORE_READER_ROLE,)
+
+        def close(self):
+            pass
+
+    commits = []
+    connection = SimpleNamespace(
+        cursor=lambda: Cursor(), read_only=False,
+        commit=lambda: commits.append(True),
+    )
+    monkeypatch.setenv("HISTORICAL_SCORE_DATABASE_URL", "postgresql://test")
+    monkeypatch.setitem(
+        sys.modules, "psycopg",
+        SimpleNamespace(connect=lambda _url: connection),
+    )
+    assert verifier_module.connect_score_reader_from_environment() is connection
+    assert connection.read_only is True
+    assert commits == [True]
+
+
+def test_score_reader_verification_sets_bounded_statement_timeout(monkeypatch):
+    import quant.historical_evidence_verifier as verifier_module
+
+    class Cursor:
+        def execute(self, sql, params):
+            assert "statement_timeout" in sql
+            assert params == ("1250ms",)
+
+        def close(self):
+            pass
+
+    connection = SimpleNamespace(cursor=lambda: Cursor())
+    expected = object()
+    monkeypatch.setattr(
+        verifier_module, "connect_score_reader_from_environment",
+        lambda: nullcontext(connection),
+    )
+    monkeypatch.setattr(
+        verifier_module.HistoricalEvidenceVerifier, "verify",
+        lambda _self, replay_run_id, **kwargs: (
+            expected if replay_run_id == RUN and
+            kwargs == {"expected_frame_count": 1} else None
+        ),
+    )
+    assert verifier_module.verify_from_score_environment(
+        RUN, statement_timeout_seconds=1.25, expected_frame_count=1,
+    ) is expected
+
+
+def test_stored_manifest_is_read_and_rehashed_through_score_reader(monkeypatch):
+    import quant.historical_evidence_verifier as verifier_module
+
+    forecast_rows = tuple(rows())
+    stored_row = manifest(forecast_rows)
+
+    class Cursor:
+        def __init__(self):
+            self.result = ()
+
+        def execute(self, sql, _params):
+            if "atom_historical_replay_runs" in sql:
+                self.result = (stored_row,)
+
+        def fetchmany(self, size):
+            assert size == 2
+            return self.result
+
+        def close(self):
+            pass
+
+    connection = SimpleNamespace(cursor=Cursor)
+    monkeypatch.setattr(
+        verifier_module, "connect_score_reader_from_environment",
+        lambda: nullcontext(connection),
+    )
+    observed = verifier_module.read_manifest_from_score_environment(RUN)
+    assert observed.replay_run_id == RUN
+    assert observed.content_sha256 == stored_row[-1]
 
 
 def test_postgresql_timestamptz_offset_is_normalized_to_h2a_utc_payload():

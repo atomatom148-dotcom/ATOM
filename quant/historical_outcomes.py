@@ -509,11 +509,31 @@ def score_from_environment(replay_run_id: str) -> ScoringReceipt:
 def resolve_outcomes_from_environment(
         replay_run_id: str, *, expected_dataset_digest: str,
         expected_configuration_digest: str, expected_frame_count: int,
-        require_existing: bool = False) -> int:
+        require_existing: bool = False,
+        timeout_seconds: float | None = None) -> int:
     """Resolve through only the dedicated append-only H2-C role."""
+    if (timeout_seconds is not None and
+            (not math.isfinite(timeout_seconds) or timeout_seconds <= 0)):
+        raise ValueError("timeout_seconds must be positive and finite")
+    deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+
+    def remaining() -> float | None:
+        if deadline is None:
+            return None
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise RuntimeError("H2D6_OUTCOME_TIMEOUT")
+        return value
+
     with _connect("HISTORICAL_OUTCOME_DATABASE_URL",
                   "atom_historical_outcome_resolver") as connection:
         cursor = connection.cursor()
+        current_timeout = remaining()
+        if current_timeout is not None:
+            cursor.execute(
+                "SELECT set_config('statement_timeout',%s,true)",
+                (f"{max(1, int(current_timeout * 1_000))}ms",),
+            )
         cursor.execute(
             "SELECT historical_session FROM public.atom_historical_replay_runs "
             "WHERE replay_run_id=%s", (replay_run_id,),
@@ -528,6 +548,14 @@ def resolve_outcomes_from_environment(
         quotes = reader.read_session(
             session_open=session_open, session_close=session_close,
         )
+        current_timeout = remaining()
+        if current_timeout is not None:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT set_config('statement_timeout',%s,true)",
+                (f"{max(1, int(current_timeout * 1_000))}ms",),
+            )
+            cursor.close()
         return HistoricalOutcomeResolver(connection).resolve(
             replay_run_id, quotes, retrieval_proof=reader.last_retrieval_proof,
             expected_dataset_digest=expected_dataset_digest,

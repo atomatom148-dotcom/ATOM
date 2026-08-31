@@ -37,6 +37,29 @@ def _require_equal(actual: object, expected: object, reason: str) -> None:
         raise PersistenceGateFailure(reason)
 
 
+def _remaining(deadline: float) -> float:
+    value = deadline - time.monotonic()
+    if value <= 0:
+        raise PersistenceGateFailure("H2D6_TIMEOUT")
+    return value
+
+
+def _stable_manifest_payload(manifest) -> dict:
+    payload = manifest.payload()
+    for field in ("stage_timings", "family_timings", "created_at"):
+        payload.pop(field)
+    return payload
+
+
+def _set_database_timeout(connection, timeout_seconds: float) -> None:
+    cursor = connection.cursor()
+    cursor.execute(
+        "SELECT set_config('statement_timeout',%s,true)",
+        (f"{max(1, int(timeout_seconds * 1_000))}ms",),
+    )
+    cursor.close()
+
+
 def _read_control(timeout_seconds: float) -> tuple[dict, dict, str]:
     return h2d5._capture_control(
         FROZEN_SESSION, FROZEN_RUN_ID, timeout_seconds,
@@ -62,17 +85,22 @@ def _require_frozen_control(snapshot: dict, score: dict,
                    "H2D6_D5_CONTROL_HASH")
 
 
-def _replay_and_retry_forecasts(snapshot: dict) -> dict:
+def _replay_and_retry_forecasts(snapshot: dict, timeout_seconds: float) -> dict:
     from .historical_evidence import (
         HistoricalEvidenceSpool, HistoricalEvidenceWriter, build_manifest,
         connect_writer_from_environment,
+    )
+    from .historical_evidence_verifier import (
+        read_manifest_from_score_environment,
     )
     from .historical_replay import AlpacaHistoricalSipReader
     from .historical_replay_h1 import _session, run_h1_session
 
     started = time.monotonic()
+    deadline = started + timeout_seconds
     opened, closed = _session(date.fromisoformat(FROZEN_SESSION))
     with HistoricalEvidenceSpool() as evidence:
+        _remaining(deadline)
         report = run_h1_session(
             reader=AlpacaHistoricalSipReader.from_environment(),
             session_open=opened,
@@ -81,6 +109,7 @@ def _replay_and_retry_forecasts(snapshot: dict) -> dict:
             maximum_interior_gap_seconds=5,
             forecast_evidence=evidence,
         )
+        _remaining(deadline)
         artifact_sha256, ordered_sha256 = h2d3._fresh_forecast_hashes(evidence)
         for field, expected in (
             ("historical_session", FROZEN_SESSION),
@@ -113,16 +142,27 @@ def _replay_and_retry_forecasts(snapshot: dict) -> dict:
         _require_equal(ordered_sha256,
                        snapshot["forecast_ordered_content_sha256"],
                        "H2D6_H1_ORDERED_HASH")
-        manifest = build_manifest(
+        fresh_manifest = build_manifest(
             report, evidence, git_commit=snapshot["git_commit"],
         )
-        _require_equal(manifest.content_sha256,
+        stored_manifest = read_manifest_from_score_environment(
+            FROZEN_RUN_ID,
+            statement_timeout_seconds=_remaining(deadline),
+        )
+        _require_equal(
+            _stable_manifest_payload(fresh_manifest),
+            _stable_manifest_payload(stored_manifest),
+            "H2D6_MANIFEST_CONTENT",
+        )
+        _require_equal(stored_manifest.content_sha256,
                        snapshot["manifest_content_sha256"],
                        "H2D6_MANIFEST_HASH")
         with connect_writer_from_environment() as connection:
+            _set_database_timeout(connection, _remaining(deadline))
             writes = HistoricalEvidenceWriter(connection).persist(
-                manifest, evidence, require_existing=True,
+                stored_manifest, evidence, require_existing=True,
             )
+        _remaining(deadline)
     _require_equal(writes, 0, "H2D6_FORECAST_RETRY_WROTE_EVIDENCE")
     return {
         "forecast_writes": writes,
@@ -132,7 +172,7 @@ def _replay_and_retry_forecasts(snapshot: dict) -> dict:
     }
 
 
-def _retry_outcomes(snapshot: dict) -> int:
+def _retry_outcomes(snapshot: dict, timeout_seconds: float) -> int:
     from .historical_outcomes import resolve_outcomes_from_environment
 
     return resolve_outcomes_from_environment(
@@ -141,32 +181,38 @@ def _retry_outcomes(snapshot: dict) -> int:
         expected_configuration_digest=snapshot["configuration_digest"],
         expected_frame_count=FROZEN_FRAME_COUNT,
         require_existing=True,
+        timeout_seconds=timeout_seconds,
     )
 
 
 def execute_persistence_gate(
         *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         control_reader: Callable[[float], tuple[dict, dict, str]] | None = None,
-        forecast_retry: Callable[[dict], dict] | None = None,
-        outcome_retry: Callable[[dict], int] | None = None) -> dict:
+        forecast_retry: Callable[[dict, float], dict] | None = None,
+        outcome_retry: Callable[[dict, float], int] | None = None) -> dict:
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive and finite")
     control_reader = control_reader or _read_control
     forecast_retry = forecast_retry or _replay_and_retry_forecasts
     outcome_retry = outcome_retry or _retry_outcomes
     started = time.monotonic()
+    deadline = started + timeout_seconds
 
-    pre_snapshot, pre_score, pre_sha256 = control_reader(timeout_seconds)
+    pre_snapshot, pre_score, pre_sha256 = control_reader(_remaining(deadline))
     _require_frozen_control(pre_snapshot, pre_score, pre_sha256)
-    forecast_receipt = forecast_retry(pre_snapshot)
+    forecast_receipt = forecast_retry(pre_snapshot, _remaining(deadline))
+    _remaining(deadline)
     _require_equal(forecast_receipt["forecast_writes"], 0,
                    "H2D6_FORECAST_RETRY_WROTE_EVIDENCE")
     outcome_started = time.monotonic()
-    outcome_writes = outcome_retry(pre_snapshot)
+    outcome_writes = outcome_retry(pre_snapshot, _remaining(deadline))
+    _remaining(deadline)
     outcome_seconds = time.monotonic() - outcome_started
     _require_equal(outcome_writes, 0,
                    "H2D6_OUTCOME_RETRY_WROTE_EVIDENCE")
-    post_snapshot, post_score, post_sha256 = control_reader(timeout_seconds)
+    post_snapshot, post_score, post_sha256 = control_reader(
+        _remaining(deadline),
+    )
     _require_frozen_control(post_snapshot, post_score, post_sha256)
     _require_equal(post_snapshot, pre_snapshot, "H2D6_EVIDENCE_DRIFT")
     _require_equal(post_score, pre_score, "H2D6_SCORE_DRIFT")
