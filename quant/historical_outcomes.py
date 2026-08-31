@@ -189,7 +189,10 @@ class HistoricalOutcomeResolver:
 
     def resolve(self, replay_run_id: str, quotes: Iterable[HistoricalSipQuote], *,
                 retrieval_proof: HistoricalSipRetrievalProof | None = None,
+                require_existing: bool = False,
                 **expected) -> int:
+        if not isinstance(require_existing, bool):
+            raise TypeError("require_existing must be bool")
         # Materialize and authenticate the re-fetch before acquiring the advisory
         # lock or attempting any outcome write.
         materialized = tuple(quotes)
@@ -250,9 +253,16 @@ class HistoricalOutcomeResolver:
             for row in rows:
                 batch.append(row)
                 if len(batch) == self.batch_size:
-                    inserted += self._write(cursor, replay_run_id, batch); batch.clear()
+                    inserted += self._write(
+                        cursor, replay_run_id, batch,
+                        require_existing=require_existing,
+                    )
+                    batch.clear()
             if batch:
-                inserted += self._write(cursor, replay_run_id, batch)
+                inserted += self._write(
+                    cursor, replay_run_id, batch,
+                    require_existing=require_existing,
+                )
             self.connection.commit()
             return inserted
         except Exception:
@@ -261,7 +271,8 @@ class HistoricalOutcomeResolver:
             cursor.close()
 
     @staticmethod
-    def _write(cursor, replay_run_id: str, rows: list[HistoricalOutcome]) -> int:
+    def _write(cursor, replay_run_id: str, rows: list[HistoricalOutcome], *,
+               require_existing: bool = False) -> int:
         values = [r.payload() for r in rows]
         expected = [{"cutoff_at": r.cutoff_at, "horizon": r.horizon,
                      "content_sha256": r.content_sha256} for r in rows]
@@ -272,6 +283,8 @@ class HistoricalOutcomeResolver:
         cursor.execute("SELECT count(*) FROM jsonb_to_recordset(%s::jsonb) x(cutoff_at timestamptz,horizon text) JOIN public.atom_historical_replay_outcomes o ON o.replay_run_id=%s AND o.cutoff_at=x.cutoff_at AND o.horizon=x.horizon", (_canonical(expected), replay_run_id))
         if cursor.fetchone()[0]:
             raise RuntimeError("H2C_OUTCOME_CONFLICT")
+        if require_existing:
+            raise RuntimeError("H2C_OUTCOME_MISSING")
         cursor.execute("INSERT INTO public.atom_historical_replay_outcomes (replay_run_id,cutoff_at,horizon,actual_return_bps,availability_status,unavailable_reason,cutoff_midpoint_at,cutoff_midpoint,target_midpoint_at,target_midpoint,data_schema_version,source_schema_version,resolution_spec_version,outcome_source_dataset_digest,content_sha256,resolved_at) SELECT replay_run_id,cutoff_at,horizon,actual_return_bps,availability_status,unavailable_reason,cutoff_midpoint_at,cutoff_midpoint,target_midpoint_at,target_midpoint,data_schema_version,source_schema_version,resolution_spec_version,outcome_source_dataset_digest,content_sha256,resolved_at FROM jsonb_to_recordset(%s::jsonb) x(replay_run_id text,cutoff_at timestamptz,horizon text,actual_return_bps float8,availability_status text,unavailable_reason text,cutoff_midpoint_at timestamptz,cutoff_midpoint float8,target_midpoint_at timestamptz,target_midpoint float8,data_schema_version text,source_schema_version text,resolution_spec_version text,outcome_source_dataset_digest text,content_sha256 text,resolved_at timestamptz)", (_canonical(values),))
         return len(rows)
 
@@ -493,6 +506,37 @@ def score_from_environment(replay_run_id: str) -> ScoringReceipt:
         return score(connection, replay_run_id)
 
 
+def resolve_outcomes_from_environment(
+        replay_run_id: str, *, expected_dataset_digest: str,
+        expected_configuration_digest: str, expected_frame_count: int,
+        require_existing: bool = False) -> int:
+    """Resolve through only the dedicated append-only H2-C role."""
+    with _connect("HISTORICAL_OUTCOME_DATABASE_URL",
+                  "atom_historical_outcome_resolver") as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT historical_session FROM public.atom_historical_replay_runs "
+            "WHERE replay_run_id=%s", (replay_run_id,),
+        )
+        session = cursor.fetchone()
+        cursor.close()
+        if session is None:
+            raise RuntimeError("H2C_MANIFEST_MISSING")
+        from .historical_replay_h1 import _session
+        session_open, session_close = _session(session[0])
+        reader = AlpacaHistoricalSipReader.from_environment()
+        quotes = reader.read_session(
+            session_open=session_open, session_close=session_close,
+        )
+        return HistoricalOutcomeResolver(connection).resolve(
+            replay_run_id, quotes, retrieval_proof=reader.last_retrieval_proof,
+            expected_dataset_digest=expected_dataset_digest,
+            expected_configuration_digest=expected_configuration_digest,
+            expected_frame_count=expected_frame_count,
+            require_existing=require_existing,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -504,32 +548,22 @@ def main() -> int:
     scoring = commands.add_parser("score", help="read-only immutable scoring")
     scoring.add_argument("replay_run_id")
     args = parser.parse_args(); started = time.monotonic()
-    environment_variable, expected_role = (
-        ("HISTORICAL_SCORE_DATABASE_URL", "atom_historical_score_reader")
-        if args.command in {"score", "verify-outcomes"} else
-        ("HISTORICAL_OUTCOME_DATABASE_URL", "atom_historical_outcome_resolver")
-    )
-    with _connect(environment_variable, expected_role) as connection:
-        if args.command == "score":
+    if args.command == "resolve-outcomes":
+        inserted = resolve_outcomes_from_environment(
+            args.replay_run_id,
+            expected_dataset_digest=args.dataset_digest,
+            expected_configuration_digest=args.configuration_digest,
+            expected_frame_count=args.frame_count,
+        )
+        output = {"replay_run_id": args.replay_run_id, "inserted": inserted}
+    else:
+        with _connect("HISTORICAL_SCORE_DATABASE_URL",
+                      "atom_historical_score_reader") as connection:
             connection.read_only = True
-            output = score(connection, args.replay_run_id).payload()
-        elif args.command == "verify-outcomes":
-            connection.read_only = True
-            output = verify_outcomes(connection, args.replay_run_id).payload()
-        else:
-            # Re-fetch the same frozen SIP session identified by the verified manifest.
-            c = connection.cursor(); c.execute("SELECT historical_session FROM public.atom_historical_replay_runs WHERE replay_run_id=%s", (args.replay_run_id,)); session = c.fetchone(); c.close()
-            if session is None: raise RuntimeError("H2C_MANIFEST_MISSING")
-            from .historical_replay_h1 import _session
-            session_open, session_close = _session(session[0])
-            reader = AlpacaHistoricalSipReader.from_environment()
-            quotes = reader.read_session(session_open=session_open, session_close=session_close)
-            inserted = HistoricalOutcomeResolver(connection).resolve(args.replay_run_id, quotes,
-                retrieval_proof=reader.last_retrieval_proof,
-                expected_dataset_digest=args.dataset_digest,
-                expected_configuration_digest=args.configuration_digest,
-                expected_frame_count=args.frame_count)
-            output = {"replay_run_id": args.replay_run_id, "inserted": inserted}
+            if args.command == "score":
+                output = score(connection, args.replay_run_id).payload()
+            else:
+                output = verify_outcomes(connection, args.replay_run_id).payload()
     output |= {"elapsed_seconds": round(time.monotonic()-started, 6),
                "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
     print(_canonical(output)); return 0

@@ -83,16 +83,19 @@ Use canary CPU, memory, database, provider, and wall-time measurements to decide
 whether any Render or Supabase sizing change is justified. The recorded decision
 is to keep both tiers unchanged; see `docs/h2-d4-compute-decision.md`.
 
-### H2-D-5 — Scaled replay (implementation authorized)
+### H2-D-5 — Scaled replay (complete)
 
 Run one bounded four-date, read-only scale proof in two ordered batches of two
 workers under `docs/h2-d5-freeze.md`. No scheduler, evidence writes, or tier
 changes are authorized.
 
-### H2-D-6 — Production gate (not authorized)
+### H2-D-6 — Historical-persistence gate (implementation authorized)
 
-Require operational receipts, rollback, alerting, and numerical parity before
-any continuous replay workload.
+Run one exact retry of the smallest H2-D-5 session through the existing
+least-privilege forecast and outcome persistence seams. Both seams must return
+zero writes and the pre/post control must remain exact under
+`docs/h2-d6-persistence-gate-freeze.md`. No new date or continuous replay is
+authorized.
 
 ## Paper simulator phases
 
