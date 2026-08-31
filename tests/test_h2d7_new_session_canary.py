@@ -166,6 +166,25 @@ def test_canary_requires_the_exact_sequential_stage_set():
         _execute(stages=stages)
 
 
+def test_canary_exposes_the_failed_batch_stage_and_reason():
+    batch_receipt = _batch()
+    batch_receipt.update(
+        overall_status="FAILED",
+        completed=[],
+        failed=[canary.FROZEN_SESSION],
+        sessions=[{
+            "state": "FAILED",
+            "failed_stage": "H1",
+            "reason": "EXIT_1",
+        }],
+    )
+    with pytest.raises(
+        canary.NewSessionCanaryFailure,
+        match="H2D7_BATCH_STATUS:H1:EXIT_1",
+    ):
+        _execute(batch_receipt=batch_receipt)
+
+
 @pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
 def test_canary_rejects_unbounded_timeout(timeout):
     with pytest.raises(ValueError, match="positive and finite"):
