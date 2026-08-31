@@ -215,11 +215,13 @@ After applying the precedence in Section 3:
 - a pre-runtime publication with no open occupancy produces `SKIPPED_RESTART_GAP`; and
 - every other late actionable intent produces `SKIPPED_WINDOW_EXPIRED`.
 
-A handoff or processing time exactly equal to `entry_deadline_at` is not late. At exact equality, the worker may inspect already-buffered quotes under the original inclusive deadline rules. If no valid executable quote is available, it immediately persists `SKIPPED_WINDOW_EXPIRED` and does not leave the intent pending.
+A handoff or processing time exactly equal to `entry_deadline_at` is not late. At exact equality, the worker may inspect already-buffered quotes under the original inclusive deadline rules. If no valid executable quote is currently buffered, the intent remains pending; equality alone must not finalize `SKIPPED_WINDOW_EXPIRED`.
 
-An intent processed before its deadline may become pending only until its exact deadline. The worker's blocking wait must be bounded by the earliest pending deadline so expiry does not depend on a later market event.
+The worker finalizes an otherwise-unfilled pending intent as `SKIPPED_WINDOW_EXPIRED` only after a subsequent injected UTC clock read is strictly greater than `entry_deadline_at`. Before finalizing, it drains every SIM-4 event already admitted to the FIFO queue whose immutable admission timestamp is less than or equal to `entry_deadline_at`, in normal FIFO order. A quote callback with `accepted_at <= entry_deadline_at` that completes `put_nowait` before that strictly-greater expiry observation is therefore accounted for before expiry. A quote callback that has not completed queue admission by that observation is not an admitted SIM-4 event and cannot be reconstructed or applied retroactively.
 
-No intent delivered or processed after its deadline may produce `ENTERED`, even if a buffered quote would otherwise satisfy the provider-time predicates.
+An intent processed before its deadline may become pending only until this exact strictly-greater expiry boundary. The worker's blocking wait must be bounded by the earliest pending deadline and, on equality, must continue until the first strictly-greater clock observation after accounting for already-admitted equality-boundary events. Expiry does not depend on a later market event.
+
+No intent handed off or first processed strictly after its deadline may produce `ENTERED`, even if a buffered quote would otherwise satisfy the provider-time predicates.
 
 ## 5. Exact quote-buffer eviction
 
@@ -319,9 +321,12 @@ SIM-4 implementation must add tests for all original SIM-3A requirements and the
 - open-position collision still precedes late expiry;
 - restart gap still precedes late expiry when no position is open;
 - handoff exactly at deadline follows the inclusive boundary;
-- processing exactly at deadline may use only an already-buffered valid quote;
-- equality with no valid quote expires immediately;
-- pending wait is bounded by the earliest deadline; and
+- processing exactly at deadline may use an already-buffered valid quote;
+- equality with no valid quote remains pending rather than expiring immediately;
+- an equality-boundary quote admitted before the first strictly-greater expiry observation is processed before expiry;
+- a quote not admitted by the strictly-greater expiry observation is never reconstructed or applied retroactively;
+- pending wait is bounded by the earliest deadline and then the first strictly-greater clock observation;
+- expiry does not require a later market event; and
 - runtime clock failure does not affect SIM-1/SIM-2 persistence or production.
 
 ### Quote eviction
