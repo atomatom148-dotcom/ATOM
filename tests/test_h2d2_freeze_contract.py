@@ -19,6 +19,7 @@ ROOT_FREEZE = ROOT / "FREEZE.md"
 PHASES = ROOT / "PHASES.md"
 FREEZE = ROOT / "docs" / "h2-d2-freeze.md"
 BASELINES = ROOT / "docs" / "h2-d2-canary-baselines.json"
+H2D4_DECISION = ROOT / "docs" / "h2-d4-compute-decision.md"
 Q10_AUDIT = ROOT / "docs" / "audits" / "h2d-2026-07-22-q10-options-vol.md"
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -204,10 +205,16 @@ def test_freeze_requires_exact_behavior_parity_and_no_writes() -> None:
 def test_root_freeze_and_phase_boundary_remain_explicit() -> None:
     root_law = _law(ROOT_FREEZE)
     phases = _law(PHASES)
+    compute_decision = _law(H2D4_DECISION)
     assert "H2-D-2 is a design freeze only" in root_law
     assert "not unrelated runtime or V9 source-file hashes" in root_law
-    assert "H2-D-3 — Parallel Canary (implementation authorized)" in phases
+    assert "H2-D-3 — Parallel Canary (complete)" in phases
     assert "No within-date concurrency or evidence writes" in phases
+    assert "H2-D-4 — Compute decision (complete)" in phases
+    assert "H2-D-5 — Scaled replay (not authorized)" in phases
+    assert "keep current Render and Supabase tiers" in compute_decision
+    assert "1.9470569578619206" in compute_decision
+    assert "Evidence writes | `0`" in compute_decision
 
 
 def test_q10_audit_uses_frames_not_outcomes_in_forecast_equation() -> None:
