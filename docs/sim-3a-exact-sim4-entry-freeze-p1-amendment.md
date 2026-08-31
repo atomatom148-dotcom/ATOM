@@ -45,24 +45,23 @@ recovery_lower_bound = runtime_started_at - exactly 2 seconds
 owned pre-start interval = [recovery_lower_bound, runtime_started_at)
 ```
 
-An unmatched intent with `publication_at < recovery_lower_bound` is outside SIM-4 runtime ownership. Whether it arrives through startup recovery, a delayed live callback, or replayed callback, SIM-4 must end without creating an entry row, scanning quotes, or classifying collision, restart gap, or expiry. Equality at `recovery_lower_bound` is owned. This preserves the original no-historical-backfill boundary.
+Before any entry-store transaction or quote scan, SIM-4 applies the ownership gate using only the immutable intent and the active runtime's `runtime_started_at`. An unmatched intent with `publication_at < recovery_lower_bound` is outside SIM-4 runtime ownership. Whether it arrives through startup recovery, a delayed live callback, or replayed callback, SIM-4 must return without creating or reading an entry row, scanning quotes, or classifying collision, restart gap, or expiry. Equality at `recovery_lower_bound` is owned. This preserves the original no-historical-backfill boundary.
 
-For every owned actionable intent, the following precedence is binding. No later item may override an earlier item:
+For every remaining owned actionable intent, the following precedence is binding. No later item may override an earlier item:
 
-1. Begin a short entry transaction and acquire both the active-worker fence required by section 4.1 and the exact horizon advisory lock frozen in section 4.2.
-2. Under those locks, read any terminal entry row for the same `intent_id`. If one exists, validate and return the frozen idempotent result.
-3. If the intent is pre-start and older than `recovery_lower_bound`, end the transaction without an entry row under the ownership rule above.
-4. Under the same horizon lock, read durable open occupancy for the intent horizon.
-5. If a durable open `ENTERED` row exists, persist or validate `SKIPPED_POSITION_OPEN` with that row's exact `entry_id` as `blocking_entry_id`.
-6. Otherwise, if `publication_at < runtime_started_at`, persist or validate `SKIPPED_RESTART_GAP`.
-7. Otherwise, if the live intent is late under section 3.1, persist or validate `SKIPPED_WINDOW_EXPIRED`.
-8. Otherwise, end the short classification transaction without an entry row and admit the intent to the normal bounded quote-selection window.
+1. On the sole connection already holding the active-worker fence from section 4.1, begin a short entry transaction and acquire the exact horizon advisory lock frozen in section 4.2.
+2. Under that horizon lock, read any terminal entry row for the same `intent_id`. If one exists, validate and return the frozen idempotent result.
+3. Under the same horizon lock, read durable open occupancy for the intent horizon.
+4. If a durable open `ENTERED` row exists, persist or validate `SKIPPED_POSITION_OPEN` with that row's exact `entry_id` as `blocking_entry_id`.
+5. Otherwise, if `publication_at < runtime_started_at`, persist or validate `SKIPPED_RESTART_GAP`.
+6. Otherwise, if the live intent is late under section 3.1, persist or validate `SKIPPED_WINDOW_EXPIRED`.
+7. Otherwise, end the short classification transaction without an entry row and admit the intent to the normal bounded quote-selection window.
 
 The short classification transaction must commit an immediate terminal row or end without one; it must never remain open while waiting for a quote.
 
-When a pending intent later reaches quote selection or expiry, its terminal transaction must reacquire the active-worker fence condition and the same horizon advisory lock and repeat, in order, the existing-intent idempotency read and durable-occupancy read before choosing a terminal result. A blocker found then produces `SKIPPED_POSITION_OPEN`; only a still-unblocked intent may become `ENTERED` or `SKIPPED_WINDOW_EXPIRED`.
+When a pending intent later reaches quote selection or expiry, its terminal transaction must run on the same still-fenced connection, reacquire the same horizon advisory lock, and repeat, in order, the existing-intent idempotency read and durable-occupancy read before choosing a terminal result. A blocker found then produces `SKIPPED_POSITION_OPEN`; only a still-unblocked intent may become `ENTERED` or `SKIPPED_WINDOW_EXPIRED`.
 
-`NO_TRADE` and `UNAVAILABLE` intents retain their exact immediate mappings only inside the same bounded ownership interval. Older unmatched pre-start non-actionable intents remain untouched.
+`NO_TRADE` and `UNAVAILABLE` intents retain their exact immediate mappings only after passing the same bounded ownership gate. Older unmatched pre-start non-actionable intents remain untouched.
 
 Within the owned interval, collision precedence applies both to startup recovery and to a live intent delivered after a worker restart. A recent unmatched actionable intent for a horizon already occupied by a durable `ENTERED` row is always `SKIPPED_POSITION_OPEN`, never `SKIPPED_RESTART_GAP`, and preserves the exact blocker ID. `SKIPPED_RESTART_GAP` is permitted only when no durable blocker exists.
 
@@ -86,9 +85,9 @@ After the ownership, collision, and restart checks in section 2, a live actionab
 intent_observed_at > entry_deadline_at
 ```
 
-A live actionable intent observed exactly at the inclusive deadline is not late. A late intent becomes `SKIPPED_WINDOW_EXPIRED` without scanning, selecting, or reconstructing any quote that was not already successfully enqueued by the watermark rule in section 3.2. Database insertion delay, SIM-3 callback delay, event-queue delay, and worker backlog do not extend the frozen two-second window.
+A live actionable intent observed exactly at the inclusive deadline is not late. An intent first observed after its deadline immediately becomes `SKIPPED_WINDOW_EXPIRED` after the locked precedence checks, without a quote-buffer scan, queued-event drain, or expiry watermark, even if an older quote's timestamps would fit the historical window. Database insertion delay, SIM-3 callback delay, event-queue delay, and worker backlog do not extend the frozen two-second window.
 
-### 3.2 Exact event sequence and expiry watermark
+### 3.2 Exact event sequence and pending-intent expiry watermark
 
 The one active worker owns one submission mutex and one monotonically increasing operational enqueue sequence:
 
@@ -101,7 +100,7 @@ Intent and quote adapters acquire the submission mutex only for bounded event co
 
 For a quote event, the injected `accepted_at` clock read occurs inside the same submission critical section immediately before the successful `put_nowait`. A quote event that is not successfully enqueued is not admitted to SIM-4 and cannot satisfy an intent.
 
-The worker processes the event queue in ascending enqueue sequence and tracks `last_processed_sequence`. When it first observes that a pending intent satisfies:
+The worker processes the event queue in ascending enqueue sequence and tracks `last_processed_sequence`. When it first observes that an already-pending intent satisfies:
 
 ```text
 entry_deadline_at < worker_now
@@ -113,13 +112,13 @@ it snapshots, under the submission mutex:
 expiry_watermark = last_successful_enqueue_sequence
 ```
 
-The watermark is fixed for that expiry decision. The worker must continue FIFO processing until `last_processed_sequence >= expiry_watermark` before persisting `SKIPPED_WINDOW_EXPIRED` for that intent. Every valid quote event with sequence at or below the watermark is therefore admitted or rejected under the frozen quote rules before expiry; a quote among them with `accepted_at <= entry_deadline_at` remains eligible even when worker or database backlog causes it to be processed after the wall-clock deadline.
+The watermark is fixed for that pending-intent expiry decision. The worker must continue FIFO processing until `last_processed_sequence >= expiry_watermark` before persisting `SKIPPED_WINDOW_EXPIRED` for that intent. Every valid quote event with sequence at or below the watermark is therefore admitted or rejected under the frozen quote rules before expiry; a quote among them with `accepted_at <= entry_deadline_at` remains eligible even when worker or database backlog causes it to be processed after the wall-clock deadline.
 
 Events successfully enqueued after the watermark have greater sequences and cannot delay or alter that expiry decision. Continuous producers cannot move an existing watermark. If an eligible quote produces `ENTERED` or a collision produces `SKIPPED_POSITION_OPEN` while the watermark is draining, no expiry row is created.
 
 ### 3.3 Exact age-based quote eviction
 
-For each deadline sweep, the worker first completes every due intent's fixed expiry watermark from section 3.2 and terminalizes those decisions. It then reads the injected UTC clock once as `eviction_now` and computes:
+For each deadline sweep, the worker first completes every due pending intent's fixed expiry watermark from section 3.2 and terminalizes those decisions. It then reads the injected UTC clock once as `eviction_now` and computes:
 
 ```text
 quote_eviction_cutoff = eviction_now - exactly 2 seconds
@@ -158,9 +157,11 @@ SELECT pg_try_advisory_lock(
 );
 ```
 
-The worker obtains one dedicated connection from the existing simulator connection factory and calls the acquisition exactly once per attempt. Only a `true` result activates that worker. The fence connection is also the sole connection on which that active worker performs SIM-4 recovery reads and entry-store transactions. Cursors still close after each operation and every transaction commits or rolls back; the fence connection itself remains open only for the fenced runtime and closes at deactivation. This dedicated runtime connection is the sole exception to earlier per-operation connection-close language.
+The worker obtains one dedicated connection from the existing simulator connection factory and calls the acquisition exactly once per activation attempt. Only a `true` result activates that worker. A repeated `start()` on an already active worker is idempotent and must not call the re-entrant advisory-lock function again.
 
-A worker that receives `false` is inactive. It may retry in its daemon lifecycle no more often than once every exactly 100 milliseconds, but it must not read `runtime_started_at`, run recovery, accept or queue intent or quote events, retain a quote buffer, or perform an entry read or write before acquiring the fence. Its adapters return immediately without affecting production or SIM-3.
+The fence connection is also the sole connection on which that active worker performs SIM-4 recovery reads and entry-store transactions. Cursors still close after each operation and every transaction commits or rolls back; the fence connection itself remains open only for the fenced runtime and closes at deactivation. This dedicated runtime connection is the sole exception to earlier per-operation connection-close language.
+
+A worker that receives `false` is inactive. It may retry in its daemon lifecycle only after at least exactly 100 milliseconds have elapsed, but it must not read `runtime_started_at`, run recovery, accept or queue intent or quote events, retain a quote buffer, or perform an entry read or write before acquiring the fence. Its adapters return immediately without affecting production or SIM-3.
 
 After acquiring the fence, the worker clears all operational queue and buffer state, reads `runtime_started_at` exactly once, runs bounded recovery, and only then atomically enables event intake. No event collected while inactive may cross the activation boundary.
 
@@ -173,7 +174,7 @@ SELECT pg_advisory_unlock(
 );
 ```
 
-and closes the fence connection. If the one-second join bound is reached, the worker is first marked inactive and its sole fence/store connection is closed so any in-flight transaction rolls back and no further terminal write is possible; process shutdown then continues without voluntarily handing an active writer to the next version.
+The unlock must return `true`, after which the worker closes the fence connection. A `false` result is a fence failure and forces immediate connection close with the worker inactive. If the one-second join bound is reached, the worker is first marked inactive and its sole fence/store connection is closed so any in-flight transaction rolls back and no further terminal write is possible; process shutdown then continues.
 
 If the fence connection is lost, the worker immediately becomes inactive, drops its in-memory queue, pending state, and quote buffer, and may not perform another entry read or write. Reacquisition creates a fresh fenced runtime with a new `runtime_started_at` and the exact bounded restart rules. It may not resume old in-memory candidates.
 
@@ -213,23 +214,25 @@ The SIM-4 implementation test obligation is extended by exactly these cases:
 - missing, duplicate, unknown, or non-SIP feed identity produces no SIM-4 quote event;
 - SIM-4 neither mutates the shared production request nor creates a second provider request;
 - the bounded owned pre-start interval is exactly `[runtime_started_at - 2 seconds, runtime_started_at)`;
-- an older unmatched pre-start intent, including a delayed live callback, creates no entry row;
+- an older unmatched pre-start intent, including a delayed live callback, creates and reads no entry row;
 - equality at the recovery lower bound remains owned;
 - a recovered durable blocker inside the owned interval yields `SKIPPED_POSITION_OPEN`, not `SKIPPED_RESTART_GAP`, with the exact blocker ID;
 - restart gap is emitted only for an owned actionable pre-start intent with no durable blocker;
-- transaction start, active fence, and exact horizon-lock acquisition precede the idempotency read;
+- transaction start and exact horizon-lock acquisition occur on the connection already holding the active fence and precede the idempotency read;
 - the first and repeated terminal transactions both recheck idempotency before occupancy;
 - no database transaction remains open while an intent waits for a quote;
 - successful queue events receive gap-free increasing operational sequences and dropped events consume no sequence;
 - quote `accepted_at` and successful enqueue occur under the same bounded submission critical section;
 - `intent_observed_at == entry_deadline_at` remains eligible for normal selection;
-- the first representable time after the deadline starts a fixed expiry watermark rather than immediate expiry;
-- every already-enqueued quote at or below that watermark is processed before expiry;
+- an intent first observed after the deadline expires immediately without a quote scan or watermark;
+- the first worker observation after the deadline for an already-pending intent starts a fixed expiry watermark rather than immediate expiry;
+- every already-enqueued quote at or below that watermark is processed before pending-intent expiry;
 - a watermark does not advance when later events arrive and remains bounded under continuous production;
 - expired pending intents complete their watermarks before age eviction;
 - quotes strictly older than `eviction_now - 2 seconds` are evicted before capacity testing;
 - a stale full buffer cannot permanently reject new quotes after age eviction;
 - the exact session fence SQL and `(209182638, -1)` key are used;
+- repeated active `start()` calls do not increase the session lock count;
 - two rolling workers cannot both activate, accept events, or write entries;
 - an inactive worker carries no queue or quote state into activation;
 - fence loss disables writes, rolls back in-flight work, and requires fresh bounded recovery;
