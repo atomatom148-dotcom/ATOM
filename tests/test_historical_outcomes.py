@@ -283,6 +283,15 @@ class ResolverContractTests(unittest.TestCase):
             HistoricalOutcomeResolver._write(conflict,"run",[self.make_outcome()])
         self.assertFalse(any(sql.startswith("INSERT") for sql in conflict.sql))
 
+    def test_compare_only_retry_refuses_missing_outcome_before_insert(self):
+        from quant.historical_outcomes import HistoricalOutcomeResolver
+        missing = _WriteCursor([(1, 0), (0,)])
+        with self.assertRaisesRegex(RuntimeError, "H2C_OUTCOME_MISSING"):
+            HistoricalOutcomeResolver._write(
+                missing, "run", [self.make_outcome()], require_existing=True,
+            )
+        self.assertFalse(any(sql.startswith("INSERT") for sql in missing.sql))
+
     def test_unverified_replay_is_rejected_before_cursor_or_writes(self):
         from types import SimpleNamespace
         from unittest.mock import patch

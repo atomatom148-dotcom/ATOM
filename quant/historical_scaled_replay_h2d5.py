@@ -52,12 +52,12 @@ def _capture_control(day: str, replay_run_id: str,
             raise ScaledReplayFailure("H2D5_CONTROL_TIMEOUT")
         return value
 
-    from .historical_evidence_verifier import verify_from_environment
+    from .historical_evidence_verifier import verify_from_score_environment
     from .historical_outcomes import (score_from_environment,
                                       verify_outcomes_from_environment)
 
     h2b = h2d3._retry_database_read(
-        verify_from_environment, replay_run_id,
+        verify_from_score_environment, replay_run_id,
         retry_result=h2d3._database_interrupted,
         statement_timeout_seconds=remaining(),
     )

@@ -127,6 +127,19 @@ def test_exact_retry_is_idempotent():
     assert connection.commits == 1
 
 
+def test_compare_only_retry_refuses_missing_manifest_before_insert():
+    rows = _rows()
+    manifest = build_manifest(_report(), rows, git_commit="93e63bf")
+    connection = Connection()
+    with pytest.raises(RuntimeError, match="MANIFEST_MISSING"):
+        HistoricalEvidenceWriter(connection).persist(
+            manifest, rows, require_existing=True,
+        )
+    statements = [sql for sql, _params in connection.statements]
+    assert not any(sql.startswith("INSERT INTO") for sql in statements)
+    assert connection.rollbacks == 1 and connection.commits == 0
+
+
 def test_same_identity_with_different_manifest_fails_closed():
     rows = _rows()
     manifest = build_manifest(_report(), rows, git_commit="93e63bf")

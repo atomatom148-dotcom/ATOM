@@ -1,8 +1,12 @@
 # H2-D-5 bounded scaled-replay freeze
 
-**Status:** LAW — implementation authorized; execution not yet passed  
-**Current runtime:** H2-D-1 sequential  
-**Next gate:** one four-session read-only scale proof
+**Status:** LAW — implementation and bounded execution complete
+**Current runtime:** H2-D-1 sequential
+**Final receipt:** `PASSED` at `2026-08-31T05:16:56Z`
+
+The bounded proof completed in `5992.709975` seconds with two workers, zero
+evidence writes, an unchanged pre/post control, zero surviving workers, and a
+peak worker RSS of `423344 KiB`. Render and Supabase tiers remained unchanged.
 
 ## Decision
 
@@ -56,5 +60,5 @@ evidence insert, update, delete, repair, or recertification is authorized.
 H2-D-5 authorizes no Render or Supabase tier change, scheduler, continuous
 replay, production deployment, baseline rewrite, V9 change, or evidence write.
 Production `atom-v9-thin` remains untouched. Passing this proof returns the
-benchmark service to `sleep infinity` and suspension. H2-D-6 remains
-unauthorized until the H2-D-5 receipt passes a separate freeze decision.
+benchmark service to `sleep infinity` and suspension. H2-D-6 remains a separate
+gate governed only by `docs/h2-d6-persistence-gate-freeze.md`.

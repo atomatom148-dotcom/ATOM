@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import tempfile
 from typing import Iterable, Iterator
@@ -14,6 +15,7 @@ from typing import Iterable, Iterator
 
 HISTORICAL_EVIDENCE_SCHEMA_VERSION = "H2-A-1"
 DEFAULT_BATCH_SIZE = 2_000
+HISTORICAL_EVIDENCE_WRITER_ROLE = "atom_historical_replay_writer"
 
 
 def _canonical(value: object) -> str:
@@ -198,7 +200,10 @@ class HistoricalEvidenceWriter:
             yield tuple(batch)
 
     def persist(self, manifest: HistoricalReplayManifest,
-                forecasts: Iterable[HistoricalForecastEvidence]) -> int:
+                forecasts: Iterable[HistoricalForecastEvidence], *,
+                require_existing: bool = False) -> int:
+        if not isinstance(require_existing, bool):
+            raise TypeError("require_existing must be bool")
         if manifest.execution_stage != "REPLAY_COMPLETE" or manifest.certification_status != "CERTIFIED":
             raise ValueError("only REPLAY_COMPLETE + CERTIFIED runs may persist")
         if artifact_sha256(forecasts) != manifest.artifact_sha256:
@@ -227,6 +232,8 @@ class HistoricalEvidenceWriter:
                     raise RuntimeError("HISTORICAL_REPLAY_FORECAST_CONFLICT")
                 self.connection.commit()
                 return 0
+            if require_existing:
+                raise RuntimeError("HISTORICAL_REPLAY_MANIFEST_MISSING")
             payload = manifest.payload() | {"content_sha256": manifest.content_sha256}
             cursor.execute("INSERT INTO public.atom_historical_replay_runs (replay_run_id,historical_session,execution_stage,certification_status,git_commit,configuration_digest,dataset_digest,session_digest,artifact_sha256,frame_count,quote_counts,available_observation_count,unavailable_observation_count,stage_timings,family_timings,data_schema_version,source_schema_version,created_at,content_sha256) SELECT replay_run_id,historical_session,execution_stage,certification_status,git_commit,configuration_digest,dataset_digest,session_digest,artifact_sha256,frame_count,quote_counts,available_observation_count,unavailable_observation_count,stage_timings,family_timings,data_schema_version,source_schema_version,created_at,content_sha256 FROM jsonb_to_record(%s::jsonb) AS x(replay_run_id text,historical_session date,execution_stage text,certification_status text,git_commit text,configuration_digest text,dataset_digest text,session_digest text,artifact_sha256 text,frame_count bigint,quote_counts jsonb,available_observation_count bigint,unavailable_observation_count bigint,stage_timings jsonb,family_timings jsonb,data_schema_version text,source_schema_version text,created_at timestamptz,content_sha256 text)", (_canonical(payload),))
             inserted = 0
@@ -243,3 +250,27 @@ class HistoricalEvidenceWriter:
             close = getattr(cursor, "close", None)
             if callable(close):
                 close()
+
+
+def connect_writer_from_environment():
+    """Open the H2-A writer connection and fail closed on role drift."""
+    database_url = os.environ.get("HISTORICAL_EVIDENCE_DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("HISTORICAL_EVIDENCE_DATABASE_URL is required")
+    import psycopg
+
+    connection = psycopg.connect(database_url)
+    try:
+        cursor = connection.cursor()
+        cursor.execute("SELECT current_user")
+        role = cursor.fetchone()[0]
+        cursor.close()
+        if role != HISTORICAL_EVIDENCE_WRITER_ROLE:
+            raise RuntimeError(
+                f"H2A_DATABASE_ROLE_MISMATCH:{HISTORICAL_EVIDENCE_WRITER_ROLE}"
+            )
+        connection.commit()
+        return connection
+    except Exception:
+        connection.close()
+        raise

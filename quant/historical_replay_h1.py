@@ -1446,17 +1446,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             if report.execution_stage != "REPLAY_COMPLETE" or report.data_status != "CERTIFIED":
                 print(json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":")))
                 return 2
-            database_url = os.environ.get("HISTORICAL_EVIDENCE_DATABASE_URL")
-            if not database_url:
-                parser.error("HISTORICAL_EVIDENCE_DATABASE_URL is required to persist")
-            import psycopg
-            from .historical_evidence import HistoricalEvidenceWriter, build_manifest
+            from .historical_evidence import (
+                HistoricalEvidenceWriter, build_manifest,
+                connect_writer_from_environment,
+            )
             git_commit = arguments.git_commit or subprocess.run(
                 ("git", "rev-parse", "HEAD"), check=True, capture_output=True,
                 text=True,
             ).stdout.strip()
             manifest = build_manifest(report, evidence, git_commit=git_commit)
-            with psycopg.connect(database_url) as connection:
+            with connect_writer_from_environment() as connection:
                 writes = HistoricalEvidenceWriter(connection).persist(
                     manifest, evidence,
                 )

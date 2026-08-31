@@ -21,6 +21,7 @@ QUANTS = tuple(f"q{i}_{name}" for i, name in enumerate((
     "options_vol", "regime", "event_session"), 1))
 HORIZONS = ("30S", "1M", "5M", "15M", "30M", "1H")
 SLOTS = frozenset((quant, horizon) for quant in QUANTS for horizon in HORIZONS)
+HISTORICAL_SCORE_READER_ROLE = "atom_historical_score_reader"
 
 MANIFEST_COLUMNS = (
     "replay_run_id", "historical_session", "execution_stage", "certification_status",
@@ -297,6 +298,79 @@ def verify_from_environment(replay_run_id: str, *,
             )
             cursor.close()
         return HistoricalEvidenceVerifier(connection).verify(replay_run_id, **expected)
+
+
+def connect_score_reader_from_environment():
+    """Open the exact read-only H2 score-reader credential."""
+    database_url = os.environ.get("HISTORICAL_SCORE_DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("HISTORICAL_SCORE_DATABASE_URL is required")
+    import psycopg
+    connection = psycopg.connect(database_url)
+    connection.read_only = True
+    cursor = connection.cursor()
+    cursor.execute("SELECT current_user")
+    role = cursor.fetchone()[0]
+    cursor.close()
+    if role != HISTORICAL_SCORE_READER_ROLE:
+        connection.close()
+        raise RuntimeError(
+            f"H2B_DATABASE_ROLE_MISMATCH:{HISTORICAL_SCORE_READER_ROLE}"
+        )
+    connection.commit()
+    return connection
+
+
+def _set_statement_timeout(connection, timeout_seconds: float | None) -> None:
+    if timeout_seconds is None:
+        return
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("statement_timeout_seconds must be positive and finite")
+    cursor = connection.cursor()
+    cursor.execute(
+        "SELECT set_config('statement_timeout',%s,true)",
+        (f"{max(1, int(timeout_seconds * 1_000))}ms",),
+    )
+    cursor.close()
+
+
+def verify_from_score_environment(
+        replay_run_id: str, *, statement_timeout_seconds: float | None = None,
+        **expected: str | None) -> VerificationReceipt:
+    """Verify forecasts through exactly the read-only score-reader role."""
+    with connect_score_reader_from_environment() as connection:
+        _set_statement_timeout(connection, statement_timeout_seconds)
+        return HistoricalEvidenceVerifier(connection).verify(
+            replay_run_id, **expected,
+        )
+
+
+def read_manifest_from_score_environment(
+        replay_run_id: str, *,
+        statement_timeout_seconds: float | None = None,
+) -> HistoricalReplayManifest:
+    """Read the one immutable stored manifest through the score reader."""
+    if not replay_run_id or len(replay_run_id) > 128:
+        raise ValueError("replay_run_id must contain 1..128 characters")
+    with connect_score_reader_from_environment() as connection:
+        _set_statement_timeout(connection, statement_timeout_seconds)
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                "SELECT " + ",".join(MANIFEST_COLUMNS) +
+                " FROM public.atom_historical_replay_runs "
+                "WHERE replay_run_id=%s",
+                (replay_run_id,),
+            )
+            rows = cursor.fetchmany(2)
+        finally:
+            cursor.close()
+        if len(rows) != 1:
+            raise RuntimeError("H2D6_STORED_MANIFEST_COUNT")
+        manifest, stored_hash = _as_manifest(rows[0])
+        if manifest.content_sha256 != stored_hash:
+            raise RuntimeError("H2D6_STORED_MANIFEST_HASH")
+        return manifest
 
 
 def main() -> int:
