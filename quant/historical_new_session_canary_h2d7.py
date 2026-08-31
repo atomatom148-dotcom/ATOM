@@ -138,8 +138,17 @@ def execute_new_session_canary(
 
     batch_receipt, stages = batch_runner(_remaining(deadline))
     _remaining(deadline)
-    _require_equal(batch_receipt.get("overall_status"), "COMPLETED",
-                   "H2D7_BATCH_STATUS")
+    if batch_receipt.get("overall_status") != "COMPLETED":
+        failed_session = next(
+            (item for item in batch_receipt.get("sessions", ())
+             if item.get("state") == "FAILED"),
+            {},
+        )
+        raise NewSessionCanaryFailure(
+            "H2D7_BATCH_STATUS:"
+            f"{failed_session.get('failed_stage', 'UNKNOWN')}:"
+            f"{failed_session.get('reason', 'UNKNOWN')}"
+        )
     for field, expected in (
         ("requested_dates", [FROZEN_SESSION]),
         ("completed", [FROZEN_SESSION]),
