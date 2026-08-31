@@ -166,3 +166,28 @@ def test_cohort_metric_reader_falls_back_before_applying_the_window_limit():
     assert "INSERT INTO atom_v9_internal.legacy_evidence_publications" not in sql
     assert "UPDATE atom_v9_internal.legacy_evidence_publications" not in sql
     assert "DELETE FROM atom_v9_internal.legacy_evidence_publications" not in sql
+
+
+def test_cohort_metric_window_selects_mature_forecasts_before_limiting():
+    sql = (
+        ROOT / "migrations" /
+        "026_fix_cohort_metric_maturity_window.sql"
+    ).read_text()
+    normalized = " ".join(sql.split())
+    maturity = "f.maturity_epoch<=extract(epoch FROM p_as_of)"
+    assert normalized.count(maturity) == 2
+    assert normalized.count("LIMIT v_limit + 1") == 2
+    first_limit = normalized.index("LIMIT v_limit + 1")
+    second_limit = normalized.index("LIMIT v_limit + 1", first_limit + 1)
+    first_maturity = normalized.index(maturity)
+    second_maturity = normalized.index(maturity, first_maturity + 1)
+    assert first_maturity < first_limit
+    assert second_maturity < second_limit
+    assert "CREATE OR REPLACE FUNCTION" in normalized
+    assert "SECURITY DEFINER" in sql
+    assert "SET search_path=pg_catalog" in sql
+    assert "OWNER TO atom_v9_proof_owner" in sql
+    assert "TO atom_v9_v4_runtime" in sql
+    assert "INSERT INTO atom_v9_internal.legacy_evidence_publications" not in sql
+    assert "UPDATE atom_v9_internal.legacy_evidence_publications" not in sql
+    assert "DELETE FROM atom_v9_internal.legacy_evidence_publications" not in sql
