@@ -12,6 +12,8 @@ QUANT = ROOT / "quant"
 BUS = QUANT / "schwab_market_bus.py"
 WORKER = QUANT / "schwab_market_worker.py"
 S1_MODULES = (BUS, WORKER)
+S2_PROOF = QUANT / "schwab_s2_live_proof.py"
+SCHWAB_BOUNDARY_MODULES = (*S1_MODULES, S2_PROOF)
 
 EXPECTED_QUANT_EXPORTS = (
     "HORIZONS",
@@ -115,7 +117,7 @@ class SchwabMarketAuthorityTests(unittest.TestCase):
             "get_orders",
         }
 
-        for path in S1_MODULES:
+        for path in SCHWAB_BOUNDARY_MODULES:
             with self.subTest(module=path.name):
                 tree = _tree(path)
                 imports = _imports(tree)
@@ -139,9 +141,60 @@ class SchwabMarketAuthorityTests(unittest.TestCase):
                     lowered = imported.lower()
                     self.assertNotRegex(lowered, r"(^|\.)v9_v[234]($|_)")
 
+    def test_s2_proof_is_one_shot_transient_and_has_no_storage_surface(self) -> None:
+        tree = _tree(S2_PROOF)
+        imports = _imports(tree)
+        import_parts = {
+            part
+            for imported in imports
+            for part in imported.lower().split(".")
+        }
+        self.assertTrue(
+            {
+                "pathlib",
+                "psycopg",
+                "redis",
+                "sqlite3",
+                "supabase",
+            }.isdisjoint(import_parts)
+        )
+        calls = {
+            _call_name(node).lower()
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+        }
+        self.assertTrue(
+            {
+                "open",
+                "write",
+                "write_bytes",
+                "write_text",
+                "append_forecast",
+                "commit_forecast",
+                "resolve",
+            }.isdisjoint(calls)
+        )
+        assignments = {
+            node.targets[0].id: node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant)
+        }
+        self.assertEqual(assignments.get("MAX_PROOF_SECONDS"), 45.0)
+        strings = {
+            node.value.lower()
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertFalse(any("render" in value for value in strings))
+        self.assertFalse(any("supabase" in value for value in strings))
+        self.assertFalse(any("q5" in value for value in strings))
+
     def test_no_existing_quant_module_consumes_schwab_s1(self) -> None:
         for path in sorted(QUANT.glob("*.py")):
-            if path in S1_MODULES:
+            if path in SCHWAB_BOUNDARY_MODULES:
                 continue
             with self.subTest(module=path.name):
                 tree = _tree(path)
