@@ -1011,7 +1011,8 @@ def main(*, simulator_connection_factory: Callable | None = None,
                 os.environ, runtime_connect)
         outbox = EvidenceOutbox(metrics=metrics)
         ledger_connection = runtime_connect(database_url)
-        state_connection = runtime_connect(database_url)
+        external_state_builder = (
+            os.environ.get("ATOM_V4_STATE_BUILDER_EXTERNAL", "0") == "1")
         cache_refresher = V4StateCacheRefresher(
             compact_store=V4CStateStore(ledger_connection),
             accuracy_store=AccuracyStateStore(ledger_connection),
@@ -1019,17 +1020,19 @@ def main(*, simulator_connection_factory: Callable | None = None,
             accuracy_cache=v9_runtime.accuracy_cache,
             metrics=metrics,
         )
-        accuracy_builder = PostgresV4BStateBuilder(state_connection)
-        compact_builder = PostgresV4CStateBuilder(state_connection)
-        state_builder = PostgresV4StateBuilder(
-            accuracy_builder, compact_builder, connection=state_connection)
-        state_scheduler = OfflineStateBuildScheduler(
-            state_builder.build_and_publish, metrics=metrics,
-        )
-        state_build_worker = V4StateBuildWorker(
-            state_builder, state_scheduler, connection=state_connection,
-            connect=runtime_connect, database_url=database_url, metrics=metrics)
-        state_build_worker.start()
+        if not external_state_builder:
+            state_connection = runtime_connect(database_url)
+            accuracy_builder = PostgresV4BStateBuilder(state_connection)
+            compact_builder = PostgresV4CStateBuilder(state_connection)
+            state_builder = PostgresV4StateBuilder(
+                accuracy_builder, compact_builder, connection=state_connection)
+            state_scheduler = OfflineStateBuildScheduler(
+                state_builder.build_and_publish, metrics=metrics,
+            )
+            state_build_worker = V4StateBuildWorker(
+                state_builder, state_scheduler, connection=state_connection,
+                connect=runtime_connect, database_url=database_url, metrics=metrics)
+            state_build_worker.start()
         sim3 = _start_sim3(simulator_connection_factory, simulator_utc_clock)
         ledger_worker = EvidenceLedgerWorker(
             outbox, evidence_store=PostgresEvidenceStore(
@@ -1037,7 +1040,8 @@ def main(*, simulator_connection_factory: Callable | None = None,
             connection=ledger_connection,
             connect=runtime_connect, database_url=database_url,
             metrics=metrics, cache_refresher=cache_refresher,
-            state_build_submit=state_build_worker.submit,
+            state_build_submit=(state_build_worker.submit
+                                if state_build_worker is not None else None),
             simulation_submit=sim3.submit if sim3 is not None else None,
         )
         ledger_worker.start()

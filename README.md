@@ -51,5 +51,15 @@ standard-library HTTPS polling runtime (Render supplies `PORT`):
 python -m quant.web --host 0.0.0.0 --port "$PORT"
 ```
 
+The optional derived-state background process uses the same `DATABASE_URL`:
+
+```
+python -m quant.v4_state_worker
+```
+
+Keep the web-hosted builder enabled until that process is provisioned. Then set
+`ATOM_V4_STATE_BUILDER_EXTERNAL=1` on the web service, verify that deployment,
+and finally set `ATOM_V4_STATE_WORKER_ENABLED=1` on the background process.
+
 ## Not included
 Charts, Research OS, Scout/Shadow, Direction Brain, broker, fat migration branch.

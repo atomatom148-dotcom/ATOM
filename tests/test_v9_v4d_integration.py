@@ -1366,6 +1366,24 @@ def test_state_builder_reconnects_both_builders_and_preserves_generation():
         "v4_state_build_worker.reconnect_success"] == 1
 
 
+def test_recovery_only_reader_does_not_load_live_pending_forecasts(monkeypatch):
+    monkeypatch.setattr(
+        EvidenceLedgerWorker,
+        "_load_pending",
+        lambda _self: (_ for _ in ()).throw(AssertionError("unexpected load")),
+    )
+
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(),
+        evidence_store=_RawStore(),
+        connection=_WorkerConnection(),
+        load_pending=False,
+    )
+
+    assert worker._pending == []
+    worker.close()
+
+
 def test_state_builder_rate_limit_retains_exact_candidate_until_insert():
     class Connection:
         def close(self): pass
