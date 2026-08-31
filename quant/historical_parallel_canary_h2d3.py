@@ -187,9 +187,9 @@ def _observed_evidence_snapshot(h2b, outcomes) -> dict:
     }
 
 
-def read_evidence_snapshot(
-        day: str, timeout_seconds: float = DEFAULT_DATE_TIMEOUT_SECONDS) -> dict:
-    """Read and verify the post-canary evidence state without running V9."""
+def read_evidence_snapshot_for_baseline(
+        baseline: dict, timeout_seconds: float = DEFAULT_DATE_TIMEOUT_SECONDS) -> dict:
+    """Read and verify one supplied evidence baseline without running V9."""
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive and finite")
     deadline = time.monotonic() + timeout_seconds
@@ -200,10 +200,6 @@ def read_evidence_snapshot(
             raise CanaryFailure("H2D3_POST_SNAPSHOT_TIMEOUT")
         return value
 
-    _, baselines = _baseline_bundle()
-    if day not in baselines:
-        raise CanaryFailure("H2D3_DATE_NOT_FROZEN")
-    baseline = baselines[day]
     from .historical_evidence_verifier import verify_from_environment
     from .historical_outcomes import verify_outcomes_from_environment
 
@@ -228,12 +224,19 @@ def read_evidence_snapshot(
     return observed
 
 
-def run_read_only_date(day: str) -> dict:
-    """Run H1/H2B/H2C verification/scoring in-process without persistence."""
-    bundle, baselines = _baseline_bundle()
+def read_evidence_snapshot(
+        day: str, timeout_seconds: float = DEFAULT_DATE_TIMEOUT_SECONDS) -> dict:
+    """Read and verify the post-canary evidence state without running V9."""
+    _, baselines = _baseline_bundle()
     if day not in baselines:
         raise CanaryFailure("H2D3_DATE_NOT_FROZEN")
-    baseline = baselines[day]
+    return read_evidence_snapshot_for_baseline(baselines[day], timeout_seconds)
+
+
+def run_read_only_session(day: str, baseline: dict, metric_contract: dict) -> dict:
+    """Run one supplied H1/H2B/H2C baseline without persistence."""
+    _require_equal(baseline.get("historical_session"), day,
+                   "H2D3_BASELINE_SESSION_MISMATCH")
 
     from .historical_evidence_verifier import verify_from_environment
     from .historical_evidence import HistoricalEvidenceSpool
@@ -313,7 +316,7 @@ def run_read_only_date(day: str) -> dict:
     _require_equal(scoring.forecast_count, baseline["forecast_count"], "H2D3_SCORE_FORECASTS")
     _require_equal(scoring.outcome_count, baseline["outcome_count"], "H2D3_SCORE_OUTCOMES")
     metric_rows, metric_sha256 = canonical_metric_projection(
-        scoring.metrics, bundle["metric_hash_contract"],
+        scoring.metrics, metric_contract,
     )
 
     frozen_snapshot = _frozen_evidence_snapshot(baseline)
@@ -352,6 +355,16 @@ def run_read_only_date(day: str) -> dict:
     return projection
 
 
+def run_read_only_date(day: str) -> dict:
+    """Run H1/H2B/H2C verification/scoring in-process without persistence."""
+    bundle, baselines = _baseline_bundle()
+    if day not in baselines:
+        raise CanaryFailure("H2D3_DATE_NOT_FROZEN")
+    return run_read_only_session(
+        day, baselines[day], bundle["metric_hash_contract"],
+    )
+
+
 def _worker(send, day: str, run_date: Callable[[str], dict]) -> None:
     try:
         receipt = run_date(day)
@@ -381,10 +394,12 @@ def _stop_processes(processes) -> None:
 
 def run_isolated(dates: tuple[str, ...], *, timeout_seconds: float,
                  run_date: Callable[[str], dict] = run_read_only_date,
-                 context=None) -> tuple[list[dict], list[dict]]:
+                 context=None, allowed_dates: tuple[str, ...] = FROZEN_DATES,
+                 process_name: str = "h2d3") -> tuple[list[dict], list[dict]]:
+    allowed_dates = tuple(allowed_dates)
     if (not dates or len(dates) > 2 or len(set(dates)) != len(dates) or
-            any(day not in FROZEN_DATES for day in dates) or
-            (len(dates) == 2 and dates != FROZEN_DATES)):
+            not allowed_dates or len(set(allowed_dates)) != len(allowed_dates) or
+            dates != tuple(day for day in allowed_dates if day in dates)):
         raise ValueError("one or two unique dates are required")
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive and finite")
@@ -396,7 +411,7 @@ def run_isolated(dates: tuple[str, ...], *, timeout_seconds: float,
         for day in dates:
             receive, send = ctx.Pipe(duplex=False)
             process = ctx.Process(target=_worker, args=(send, day, run_date),
-                                  name=f"h2d3-{day}")
+                                  name=f"{process_name}-{day}")
             process.start()
             send.close()
             processes.append(process)
