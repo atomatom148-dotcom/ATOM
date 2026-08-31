@@ -20,6 +20,7 @@ PHASES = ROOT / "PHASES.md"
 FREEZE = ROOT / "docs" / "h2-d2-freeze.md"
 BASELINES = ROOT / "docs" / "h2-d2-canary-baselines.json"
 H2D4_DECISION = ROOT / "docs" / "h2-d4-compute-decision.md"
+H2D5_FREEZE = ROOT / "docs" / "h2-d5-freeze.md"
 Q10_AUDIT = ROOT / "docs" / "audits" / "h2d-2026-07-22-q10-options-vol.md"
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -211,7 +212,12 @@ def test_root_freeze_and_phase_boundary_remain_explicit() -> None:
     assert "H2-D-3 — Parallel Canary (complete)" in phases
     assert "No within-date concurrency or evidence writes" in phases
     assert "H2-D-4 — Compute decision (complete)" in phases
-    assert "H2-D-5 — Scaled replay (not authorized)" in phases
+    scale_law = _law(H2D5_FREEZE)
+    assert "H2-D-5 — Scaled replay (implementation authorized)" in phases
+    assert "exactly four certified sessions" in scale_law
+    assert "exactly two ordered batches of two worker processes" in scale_law
+    assert "No evidence insert, update, delete, repair, or recertification" in scale_law
+    assert "H2-D-6 remains unauthorized" in scale_law
     assert "keep current Render and Supabase tiers" in compute_decision
     assert "1.9470569578619206" in compute_decision
     assert "Evidence writes | `0`" in compute_decision
