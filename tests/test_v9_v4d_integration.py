@@ -1766,6 +1766,30 @@ def test_offline_builder_requires_new_outcome_and_sixty_seconds():
     assert scheduler.run_if_due() == "INSERT" and len(calls) == 2
 
 
+def test_offline_builder_cooldown_starts_after_slow_build_finishes():
+    clock = [0.0]
+    calls = []
+
+    def slow_build():
+        calls.append(clock[0])
+        clock[0] += 70.0
+        return "INSERT"
+
+    scheduler = OfflineStateBuildScheduler(
+        slow_build, monotonic_clock=lambda: clock[0],
+    )
+    scheduler.note_new_outcome()
+    assert scheduler.run_if_due() == "INSERT"
+
+    scheduler.note_new_outcome()
+    assert scheduler.run_if_due() == "SKIPPED_RATE_LIMIT"
+    clock[0] = 129.0
+    assert scheduler.run_if_due() == "SKIPPED_RATE_LIMIT"
+    clock[0] = 130.0
+    assert scheduler.run_if_due() == "INSERT"
+    assert calls == [0.0, 130.0]
+
+
 def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkeypatch):
     v1, v2 = _inputs()
     calculated = V4DCoordinator(
