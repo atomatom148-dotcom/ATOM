@@ -119,7 +119,3 @@ The simulator is an isolated downstream research path governed by `SIMULATION_FR
 ### SIM-9 — Database-backed market-open acceptance
 
 ### SIM-10 — Continuous evidence operation
-
-### SIM-9 — Database-backed market-open acceptance
-
-### SIM-10 — Continuous evidence operation
