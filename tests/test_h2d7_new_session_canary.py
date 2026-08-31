@@ -185,6 +185,30 @@ def test_canary_exposes_the_failed_batch_stage_and_reason():
         _execute(batch_receipt=batch_receipt)
 
 
+def test_canary_exposes_h1_rejection_status_and_reason_codes(monkeypatch):
+    payload = {
+        "data_status": "DATA_INCOMPLETE",
+        "data_reason_codes": ["COIN_INTERQUOTE_GAP"],
+    }
+    monkeypatch.setattr(
+        canary.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout=json.dumps(payload), returncode=2,
+        ),
+    )
+    batch_receipt, stages = canary._run_frozen_batch(30)
+
+    with pytest.raises(
+        canary.NewSessionCanaryFailure,
+        match=(
+            "H2D7_BATCH_STATUS:H1:EXIT_2:"
+            "DATA_INCOMPLETE:COIN_INTERQUOTE_GAP"
+        ),
+    ):
+        _execute(batch_receipt=batch_receipt, stages=stages)
+
+
 @pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
 def test_canary_rejects_unbounded_timeout(timeout):
     with pytest.raises(ValueError, match="positive and finite"):

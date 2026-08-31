@@ -95,6 +95,7 @@ def _run_frozen_batch(timeout_seconds: float) -> tuple[dict, dict[str, dict]]:
             except json.JSONDecodeError as error:
                 raise batch.StageFailure(stage, "INVALID_JSON_OUTPUT") from error
             if completed.returncode:
+                stage_receipts[stage] = payload
                 raise batch.StageFailure(
                     stage, f"EXIT_{completed.returncode}", payload,
                 )
@@ -144,10 +145,18 @@ def execute_new_session_canary(
              if item.get("state") == "FAILED"),
             {},
         )
+        failed_stage = failed_session.get("failed_stage", "UNKNOWN")
+        failed_payload = stages.get(failed_stage, {})
+        h1_detail = ""
+        if failed_stage == "H1":
+            h1_detail = (
+                f":{failed_payload.get('data_status', 'UNKNOWN')}:"
+                f"{','.join(failed_payload.get('data_reason_codes', ()))}"
+            )
         raise NewSessionCanaryFailure(
             "H2D7_BATCH_STATUS:"
-            f"{failed_session.get('failed_stage', 'UNKNOWN')}:"
-            f"{failed_session.get('reason', 'UNKNOWN')}"
+            f"{failed_stage}:{failed_session.get('reason', 'UNKNOWN')}"
+            f"{h1_detail}"
         )
     for field, expected in (
         ("requested_dates", [FROZEN_SESSION]),
