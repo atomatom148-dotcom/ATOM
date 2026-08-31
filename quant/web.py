@@ -12,7 +12,7 @@ from html import escape
 import time
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 from wsgiref.simple_server import make_server
 
 from .g2_cross_asset import CrossAssetState
@@ -33,6 +33,7 @@ from .v9_v4d_integration import OperationalMetrics
 
 
 HORIZON_LABELS = ("30S", "1M", "5M", "15M", "30M", "1H")
+SIMULATOR_DATABASE_URL_ENV = "ATOM_V9_SIM_DATABASE_URL"
 FAMILY_NAMES = (
     "Momentum",
     "Mean Reversion",
@@ -915,6 +916,17 @@ def _start_sim3(simulator_connection_factory: Callable | None,
         return None
 
 
+def _configured_simulator_connection_factory(
+    environ: Mapping[str, str],
+    connect: Callable[[str], object],
+) -> Callable[[], object] | None:
+    """Build the explicit SIM runtime factory without production fallback."""
+    database_url = environ.get(SIMULATOR_DATABASE_URL_ENV)
+    if not database_url:
+        return None
+    return lambda: connect(database_url)
+
+
 def _install_shutdown_handlers(shutdown_requested: Event) -> dict[int, object]:
     """Translate Render/terminal signals into the coordinated drain path."""
 
@@ -994,6 +1006,9 @@ def main(*, simulator_connection_factory: Callable | None = None,
                 keepalives_idle=5, keepalives_interval=2,
                 keepalives_count=3,
             )
+        if simulator_connection_factory is None:
+            simulator_connection_factory = _configured_simulator_connection_factory(
+                os.environ, runtime_connect)
         outbox = EvidenceOutbox(metrics=metrics)
         ledger_connection = runtime_connect(database_url)
         state_connection = runtime_connect(database_url)
