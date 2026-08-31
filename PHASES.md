@@ -97,6 +97,14 @@ zero writes and the pre/post control must remain exact under
 `docs/h2-d6-persistence-gate-freeze.md`. No new date or continuous replay is
 authorized.
 
+### H2-D-7 — One-session historical admission (implementation authorized)
+
+Admit only `2026-07-23` as `h2d-2026-07-23` through the existing sequential
+certified replay, append-only persistence, outcome-resolution, and score-reader
+seams under `docs/h2-d7-one-session-write-freeze.md`. No alternate date,
+parallel replay, backfill, scheduler, continuous replay, or tier change is
+authorized.
+
 ## Paper simulator phases
 
 The simulator is an isolated downstream research path governed by `SIMULATION_FREEZE.md`. SIM-0A is documentation-only. Only SIM-1 becomes authorized after SIM-0A is merged, and no later phase may be implemented early.
