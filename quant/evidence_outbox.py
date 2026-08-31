@@ -800,6 +800,7 @@ class EvidenceLedgerWorker:
                  cache_refresher: V4StateCacheRefresher | None = None,
                  state_build_submit: Callable | None = None,
                  simulation_submit: Callable | None = None,
+                 load_pending: bool = True,
                  wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
         self._validate_runtime_database_url(database_url)
         if connection is None:
@@ -815,7 +816,8 @@ class EvidenceLedgerWorker:
         self._cache_refresher = cache_refresher
         self._state_build_submit = state_build_submit
         self._simulation_submit = simulation_submit
-        self._pending: list[V4ForecastRecord] = self._load_pending()
+        self._pending: list[V4ForecastRecord] = (
+            self._load_pending() if load_pending else [])
         self._handoff_anchor: MidpointObservation | None = None
         self._handoff_fence_anchor: MidpointObservation | None = None
         self._last_sequence: int | None = None
@@ -1591,12 +1593,18 @@ class EvidenceLedgerWorker:
                 tzinfo=timezone.utc)) < created_at
         )
 
+    def recovery_state_build_candidates(
+            self) -> tuple[tuple[str, dict[str, tuple[str, str]], datetime], ...]:
+        """Return bounded, proof-validated state work for the derived worker."""
+
+        return self._resolved_recovery_cohorts()
+
     def _submit_recovery_state_build(self) -> None:
         if self._state_build_submit is None:
             return
         recovery_clock = self._clock()
         failed = False
-        for symbol, cohorts, outcome_created_at in self._resolved_recovery_cohorts():
+        for symbol, cohorts, outcome_created_at in self.recovery_state_build_candidates():
             try:
                 self._state_build_submit(
                     symbol=symbol,
