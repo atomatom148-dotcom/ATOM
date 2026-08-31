@@ -24,13 +24,17 @@ While the replacement does not own the frozen SIM-4 runtime advisory lock:
 - process-local SIM-4 callbacks may be dropped without affecting SIM-1/SIM-2 persistence; and
 - restart recovery is forbidden.
 
-After the replacement acquires exclusive SIM-4 runtime ownership, it reads `runtime_started_at` exactly once and performs one bounded-by-generation recovery query for unmatched persisted intents whose `eligible_at` satisfies:
+After the replacement acquires exclusive SIM-4 runtime ownership, it reads `runtime_started_at` exactly once and performs one bounded-by-generation recovery query for unmatched persisted intents whose `eligible_at` satisfies the **inclusive acquisition interval**:
 
 ```text
-ownership_wait_started_at <= eligible_at < runtime_started_at
+ownership_wait_started_at <= eligible_at <= runtime_started_at
 ```
 
-It then also applies the original normal recent-recovery rule where necessary. The effective recovery set is the union, deduplicated by immutable `intent_id`, so no intent persisted during the ownership-wait interval can become permanently unmatched merely because ownership acquisition took longer than two seconds.
+The upper boundary is inclusive. An intent whose microsecond-resolution `eligible_at` equals `runtime_started_at` is part of handoff recovery and may not fall between recovery and live admission.
+
+It then also applies the original normal recent-recovery rule where necessary. The effective recovery set is the union, deduplicated by immutable `intent_id`, so no intent persisted during the ownership-wait interval or exactly on the ownership-acquisition timestamp can become permanently unmatched.
+
+If a live callback for an intent included by the inclusive recovery query is also admitted after ownership acquisition, the single worker deduplicates by immutable `intent_id` before terminal selection. Existing-terminal idempotency remains the final durable guard.
 
 This query is finite because its lower bound is the current replacement generation's own `ownership_wait_started_at`. It must not scan before that timestamp and must not backfill historical SIM-1/SIM-2 intents from earlier generations.
 
@@ -80,25 +84,46 @@ If the owner session is lost at any point:
 
 The earlier pre-event `SELECT 1` liveness probe is not an authorization fence and is no longer sufficient by itself. Same-session persistence is the controlling ownership fence.
 
-## 3. Exact ownership-connection validation
+## 3. Exact ownership-connection allowlist
 
-The SIM-4 runtime-owner session must be backed by a session-capable PostgreSQL connection. Transaction-pooled Supavisor connections are forbidden for runtime ownership.
+The SIM-4 runtime-owner session must be backed by a PostgreSQL connection whose backend-session semantics are explicitly known. An arbitrary DSN is not considered session-capable merely because it is not a known transaction-pool endpoint.
 
-SIM-4 freezes the same fail-closed validation rule already used by `PostgresEvidenceOutbox`:
-
-- parse URL-style DSNs with `urlparse`;
-- parse keyword DSNs equivalently;
-- normalize hostname to lowercase;
-- obtain the configured port; and
-- if the hostname ends with `.pooler.supabase.com` and the port is exactly `6543`, raise an error before any ownership attempt.
-
-The rejection reason is conceptually:
+For the production Supabase deployment, the runtime-owner DSN is accepted only when its normalized host/port matches one of these two forms:
 
 ```text
-SIM-4 runtime ownership requires Supabase session mode, not port 6543
+DIRECT:
+  hostname starts with "db."
+  hostname ends with ".supabase.co"
+  port = 5432
+
+SUPAVISOR_SESSION_MODE:
+  hostname ends with ".pooler.supabase.com"
+  port = 5432
 ```
 
-No transaction-pooled connection may acquire or represent the SIM-4 runtime-owner lock. There is no fallback to a weaker ownership mechanism.
+The following are rejected before any runtime-owner advisory-lock attempt:
+
+- any `.pooler.supabase.com` endpoint on port `6543`;
+- any other port for the two allowed Supabase hostname classes;
+- any hostname/port combination outside the two explicit production forms above;
+- any DSN whose host or port cannot be parsed exactly; and
+- any connection mode known or declared to be transaction pooled.
+
+There is no fallback from an unrecognized DSN to a session advisory lock.
+
+Tests may inject a dedicated non-pooled PostgreSQL connection factory without using a production Supabase hostname. Such an injected test connection is not a production configuration path and must prove stable backend-session identity across ownership acquisition and a terminal transaction using:
+
+```sql
+SELECT pg_backend_pid()
+```
+
+The observed backend PID must remain identical while the session advisory lock is owned. Production runtime configuration does not receive this test-only bypass.
+
+The rejection reason for Supabase transaction mode is conceptually:
+
+```text
+SIM-4 runtime ownership requires a direct or Supavisor session-mode connection; transaction pooling is forbidden
+```
 
 This validation applies only to the SIM-4 runtime-owner connection required by this freeze and does not modify production V9 connection behavior.
 
@@ -170,8 +195,10 @@ SIM-4 implementation must test all earlier requirements plus the following.
 - capture `ownership_wait_started_at` before the first ownership attempt;
 - a wait longer than two seconds does not lose persisted SIM-3 intents;
 - recovery covers the full current-generation ownership-wait interval;
+- recovery includes `eligible_at == runtime_started_at` exactly;
 - recovery never scans before `ownership_wait_started_at`;
 - the union with normal recent recovery is deduplicated by `intent_id`;
+- a recovered intent also delivered by live callback is deduplicated by `intent_id`;
 - waiting-generation actionable intents cannot become retroactive `ENTERED` records; and
 - normal collision precedence remains intact during handoff recovery.
 
@@ -187,10 +214,13 @@ SIM-4 implementation must test all earlier requirements plus the following.
 
 ### Connection validation
 
-- `.pooler.supabase.com:6543` URL DSNs are rejected;
-- equivalent keyword DSNs are rejected;
-- invalid configured ports fail closed;
-- session-capable non-6543 configurations are not rejected by this specific predicate; and
+- direct `db.*.supabase.co:5432` is accepted by the production owner-DSN allowlist;
+- `.pooler.supabase.com:5432` session mode is accepted by the production owner-DSN allowlist;
+- `.pooler.supabase.com:6543` is rejected;
+- unrecognized production hostname/port combinations are rejected;
+- missing or invalid host/port values fail closed;
+- arbitrary non-Supabase production DSNs are not assumed session-capable;
+- injected test connections prove stable `pg_backend_pid()` while ownership is held; and
 - no transaction-pool fallback exists.
 
 ### Shutdown ownership retention
