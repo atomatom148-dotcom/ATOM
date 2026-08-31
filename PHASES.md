@@ -83,9 +83,11 @@ Use canary CPU, memory, database, provider, and wall-time measurements to decide
 whether any Render or Supabase sizing change is justified. The recorded decision
 is to keep both tiers unchanged; see `docs/h2-d4-compute-decision.md`.
 
-### H2-D-5 — Scaled replay (not authorized)
+### H2-D-5 — Scaled replay (implementation authorized)
 
-Scale only after the canary and compute decision pass a separate freeze gate.
+Run one bounded four-date, read-only scale proof in two ordered batches of two
+workers under `docs/h2-d5-freeze.md`. No scheduler, evidence writes, or tier
+changes are authorized.
 
 ### H2-D-6 — Production gate (not authorized)
 
@@ -113,6 +115,10 @@ The simulator is an isolated downstream research path governed by `SIMULATION_FR
 ### SIM-7 — Read-only simulation page
 
 ### SIM-8 — Security, isolation, and freeze audit
+
+### SIM-9 — Database-backed market-open acceptance
+
+### SIM-10 — Continuous evidence operation
 
 ### SIM-9 — Database-backed market-open acceptance
 
