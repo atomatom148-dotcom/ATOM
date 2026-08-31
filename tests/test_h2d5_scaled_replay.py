@@ -8,6 +8,13 @@ from quant import historical_scaled_replay_h2d5 as scaled
 def _receipt(day: str) -> dict:
     return {
         "historical_session": day,
+        "replay_run_id": f"h2d-{day}",
+        "evidence_snapshot": {
+            "frame_count": 1,
+            "forecast_count": 72,
+            "outcome_count": 6,
+        },
+        "score": {"metric_sha256": f"metric-{day}"},
         "parity_sha256": f"parity-{day}",
         "stored_control_sha256": f"control-{day}",
     }
@@ -48,6 +55,10 @@ def test_scaled_replay_runs_two_ordered_batches_and_verifies_post_controls():
     assert result["read_only"] is True and result["evidence_writes"] == 0
     assert result["pre_post_unchanged"] is True
     assert result["surviving_workers"] == 0
+    assert [row["historical_session"] for row in result["session_receipts"]] == list(
+        scaled.FROZEN_DATES,
+    )
+    assert all(row["forecast_count"] == 72 for row in result["session_receipts"])
 
 
 def test_scaled_replay_fails_closed_on_post_control_drift():
