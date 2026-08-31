@@ -12,8 +12,8 @@ least-privilege roles.
 
 | Frozen field | Exact value |
 |---|---|
-| Historical session | `2026-07-23` |
-| Replay run ID | `h2d-2026-07-23` |
+| Historical session | `2026-07-24` |
+| Replay run ID | `h2d-2026-07-24` |
 | Maximum interior quote gap | `5` seconds |
 | Expected forecast rows | `frame_count × 72` |
 | Expected outcome rows | `frame_count × 6` |
