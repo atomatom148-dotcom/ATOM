@@ -16,7 +16,12 @@ from quant.v9_sim3_capture import (
 )
 from quant.v9_v4d_integration import V4DCycleOutput
 from quant.live_market import LiveMarketState
-from quant.web import _start_sim3, create_app
+from quant.web import (
+    SIMULATOR_DATABASE_URL_ENV,
+    _configured_simulator_connection_factory,
+    _start_sim3,
+    create_app,
+)
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -330,6 +335,44 @@ def test_missing_configuration_startup_failure_and_request_path_isolation():
     source = inspect.getsource(create_app)
     assert "SimulationCapture" not in source
     assert "SimulationIntentStore" not in source
+
+
+def test_default_entrypoint_uses_only_dedicated_simulator_configuration():
+    connections = []
+
+    def connect(database_url):
+        connections.append(database_url)
+        return object()
+
+    assert _configured_simulator_connection_factory(
+        {"DATABASE_URL": "production-runtime"}, connect) is None
+    assert connections == []
+
+    factory = _configured_simulator_connection_factory(
+        {SIMULATOR_DATABASE_URL_ENV: "sim-runtime"}, connect)
+    assert factory is not None
+    assert factory() is not None
+    assert connections == ["sim-runtime"]
+
+    import quant.web as web
+    startup = ast.parse(inspect.getsource(web.main))
+    configured_calls = [
+        node for node in ast.walk(startup)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_configured_simulator_connection_factory"
+    ]
+    assert len(configured_calls) == 1
+    assert tuple(ast.unparse(arg) for arg in configured_calls[0].args) == (
+        "os.environ", "runtime_connect")
+
+
+def test_positive_sim3_startup_lifecycle():
+    adapter = _start_sim3(lambda: object(), lambda: NOW)
+    assert adapter is not None
+    assert adapter.telemetry.snapshot().sim3_submit_status == "READY"
+    adapter.stop()
+    assert adapter.telemetry.snapshot().sim3_submit_status == "STOPPED"
 
 
 def test_sim3_integration_boundary_is_static_and_history_independent():
