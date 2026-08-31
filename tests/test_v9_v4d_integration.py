@@ -1788,6 +1788,9 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
         def execute(self, sql, params):
             assert "atom_v9_v4_forecasts" in sql and "atom_v9_v4_outcomes" in sql
             assert "o.created_at<=%s" in sql
+            proof_filter = "o.record_json->>'proof_eligible'='true'"
+            assert proof_filter in sql
+            assert sql.index(proof_filter) < sql.index("LIMIT %s")
             assert "f.record_json->>'cohort_id'=%s" in sql
             assert "f.record_json->>'cohort_hash'=%s" in sql
             assert "read_forecast_commit_proof" in sql and "LIMIT %s" in sql
@@ -1879,6 +1882,9 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
         def execute(self, sql, params):
             assert "atom_v9_v4_forecasts" in sql and "atom_v9_v4_outcomes" in sql
             assert "o.created_at<=%s" in sql
+            proof_filter = "o.record_json->>'proof_eligible'='true'"
+            assert proof_filter in sql
+            assert sql.index(proof_filter) < sql.index("LIMIT %s")
             assert "f.record_json->>'cohort_id'=%s" in sql
             assert "f.record_json->>'cohort_hash'=%s" in sql
             assert "read_forecast_commit_proof" in sql and "LIMIT %s" in sql

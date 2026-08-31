@@ -174,6 +174,7 @@ class PostgresV4BStateBuilder:
                        f.forecast_record_id
                    ) AS p ON p.proof_eligible
                    WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
+                     AND o.record_json->>'proof_eligible'='true'
                      AND ({cohort_scope})
                    ORDER BY f.cutoff_at, f.forecast_record_id,
                             o.created_at, o.outcome_record_id
@@ -256,6 +257,7 @@ class PostgresV4CStateBuilder:
                        f.forecast_record_id
                    ) AS p ON p.proof_eligible
                    WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
+                     AND o.record_json->>'proof_eligible'='true'
                      AND ({cohort_scope})
                    ORDER BY f.cutoff_at, f.forecast_record_id,
                             o.created_at, o.outcome_record_id
