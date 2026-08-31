@@ -15,8 +15,8 @@ from . import historical_scaled_replay_h2d5 as h2d5
 
 
 H2D7_VERSION = "H2-D-7"
-FROZEN_SESSION = "2026-07-23"
-FROZEN_RUN_ID = "h2d-2026-07-23"
+FROZEN_SESSION = "2026-07-24"
+FROZEN_RUN_ID = "h2d-2026-07-24"
 DEFAULT_TIMEOUT_SECONDS = 10_800.0
 
 
