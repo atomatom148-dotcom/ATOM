@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 
 import pytest
 
@@ -20,6 +21,10 @@ def _receipt(day: str) -> dict:
     }
 
 
+def _isolated_receipt(day: str) -> dict:
+    return {"historical_session": day}
+
+
 def test_frozen_sessions_are_exactly_four_new_certified_dates():
     assert scaled.FROZEN_SESSIONS == (
         ("2026-06-17", "h2d-2026-06-17"),
@@ -27,6 +32,25 @@ def test_frozen_sessions_are_exactly_four_new_certified_dates():
         ("2026-06-22", "h2d-2026-06-22"),
         ("2026-06-23", "h2d-2026-06-23"),
     )
+
+
+def test_shared_process_seam_accepts_only_an_ordered_frozen_batch():
+    rows, statuses = scaled.h2d3.run_isolated(
+        scaled.FROZEN_DATES[:2], timeout_seconds=2,
+        run_date=_isolated_receipt,
+        context=multiprocessing.get_context("fork"),
+        allowed_dates=scaled.FROZEN_DATES,
+        process_name="h2d5",
+    )
+    assert [row["historical_session"] for row in rows] == list(
+        scaled.FROZEN_DATES[:2],
+    )
+    assert all(item["exit_code"] == 0 for item in statuses)
+    with pytest.raises(ValueError):
+        scaled.h2d3.run_isolated(
+            tuple(reversed(scaled.FROZEN_DATES[:2])), timeout_seconds=1,
+            allowed_dates=scaled.FROZEN_DATES,
+        )
 
 
 def test_scaled_replay_runs_two_ordered_batches_and_verifies_post_controls():
