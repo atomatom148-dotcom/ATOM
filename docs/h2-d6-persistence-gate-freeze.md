@@ -1,8 +1,8 @@
 # H2-D-6 historical-persistence gate freeze
 
-**Status:** LAW — implementation authorized; execution not yet passed
-**Current runtime:** bounded H2-D-5 proof complete
-**Next gate:** one exact idempotent persistence retry
+**Status:** COMPLETE — exact frozen execution passed
+**Current runtime:** H2-D-7 passed; benchmark is idle and suspended
+**Next gate:** a separate bounded read-only qualification freeze
 
 ## Decision
 
@@ -51,6 +51,29 @@ mutation triggers, composite primary keys, and separate forecast-writer,
 outcome-resolver, and score-reader credentials. H2-D-6 adds no migration and
 grants no privilege. Metrics remain deterministic read-only derivations and are
 recorded by hash in the final receipt; no redundant metrics table is added.
+
+## Completion receipt
+
+The single frozen retry passed on August 31, 2026.
+
+| Result | Exact value |
+|---|---|
+| Historical session | `2026-06-23` |
+| Replay run ID | `h2d-2026-06-23` |
+| Frames | `10,332` |
+| Forecasts / outcomes | `743,904 / 61,992` |
+| Forecast writes / outcome writes | `0 / 0` |
+| Artifact SHA-256 | `cb3f785d2f27fc5db12808461d6676e90c103c5c69bf91f0af59adac8d6f7371` |
+| Ordered forecast SHA-256 | `caa66e6a6a94b64ee31224553acf1eb0b2a05d3e7d56e72e4d0c67bb28f26d0d` |
+| Metric SHA-256 | `80758914447775d02f9a247ee1e5593714345434ab5204cd43eb65be4a47dc0c` |
+| Control SHA-256 | `30e0ed37295ae8ff9be29bf818af259165314860aeb5e6468a04ac2eadde6c6b` |
+| Elapsed / replay / outcome retry | `3315.997264s / 2412.221343s / 730.287785s` |
+| Peak RSS | `378,848 KiB` |
+| Pre/post unchanged | `true` |
+| New-date admission / continuous replay | `false / false` |
+
+The exact writer, resolver, and score-reader roles passed. The retry wrote no
+evidence and left the stored control unchanged.
 
 ## Exclusions and stopping rule
 
