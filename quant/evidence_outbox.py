@@ -788,6 +788,22 @@ class V4StateBuildWorker:
         with self._latest_lock:
             return bool(self._pending_candidates)
 
+    def _coalesce_active(
+            self, active: V4StateBuildCandidate,
+    ) -> tuple[V4StateBuildCandidate, bool]:
+        """Replace a rate-limited candidate with its newest cohort peer."""
+
+        key = (active.symbol, active.cohorts)
+        with self._latest_lock:
+            pending = self._pending_candidates.pop(key, None)
+        if pending is None:
+            return active, False
+        self._metrics.increment("v4_state_build_worker.coalesced")
+        return (
+            pending if pending.state_as_of >= active.state_as_of else active,
+            True,
+        )
+
     def _shutdown_expired(self) -> bool:
         return (self._stop.is_set() and self._shutdown_deadline is not None and
                 time.monotonic() >= self._shutdown_deadline)
@@ -826,6 +842,13 @@ class V4StateBuildWorker:
                     continue
                 if active is None:
                     active = self._take_next()
+                elif pending_generation:
+                    active, coalesced = self._coalesce_active(active)
+                    if coalesced:
+                        # ``prepare`` captured the prior state_as_of.  Re-arm
+                        # the same generation with the newest cohort peer so
+                        # cooldown time cannot become publication staleness.
+                        pending_generation = False
                 if active is not None and not pending_generation:
                     try:
                         self._builder.prepare(
