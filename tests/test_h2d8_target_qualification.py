@@ -129,6 +129,25 @@ def test_independent_five_second_gate_rejects_six_seconds(monkeypatch):
     assert receipt["selected_sessions"] == ["2026-07-28", "2026-07-29"]
 
 
+def test_over_gap_receipt_still_requires_valid_lineage(monkeypatch):
+    payloads = {day: _payload(day) for day, _run_id in qualifier.FROZEN_TARGETS}
+    payloads["2026-07-27"] = _payload("2026-07-27", gap_seconds=6)
+    payloads["2026-07-27"]["configuration_digest"] = "0" * 64
+    with pytest.raises(
+        qualifier.TargetQualificationFailure, match="LINEAGE_OR_RECEIPT_ERROR",
+    ):
+        _execute(monkeypatch, payloads)
+
+
+def test_qualifying_receipt_requires_expected_preflight_run_id(monkeypatch):
+    payloads = {day: _payload(day) for day, _run_id in qualifier.FROZEN_TARGETS}
+    payloads["2026-07-27"]["replay_run_id"] = "h1-preflight-wrong"
+    with pytest.raises(
+        qualifier.TargetQualificationFailure, match="LINEAGE_OR_RECEIPT_ERROR",
+    ):
+        _execute(monkeypatch, payloads)
+
+
 def test_non_absent_target_fails_before_h1(monkeypatch):
     preflight_calls = []
     present = dict(qualifier._ABSENT, session_manifest_count=1)
@@ -210,6 +229,24 @@ def test_final_control_error_retains_inspected_candidates(monkeypatch):
         )
     assert len(raised.value.inspected) == 2
     assert len(raised.value.selected) == 2
+
+
+def test_expired_budget_preserves_original_failure(monkeypatch):
+    now = iter((0.0, 0.0, 0.0, 0.0, 2.0, 2.0))
+    monkeypatch.setattr(qualifier.time, "monotonic", lambda: next(now))
+
+    with pytest.raises(
+        qualifier.TargetQualificationFailure, match="PREFLIGHT_TIMEOUT",
+    ) as raised:
+        qualifier.execute_target_qualification(
+            timeout_seconds=1,
+            target_reader=_absent,
+            preflight_runner=lambda *_args: (_ for _ in ()).throw(
+                qualifier.TargetQualificationFailure("H2D8_PREFLIGHT_TIMEOUT")
+            ),
+            control_reader=_stable_control,
+        )
+    assert "POST_CONTROL_ERROR" not in str(raised.value)
 
 
 def test_default_preflight_enforces_and_clears_deadline(monkeypatch):
