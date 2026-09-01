@@ -1984,6 +1984,16 @@ class SimulationEntryWorker:
     def _due_deadline(self) -> int | None:
         return min((pending.deadline_epoch_ns for pending in self._pending.values()), default=None)
 
+    def _next_uncaptured_deadline(self) -> int | None:
+        return min(
+            (
+                pending.deadline_epoch_ns
+                for pending in self._pending.values()
+                if pending.deadline_epoch_ns not in self._deadline_closures
+            ),
+            default=None,
+        )
+
     def _earliest_quote_expiry(self) -> int | None:
         expiries: list[int] = []
         for envelope in self._quotes:
@@ -2033,6 +2043,11 @@ class SimulationEntryWorker:
         )
         if not greater:
             return False
+        retry_not_before = (
+            None
+            if self._target is None
+            else self._target.retry_not_before_monotonic
+        )
         self._drain_through(watermark)
         admitted_quotes = tuple(
             envelope.quote
@@ -2070,6 +2085,8 @@ class SimulationEntryWorker:
         # full semantic order.  Already-known discovery instants remain in
         # ``_pending`` and are preserved when those rows are rediscovered.
         self._new_target(fence, "RECONCILIATION")
+        if self._target is not None:
+            self._target.retry_not_before_monotonic = retry_not_before
         return True
 
     def _complete_deadline_if_reconciled(
@@ -2156,8 +2173,37 @@ class SimulationEntryWorker:
         while not self._stop_requested.is_set() and not self._generation_failed:
             boundary_recheck = False
             cached_deadline_retry_waiting = False
+            capture_due = self._next_uncaptured_deadline()
+            if capture_due is not None:
+                greater, now_ns, watermark = self._deadline_sample(capture_due)
+                if greater:
+                    self._terminalize_forced_deadline_paths(store, capture_due)
+                    ordinary_due = any(
+                        pending.deadline_epoch_ns == capture_due
+                        for pending in self._pending.values()
+                    )
+                    if ordinary_due:
+                        # Fix every newly crossed boundary before servicing an
+                        # older closure.  Its first watermark/fence pair is
+                        # immutable even while that older closure retries.
+                        self._begin_due_deadline(
+                            capture_due,
+                            sampled=(greater, now_ns, watermark),
+                        )
+                    else:
+                        if (
+                            self._target is not None
+                            and self._target.waiting_until_epoch_ns
+                            == capture_due
+                        ):
+                            self._target.waiting_until_epoch_ns = None
+                            self._process_target_page(store)
+                        self._evict_quotes_after_deadlines(now_ns)
+                    continue
+                if now_ns == capture_due:
+                    boundary_recheck = True
             due = self._due_deadline()
-            if due is not None:
+            if due is not None and not boundary_recheck:
                 cached_closure = self._deadline_closures.get(due)
                 if cached_closure is not None:
                     target = self._target
@@ -2202,55 +2248,6 @@ class SimulationEntryWorker:
                         # The first immutable watermark/fence pair drives all
                         # later work for D; never sample a replacement watermark.
                         continue
-                if not cached_deadline_retry_waiting:
-                    greater, now_ns, watermark = self._deadline_sample(due)
-                    if greater:
-                        self._terminalize_forced_deadline_paths(store, due)
-                        if (
-                            self._target is not None
-                            and self._target.waiting_until_epoch_ns == due
-                        ):
-                            self._target.waiting_until_epoch_ns = None
-                            self._process_target_page(store)
-                        ordinary_due = any(
-                            pending.deadline_epoch_ns == due
-                            for pending in self._pending.values()
-                        )
-                        if not ordinary_due:
-                            self._evict_quotes_after_deadlines(now_ns)
-                            continue
-                        if due not in self._deadline_closures:
-                            # Reuse the first strict-greater observation and its
-                            # watermark; no second sample may widen the fence.
-                            self._begin_due_deadline(
-                                due, sampled=(greater, now_ns, watermark),
-                            )
-                        processed_deadline_page = False
-                        if self._target is not None:
-                            processed_deadline_page = self._process_target_page(
-                                store
-                            )
-                        elif (
-                            self._deadline_closures[due].publication_fence is not None
-                            and self._deadline_closures[due].publication_fence
-                            > self._checkpoint_last
-                        ):
-                            self._new_target(
-                                self._deadline_closures[due].publication_fence,
-                                "RECONCILIATION",
-                            )
-                        completed = self._complete_deadline_if_reconciled(store, due)
-                        if completed:
-                            self._evict_quotes_after_deadlines(now_ns)
-                        if (
-                            processed_deadline_page
-                            and self._target is not None
-                        ):
-                            self._drain_one_quote_event()
-                        continue
-                    if now_ns == due:
-                        boundary_recheck = True
-
             quote_expiry = self._earliest_quote_expiry()
             if (
                 quote_expiry is not None
@@ -2311,12 +2308,11 @@ class SimulationEntryWorker:
                     max(0.0, self._next_periodic_opportunity - now),
                 )
             if (
-                due is not None
+                capture_due is not None
                 and self._anchor is not None
-                and not cached_deadline_retry_waiting
             ):
                 derived_now = self._anchor.derived_epoch_ns(self._monotonic_ns())
-                remaining = max(0, due - derived_now) / 1_000_000_000
+                remaining = max(0, capture_due - derived_now) / 1_000_000_000
                 timeout = min(timeout, remaining if remaining > 0 else SIM4_BOUNDARY_RECHECK_SECONDS)
                 if remaining == 0:
                     timeout = min(timeout, SIM4_BOUNDARY_RECHECK_SECONDS)
