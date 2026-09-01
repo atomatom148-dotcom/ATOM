@@ -14,8 +14,10 @@ from quant.live_market import (
     BTC_SOURCE_TIMEOUT_SECONDS, MAX_BTC_AGE_SECONDS,
     ALPACA_NDX_LATEST_VALUE_URL, MARKET_DISPLAY_FETCH_SECONDS, LiveMarketState,
     MASSIVE_NDX_SNAPSHOT_URL, alpaca_btc_stream_url, parse_alpaca_ndx_value,
-    parse_alpaca_timestamp, parse_massive_ndx_snapshot, poll_alpaca,
-    poll_alpaca_g2, poll_massive_ndx,
+    SCHWAB_NDX_ENABLED_ENV, SCHWAB_NDX_QUOTE_URL,
+    parse_alpaca_timestamp, parse_massive_ndx_snapshot, parse_schwab_ndx_quote,
+    poll_alpaca, poll_alpaca_g2, poll_massive_ndx, poll_schwab_ndx,
+    start_massive_ndx_poller,
 )
 from quant.web import create_app
 from quant.history import MidpointObservation
@@ -1219,6 +1221,179 @@ class LiveMarketTests(unittest.TestCase):
                 poll_massive_ndx(state)
 
         self.assertIsNone(state.cross_asset_state().ndx_price)
+
+    def test_schwab_ndx_wrapper_preserves_read_only_quote_and_provider_time(self):
+        price, event_epoch = parse_schwab_ndx_quote({
+            "ok": True,
+            "mode": "READ ONLY",
+            "symbol": "$NDX",
+            "data": {
+                "$NDX": {
+                    "symbol": "$NDX",
+                    "quote": {
+                        "lastPrice": 23_812.125,
+                        "tradeTime": 100_000,
+                        "mark": 23_813.0,
+                        "quoteTime": 101_000,
+                    },
+                },
+            },
+        }, received_at_epoch=102.0)
+
+        self.assertEqual(price, 23_812.125)
+        self.assertEqual(event_epoch, 100.0)
+
+        for payload in (
+            {},
+            {"ok": True, "mode": "WRITE", "symbol": "$NDX", "data": {}},
+            {"ok": True, "mode": "READ ONLY", "symbol": "COIN", "data": {}},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises((TypeError, ValueError)):
+                    parse_schwab_ndx_quote(payload, received_at_epoch=102.0)
+
+    def test_schwab_ndx_poller_uses_coin_service_and_accepts_only_fresh_data(self):
+        state = LiveMarketState(clock=lambda: 101.0)
+        response = BytesIO(json.dumps({
+            "ok": True,
+            "mode": "READ ONLY",
+            "symbol": "$NDX",
+            "data": {
+                "$NDX": {
+                    "symbol": "$NDX",
+                    "quote": {
+                        "lastPrice": 23_812.125,
+                        "tradeTime": 100_000,
+                        "quoteTime": 100_500,
+                    },
+                },
+            },
+        }).encode())
+
+        with patch(
+            "quant.live_market.urlopen", return_value=response,
+        ) as urlopen, patch(
+            "quant.live_market.time.time", return_value=101.0,
+        ), patch(
+            "quant.live_market.time.sleep", side_effect=RuntimeError("stop"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                poll_schwab_ndx(state)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, SCHWAB_NDX_QUOTE_URL)
+        self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(state.cross_asset_state().ndx_price, 23_812.125)
+
+    def test_schwab_ndx_poller_expires_stale_value_to_unavailable(self):
+        state = LiveMarketState(clock=lambda: 101.0)
+        self.assertTrue(state.accept_g2_price(
+            asset="NDX", price=23_812.125, event_epoch=90.0,
+        ))
+        response = BytesIO(json.dumps({
+            "ok": True,
+            "mode": "READ ONLY",
+            "symbol": "$NDX",
+            "data": {
+                "$NDX": {
+                    "symbol": "$NDX",
+                    "quote": {
+                        "lastPrice": 23_812.125,
+                        "tradeTime": 90_000,
+                        "quoteTime": 90_000,
+                    },
+                },
+            },
+        }).encode())
+
+        with patch(
+            "quant.live_market.urlopen", return_value=response,
+        ), patch(
+            "quant.live_market.time.time", return_value=101.0,
+        ), patch(
+            "quant.live_market.time.sleep", side_effect=RuntimeError("stop"),
+        ), patch("builtins.print"):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                poll_schwab_ndx(state)
+
+        value = state.cross_asset_state()
+        self.assertIsNone(value.ndx_price)
+        self.assertIsNone(value.ndx_age_seconds)
+        self.assertEqual(value.ndx_return_bps, (None,) * 6)
+
+    def test_schwab_ndx_defensive_no_op_paths(self):
+        with self.assertRaises(TypeError):
+            parse_schwab_ndx_quote([], received_at_epoch=102.0)
+
+        state = LiveMarketState(clock=lambda: 101.0)
+        self.assertFalse(state.expire_ndx_if_stale(now_epoch=True))
+        self.assertFalse(state.expire_ndx_if_stale(now_epoch=101.0))
+        self.assertTrue(state.accept_g2_price(
+            asset="NDX", price=23_812.125, event_epoch=100.0,
+        ))
+        self.assertFalse(state.expire_ndx_if_stale(now_epoch=101.0))
+
+    def test_stale_ndx_cannot_survive_a_blocked_request_or_coin_cycle(self):
+        now = [101.0]
+        entered_handler = threading.Event()
+        release_handler = threading.Event()
+
+        def handler(*_args):
+            entered_handler.set()
+            self.assertTrue(release_handler.wait(timeout=2))
+            return None
+
+        state = LiveMarketState(
+            clock=lambda: now[0], v9_cycle_handler=handler,
+        )
+        self.assertTrue(state.accept_g2_price(
+            asset="NDX", price=23_812.125, event_epoch=100.0,
+        ))
+        ingress = threading.Thread(target=lambda: state.accept_quote(
+            bid=99.0, ask=101.0, event_epoch=101.0,
+        ))
+        ingress.start()
+        self.assertTrue(entered_handler.wait(timeout=1))
+
+        now[0] = 102.0
+        self.assertTrue(state.accept_g2_price(
+            asset="NDX", price=23_813.0, event_epoch=102.0,
+        ))
+        during = state.publication().cross_asset_state
+        self.assertIsNone(during.coin_price)
+        self.assertEqual(during.ndx_price, 23_813.0)
+        self.assertEqual(during.as_of_epoch, 102.0)
+        self.assertEqual(during.ndx_age_seconds, 0.0)
+
+        with patch.dict(os.environ, {SCHWAB_NDX_ENABLED_ENV: "true"}):
+            now[0] = 113.0
+            self.assertIsNone(state.publication().cross_asset_state.ndx_price)
+            release_handler.set()
+            ingress.join(timeout=2)
+            self.assertFalse(ingress.is_alive())
+            self.assertIsNone(state.publication().cross_asset_state.ndx_price)
+
+    def test_ndx_source_switch_is_disabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "quant.live_market.threading.Thread",
+        ) as thread_type:
+            start_massive_ndx_poller(LiveMarketState())
+        self.assertIs(thread_type.call_args.kwargs["target"], poll_massive_ndx)
+
+        with patch.dict(os.environ, {SCHWAB_NDX_ENABLED_ENV: "true"}), patch(
+            "quant.live_market.threading.Thread",
+        ) as thread_type:
+            start_massive_ndx_poller(LiveMarketState())
+        self.assertIs(thread_type.call_args.kwargs["target"], poll_schwab_ndx)
+
+        for value in ("1", "yes", "on"):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {SCHWAB_NDX_ENABLED_ENV: value}, clear=True,
+            ), patch("quant.live_market.threading.Thread") as thread_type:
+                start_massive_ndx_poller(LiveMarketState())
+            self.assertIs(
+                thread_type.call_args.kwargs["target"], poll_massive_ndx,
+            )
 
 
 if __name__ == "__main__":
