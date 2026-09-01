@@ -28,7 +28,7 @@ from quant.evidence_outbox import (
     PostgresV4BStateBuilder, PostgresV4CStateBuilder, PostgresV4StateBuilder,
     V4StateBuildWorker, V4StateCacheRefresher, _decode_v4_state_row,
     _iter_v4_state_pages,
-    _prepare_v4_state_evidence,
+    _prepare_v4_state_evidence, _prepare_v4_state_evidence_sets,
 )
 from quant.history import MidpointObservation
 from quant.live_market import LiveMarketState
@@ -1772,7 +1772,7 @@ def test_outcome_is_separate_unverified_append_and_cannot_mutate_forecast():
     assert forecast.persisted_at is None and len(writer.outcomes) == 1
 
 
-def test_offline_builder_requires_new_outcome_and_sixty_seconds():
+def test_offline_builder_requires_new_outcome_and_thirty_seconds():
     clock = [0.0]
     calls = []
     scheduler = OfflineStateBuildScheduler(lambda: calls.append(1) or "INSERT",
@@ -1780,9 +1780,9 @@ def test_offline_builder_requires_new_outcome_and_sixty_seconds():
     assert scheduler.run_if_due() == "SKIPPED_NO_NEW_OUTCOME"
     scheduler.note_new_outcome()
     assert scheduler.run_if_due() == "INSERT"
-    scheduler.note_new_outcome(); clock[0] = 59
+    scheduler.note_new_outcome(); clock[0] = 29
     assert scheduler.run_if_due() == "SKIPPED_RATE_LIMIT"
-    clock[0] = 60
+    clock[0] = 30
     assert scheduler.run_if_due() == "INSERT" and len(calls) == 2
 
 
@@ -1803,11 +1803,11 @@ def test_offline_builder_cooldown_starts_after_slow_build_finishes():
 
     scheduler.note_new_outcome()
     assert scheduler.run_if_due() == "SKIPPED_RATE_LIMIT"
-    clock[0] = 129.0
+    clock[0] = 99.0
     assert scheduler.run_if_due() == "SKIPPED_RATE_LIMIT"
-    clock[0] = 130.0
+    clock[0] = 100.0
     assert scheduler.run_if_due() == "INSERT"
-    assert calls == [0.0, 130.0]
+    assert calls == [0.0, 100.0]
 
 
 def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkeypatch):
@@ -1999,21 +1999,34 @@ def test_streamed_overlap_selection_matches_frozen_whole_history(
 
     monkeypatch.setattr(
         "quant.evidence_outbox.V4_STATE_BUILD_QUERY_CHUNK", page_size)
+    decoded = []
+    def decode(row):
+        decoded.append(row)
+        return row
     monkeypatch.setattr(
-        "quant.evidence_outbox._decode_v4_state_row", lambda row: row)
+        "quant.evidence_outbox._decode_v4_state_row", decode)
     cohorts = {
         horizon: (base.cohort_id, base.cohort_hash)
         for horizon in HORIZONS
     }
 
-    prepared = _prepare_v4_state_evidence(
+    prepared_sets = _prepare_v4_state_evidence_sets(
         Connection(), symbol="COIN", state_as_of=NOW + timedelta(hours=1),
         cohorts=cohorts,
-        governed=lambda **kwargs: tuple(kwargs["pairs"]),
+        governed_sets={
+            "all": lambda **kwargs: tuple(kwargs["pairs"]),
+            "later": lambda **kwargs: tuple(
+                pair for pair in kwargs["pairs"]
+                if pair[0].cutoff_at > NOW),
+        },
     )
+    prepared = prepared_sets["all"]
     expected = select_non_overlapping(pairs)
+    later_expected = select_non_overlapping(pairs[1:])
 
+    assert len(decoded) == len(pairs)
     assert prepared.selection_map()["1M"] == expected
+    assert prepared_sets["later"].selection_map()["1M"] == later_expected
     assert tuple(pair[0].forecast_record_id for pair in prepared.evidence) == \
         expected.selected_ids
     as_of = NOW + timedelta(hours=1)
@@ -2241,6 +2254,62 @@ def test_combined_builder_keeps_accuracy_and_compact_in_one_generation():
     assert accuracy.connections[-1] is compact.connections[-1] is replacement
     assert accuracy.connections[-2].__class__.__name__ == \
         compact.connections[-2].__class__.__name__ == "_CommitSuppressingConnection"
+
+
+def test_combined_builder_streams_one_snapshot_for_both_frozen_states(monkeypatch):
+    class Connection:
+        autocommit = False
+        def __init__(self):
+            self.commits = 0; self.rollbacks = 0; self.events = []
+        def cursor(self):
+            connection = self
+            class Cursor:
+                def execute(self, sql): connection.events.append(sql)
+                def close(self): pass
+            return Cursor()
+        def commit(self): self.commits += 1; self.events.append("COMMIT")
+        def rollback(self): self.rollbacks += 1
+
+    accuracy_prepared = SimpleNamespace(name="accuracy")
+    compact_prepared = SimpleNamespace(name="compact")
+    shared_calls = []
+    def prepare_sets(connection, **kwargs):
+        shared_calls.append((connection, kwargs))
+        return {"accuracy": accuracy_prepared, "compact": compact_prepared}
+    monkeypatch.setattr(
+        "quant.evidence_outbox._prepare_v4_state_evidence_sets", prepare_sets)
+
+    class Builder:
+        def __init__(self, result):
+            self.result = result; self.prepared = []; self.received = []
+        def prepare(self, **candidate): self.prepared.append(candidate)
+        def rebind_connection(self, connection): self._connection = connection
+        def build_and_publish(self):
+            raise AssertionError("combined builder repeated the history scan")
+        def build_and_publish_prepared(self, prepared):
+            self.received.append(prepared)
+            self._connection.commit()
+            return self.result
+
+    accuracy, compact = Builder("INSERT"), Builder("IDEMPOTENT")
+    connection = Connection()
+    builder = PostgresV4StateBuilder(
+        accuracy, compact, connection=connection)
+    candidate = {"symbol": "COIN", "state_as_of": NOW,
+                 "cohorts": {h: ("c", "h") for h in HORIZONS}}
+    builder.prepare(**candidate)
+
+    assert builder.build_and_publish() == "INSERT"
+    assert len(shared_calls) == 1
+    shared_connection, shared_kwargs = shared_calls[0]
+    assert shared_connection.__class__.__name__ == "_CommitSuppressingConnection"
+    assert shared_kwargs["symbol"] == "COIN"
+    assert shared_kwargs["state_as_of"] == NOW
+    assert shared_kwargs["cohorts"] == candidate["cohorts"]
+    assert tuple(shared_kwargs["governed_sets"]) == ("accuracy", "compact")
+    assert accuracy.received == [accuracy_prepared]
+    assert compact.received == [compact_prepared]
+    assert connection.commits == 1 and connection.rollbacks == 0
 
 
 def test_compact_failure_rolls_back_staged_accuracy_publication():
