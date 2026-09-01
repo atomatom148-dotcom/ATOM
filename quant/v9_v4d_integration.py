@@ -348,11 +348,11 @@ class OfflineStateBuildScheduler:
     def __init__(self, build_and_publish: Callable[[], str], *,
                  metrics: OperationalMetrics | None = None,
                  monotonic_clock: Callable[[], float] = time.monotonic,
-                 minimum_interval_seconds: float = 60.0):
+                 minimum_interval_seconds: float = 30.0):
         self._build = build_and_publish
         self._metrics = metrics or OperationalMetrics()
         self._clock = monotonic_clock
-        self._interval = max(60.0, minimum_interval_seconds)
+        self._interval = max(30.0, minimum_interval_seconds)
         self._last_build: float | None = None
         self._latest_outcome_generation = 0
         self._built_generation = 0
