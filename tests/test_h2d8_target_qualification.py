@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import date
 import json
 from pathlib import Path
+import signal
 
 import pytest
 
@@ -10,22 +12,46 @@ from quant import historical_target_qualification_h2d8 as qualifier
 
 def _payload(day: str, *, gap_seconds: int = 5,
              rejected: bool = False) -> dict:
-    return {
+    opened, closed = qualifier.h1._session(date.fromisoformat(day))
+    open_ns = qualifier.h1._ns(opened)
+    close_ns = qualifier.h1._ns(closed)
+    configuration_digest = qualifier.h1._configuration_digest(
+        session_open_ns=open_ns, session_close_ns=close_ns,
+    )
+    coin_count = 1 if rejected else 2
+    reason_codes = ["COIN_INSUFFICIENT_QUOTES"] if rejected else []
+    quote_coverage = [
+        {"symbol": "COIN", "count": coin_count,
+         "max_gap_ns": None if rejected else gap_seconds * 1_000_000_000},
+        {"symbol": "QQQ", "count": 2,
+         "max_gap_ns": gap_seconds * 1_000_000_000},
+    ]
+    payload = {
+        "runner_version": qualifier.h1.H1_RUNNER_VERSION,
+        "replay_run_id": f"h1-preflight-{day}",
         "historical_session": day,
+        "session_open_ns": open_ns,
+        "session_close_ns": close_ns,
         "frame_count": 0,
         "execution_stage": "PREFLIGHT_REJECTED" if rejected else "PREFLIGHT_ONLY",
         "data_status": "DATA_INCOMPLETE" if rejected else "DATA_COMPLETE",
-        "data_reason_codes": ["COIN_OPEN_EDGE_GAP"] if rejected else [],
-        "quote_counts": [("COIN", 1), ("QQQ", 1)],
-        "quote_coverage": [{
-            "symbol": "COIN",
-            "max_gap_ns": gap_seconds * 1_000_000_000,
-        }],
+        "data_reason_codes": reason_codes,
+        "quote_counts": [("COIN", coin_count), ("QQQ", 2)],
+        "quote_coverage": quote_coverage,
         "retrieval_proof": {},
         "dataset_digest": "d" * 64,
-        "configuration_digest": "c" * 64,
-        "session_digest": "e" * 64,
+        "configuration_digest": configuration_digest,
     }
+    payload["session_digest"] = qualifier.h1.canonical_sha256({
+        "dataset_digest": payload["dataset_digest"],
+        "configuration_digest": configuration_digest,
+        "execution_stage": payload["execution_stage"],
+        "data_status": payload["data_status"],
+        "data_reason_codes": reason_codes,
+        "quote_coverage": quote_coverage,
+        "retrieval_proof": {},
+    })
+    return payload
 
 
 def _absent(_day: str, _run_id: str, _timeout: float) -> dict[str, int]:
@@ -83,8 +109,9 @@ def test_skips_honest_market_data_rejection_in_fixed_order(monkeypatch):
     assert receipt["selected_sessions"] == ["2026-07-28", "2026-07-29"]
     rejected = receipt["inspected_candidates"][0]
     assert rejected["status"] == "REJECTED"
-    assert rejected["reason_codes"] == ["COIN_OPEN_EDGE_GAP"]
+    assert rejected["reason_codes"] == ["COIN_INSUFFICIENT_QUOTES"]
     assert rejected["result_source"] == "NEW_PREFLIGHT"
+    assert rejected["maximum_interior_gap_seconds"] is None
 
 
 def test_independent_five_second_gate_rejects_six_seconds(monkeypatch):
@@ -135,6 +162,18 @@ def test_provider_or_system_error_fails_complete_phase(monkeypatch):
     assert raised.value.inspected[0]["status"] == "FAILED"
 
 
+def test_rejected_receipt_with_lineage_drift_fails_closed(monkeypatch):
+    payloads = {day: _payload(day) for day, _run_id in qualifier.FROZEN_TARGETS}
+    payloads["2026-07-27"] = _payload("2026-07-27", rejected=True)
+    payloads["2026-07-27"]["runner_version"] = "drifted"
+    with pytest.raises(
+        qualifier.TargetQualificationFailure,
+        match="PROVIDER_SYSTEM_OR_RECEIPT_ERROR",
+    ) as raised:
+        _execute(monkeypatch, payloads)
+    assert raised.value.inspected[0]["status"] == "FAILED"
+
+
 def test_fails_if_evidence_control_changes(monkeypatch):
     controls = iter(((1, 2, 3), (1, 2, 4)))
     payloads = {day: _payload(day) for day, _run_id in qualifier.FROZEN_TARGETS}
@@ -148,6 +187,58 @@ def test_fails_if_evidence_control_changes(monkeypatch):
             preflight_runner=lambda day, _timeout: payloads[day],
             control_reader=lambda _timeout: next(controls),
         )
+
+
+def test_final_control_error_retains_inspected_candidates(monkeypatch):
+    payloads = {day: _payload(day) for day, _run_id in qualifier.FROZEN_TARGETS}
+    monkeypatch.setattr(qualifier.h1, "_qualifies_cached_result", lambda *_a, **_k: True)
+    controls = iter(((1, 2, 3), RuntimeError("database unavailable")))
+
+    def control(_timeout):
+        value = next(controls)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    with pytest.raises(
+        qualifier.TargetQualificationFailure, match="POST_CONTROL_ERROR",
+    ) as raised:
+        qualifier.execute_target_qualification(
+            target_reader=_absent,
+            preflight_runner=lambda day, _timeout: payloads[day],
+            control_reader=control,
+        )
+    assert len(raised.value.inspected) == 2
+    assert len(raised.value.selected) == 2
+
+
+def test_default_preflight_enforces_and_clears_deadline(monkeypatch):
+    handler = {}
+    timer_calls = []
+
+    def set_handler(_signal, value):
+        previous = handler.get("value", "previous")
+        handler["value"] = value
+        return previous
+
+    def run_h1_session(**_kwargs):
+        handler["value"](signal.SIGALRM, None)
+
+    monkeypatch.setattr(qualifier.signal, "signal", set_handler)
+    monkeypatch.setattr(
+        qualifier.signal, "setitimer",
+        lambda which, seconds: timer_calls.append((which, seconds)),
+    )
+    monkeypatch.setattr(qualifier.h1, "run_h1_session", run_h1_session)
+
+    with pytest.raises(
+        qualifier.TargetQualificationFailure, match="PREFLIGHT_TIMEOUT",
+    ):
+        qualifier._run_preflight(object(), "2026-07-27", 2.5)
+    assert timer_calls == [
+        (signal.ITIMER_REAL, 2.5), (signal.ITIMER_REAL, 0),
+    ]
+    assert handler["value"] == "previous"
 
 
 def test_fails_after_fixed_list_if_two_targets_do_not_qualify(monkeypatch):
