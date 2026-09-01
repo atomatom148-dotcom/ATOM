@@ -6,6 +6,7 @@ from datetime import date
 import json
 import math
 import resource
+import signal
 import time
 from typing import Callable, Iterable
 
@@ -108,17 +109,27 @@ def _read_evidence_control(timeout_seconds: float) -> tuple[int, int, int]:
     return tuple(map(int, row))
 
 
-def _run_preflight(reader: object, historical_session: str, _timeout: float) -> dict:
+def _run_preflight(reader: object, historical_session: str, timeout: float) -> dict:
     day = date.fromisoformat(historical_session)
     opened, closed = h1._session(day)
-    return h1.run_h1_session(
-        reader=reader,
-        session_open=opened,
-        session_close=closed,
-        replay_run_id=f"h1-preflight-{historical_session}",
-        preflight_only=True,
-        maximum_interior_gap_seconds=MAX_INTERIOR_GAP_SECONDS,
-    ).to_dict()
+
+    def deadline_expired(_signum: int, _frame: object) -> None:
+        raise TargetQualificationFailure("H2D8_PREFLIGHT_TIMEOUT")
+
+    previous_handler = signal.signal(signal.SIGALRM, deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        return h1.run_h1_session(
+            reader=reader,
+            session_open=opened,
+            session_close=closed,
+            replay_run_id=f"h1-preflight-{historical_session}",
+            preflight_only=True,
+            maximum_interior_gap_seconds=MAX_INTERIOR_GAP_SECONDS,
+        ).to_dict()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _hex_digest(payload: dict, field: str) -> str:
@@ -129,7 +140,7 @@ def _hex_digest(payload: dict, field: str) -> str:
     return value
 
 
-def _coin_gap_ns(payload: dict) -> int:
+def _coin_gap_ns(payload: dict, *, allow_none: bool = False) -> int | None:
     coverage = payload.get("quote_coverage")
     if not isinstance(coverage, (list, tuple)):
         raise TargetQualificationFailure("H2D8_RECEIPT_QUOTE_COVERAGE")
@@ -138,6 +149,8 @@ def _coin_gap_ns(payload: dict) -> int:
     if len(coin) != 1:
         raise TargetQualificationFailure("H2D8_RECEIPT_COIN_COVERAGE")
     maximum_gap = coin[0].get("max_gap_ns")
+    if maximum_gap is None and allow_none:
+        return None
     if (isinstance(maximum_gap, bool) or
             not isinstance(maximum_gap, int) or maximum_gap < 0):
         raise TargetQualificationFailure("H2D8_RECEIPT_COIN_GAP")
@@ -145,17 +158,59 @@ def _coin_gap_ns(payload: dict) -> int:
 
 
 def _honest_rejection(payload: dict, historical_session: str) -> bool:
+    day = date.fromisoformat(historical_session)
+    opened, closed = h1._session(day)
+    open_ns, close_ns = h1._ns(opened), h1._ns(closed)
+    reasons = payload.get("data_reason_codes")
+    allowed_reasons = {
+        "COIN_INSUFFICIENT_QUOTES", "COIN_OPEN_EDGE_GAP",
+        "COIN_CLOSE_EDGE_GAP",
+        *(f"{horizon}_ENDPOINT_GAP" for horizon in h1.HORIZONS),
+    }
     counts = payload.get("quote_counts")
     if (not isinstance(counts, (list, tuple)) or
+            tuple(row[0] for row in counts
+                  if isinstance(row, (list, tuple)) and len(row) == 2) !=
+            ("COIN", "QQQ") or
             any(not isinstance(row, (list, tuple)) or len(row) != 2 or
                 isinstance(row[1], bool) or not isinstance(row[1], int) or
                 row[1] < 0 for row in counts)):
         return False
-    opened, closed = h1._session(date.fromisoformat(historical_session))
-    return h1._retrieval_proof_valid(
-        payload.get("retrieval_proof"),
-        open_ns=h1._ns(opened), close_ns=h1._ns(closed),
-        retained_count=sum(row[1] for row in counts),
+    coverage = payload.get("quote_coverage")
+    if (not isinstance(coverage, (list, tuple)) or len(coverage) != 2 or
+            tuple(row.get("symbol") for row in coverage
+                  if isinstance(row, dict)) != ("COIN", "QQQ") or
+            any(row.get("count") != dict(counts)[row["symbol"]]
+                for row in coverage)):
+        return False
+    expected_configuration = h1._configuration_digest(
+        session_open_ns=open_ns, session_close_ns=close_ns,
+    )
+    expected_session = h1.canonical_sha256({
+        "dataset_digest": payload.get("dataset_digest"),
+        "configuration_digest": expected_configuration,
+        "execution_stage": "PREFLIGHT_REJECTED",
+        "data_status": "DATA_INCOMPLETE",
+        "data_reason_codes": reasons,
+        "quote_coverage": coverage,
+        "retrieval_proof": payload.get("retrieval_proof"),
+    })
+    return (
+        payload.get("runner_version") == h1.H1_RUNNER_VERSION and
+        payload.get("replay_run_id") == f"h1-preflight-{historical_session}" and
+        payload.get("session_open_ns") == open_ns and
+        payload.get("session_close_ns") == close_ns and
+        payload.get("configuration_digest") == expected_configuration and
+        payload.get("session_digest") == expected_session and
+        payload.get("execution_stage") == "PREFLIGHT_REJECTED" and
+        payload.get("data_status") == "DATA_INCOMPLETE" and
+        isinstance(reasons, (list, tuple)) and
+        list(reasons) == sorted(set(reasons)) and
+        set(reasons).issubset(allowed_reasons) and
+        h1._retrieval_proof_valid(
+            payload.get("retrieval_proof"), open_ns=open_ns,
+            close_ns=close_ns, retained_count=sum(row[1] for row in counts),
+        )
     )
 
 
@@ -195,9 +250,10 @@ def _candidate_receipt(
     if (not isinstance(reason_codes, (list, tuple)) or
             any(not isinstance(code, str) for code in reason_codes)):
         raise TargetQualificationFailure("H2D8_RECEIPT_REASON_CODES")
-    gap_ns = _coin_gap_ns(payload)
     stage = payload.get("execution_stage")
     data_status = payload.get("data_status")
+    rejected_stage = stage == "PREFLIGHT_REJECTED"
+    gap_ns = _coin_gap_ns(payload, allow_none=rejected_stage)
     qualification_reasons: list[str] = []
 
     if stage == "PREFLIGHT_ONLY" and data_status == "DATA_COMPLETE" and not reason_codes:
@@ -225,7 +281,9 @@ def _candidate_receipt(
         "reason_codes": list(reason_codes),
         "qualification_reason_codes": qualification_reasons,
         "result_source": "NEW_PREFLIGHT",
-        "maximum_interior_gap_seconds": gap_ns / _NANOSECONDS,
+        "maximum_interior_gap_seconds": (
+            None if gap_ns is None else gap_ns / _NANOSECONDS
+        ),
         "frame_count": frame_count,
         "dataset_digest": _hex_digest(payload, "dataset_digest"),
         "configuration_digest": _hex_digest(payload, "configuration_digest"),
@@ -349,7 +407,14 @@ def execute_target_qualification(
             elapsed_seconds=time.monotonic() - started,
         ) from error
 
-    unchanged = control_reader(_remaining(deadline)) == before
+    try:
+        unchanged = control_reader(_remaining(deadline)) == before
+    except Exception as error:
+        raise TargetQualificationFailure(
+            f"H2D8_POST_CONTROL_ERROR:{type(error).__name__}",
+            inspected=inspected, selected=selected,
+            elapsed_seconds=time.monotonic() - started,
+        ) from error
     if not unchanged:
         raise TargetQualificationFailure(
             "H2D8_EVIDENCE_DRIFT", inspected=inspected,
