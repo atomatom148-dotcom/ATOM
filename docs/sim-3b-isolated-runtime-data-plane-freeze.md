@@ -266,6 +266,15 @@ The SIM-2 publisher store continues to require
 `current_user = atom_v9_sim_entry_runtime`; it never accepts the publisher role
 or falls back to it.
 
+This role split expressly supersedes every carried SIM-3A grant of a SIM-4
+fence, capture, reconciliation, or checkpoint function to
+`atom_v9_sim_runtime`. Migration 027 creates none of the superseded operational
+functions, revokes every migration-created operational-function `EXECUTE` from
+the publisher, and grants only the fence-reader and compare-and-advance
+functions named in Section 4.4 to `atom_v9_sim_entry_runtime`. The publisher
+retains only its shared-lock trigger path; it cannot capture a fence, read the
+publication sequence, or move reconciliation progress.
+
 No login runtime role owns an object, inherits from another role, is a member
 of another role, has schema `CREATE`, has sequence privilege, or receives
 `UPDATE`, `DELETE`, `TRUNCATE`, ownership, RLS bypass, service-role, or
@@ -640,8 +649,15 @@ and is valid only when it is an integer, not a Boolean, satisfying:
 
 This is the exact PostgreSQL `bigint` domain; an overflow or negative value
 rejects the quote before admission.
-Bid, ask, bid size, ask size, symbol, provider timestamp, accepted timestamp,
-source identity, and quote hash retain the merged PR #223 contract.
+
+The worker-admission event and monotonic-derived timestamp in Section 6
+expressly replace merged PR #223's requirement that `accepted_at` be sampled
+after a corresponding production market/V9 publication commits. SIM-4 has no
+production quote callback or publication visibility. Its successful
+mutex-serialized worker queue admission is the sole replacement causal point
+for `accepted_at`, quote identity, window eligibility, and the quote hash. Bid,
+ask, sizes, symbol, provider timestamp, source identity, canonicalization, and
+every other quote/hash field retain the merged PR #223 contract.
 
 ## 6. Monotonic accepted time and deterministic quote ordering
 
@@ -934,12 +950,19 @@ the worker does not stage the whole closed interval in memory and does not
 terminalize a later page while an earlier row remains incomplete.
 
 For timing classification, a fetched publication becomes discovered exactly
-once: after its sidecar, joined intent row, canonical JSON/hash, project
-identity, and publication invariants have all validated, and before any yield
-or pending-queue insertion, the owner thread samples `monotonic_ns` and derives
-one discovery instant through the immutable Section 6 anchor. Equality with the
-inclusive deadline is timely; a derived instant strictly greater is late. A
-validation failure discovers nothing and fails closed under its frozen error
+once after its sidecar, joined intent row, canonical JSON/hash, project identity,
+and publication invariants have all validated. Before any yield, the owner
+thread acquires the same admission mutex used by the deadline fence, samples
+`monotonic_ns`, derives one discovery instant through the immutable Section 6
+anchor, and atomically registers the validated intent in pending state before
+releasing that mutex. Registration is timely only when the derived instant is
+at or before the inclusive deadline and that deadline has not already been
+marked closed under the mutex. The strict-greater deadline path marks its
+deadline closed and snapshots its quote watermark in the same mutex critical
+section. Therefore discovery registration and deadline closure have one total
+order: whichever completes that critical section first controls, and no row can
+be fetched before the deadline yet ambiguously register after its closure. A
+validation failure registers nothing and fails closed under its frozen error
 rule.
 
 An ordinary pending intent must be discovered no later than its inclusive
@@ -1031,6 +1054,8 @@ The SIM-4 implementation must prove at minimum:
 - neither runtime role has production, mutation, ownership, membership in the
   other role, or RLS-bypass privilege;
 - exact NOLOGIN owner, forced-RLS policies, and exactly three definer functions;
+- every carried publisher operational-function grant is superseded/revoked and
+  only the entry-worker role can execute the two SIM-4 operational functions;
 - exact four-column sidecar, 1..6 horizon order, restrictive FK, semantic
   keyset index, and publication-sequence membership path;
 - BEFORE invoker shared-lock and AFTER definer publication behavior, including
@@ -1047,6 +1072,8 @@ The SIM-4 implementation must prove at minimum:
 - exact SIP websocket URL and COIN-only quote subscription;
 - successful auth and subscription are required before admission;
 - the exact four AuthX/attestation environment names are required;
+- worker queue admission, never a production publication callback or commit,
+  is the sole `accepted_at` causal point used by identity/hash/window logic;
 - the external provisioning record, not runtime token introspection, attests
   Data-read-only, every other scope No-Access, and SIP entitlement;
 - a standard Trading API key, legacy Broker key, Alpaca Connect user token, or
@@ -1072,6 +1099,8 @@ The SIM-4 implementation must prove at minimum:
   one mutex-serialized operation;
 - deadline time sampling and watermark capture use that same mutex, so a
   pre-deadline sample cannot enqueue after the fence;
+- forced interleavings prove discovery registration and deadline closure share
+  that mutex and produce one total timely/late order;
 - equal accepted timestamps are fully drained and sorted by provider
   nanoseconds and quote ID before selection;
 - reverse arrival order with equal accepted time selects lower provider
