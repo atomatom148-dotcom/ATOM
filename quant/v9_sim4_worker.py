@@ -78,6 +78,7 @@ SIM4_RUNTIME_OWNER_STARTUP_WAIT_SECONDS = 1.000
 SIM4_PERIODIC_CAPTURE_SECONDS = 1.000
 SIM4_PUBLIC_STOP_JOIN_SECONDS = 1.000
 SIM4_TELEMETRY_LOG_INTERVAL_SECONDS = 1.000
+SIM4_DATABASE_CONNECT_TIMEOUT_SECONDS = 5
 
 SIM4_TOKEN_CONNECT_TIMEOUT_SECONDS = 5.0
 SIM4_TOKEN_TOTAL_TIMEOUT_SECONDS = 10.0
@@ -1110,6 +1111,7 @@ class DeadlineClosure:
     candidates: dict[str, object | None]
     publication_fence: int | None = None
     reconciliation_complete: bool = False
+    admitted_quotes: tuple[SimulationExecutableQuote, ...] = ()
 
 
 def quote_is_eligible(intent: SimulationTradeIntent, quote: object) -> bool:
@@ -1206,7 +1208,10 @@ class SimulationEntryWorker:
         if connection_factory is None:
             def connection_factory() -> _Connection:
                 import psycopg
-                return psycopg.connect(config.database_url)  # type: ignore[return-value]
+                return psycopg.connect(  # type: ignore[return-value]
+                    config.database_url,
+                    connect_timeout=SIM4_DATABASE_CONNECT_TIMEOUT_SECONDS,
+                )
         token_client = AuthXTokenClient(
             config.authx_client_id,
             config.authx_client_secret,
@@ -1482,6 +1487,12 @@ class SimulationEntryWorker:
                 raise Sim4ConfigurationError("SIP receiver lacks readiness acknowledgement")
         while not self._stop_requested.is_set():
             if ready.wait(SIM4_RUNTIME_OWNER_RETRY_SECONDS):
+                try:
+                    self._enable_admission_with_anchor()
+                except Sim4ProtocolError:
+                    # The receiver cleared readiness while beginning its
+                    # normal reconnect loop.  Wait on that same receiver.
+                    continue
                 return True
         return False
 
@@ -1803,28 +1814,25 @@ class SimulationEntryWorker:
                 )
             )
             return False
-        if publication.discovered_epoch_ns > deadline_ns:
-            # First-late discovery cannot use an existing closure or inspect
-            # retained quotes, even when its sequence lies below that fence.
-            self._terminalize(store, publication, "SKIPPED_WINDOW_EXPIRED")
-            return True
         closure = self._deadline_closures.get(deadline_ns)
         if closure is not None and closure.publication_fence is not None:
             if publication.publication_seq > closure.publication_fence:
                 self._terminalize(store, publication, "SKIPPED_WINDOW_EXPIRED")
                 self._pending.pop(intent.intent_id, None)
                 return True
-            if intent.intent_id not in closure.candidates:
-                # The immutable local candidate set was completed before the
-                # DB fence.  A row absent from that set cannot inspect quotes
-                # or be added after closure.
-                self._terminalize(store, publication, "SKIPPED_WINDOW_EXPIRED")
-                self._pending.pop(intent.intent_id, None)
-                return True
-            quote = closure.candidates[intent.intent_id]
+            quote = (
+                closure.candidates[intent.intent_id]
+                if intent.intent_id in closure.candidates
+                else select_executable_quote(intent, closure.admitted_quotes)
+            )
             requested = "ENTERED" if quote is not None else "SKIPPED_WINDOW_EXPIRED"
             self._terminalize(store, publication, requested, quote)
             self._pending.pop(intent.intent_id, None)
+            return True
+        if publication.discovered_epoch_ns > deadline_ns:
+            # Without an earlier immutable publication fence, a first-late
+            # discovery cannot inspect retained quotes.
+            self._terminalize(store, publication, "SKIPPED_WINDOW_EXPIRED")
             return True
         self._remember_pending(PendingIntent(publication, deadline_ns))
         return False
@@ -2026,24 +2034,35 @@ class SimulationEntryWorker:
         if not greater:
             return False
         self._drain_through(watermark)
+        admitted_quotes = tuple(
+            envelope.quote
+            for envelope in self._quotes
+            if (
+                envelope.admission_sequence <= watermark
+                and isinstance(envelope.quote, SimulationExecutableQuote)
+            )
+        )
         due = [pending for pending in self._pending.values()
                if pending.deadline_epoch_ns == deadline_ns
                and pending.forced_status_after_deadline is None]
         candidates: dict[str, object | None] = {}
         for pending in due:
-            admitted = [
-                envelope.quote for envelope in self._quotes
-                if envelope.admission_sequence <= watermark
-            ]
             candidates[pending.publication.intent.intent_id] = select_executable_quote(
                 pending.publication.intent,
-                (quote for quote in admitted if isinstance(quote, SimulationExecutableQuote)),
+                admitted_quotes,
             )
             pending.admission_watermark = watermark
             pending.selected_quote = candidates[pending.publication.intent.intent_id]
-        # The complete fixed local set exists before the blocking DB closure.
+        # Freeze the complete local quote input before the blocking DB closure;
+        # rows not yet paged can derive only from this bounded snapshot.
         fence = self._capture_deadline_publication_fence()
-        closure = DeadlineClosure(deadline_ns, watermark, candidates, fence)
+        closure = DeadlineClosure(
+            deadline_ns,
+            watermark,
+            candidates,
+            fence,
+            admitted_quotes=admitted_quotes,
+        )
         self._deadline_closures[deadline_ns] = closure
         # Deadline work supersedes an incomplete activation/periodic runtime
         # cursor.  Rebuild from the durable checkpoint through the immutable
@@ -2348,7 +2367,6 @@ class SimulationEntryWorker:
             store = self._verify_startup()
             if not self._wait_for_sip_readiness():
                 return
-            self._enable_admission_with_anchor()
             activation_fence = None
             while not self._stop_requested.is_set() and activation_fence is None:
                 try:
