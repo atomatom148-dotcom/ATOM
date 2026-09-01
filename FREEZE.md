@@ -39,6 +39,23 @@ the default until `ATOM_V4_STATE_BUILDER_EXTERNAL=1` is explicitly set after
 the separate worker is provisioned; the separate process remains inert until
 `ATOM_V4_STATE_WORKER_ENABLED=1` is explicitly set.
 
+## Family evidence cadence amendment
+
+All 12 family equations continue to run on every accepted live COIN cycle and
+V9 continues to receive the complete in-memory exact-six family surface. Only
+future durable family forecast writes may be paced: for each exact family,
+formula version, symbol, and horizon, the ledger may persist at most the first
+eligible observation in each UTC epoch-aligned horizon interval. Existing
+forecasts, outcomes, publications, and states remain append-only and unchanged.
+
+The cadence decision must be restart-safe and database-observed; process memory
+alone cannot establish interval ownership. Resolution, proof publication,
+target/source specifications, eligibility, Phase-E readers, and V9 mathematics
+remain unchanged. The gate is disabled by default and may operate only when
+`ATOM_FAMILY_EVIDENCE_CADENCE_ENABLED=1` is explicitly set after parity tests.
+This amendment authorizes no schema, database, service, migration, deletion,
+rewrite, or historical backfill change.
+
 ## Allowed pipeline
 
 ```
