@@ -244,7 +244,7 @@ def entry_database_row(entry):
         None if quote is None else quote.provider_event_ns,
         None if quote is None else quote.accepted_at,
         entry.entry_price,
-        json.loads(serialize_simulation_entry_record(entry)),
+        serialize_simulation_entry_record(entry),
     )
 
 
