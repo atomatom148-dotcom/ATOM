@@ -105,8 +105,8 @@ def _execute(*, target_reader=_absent, batch_receipt=None,
 
 def test_canary_admits_exactly_one_frozen_absent_session():
     receipt = _execute()
-    assert canary.FROZEN_SESSION == "2026-07-23"
-    assert canary.FROZEN_RUN_ID == "h2d-2026-07-23"
+    assert canary.FROZEN_SESSION == "2026-07-24"
+    assert canary.FROZEN_RUN_ID == "h2d-2026-07-24"
     assert receipt["status"] == "PASSED"
     assert receipt["manifest_writes"] == 1
     assert receipt["forecast_writes"] == FORECASTS

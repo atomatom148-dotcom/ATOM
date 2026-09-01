@@ -1366,6 +1366,24 @@ def test_state_builder_reconnects_both_builders_and_preserves_generation():
         "v4_state_build_worker.reconnect_success"] == 1
 
 
+def test_recovery_only_reader_does_not_load_live_pending_forecasts(monkeypatch):
+    monkeypatch.setattr(
+        EvidenceLedgerWorker,
+        "_load_pending",
+        lambda _self: (_ for _ in ()).throw(AssertionError("unexpected load")),
+    )
+
+    worker = EvidenceLedgerWorker(
+        EvidenceOutbox(),
+        evidence_store=_RawStore(),
+        connection=_WorkerConnection(),
+        load_pending=False,
+    )
+
+    assert worker._pending == []
+    worker.close()
+
+
 def test_state_builder_rate_limit_retains_exact_candidate_until_insert():
     class Connection:
         def close(self): pass
@@ -1764,6 +1782,30 @@ def test_offline_builder_requires_new_outcome_and_sixty_seconds():
     assert scheduler.run_if_due() == "SKIPPED_RATE_LIMIT"
     clock[0] = 60
     assert scheduler.run_if_due() == "INSERT" and len(calls) == 2
+
+
+def test_offline_builder_cooldown_starts_after_slow_build_finishes():
+    clock = [0.0]
+    calls = []
+
+    def slow_build():
+        calls.append(clock[0])
+        clock[0] += 70.0
+        return "INSERT"
+
+    scheduler = OfflineStateBuildScheduler(
+        slow_build, monotonic_clock=lambda: clock[0],
+    )
+    scheduler.note_new_outcome()
+    assert scheduler.run_if_due() == "INSERT"
+
+    scheduler.note_new_outcome()
+    assert scheduler.run_if_due() == "SKIPPED_RATE_LIMIT"
+    clock[0] = 129.0
+    assert scheduler.run_if_due() == "SKIPPED_RATE_LIMIT"
+    clock[0] = 130.0
+    assert scheduler.run_if_due() == "INSERT"
+    assert calls == [0.0, 130.0]
 
 
 def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkeypatch):

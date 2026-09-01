@@ -21,6 +21,24 @@ This freeze is short on purpose. If a change needs more surface area, stop and u
 9. **Approved numerical surface** — The 12-family and Phase-E evidence UI may expose computed numbers and eligible resolved truth only. Scout/Shadow, Research OS, and SEI/VJE remain excluded.
 10. **One phase at a time** — Do not scaffold later phases in the same change.
 
+## Derived-state worker amendment
+
+The expensive V4B/V4C full-history state build may run in one separate ATOM
+background process. This process is a derived-state worker only: it reads
+already-durable, proof-eligible V4 forecasts/outcomes and writes only the two
+existing atomic V4 state rows. It cannot capture market data, create or resolve
+forecasts, own the evidence FIFO, alter V1–V4 mathematics, or receive truth
+credit.
+
+The live web runtime remains the sole market, forecast, outcome, and evidence
+writer. The derived-state process must use the existing bounded recovery
+reader, preserve exact-six cohort identity, and hold one session-level
+PostgreSQL advisory lease so rolling replacements cannot build concurrently.
+Moving ownership is fail-closed and reversible: the web-hosted builder remains
+the default until `ATOM_V4_STATE_BUILDER_EXTERNAL=1` is explicitly set after
+the separate worker is provisioned; the separate process remains inert until
+`ATOM_V4_STATE_WORKER_ENABLED=1` is explicitly set.
+
 ## Allowed pipeline
 
 ```

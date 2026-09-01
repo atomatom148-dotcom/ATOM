@@ -374,11 +374,17 @@ class OfflineStateBuildScheduler:
             self._last_build = now
         started = self._clock()
         status = self._build()
-        elapsed = (self._clock() - started) * 1000
+        finished = self._clock()
+        elapsed = (finished - started) * 1000
         self._metrics.observe("state_build_latency_ms", elapsed)
         self._metrics.increment("state_publication." + status)
-        if status in ("INSERT", "IDEMPOTENT"):
-            with self._lock:
+        with self._lock:
+            # The interval is a cooldown between completed full-history builds.
+            # Measuring it from build start makes a build slower than the
+            # interval immediately eligible to run again, keeping this worker
+            # permanently busy under production evidence volume.
+            self._last_build = finished
+            if status in ("INSERT", "IDEMPOTENT"):
                 self._built_generation = max(self._built_generation, generation)
         return status
 

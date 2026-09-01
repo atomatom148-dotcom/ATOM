@@ -99,7 +99,7 @@ authorized.
 
 ### H2-D-7 — One-session historical admission (implementation authorized)
 
-Admit only `2026-07-23` as `h2d-2026-07-23` through the existing sequential
+Admit only `2026-07-24` as `h2d-2026-07-24` through the existing sequential
 certified replay, append-only persistence, outcome-resolution, and score-reader
 seams under `docs/h2-d7-one-session-write-freeze.md`. No alternate date,
 parallel replay, backfill, scheduler, continuous replay, or tier change is
