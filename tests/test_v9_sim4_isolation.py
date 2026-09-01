@@ -791,10 +791,11 @@ def test_worker_source_has_no_production_runtime_or_trading_import_surface():
 
 def test_deadline_terminalizes_before_checkpoint_and_releases_closure_transaction():
     intent = build_worker_intent()
-    published = PublishedSimulationIntent(1, WORKER_T0, 1, intent)
+    published = PublishedSimulationIntent(
+        1, WORKER_T0, WORKER_T0, 1, intent)
     deadline_ns = datetime_to_epoch_nanoseconds(WORKER_T0) + 2_000_000_000
     publication = worker.PublicationRecord(
-        1, WORKER_T0, 1, intent, deadline_ns - 1)
+        1, WORKER_T0, WORKER_T0, 1, intent, deadline_ns - 1)
     connection = WorkerTransactionConnection(((None,), (1,)))
     runtime = make_authoritative_worker(connection)
     runtime._pending[intent.intent_id] = worker.PendingIntent(
@@ -861,8 +862,8 @@ def test_reconciliation_preserves_semantic_order_when_publication_sequences_inve
     later_time = WORKER_T0 + timedelta(microseconds=1)
     later = build_worker_intent(3, eligible_at=later_time, final_bps=0.0)
     semantic_page = (
-        PublishedSimulationIntent(9, WORKER_T0, 1, earlier),
-        PublishedSimulationIntent(5, later_time, 1, later),
+        PublishedSimulationIntent(9, WORKER_T0, WORKER_T0, 1, earlier),
+        PublishedSimulationIntent(5, later_time, later_time, 1, later),
     )
     sequence_by_intent = {earlier.intent_id: 9, later.intent_id: 5}
     connection = WorkerTransactionConnection()
@@ -914,7 +915,7 @@ def test_deadline_rebuilds_from_checkpoint_and_preserves_known_timely_discovery(
     intent = build_worker_intent(4)
     deadline_ns = datetime_to_epoch_nanoseconds(WORKER_T0) + 2_000_000_000
     known = worker.PublicationRecord(
-        5, WORKER_T0, 1, intent, deadline_ns - 1)
+        5, WORKER_T0, WORKER_T0, 1, intent, deadline_ns - 1)
     runtime = make_authoritative_worker(WorkerTransactionConnection())
     runtime._checkpoint_last = 4
     runtime._checkpoint_version = 2
@@ -947,7 +948,8 @@ def test_deadline_rebuilds_from_checkpoint_and_preserves_known_timely_discovery(
 
         def load_publication_page_on_cursor(self, _cursor, **kwargs):
             self.kwargs = kwargs
-            return (PublishedSimulationIntent(5, WORKER_T0, 1, intent),)
+            return (PublishedSimulationIntent(
+                5, WORKER_T0, WORKER_T0, 1, intent),)
 
     def rediscovered_late(_published):
         raise AssertionError("known timely discovery was replaced")
@@ -973,7 +975,7 @@ def test_deadline_fence_late_page_uses_frozen_quote_snapshot(monkeypatch):
     runtime._quotes.append(worker.AdmissionEnvelope(1, quote))
     runtime._last_drained_sequence = 1
     known = worker.PublicationRecord(
-        16, WORKER_T0, 1, known_intent, deadline_ns - 1)
+        16, WORKER_T0, WORKER_T0, 1, known_intent, deadline_ns - 1)
     runtime._pending[known_intent.intent_id] = worker.PendingIntent(
         known, deadline_ns)
     monkeypatch.setattr(
@@ -992,7 +994,7 @@ def test_deadline_fence_late_page_uses_frozen_quote_snapshot(monkeypatch):
         def load_publication_page_on_cursor(_cursor, **kwargs):
             assert kwargs["after"] is not None
             return (PublishedSimulationIntent(
-                17, WORKER_T0, 1, later_page_intent),)
+                17, WORKER_T0, WORKER_T0, 1, later_page_intent),)
 
         @staticmethod
         def get_existing_entry_in_transaction(_cursor, _intent):
@@ -1010,6 +1012,46 @@ def test_deadline_fence_late_page_uses_frozen_quote_snapshot(monkeypatch):
     assert later_page.discovered_epoch_ns > deadline_ns
     assert runtime._classify_publication(store, later_page)
     assert terminal == [(later_page_intent.intent_id, "ENTERED", quote)]
+
+
+@pytest.mark.parametrize("late_admission", (False, True))
+def test_database_admission_marker_closes_sample_to_commit_gap(
+        monkeypatch, late_admission):
+    intent = build_worker_intent(53)
+    deadline_at = WORKER_T0 + timedelta(seconds=2)
+    deadline_ns = datetime_to_epoch_nanoseconds(deadline_at)
+    admitted_at = deadline_at + (
+        timedelta(microseconds=1) if late_admission else timedelta(0)
+    )
+    publication = worker.PublicationRecord(
+        2, admitted_at, WORKER_T0, 1, intent, deadline_ns + 1)
+    quote = build_worker_quote()
+    runtime = make_authoritative_worker(WorkerTransactionConnection())
+    runtime._pending[intent.intent_id] = worker.PendingIntent(
+        publication, deadline_ns)
+    runtime._deadline_closures[deadline_ns] = worker.DeadlineClosure(
+        deadline_ns,
+        1,
+        {intent.intent_id: quote},
+        2,
+        admitted_quotes=(quote,),
+    )
+    terminal = []
+
+    monkeypatch.setattr(runtime, "_existing_entry", lambda *_args: None)
+    monkeypatch.setattr(
+        runtime,
+        "_terminalize",
+        lambda _store, _publication, status, selected_quote=None:
+            terminal.append((status, selected_quote)),
+    )
+
+    assert runtime._classify_publication(object(), publication)
+    assert intent.intent_id not in runtime._pending
+    assert terminal == [(
+        "SKIPPED_WINDOW_EXPIRED" if late_admission else "ENTERED",
+        None if late_admission else quote,
+    )]
 
 
 def test_blocking_deadline_lock_freezes_later_crossing_before_commit(
@@ -1031,19 +1073,20 @@ def test_blocking_deadline_lock_freezes_later_crossing_before_commit(
         51, eligible_at=third_publication_at)
     runtime._pending[first_intent.intent_id] = worker.PendingIntent(
         worker.PublicationRecord(
-            1, WORKER_T0, 1, first_intent, first_deadline - 1),
+            1, WORKER_T0, WORKER_T0, 1,
+            first_intent, first_deadline - 1),
         first_deadline,
     )
     runtime._pending[second_intent.intent_id] = worker.PendingIntent(
         worker.PublicationRecord(
-            2, second_publication_at, 1, second_intent,
+            2, second_publication_at, second_publication_at, 1, second_intent,
             second_deadline - 1,
         ),
         second_deadline,
     )
     runtime._pending[third_intent.intent_id] = worker.PendingIntent(
         worker.PublicationRecord(
-            3, third_publication_at, 1, third_intent,
+            3, third_publication_at, third_publication_at, 1, third_intent,
             third_deadline - 1,
         ),
         third_deadline,
@@ -1112,8 +1155,10 @@ def test_page_discovery_registers_all_timely_intents_before_database_yield(
         @staticmethod
         def load_publication_page_on_cursor(_cursor, **_kwargs):
             return (
-                PublishedSimulationIntent(1, eligible_at, 1, first),
-                PublishedSimulationIntent(2, eligible_at, 1, second),
+                PublishedSimulationIntent(
+                    1, eligible_at, eligible_at, 1, first),
+                PublishedSimulationIntent(
+                    2, eligible_at, eligible_at, 1, second),
             )
 
     existing = build_simulation_entry_record(
@@ -1146,6 +1191,7 @@ def test_every_row_in_a_full_semantic_page_is_classified_without_short_circuit(
     page = [
         worker.PublicationRecord(
             index,
+            WORKER_T0 + timedelta(microseconds=index),
             WORKER_T0 + timedelta(microseconds=index),
             1,
             build_worker_intent(
@@ -1201,10 +1247,12 @@ def test_keyset_reconciliation_crosses_65536_rows_with_bounded_pages(monkeypatch
             stop = min(start + limit, total_rows + 1)
             self.page_calls += 1
             return tuple(
-                SimpleNamespace(
-                    publication_seq=index,
-                    publication_at=(
-                        WORKER_T0 + timedelta(microseconds=index)),
+                    SimpleNamespace(
+                        publication_seq=index,
+                        admitted_at=(
+                            WORKER_T0 + timedelta(microseconds=index)),
+                        publication_at=(
+                            WORKER_T0 + timedelta(microseconds=index)),
                     horizon_order=1,
                     intent=SimpleNamespace(
                         intent_id=f"large-history-{index:06d}",
@@ -1295,7 +1343,8 @@ def test_checkpoint_backoff_services_quote_fifo_instead_of_waiting(monkeypatch):
 
     intent = build_worker_intent(42)
     due = datetime_to_epoch_nanoseconds(WORKER_T0) + 2_000_000_000
-    publication = worker.PublicationRecord(1, WORKER_T0, 1, intent, due - 1)
+    publication = worker.PublicationRecord(
+        1, WORKER_T0, WORKER_T0, 1, intent, due - 1)
     runtime._pending[intent.intent_id] = worker.PendingIntent(publication, due)
     runtime._deadline_closures[due] = worker.DeadlineClosure(
         due, 1, {intent.intent_id: None}, 1)
@@ -1445,7 +1494,7 @@ def test_quote_expiry_equal_to_pending_deadline_preempts_ordinary_eviction():
         WorkerTransactionConnection(), monotonic_ns=lambda: 2_000_000_001)
     intent = build_worker_intent(41)
     publication = worker.PublicationRecord(
-        1, WORKER_T0, 1, intent, deadline_ns - 1)
+        1, WORKER_T0, WORKER_T0, 1, intent, deadline_ns - 1)
     old = worker.AdmissionEnvelope(
         1, SimpleNamespace(accepted_at=WORKER_T0))
     fresh = worker.AdmissionEnvelope(
@@ -1470,7 +1519,8 @@ def test_quote_clock_crossing_deadline_rechecks_before_expired_quote_eviction(
     runtime = make_authoritative_worker(
         WorkerTransactionConnection(), monotonic_ns=lambda: 3_000_000_000)
     intent = build_worker_intent(43)
-    publication = worker.PublicationRecord(1, WORKER_T0, 1, intent, due - 1)
+    publication = worker.PublicationRecord(
+        1, WORKER_T0, WORKER_T0, 1, intent, due - 1)
     runtime._pending[intent.intent_id] = worker.PendingIntent(publication, due)
     envelope = worker.AdmissionEnvelope(
         1, SimpleNamespace(accepted_at=WORKER_T0))
@@ -1505,7 +1555,8 @@ def test_cached_deadline_page_yields_to_one_waiting_quote_before_next_page(
         WORKER_T0 + timedelta(seconds=2))
     runtime = make_authoritative_worker(WorkerTransactionConnection())
     intent = build_worker_intent(44)
-    publication = worker.PublicationRecord(1, WORKER_T0, 1, intent, due - 1)
+    publication = worker.PublicationRecord(
+        1, WORKER_T0, WORKER_T0, 1, intent, due - 1)
     runtime._pending[intent.intent_id] = worker.PendingIntent(publication, due)
     runtime._deadline_closures[due] = worker.DeadlineClosure(
         due, 0, {intent.intent_id: None}, 2)
@@ -1555,12 +1606,13 @@ def test_later_deadline_is_fenced_while_earlier_closure_retries(monkeypatch):
         48, eligible_at=second_publication_at)
     runtime._pending[first_intent.intent_id] = worker.PendingIntent(
         worker.PublicationRecord(
-            1, WORKER_T0, 1, first_intent, first_deadline - 1),
+            1, WORKER_T0, WORKER_T0, 1,
+            first_intent, first_deadline - 1),
         first_deadline,
     )
     runtime._pending[second_intent.intent_id] = worker.PendingIntent(
         worker.PublicationRecord(
-            2, second_publication_at, 1, second_intent,
+            2, second_publication_at, second_publication_at, 1, second_intent,
             second_deadline - 1,
         ),
         second_deadline,
@@ -2422,6 +2474,22 @@ def test_bootstrap_has_exact_hardened_definers_and_publication_lock_pair():
         "AFTER INSERT ON public.atom_v9_sim_intents FOR EACH ROW EXECUTE FUNCTION "
         "public.atom_v9_sim4_publish_intent_after()"
     ) in NORMAL_SQL
+    publication_table = re.search(
+        r"CREATE TABLE public\.atom_v9_sim_intent_publications \((.*?)\n\);",
+        SQL,
+        re.DOTALL,
+    )
+    assert publication_table is not None
+    assert "admitted_at timestamptz NOT NULL CHECK" in publication_table.group(1)
+    publish_body = re.search(
+        r"CREATE FUNCTION public\.atom_v9_sim4_publish_intent_after\(\).*?"
+        r"\$atom_v9_sim4_publish_intent_after\$;",
+        SQL,
+        re.DOTALL,
+    )
+    assert publish_body is not None
+    assert "pg_catalog.clock_timestamp()" in publish_body.group(0)
+    assert "statement_timestamp" not in publish_body.group(0)
     assert "SESSION_USER::text <> 'atom_v9_sim_entry_runtime'" in NORMAL_SQL
     assert "pg_catalog.pg_try_advisory_xact_lock( 1158704842749668574::bigint )" in NORMAL_SQL
 
@@ -2753,11 +2821,15 @@ def test_bootstrap_executes_in_dedicated_disposable_postgres_database():
                 cursor.execute("RESET SESSION AUTHORIZATION")
 
             cursor.execute(
-                "SELECT publication_seq, intent_id, publication_at, horizon_order "
+                "SELECT publication_seq, intent_id, admitted_at, "
+                "publication_at, horizon_order "
                 "FROM public.atom_v9_sim_intent_publications"
             )
-            assert cursor.fetchall() == [(
-                1, intent.intent_id, intent.eligible_at, 1)]
+            publication_row = cursor.fetchone()
+            assert publication_row is not None
+            assert publication_row[:2] == (1, intent.intent_id)
+            assert publication_row[2].tzinfo is not None
+            assert publication_row[3:] == (intent.eligible_at, 1)
             cursor.execute(
                 "SELECT last_value, is_called "
                 "FROM public.atom_v9_sim4_intent_admission_seq"
