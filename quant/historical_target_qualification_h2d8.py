@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date
 import json
 import math
@@ -62,6 +63,20 @@ def _set_timeout(cursor: object, timeout_seconds: float) -> None:
     )
 
 
+@contextmanager
+def _deadline(timeout_seconds: float, reason: str):
+    def deadline_expired(_signum: int, _frame: object) -> None:
+        raise TargetQualificationFailure(reason)
+
+    previous_handler = signal.signal(signal.SIGALRM, deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def _read_target_counts(
     historical_session: str, replay_run_id: str, timeout_seconds: float,
 ) -> dict[str, int]:
@@ -69,24 +84,25 @@ def _read_target_counts(
         connect_score_reader_from_environment,
     )
 
-    with connect_score_reader_from_environment() as connection:
-        cursor = connection.cursor()
-        _set_timeout(cursor, timeout_seconds)
-        cursor.execute(
-            "SELECT "
-            "(SELECT count(*) FROM public.atom_historical_replay_runs "
-            " WHERE historical_session=%s),"
-            "(SELECT count(*) FROM public.atom_historical_replay_runs "
-            " WHERE replay_run_id=%s),"
-            "(SELECT count(*) FROM public.atom_historical_replay_forecasts "
-            " WHERE replay_run_id=%s),"
-            "(SELECT count(*) FROM public.atom_historical_replay_outcomes "
-            " WHERE replay_run_id=%s)",
-            (date.fromisoformat(historical_session), replay_run_id,
-             replay_run_id, replay_run_id),
-        )
-        row = cursor.fetchone()
-        cursor.close()
+    with _deadline(timeout_seconds, "H2D8_DATABASE_TIMEOUT"):
+        with connect_score_reader_from_environment() as connection:
+            cursor = connection.cursor()
+            _set_timeout(cursor, timeout_seconds)
+            cursor.execute(
+                "SELECT "
+                "(SELECT count(*) FROM public.atom_historical_replay_runs "
+                " WHERE historical_session=%s),"
+                "(SELECT count(*) FROM public.atom_historical_replay_runs "
+                " WHERE replay_run_id=%s),"
+                "(SELECT count(*) FROM public.atom_historical_replay_forecasts "
+                " WHERE replay_run_id=%s),"
+                "(SELECT count(*) FROM public.atom_historical_replay_outcomes "
+                " WHERE replay_run_id=%s)",
+                (date.fromisoformat(historical_session), replay_run_id,
+                 replay_run_id, replay_run_id),
+            )
+            row = cursor.fetchone()
+            cursor.close()
     return dict(zip(_ABSENT, map(int, row), strict=True))
 
 
@@ -95,17 +111,18 @@ def _read_evidence_control(timeout_seconds: float) -> tuple[int, int, int]:
         connect_score_reader_from_environment,
     )
 
-    with connect_score_reader_from_environment() as connection:
-        cursor = connection.cursor()
-        _set_timeout(cursor, timeout_seconds)
-        cursor.execute(
-            "SELECT "
-            "(SELECT count(*) FROM public.atom_historical_replay_runs),"
-            "(SELECT count(*) FROM public.atom_historical_replay_forecasts),"
-            "(SELECT count(*) FROM public.atom_historical_replay_outcomes)"
-        )
-        row = cursor.fetchone()
-        cursor.close()
+    with _deadline(timeout_seconds, "H2D8_DATABASE_TIMEOUT"):
+        with connect_score_reader_from_environment() as connection:
+            cursor = connection.cursor()
+            _set_timeout(cursor, timeout_seconds)
+            cursor.execute(
+                "SELECT "
+                "(SELECT count(*) FROM public.atom_historical_replay_runs),"
+                "(SELECT count(*) FROM public.atom_historical_replay_forecasts),"
+                "(SELECT count(*) FROM public.atom_historical_replay_outcomes)"
+            )
+            row = cursor.fetchone()
+            cursor.close()
     return tuple(map(int, row))
 
 
@@ -113,12 +130,7 @@ def _run_preflight(reader: object, historical_session: str, timeout: float) -> d
     day = date.fromisoformat(historical_session)
     opened, closed = h1._session(day)
 
-    def deadline_expired(_signum: int, _frame: object) -> None:
-        raise TargetQualificationFailure("H2D8_PREFLIGHT_TIMEOUT")
-
-    previous_handler = signal.signal(signal.SIGALRM, deadline_expired)
-    signal.setitimer(signal.ITIMER_REAL, timeout)
-    try:
+    with _deadline(timeout, "H2D8_PREFLIGHT_TIMEOUT"):
         return h1.run_h1_session(
             reader=reader,
             session_open=opened,
@@ -127,9 +139,6 @@ def _run_preflight(reader: object, historical_session: str, timeout: float) -> d
             preflight_only=True,
             maximum_interior_gap_seconds=MAX_INTERIOR_GAP_SECONDS,
         ).to_dict()
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _hex_digest(payload: dict, field: str) -> str:
@@ -157,16 +166,11 @@ def _coin_gap_ns(payload: dict, *, allow_none: bool = False) -> int | None:
     return maximum_gap
 
 
-def _honest_rejection(payload: dict, historical_session: str) -> bool:
+def _valid_lineage(payload: dict, historical_session: str) -> bool:
     day = date.fromisoformat(historical_session)
     opened, closed = h1._session(day)
     open_ns, close_ns = h1._ns(opened), h1._ns(closed)
     reasons = payload.get("data_reason_codes")
-    allowed_reasons = {
-        "COIN_INSUFFICIENT_QUOTES", "COIN_OPEN_EDGE_GAP",
-        "COIN_CLOSE_EDGE_GAP",
-        *(f"{horizon}_ENDPOINT_GAP" for horizon in h1.HORIZONS),
-    }
     counts = payload.get("quote_counts")
     if (not isinstance(counts, (list, tuple)) or
             tuple(row[0] for row in counts
@@ -189,8 +193,8 @@ def _honest_rejection(payload: dict, historical_session: str) -> bool:
     expected_session = h1.canonical_sha256({
         "dataset_digest": payload.get("dataset_digest"),
         "configuration_digest": expected_configuration,
-        "execution_stage": "PREFLIGHT_REJECTED",
-        "data_status": "DATA_INCOMPLETE",
+        "execution_stage": payload.get("execution_stage"),
+        "data_status": payload.get("data_status"),
         "data_reason_codes": reasons,
         "quote_coverage": coverage,
         "retrieval_proof": payload.get("retrieval_proof"),
@@ -202,15 +206,28 @@ def _honest_rejection(payload: dict, historical_session: str) -> bool:
         payload.get("session_close_ns") == close_ns and
         payload.get("configuration_digest") == expected_configuration and
         payload.get("session_digest") == expected_session and
-        payload.get("execution_stage") == "PREFLIGHT_REJECTED" and
-        payload.get("data_status") == "DATA_INCOMPLETE" and
         isinstance(reasons, (list, tuple)) and
         list(reasons) == sorted(set(reasons)) and
-        set(reasons).issubset(allowed_reasons) and
         h1._retrieval_proof_valid(
             payload.get("retrieval_proof"), open_ns=open_ns,
             close_ns=close_ns, retained_count=sum(row[1] for row in counts),
         )
+    )
+
+
+def _honest_rejection(payload: dict, historical_session: str) -> bool:
+    reasons = payload.get("data_reason_codes")
+    allowed_reasons = {
+        "COIN_INSUFFICIENT_QUOTES", "COIN_OPEN_EDGE_GAP",
+        "COIN_CLOSE_EDGE_GAP",
+        *(f"{horizon}_ENDPOINT_GAP" for horizon in h1.HORIZONS),
+    }
+    return (
+        payload.get("execution_stage") == "PREFLIGHT_REJECTED" and
+        payload.get("data_status") == "DATA_INCOMPLETE" and
+        isinstance(reasons, (list, tuple)) and reasons and
+        set(reasons).issubset(allowed_reasons) and
+        _valid_lineage(payload, historical_session)
     )
 
 
@@ -257,6 +274,8 @@ def _candidate_receipt(
     qualification_reasons: list[str] = []
 
     if stage == "PREFLIGHT_ONLY" and data_status == "DATA_COMPLETE" and not reason_codes:
+        if not _valid_lineage(payload, historical_session):
+            raise TargetQualificationFailure("H2D8_LINEAGE_OR_RECEIPT_ERROR")
         if gap_ns > MAX_INTERIOR_GAP_SECONDS * _NANOSECONDS:
             status = "REJECTED"
             qualification_reasons.append("H2D8_COIN_INTERIOR_GAP")
@@ -385,8 +404,17 @@ def execute_target_qualification(
                 if len(selected) == MAX_QUALIFYING_TARGETS:
                     break
     except Exception as error:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            reason = (str(error)
+                      if isinstance(error, TargetQualificationFailure)
+                      else f"H2D8_RUNTIME_ERROR:{type(error).__name__}")
+            raise TargetQualificationFailure(
+                reason, inspected=inspected, selected=selected,
+                elapsed_seconds=time.monotonic() - started,
+            ) from error
         try:
-            unchanged = control_reader(_remaining(deadline)) == before
+            unchanged = control_reader(remaining) == before
         except Exception as control_error:
             raise TargetQualificationFailure(
                 f"H2D8_POST_CONTROL_ERROR:{type(control_error).__name__}",
