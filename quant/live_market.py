@@ -1,4 +1,4 @@
-"""Minimal in-memory COIN quote ingestion and Alpaca HTTPS polling."""
+"""Minimal in-memory market ingestion and read-only provider polling."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from .v9_math_core import V9MathCore, V9MathInput, V9QuantFamily
 from .v9_telemetry import record_v9_observation
 from .v9_v4d_integration import OperationalMetrics
 from .evidence_outbox import EvidenceOutbox, QuoteEvidenceWork
+from .schwab_market_bus import normalize_ndx_quote
 
 
 ALPACA_LATEST_QUOTES_URL = "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=COIN%2CQQQ"
@@ -53,6 +54,10 @@ ALPACA_NDX_LATEST_VALUE_URL = (
 MASSIVE_NDX_SNAPSHOT_URL = (
     "https://api.massive.com/v3/snapshot/indices?ticker=I%3ANDX"
 )
+SCHWAB_NDX_QUOTE_URL = (
+    "https://coin-market-api.onrender.com/schwab/quote/%24NDX"
+)
+SCHWAB_NDX_ENABLED_ENV = "ATOM_SCHWAB_NDX_ENABLED"
 MAX_NDX_AGE_SECONDS = 10.0
 HISTORY_SECONDS = 3600.0
 MARKET_DISPLAY_FETCH_SECONDS = 0.25
@@ -193,6 +198,7 @@ class LiveMarketState:
         self._lock = threading.Lock()
         self._btc_history = MidpointHistory()
         self._ndx_history = MidpointHistory()
+        self._ndx_available = False
         self._g2_state = synchronize(
             as_of_epoch=0.0, btc=self._btc_history, coin=MidpointHistory(),
             qqq=MidpointHistory(), ndx=self._ndx_history,
@@ -356,7 +362,19 @@ class LiveMarketState:
             history = self._btc_history if asset == "BTC" else self._ndx_history
             latest = history.latest
             if latest is not None and event_epoch == latest.event_epoch:
-                return price == latest.midpoint
+                if price != latest.midpoint:
+                    return False
+                if asset == "NDX" and not self._ndx_available:
+                    self._ndx_available = True
+                    self._refresh_g2(event_epoch)
+                    published_g2 = (
+                        self._with_current_ndx(self._publication.cross_asset_state)
+                        if self._coin_cycle_pending else self._g2_state
+                    )
+                    self._publication = replace(
+                        self._publication, cross_asset_state=published_g2,
+                    )
+                return True
             try:
                 updated = append_bounded(history, MidpointObservation(event_epoch, price))
             except ValueError:
@@ -368,14 +386,86 @@ class LiveMarketState:
                 self._btc_history = updated
             else:
                 self._ndx_history = updated
+                self._ndx_available = True
             self._refresh_g2(event_epoch)
             # BTC and NDX are independent display inputs.  Keep them visible
             # while a replacement process waits for the evidence-writer lock;
             # ownership gates COIN/evidence publication, not benchmark data.
-            if not self._coin_cycle_pending:
+            if asset == "NDX":
+                published_g2 = (
+                    self._with_current_ndx(self._publication.cross_asset_state)
+                    if self._coin_cycle_pending else self._g2_state
+                )
+                self._publication = replace(
+                    self._publication, cross_asset_state=published_g2,
+                )
+            elif not self._coin_cycle_pending:
                 self._publication = replace(
                     self._publication, cross_asset_state=self._g2_state,
                 )
+        return True
+
+    def _with_current_ndx(self, base: CrossAssetState) -> CrossAssetState:
+        latest = self._ndx_history.latest
+        cutoff = max(
+            base.as_of_epoch,
+            latest.event_epoch if latest is not None else base.as_of_epoch,
+        )
+        delta = cutoff - base.as_of_epoch
+        ndx = synchronize(
+            as_of_epoch=cutoff,
+            btc=MidpointHistory(), coin=MidpointHistory(),
+            qqq=MidpointHistory(), ndx=self._ndx_history,
+        )
+        return replace(
+            base,
+            as_of_epoch=cutoff,
+            btc_age_seconds=(
+                None if base.btc_age_seconds is None
+                else base.btc_age_seconds + delta
+            ),
+            coin_age_seconds=(
+                None if base.coin_age_seconds is None
+                else base.coin_age_seconds + delta
+            ),
+            qqq_age_seconds=(
+                None if base.qqq_age_seconds is None
+                else base.qqq_age_seconds + delta
+            ),
+            ndx_price=ndx.ndx_price if self._ndx_available else None,
+            ndx_age_seconds=ndx.ndx_age_seconds if self._ndx_available else None,
+            ndx_return_bps=ndx.ndx_return_bps if self._ndx_available else (None,) * 6,
+        )
+
+    def expire_ndx_if_stale(
+        self, *, now_epoch: float,
+        max_age_seconds: float = MAX_NDX_AGE_SECONDS,
+    ) -> bool:
+        """Publish honest NDX unavailability after its freshness window closes."""
+
+        values = (now_epoch, max_age_seconds)
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in values
+        ) or float(max_age_seconds) <= 0:
+            return False
+        with self._lock:
+            latest = self._ndx_history.latest
+            if latest is not None:
+                age = float(now_epoch) - latest.event_epoch
+                if 0 <= age < float(max_age_seconds):
+                    return False
+            if not self._ndx_available and self._g2_state.ndx_price is None:
+                return False
+            self._ndx_available = False
+            self._refresh_g2(self._g2_state.as_of_epoch)
+            self._publication = replace(
+                self._publication,
+                cross_asset_state=self._with_current_ndx(
+                    self._publication.cross_asset_state,
+                ),
+            )
         return True
 
     def btc_latest_observation(self) -> MidpointObservation | None:
@@ -391,10 +481,19 @@ class LiveMarketState:
             coin=self._snapshot.history, qqq=self._snapshot.qqq_history,
             ndx=self._ndx_history,
         )
+        if not self._ndx_available:
+            self._g2_state = replace(
+                self._g2_state,
+                ndx_price=None,
+                ndx_age_seconds=None,
+                ndx_return_bps=(None,) * 6,
+            )
 
     def cross_asset_state(self) -> CrossAssetState:
         """Return the latest already-maintained immutable G2-A state."""
 
+        if schwab_ndx_enabled():
+            self.expire_ndx_if_stale(now_epoch=self._clock())
         with self._lock:
             return self._publication.cross_asset_state
 
@@ -799,6 +898,7 @@ class LiveMarketState:
             self._coin_cycle_pending = False
             if self._runtime_ready():
                 self._owner_publication_armed = True
+                cycle_g2_state = self._with_current_ndx(cycle_g2_state)
                 self._publication = LivePublication(
                     next_snapshot, output, cycle_g2_state, cycle_market_display,
                 )
@@ -813,6 +913,8 @@ class LiveMarketState:
     def publication(self) -> LivePublication:
         """Return market, V9, cross-asset, and display state from one commit."""
 
+        if schwab_ndx_enabled():
+            self.expire_ndx_if_stale(now_epoch=self._clock())
         with self._lock:
             return self._publication
 
@@ -970,6 +1072,24 @@ def parse_massive_ndx_snapshot(payload: object) -> tuple[float, float]:
     if not math.isfinite(value) or value <= 0 or not math.isfinite(event_epoch):
         raise ValueError("Massive NDX snapshot has invalid value or last_updated")
     return value, event_epoch
+
+
+def parse_schwab_ndx_quote(
+    payload: object, *, received_at_epoch: float,
+) -> tuple[float, float]:
+    """Validate Coin's read-only Schwab wrapper and preserve provider time."""
+
+    if not isinstance(payload, dict):
+        raise TypeError("Schwab NDX response must be an object")
+    if payload.get("ok") is not True or payload.get("mode") != "READ ONLY":
+        raise ValueError("Schwab NDX response is not an authorized read-only quote")
+    symbol = payload.get("symbol")
+    if not isinstance(symbol, str) or symbol.upper() not in {"NDX", "$NDX"}:
+        raise ValueError("Schwab NDX response has the wrong symbol")
+    snapshot = normalize_ndx_quote(
+        payload.get("data"), received_at_epoch=received_at_epoch,
+    )
+    return snapshot.price, snapshot.provider_epoch
 
 
 def poll_alpaca(
@@ -1357,6 +1477,43 @@ def poll_massive_ndx(state: LiveMarketState, *, interval: float = 1.0,
             return
 
 
+def poll_schwab_ndx(state: LiveMarketState, *, interval: float = 1.0,
+                    stop_event: threading.Event | None = None) -> None:
+    """Consume only Coin's read-only `$NDX` route into the existing NDX seam."""
+
+    while stop_event is None or not stop_event.is_set():
+        try:
+            request = Request(
+                SCHWAB_NDX_QUOTE_URL,
+                headers={"Accept": "application/json"},
+            )
+            with urlopen(request, timeout=10) as response:
+                payload = json.load(response)
+            received_at_epoch = time.time()
+            price, event_epoch = parse_schwab_ndx_quote(
+                payload, received_at_epoch=received_at_epoch,
+            )
+            age = received_at_epoch - event_epoch
+            if age < 0 or age >= MAX_NDX_AGE_SECONDS:
+                raise ValueError("Schwab NDX quote is stale")
+            if not state.accept_g2_price(
+                    asset="NDX", price=price, event_epoch=event_epoch):
+                raise ValueError("Schwab NDX quote was rejected")
+        except Exception as error:
+            state.expire_ndx_if_stale(now_epoch=time.time())
+            print(f"Schwab NDX quote poll failed: {error}", flush=True)
+        if stop_event is None:
+            time.sleep(interval)
+        elif stop_event.wait(interval):
+            return
+
+
+def schwab_ndx_enabled() -> bool:
+    """Return whether the disabled-by-default Schwab NDX bridge is selected."""
+
+    return os.environ.get(SCHWAB_NDX_ENABLED_ENV, "false").strip().lower() == "true"
+
+
 def start_alpaca_poller(state: LiveMarketState, *,
                         stop_event: threading.Event | None = None) -> threading.Thread:
     thread = threading.Thread(
@@ -1375,8 +1532,9 @@ def start_alpaca_g2_poller(state: LiveMarketState, *,
 
 def start_massive_ndx_poller(state: LiveMarketState, *,
                              stop_event: threading.Event | None = None) -> threading.Thread:
+    target = poll_schwab_ndx if schwab_ndx_enabled() else poll_massive_ndx
     thread = threading.Thread(
-        target=poll_massive_ndx, args=(state,), kwargs={"stop_event": stop_event}, daemon=True)
+        target=target, args=(state,), kwargs={"stop_event": stop_event}, daemon=True)
     thread.start()
     return thread
 
@@ -1398,7 +1556,8 @@ __all__ = ["LatestMarketDisplay", "LiveMarketState", "LivePublication", "LiveSna
            "BTC_RECONNECT_SECONDS", "BTC_SOURCE_TIMEOUT_SECONDS", "MAX_BTC_AGE_SECONDS",
            "MARKET_DISPLAY_FETCH_SECONDS", "QUANT_CYCLE_SECONDS", "parse_alpaca_ndx_value",
            "alpaca_btc_stream_url", "parse_alpaca_timestamp",
-           "parse_massive_ndx_snapshot", "poll_alpaca",
-           "poll_alpaca_g2", "poll_massive_ndx", "start_alpaca_g2_poller",
+           "parse_massive_ndx_snapshot", "parse_schwab_ndx_quote", "poll_alpaca",
+           "poll_alpaca_g2", "poll_massive_ndx", "poll_schwab_ndx",
+           "schwab_ndx_enabled", "start_alpaca_g2_poller",
            "start_alpaca_options_poller", "start_alpaca_poller",
            "start_massive_ndx_poller"]

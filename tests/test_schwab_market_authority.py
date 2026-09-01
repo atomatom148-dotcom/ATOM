@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 QUANT = ROOT / "quant"
 BUS = QUANT / "schwab_market_bus.py"
 WORKER = QUANT / "schwab_market_worker.py"
+LIVE_CONSUMER = QUANT / "live_market.py"
 S1_MODULES = (BUS, WORKER)
 
 EXPECTED_QUANT_EXPORTS = (
@@ -139,19 +140,24 @@ class SchwabMarketAuthorityTests(unittest.TestCase):
                     lowered = imported.lower()
                     self.assertNotRegex(lowered, r"(^|\.)v9_v[234]($|_)")
 
-    def test_no_existing_quant_module_consumes_schwab_s1(self) -> None:
+    def test_only_frozen_ndx_seam_consumes_schwab_s1(self) -> None:
         for path in sorted(QUANT.glob("*.py")):
             if path in S1_MODULES:
                 continue
             with self.subTest(module=path.name):
                 tree = _tree(path)
                 imports = _imports(tree)
-                self.assertFalse(
-                    any(
-                        imported.endswith(("schwab_market_bus", "schwab_market_worker"))
-                        for imported in imports
+                schwab_imports = {
+                    imported
+                    for imported in imports
+                    if imported.endswith(
+                        ("schwab_market_bus", "schwab_market_worker")
                     )
-                )
+                }
+                if path == LIVE_CONSUMER:
+                    self.assertEqual(schwab_imports, {"schwab_market_bus"})
+                else:
+                    self.assertFalse(schwab_imports)
                 strings = {
                     node.value
                     for node in ast.walk(tree)
