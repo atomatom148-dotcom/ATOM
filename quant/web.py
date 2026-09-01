@@ -34,6 +34,16 @@ from .v9_v4d_integration import OperationalMetrics
 
 HORIZON_LABELS = ("30S", "1M", "5M", "15M", "30M", "1H")
 SIMULATOR_DATABASE_URL_ENV = "ATOM_V9_SIM_DATABASE_URL"
+SIMULATOR_PROJECT_REF_ENV = "ATOM_V9_SIM_PROJECT_REF"
+_SIMULATOR_PUBLISHER_ROLE = "atom_v9_sim_runtime"
+_SIMULATOR_INSTALLATION_ID = "ATOM_TRUE_V9_SIM_INSTALLATION_1"
+_SIMULATOR_WORKER_CREDENTIAL_ENVS = frozenset({
+    "ATOM_V9_SIM4_DATABASE_URL",
+    "ATOM_V9_SIM4_ALPACA_AUTHX_CLIENT_ID",
+    "ATOM_V9_SIM4_ALPACA_AUTHX_CLIENT_SECRET",
+    "ATOM_V9_SIM4_ALPACA_PROVISIONING_ATTESTATION_ID",
+    "ATOM_V9_SIM4_ALPACA_PROVISIONING_ATTESTATION_SHA256",
+})
 FAMILY_NAMES = (
     "Momentum",
     "Mean Reversion",
@@ -927,6 +937,83 @@ def _configured_simulator_connection_factory(
     return lambda: connect(database_url)
 
 
+def _isolated_simulator_connection_factory(
+    environ: Mapping[str, str],
+    connection_factory: Callable[[], object] | None,
+) -> Callable[[], object] | None:
+    """Fail closed unless the production SIM publisher is fully isolated."""
+    if connection_factory is None:
+        return None
+    database_url = environ.get(SIMULATOR_DATABASE_URL_ENV)
+    project_ref = environ.get(SIMULATOR_PROJECT_REF_ENV)
+    production_database_url = environ.get("DATABASE_URL")
+    if (not database_url or not project_ref or not production_database_url or
+            any(name in environ for name in _SIMULATOR_WORKER_CREDENTIAL_ENVS)):
+        return None
+    try:
+        from .v9_sim4_entry import (
+            discover_supabase_project_ref,
+            validate_simulator_database_url,
+        )
+        identity = validate_simulator_database_url(
+            database_url,
+            project_ref=project_ref,
+            required_role=_SIMULATOR_PUBLISHER_ROLE,
+        )
+        production_project_ref = discover_supabase_project_ref(
+            production_database_url)
+    except Exception:
+        return None
+    if (production_project_ref is None or
+            production_project_ref == identity.project_ref):
+        return None
+
+    verification_lock = Lock()
+    installation_verified = False
+
+    def simulator_connect():
+        nonlocal installation_verified
+        connection = connection_factory()
+        with verification_lock:
+            if installation_verified:
+                return connection
+            cursor = None
+            try:
+                cursor = connection.cursor()
+                cursor.execute(
+                    "SELECT current_user, installation_id, project_ref "
+                    "FROM public.atom_v9_sim_installation "
+                    "WHERE installation_id = %s",
+                    (_SIMULATOR_INSTALLATION_ID,),
+                )
+                if cursor.fetchone() != (
+                        _SIMULATOR_PUBLISHER_ROLE,
+                        _SIMULATOR_INSTALLATION_ID,
+                        identity.project_ref):
+                    raise RuntimeError("simulator installation identity mismatch")
+                connection.commit()
+                cursor.close()
+            except Exception:
+                if cursor is not None:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+                raise
+            installation_verified = True
+        return connection
+
+    return simulator_connect
+
+
 def _install_shutdown_handlers(shutdown_requested: Event) -> dict[int, object]:
     """Translate Render/terminal signals into the coordinated drain path."""
 
@@ -1009,6 +1096,8 @@ def main(*, simulator_connection_factory: Callable | None = None,
         if simulator_connection_factory is None:
             simulator_connection_factory = _configured_simulator_connection_factory(
                 os.environ, runtime_connect)
+            simulator_connection_factory = _isolated_simulator_connection_factory(
+                os.environ, simulator_connection_factory)
         outbox = EvidenceOutbox(metrics=metrics)
         ledger_connection = runtime_connect(database_url)
         external_state_builder = (
