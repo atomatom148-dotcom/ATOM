@@ -289,7 +289,7 @@ def test_fails_after_fixed_list_if_two_targets_do_not_qualify(monkeypatch):
         match="TWO_TARGETS_NOT_QUALIFIED",
     ) as raised:
         _execute(monkeypatch, payloads)
-    assert len(raised.value.inspected) == 5
+    assert len(raised.value.inspected) == len(qualifier.FROZEN_TARGETS)
     assert raised.value.selected == []
     assert raised.value.pre_post_unchanged is True
 
