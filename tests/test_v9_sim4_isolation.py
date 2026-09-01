@@ -1452,6 +1452,90 @@ def test_cached_deadline_page_yields_to_one_waiting_quote_before_next_page(
     assert runtime._last_drained_sequence == 1
 
 
+def test_later_deadline_is_fenced_while_earlier_closure_retries(monkeypatch):
+    first_deadline = datetime_to_epoch_nanoseconds(
+        WORKER_T0 + timedelta(seconds=2))
+    second_publication_at = WORKER_T0 + timedelta(seconds=1)
+    second_deadline = datetime_to_epoch_nanoseconds(
+        second_publication_at + timedelta(seconds=2))
+    clock = SimpleNamespace(now_ns=2_950_000_000)
+    runtime = make_authoritative_worker(
+        WorkerTransactionConnection(),
+        monotonic_ns=lambda: clock.now_ns,
+        monotonic=lambda: 0.0,
+    )
+    first_intent = build_worker_intent(47)
+    second_intent = build_worker_intent(
+        48, eligible_at=second_publication_at)
+    runtime._pending[first_intent.intent_id] = worker.PendingIntent(
+        worker.PublicationRecord(
+            1, WORKER_T0, 1, first_intent, first_deadline - 1),
+        first_deadline,
+    )
+    runtime._pending[second_intent.intent_id] = worker.PendingIntent(
+        worker.PublicationRecord(
+            2, second_publication_at, 1, second_intent,
+            second_deadline - 1,
+        ),
+        second_deadline,
+    )
+    runtime._deadline_closures[first_deadline] = worker.DeadlineClosure(
+        first_deadline, 0, {first_intent.intent_id: None}, 1)
+
+    class StopQueue:
+        def __init__(self):
+            self.timeouts = []
+
+        @staticmethod
+        def empty():
+            return True
+
+        @staticmethod
+        def get_nowait():
+            raise worker.Empty
+
+        def get(self, *, timeout):
+            self.timeouts.append(timeout)
+            clock.now_ns = 3_000_000_001
+            raise worker.Empty
+
+    stop_queue = StopQueue()
+    runtime._events = stop_queue
+    original_new_target = runtime._new_target
+
+    def new_target(fence, capture_kind):
+        if capture_kind == "ACTIVATION":
+            runtime._target = worker.ReconciliationTarget(
+                "RECONCILIATION", 0, 1, 0,
+                retry_not_before_monotonic=10.0,
+            )
+            return
+        original_new_target(fence, capture_kind)
+
+    captured = []
+    original_begin = runtime._begin_due_deadline
+
+    def begin(deadline_ns, *, sampled=None):
+        captured.append((deadline_ns, sampled))
+        result = original_begin(deadline_ns, sampled=sampled)
+        runtime._stop_requested.set()
+        return result
+
+    monkeypatch.setattr(runtime, "_new_target", new_target)
+    monkeypatch.setattr(runtime, "_begin_due_deadline", begin)
+    monkeypatch.setattr(
+        runtime, "_capture_deadline_publication_fence", lambda: 2)
+
+    runtime._ready_loop(object(), 1)
+
+    assert [item[0] for item in captured] == [second_deadline]
+    assert captured[0][1] == (True, second_deadline + 1, 0)
+    assert runtime._deadline_closures[second_deadline].publication_fence == 2
+    assert first_deadline in runtime._deadline_closures
+    assert stop_queue.timeouts == [pytest.approx(0.05)]
+    assert runtime._target.retry_not_before_monotonic == 10.0
+
+
 def test_existing_terminal_is_read_and_validated_only_after_horizon_lock():
     intent = build_worker_intent(40)
     existing = build_simulation_entry_record(
