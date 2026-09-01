@@ -532,8 +532,8 @@ class SimulationEntryStoreTests(unittest.TestCase):
         first = build_intent(horizon="30S", horizon_seconds=30)
         second = build_intent(horizon="1M", horizon_seconds=60)
         rows = [
-            (5, first.eligible_at, 1, *intent_row(first)),
-            (7, second.eligible_at, 2, *intent_row(second)),
+            (5, first.eligible_at, first.eligible_at, 1, *intent_row(first)),
+            (7, second.eligible_at, second.eligible_at, 2, *intent_row(second)),
         ]
         cursor = ScriptedCursor([("publication_seq >", rows)])
         page = store.load_publication_page_on_cursor(
@@ -543,17 +543,20 @@ class SimulationEntryStoreTests(unittest.TestCase):
         self.assertEqual(page[-1].cursor,
                          PublicationCursor(T0, 2, second.intent_id, 7))
         sql, parameters = cursor.executed[0]
+        self.assertIn("p.publication_seq, p.admitted_at, p.publication_at", sql)
         self.assertIn("p.publication_seq > %s AND p.publication_seq <= %s", sql)
         self.assertEqual(parameters[:2], (4, 7))
 
     def test_published_value_rejects_sidecar_mismatch(self):
         intent = build_intent()
         self.assertEqual(PublishedSimulationIntent(
-            1, T0, HORIZON_ORDER["30S"], intent).cursor.publication_seq, 1)
+            1, T0, T0, HORIZON_ORDER["30S"], intent
+        ).cursor.publication_seq, 1)
         with self.assertRaises(ValueError):
-            PublishedSimulationIntent(1, T0 + timedelta(microseconds=1), 1, intent)
+            PublishedSimulationIntent(
+                1, T0, T0 + timedelta(microseconds=1), 1, intent)
         with self.assertRaises(ValueError):
-            PublishedSimulationIntent(1, T0, 2, intent)
+            PublishedSimulationIntent(1, T0, T0, 2, intent)
         with self.assertRaises(ValueError):
             ReconciliationCheckpoint("wrong", 0, 0, None, T0)
 
