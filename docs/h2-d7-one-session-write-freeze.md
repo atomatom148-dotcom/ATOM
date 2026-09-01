@@ -67,6 +67,8 @@ The single frozen admission passed on commit
 | Forecast writes | `686,016` |
 | Outcome writes | `57,168` |
 | Manifest writes | `1` |
+| Verified preflight maximum interior gap | `5 seconds` |
+| Preflight result source | `NEW_PREFLIGHT` |
 | Artifact SHA-256 | `661218b81b6c7b4b51700d5138e218b9d8e3ae4acc626dfa7de9d4d2c6510d31` |
 | Manifest SHA-256 | `37dd439ab90048ef552fda52ccebc928fc221e1e2af94792f24e11b293663658` |
 | Forecast SHA-256 | `e5b7395acbf0647b2f2b26086b69a3930ba9bbc0d8fb30f3003effcbe9ff98ff` |
