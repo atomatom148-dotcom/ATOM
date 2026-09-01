@@ -28,14 +28,18 @@ For each candidate, sequentially:
 1. Read through exactly `atom_historical_score_reader` and prove that the
    session and replay run ID are absent from replay manifests, run manifests,
    forecasts, and outcomes.
-2. Run the existing read-only H1 preflight with the frozen maximum interior
-   quote gap of `5` seconds.
-3. Record the exact status, reason codes, result source, maximum interior gap,
+2. Run the existing read-only H1 preflight with the configured maximum
+   interior quote gap of `5` seconds.
+3. Independently inspect the emitted COIN gap telemetry and require the observed
+   maximum interior gap to be at most `5` seconds. A valid retrieval proof does
+   not waive this H2-D-8 gate.
+4. Record the exact status, reason codes, result source, maximum interior gap,
    frame count, and any lineage or content digests emitted by the existing
    preflight.
-4. Mark a target `QUALIFYING` only when identity absence is exact and H1 is
-   `REPLAY_COMPLETE + CERTIFIED` with no reason codes.
-5. Continue in fixed order until two targets qualify, then stop without
+5. Mark a target `QUALIFYING` only when identity absence is exact, H1 is
+   `PREFLIGHT_ONLY + DATA_COMPLETE`, reason codes are empty, and the observed
+   COIN maximum interior gap is at most `5` seconds.
+6. Continue in fixed order until two targets qualify, then stop without
    inspecting later candidates.
 
 A candidate rejected for honest market-data quality may be recorded and skipped.
@@ -68,8 +72,8 @@ The final receipt must include:
 - exact selected sessions and replay run IDs, if any;
 - absence counts for manifests, run manifests, forecasts, and outcomes;
 - maximum interior gap and result source for each candidate;
-- `forecast_writes=0`, `outcome_writes=0`, and
-  `pre_post_unchanged=true`;
+- `manifest_writes=0`, `forecast_writes=0`, `persistence_writes=0`,
+  `outcome_writes=0`, and `pre_post_unchanged=true`;
 - `continuous_replay_enabled=false` and
   `parallel_replay_enabled=false`.
 
