@@ -6,12 +6,20 @@
 
 ## Decision
 
-**Final bounded amendment — September 1, 2026:** The original July 27–31
-window and the August 3–7 window both produced zero qualifying targets and zero
-writes. Replace only that exhausted candidate set with the remaining 16 regular
-August sessions below. This is one bounded read-only qualification run, not a
-general date-selection or backfill framework. Every other H2-D-8 rule and
-stopping boundary remains unchanged.
+**Provider-gap target amendment — September 1, 2026:** The July 27–31,
+August 3–7, and August 10–31 windows produced zero qualifying targets and zero
+writes. An independently paged raw Alpaca SIP audit of August 19 retrieved
+155,717 COIN quotes and reproduced the exact D8 maximum gap: no quote was
+published between `17:36:32.325Z` and `17:36:51.462Z`. This proves the D8
+reader did not drop that interval. Do not weaken the five-second rule and do not
+synthesize missing quotes.
+
+Replace only the exhausted candidate set with the remaining regular June and
+July sessions below whose session identities and exact `h2d-<date>` run IDs
+were independently verified absent from manifests, forecasts, and outcomes.
+This is one bounded read-only qualification retry, not a general date-selection
+or backfill framework. Every other H2-D-8 rule and stopping boundary remains
+unchanged.
 
 H2-D-8 may inspect only the fixed candidate dates below, in ascending order, and
 select the first two dates that satisfy the existing H1 data-quality and
@@ -19,22 +27,20 @@ identity-absence gates.
 
 | Order | Historical session | Replay run ID |
 |---:|---|---|
-| 1 | `2026-08-10` | `h2d-2026-08-10` |
-| 2 | `2026-08-11` | `h2d-2026-08-11` |
-| 3 | `2026-08-12` | `h2d-2026-08-12` |
-| 4 | `2026-08-13` | `h2d-2026-08-13` |
-| 5 | `2026-08-14` | `h2d-2026-08-14` |
-| 6 | `2026-08-17` | `h2d-2026-08-17` |
-| 7 | `2026-08-18` | `h2d-2026-08-18` |
-| 8 | `2026-08-19` | `h2d-2026-08-19` |
-| 9 | `2026-08-20` | `h2d-2026-08-20` |
-| 10 | `2026-08-21` | `h2d-2026-08-21` |
-| 11 | `2026-08-24` | `h2d-2026-08-24` |
-| 12 | `2026-08-25` | `h2d-2026-08-25` |
-| 13 | `2026-08-26` | `h2d-2026-08-26` |
-| 14 | `2026-08-27` | `h2d-2026-08-27` |
-| 15 | `2026-08-28` | `h2d-2026-08-28` |
-| 16 | `2026-08-31` | `h2d-2026-08-31` |
+| 1 | `2026-06-16` | `h2d-2026-06-16` |
+| 2 | `2026-06-25` | `h2d-2026-06-25` |
+| 3 | `2026-06-29` | `h2d-2026-06-29` |
+| 4 | `2026-06-30` | `h2d-2026-06-30` |
+| 5 | `2026-07-01` | `h2d-2026-07-01` |
+| 6 | `2026-07-02` | `h2d-2026-07-02` |
+| 7 | `2026-07-06` | `h2d-2026-07-06` |
+| 8 | `2026-07-07` | `h2d-2026-07-07` |
+| 9 | `2026-07-08` | `h2d-2026-07-08` |
+| 10 | `2026-07-09` | `h2d-2026-07-09` |
+| 11 | `2026-07-10` | `h2d-2026-07-10` |
+| 12 | `2026-07-14` | `h2d-2026-07-14` |
+| 13 | `2026-07-16` | `h2d-2026-07-16` |
+| 14 | `2026-07-23` | `h2d-2026-07-23` |
 
 This phase is target qualification only. It authorizes no historical admission
 and no evidence write.
