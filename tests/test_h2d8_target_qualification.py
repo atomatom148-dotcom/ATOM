@@ -211,6 +211,7 @@ def test_fails_if_evidence_control_changes(monkeypatch):
 def test_final_control_error_retains_inspected_candidates(monkeypatch):
     payloads = {day: _payload(day) for day, _run_id in qualifier.FROZEN_TARGETS}
     monkeypatch.setattr(qualifier.h1, "_qualifies_cached_result", lambda *_a, **_k: True)
+    monkeypatch.setattr(qualifier.h1, "_retrieval_proof_valid", lambda *_a, **_k: True)
     controls = iter(((1, 2, 3), RuntimeError("database unavailable")))
 
     def control(_timeout):
