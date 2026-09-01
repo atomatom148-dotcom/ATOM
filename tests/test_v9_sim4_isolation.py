@@ -939,6 +939,48 @@ def test_deadline_rebuilds_from_checkpoint_and_preserves_known_timely_discovery(
     assert store.kwargs["after"] is None
 
 
+def test_page_discovery_registers_all_timely_intents_before_database_yield(
+        monkeypatch):
+    eligible_at = WORKER_T0 + timedelta(seconds=1)
+    deadline_ns = datetime_to_epoch_nanoseconds(eligible_at) + 2_000_000_000
+    clock = SimpleNamespace(now=2_999_999_999)
+    runtime = make_authoritative_worker(
+        WorkerTransactionConnection(), monotonic_ns=lambda: clock.now)
+    first = build_worker_intent(51, eligible_at=eligible_at)
+    second = build_worker_intent(52, eligible_at=eligible_at)
+    runtime._new_target(2, "RECONCILIATION")
+
+    class Store:
+        @staticmethod
+        def load_publication_page_on_cursor(_cursor, **_kwargs):
+            return (
+                PublishedSimulationIntent(1, eligible_at, 1, first),
+                PublishedSimulationIntent(2, eligible_at, 1, second),
+            )
+
+    existing = build_simulation_entry_record(
+        intent=first, entry_status="SKIPPED_WINDOW_EXPIRED")
+    probes = []
+
+    def existing_entry(_store, intent):
+        if not probes:
+            assert set(runtime._pending) == {first.intent_id, second.intent_id}
+        probes.append(intent.intent_id)
+        clock.now = 3_000_000_001
+        return existing if intent.intent_id == first.intent_id else None
+
+    monkeypatch.setattr(runtime, "_existing_entry", existing_entry)
+
+    assert runtime._process_target_page(Store()) is False
+    assert probes == [first.intent_id, second.intent_id]
+    assert first.intent_id not in runtime._pending
+    assert runtime._pending[second.intent_id].deadline_epoch_ns == deadline_ns
+    assert (
+        runtime._pending[second.intent_id].publication.discovered_epoch_ns
+        == deadline_ns - 1
+    )
+
+
 def test_every_row_in_a_full_semantic_page_is_classified_without_short_circuit(
         monkeypatch):
     connection = WorkerTransactionConnection()
@@ -1007,7 +1049,9 @@ def test_keyset_reconciliation_crosses_65536_rows_with_bounded_pages(monkeypatch
                         WORKER_T0 + timedelta(microseconds=index)),
                     horizon_order=1,
                     intent=SimpleNamespace(
-                        intent_id=f"large-history-{index:06d}"),
+                        intent_id=f"large-history-{index:06d}",
+                        status="NO_TRADE",
+                    ),
                 )
                 for index in range(start, stop)
             )
@@ -1297,6 +1341,45 @@ def test_quote_clock_crossing_deadline_rechecks_before_expired_quote_eviction(
     assert list(runtime._quotes) == [envelope]
 
 
+def test_cached_deadline_page_yields_to_one_waiting_quote_before_next_page(
+        monkeypatch):
+    due = datetime_to_epoch_nanoseconds(
+        WORKER_T0 + timedelta(seconds=2))
+    runtime = make_authoritative_worker(WorkerTransactionConnection())
+    intent = build_worker_intent(44)
+    publication = worker.PublicationRecord(1, WORKER_T0, 1, intent, due - 1)
+    runtime._pending[intent.intent_id] = worker.PendingIntent(publication, due)
+    runtime._deadline_closures[due] = worker.DeadlineClosure(
+        due, 0, {intent.intent_id: None}, 2)
+    runtime._target = worker.ReconciliationTarget(
+        "RECONCILIATION", 0, 2, 0)
+    envelope = worker.AdmissionEnvelope(1, build_worker_quote())
+    runtime._events.put_nowait(envelope)
+    page_calls = []
+
+    def process_page(_store):
+        page_calls.append(True)
+        runtime._ordinary_since_slice = False
+        return True
+
+    monkeypatch.setattr(runtime, "_process_target_page", process_page)
+    monkeypatch.setattr(
+        runtime, "_complete_deadline_if_reconciled", lambda *_args: False)
+    original_drain = runtime._drain_one_quote_event
+
+    def drain_then_stop():
+        drained = original_drain()
+        runtime._stop_requested.set()
+        return drained
+
+    monkeypatch.setattr(runtime, "_drain_one_quote_event", drain_then_stop)
+    runtime._ready_loop(object(), 0)
+
+    assert page_calls == [True]
+    assert list(runtime._quotes) == [envelope]
+    assert runtime._last_drained_sequence == 1
+
+
 def test_existing_terminal_is_read_and_validated_only_after_horizon_lock():
     intent = build_worker_intent(40)
     existing = build_simulation_entry_record(
@@ -1359,6 +1442,147 @@ def test_authx_ack_returning_at_deadline_is_rejected_after_receive():
     )
     with pytest.raises(worker.Sim4ProtocolError, match="timed out"):
         receiver._recv_until(Stream(), worker._authentication_ack, 10.0)
+
+
+def test_authx_token_failure_counts_as_auth_not_socket():
+    class TokenClient:
+        @staticmethod
+        def fetch():
+            raise RuntimeError("credential rejected")
+
+    telemetry = worker.Sim4Telemetry()
+    receiver = worker.SIPWebSocketReceiver(
+        TokenClient(),
+        lambda _quote: True,
+        websocket_factory=lambda *_args, **_kwargs: pytest.fail(
+            "token failure opened a websocket"),
+        wait=lambda _seconds: True,
+        telemetry=telemetry,
+    )
+
+    receiver._run()
+
+    snapshot = telemetry.snapshot()
+    assert snapshot["auth_failures"] == 1
+    assert snapshot["socket_failures"] == 0
+
+
+def test_websocket_handshake_failure_counts_as_auth_not_socket():
+    class TokenClient:
+        @staticmethod
+        def fetch():
+            return worker.AuthXToken("data-only-token", 30)
+
+    class Stream:
+        closed = False
+
+        @staticmethod
+        def settimeout(_timeout):
+            return None
+
+        @staticmethod
+        def recv():
+            return '[{"T":"error","msg":"denied"}]'
+
+        def close(self):
+            self.closed = True
+
+    telemetry = worker.Sim4Telemetry()
+    stream = Stream()
+    receiver = worker.SIPWebSocketReceiver(
+        TokenClient(),
+        lambda _quote: True,
+        websocket_factory=lambda *_args, **_kwargs: stream,
+        monotonic=lambda: 0.0,
+        wait=lambda _seconds: True,
+        telemetry=telemetry,
+    )
+
+    receiver._run()
+
+    snapshot = telemetry.snapshot()
+    assert snapshot["auth_failures"] == 1
+    assert snapshot["socket_failures"] == 0
+    assert stream.closed is True
+
+
+def test_numeric_quote_overflow_rejects_only_the_bad_item():
+    valid = {
+        "T": "q", "S": "COIN", "bp": 100, "ap": 101,
+        "bs": 2, "as": 3, "t": "2026-09-01T12:00:00.000000001Z",
+    }
+    invalid = dict(valid, bp=10**10000)
+    admitted = []
+    telemetry = worker.Sim4Telemetry()
+    receiver = worker.SIPWebSocketReceiver(
+        object(), admitted.append, telemetry=telemetry)
+
+    receiver._process_stream_items((invalid, valid))
+
+    assert len(admitted) == 1
+    assert admitted[0].bid == 100.0
+    assert telemetry.snapshot()["quote_invalid"] == 1
+
+
+def test_subscription_ack_frame_preserves_following_quote_without_third_recv():
+    quote = {
+        "T": "q", "S": "COIN", "bp": 100, "ap": 101,
+        "bs": 2, "as": 3, "t": "2026-09-01T12:00:00.000000001Z",
+    }
+
+    class TokenClient:
+        @staticmethod
+        def fetch():
+            return worker.AuthXToken("data-only-token", 30)
+
+    class Stream:
+        def __init__(self):
+            self.frames = iter((
+                '[{"T":"success","msg":"authenticated"}]',
+                json.dumps([
+                    {"T": "subscription", "quotes": ["COIN"]},
+                    quote,
+                ]),
+            ))
+            self.recv_calls = 0
+            self.closed = False
+
+        @staticmethod
+        def settimeout(_timeout):
+            return None
+
+        def recv(self):
+            self.recv_calls += 1
+            return next(self.frames)
+
+        @staticmethod
+        def send(payload):
+            assert payload == worker.SIM4_SUBSCRIPTION_PAYLOAD
+
+        def close(self):
+            self.closed = True
+
+    stream = Stream()
+    admitted = []
+    receiver = None
+
+    def admit(parsed):
+        admitted.append(parsed)
+        receiver.stop()
+        return True
+
+    receiver = worker.SIPWebSocketReceiver(
+        TokenClient(), admit,
+        websocket_factory=lambda *_args, **_kwargs: stream,
+        monotonic=lambda: 0.0,
+    )
+
+    assert receiver._connect_once() == 0.0
+    assert len(admitted) == 1
+    assert admitted[0].provider_event_ns == (
+        datetime_to_epoch_nanoseconds(WORKER_T0) + 1)
+    assert stream.recv_calls == 2
+    assert stream.closed is True
 
 
 @pytest.mark.parametrize("as_bytes", (False, True))
@@ -1611,6 +1835,26 @@ def test_authx_http_request_uses_one_absolute_total_deadline(monkeypatch):
 
     assert instances[0].sock.timeouts == [8.0, 6.0, 3.0]
     assert instances[0].closed is True
+
+
+def test_authx_http_request_rejects_every_nonliteral_endpoint_before_io(
+        monkeypatch):
+    monkeypatch.setattr(
+        worker.http.client,
+        "HTTPSConnection",
+        lambda *_args, **_kwargs: pytest.fail(
+            "nonliteral AuthX endpoint reached the network"),
+    )
+
+    with pytest.raises(worker.Sim4ProtocolError, match="invalid AuthX"):
+        worker._default_token_requester(
+            worker.SIM4_AUTHX_TOKEN_URL + "?redirect=https://example.com",
+            b"request",
+            {},
+            worker.SIM4_TOKEN_CONNECT_TIMEOUT_SECONDS,
+            worker.SIM4_TOKEN_TOTAL_TIMEOUT_SECONDS,
+            worker.SIM4_TOKEN_RESPONSE_MAX_BYTES,
+        )
 
 
 def test_authx_client_forwards_exact_endpoint_budgets_and_response_cap():
