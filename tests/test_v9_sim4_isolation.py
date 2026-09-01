@@ -617,11 +617,12 @@ def test_fail_closed_failure_class_logging_never_includes_exception_message():
     secret = "postgres://runtime:secret@example.invalid/postgres"
 
     worker._log_fail_closed_failure_class(
-        worker.Sim4AuthorityError(secret), logger=logger,
+        worker.Sim4AuthorityError(secret), "STARTUP_VERIFICATION", logger=logger,
     )
 
     assert records == [
-        "SIM4_FAIL_CLOSED failure_class=Sim4AuthorityError"
+        "SIM4_FAIL_CLOSED stage=STARTUP_VERIFICATION "
+        "failure_class=Sim4AuthorityError"
     ]
     assert secret not in records[0]
 
