@@ -6,10 +6,12 @@
 
 ## Decision
 
-**Narrow amendment — September 1, 2026:** The original July 27–31 window
-produced zero qualifying targets. Replace only that exhausted window with the
-next five regular sessions below. Every other H2-D-8 rule and stopping boundary
-remains unchanged.
+**Final bounded amendment — September 1, 2026:** The original July 27–31
+window and the August 3–7 window both produced zero qualifying targets and zero
+writes. Replace only that exhausted candidate set with the remaining 16 regular
+August sessions below. This is one bounded read-only qualification run, not a
+general date-selection or backfill framework. Every other H2-D-8 rule and
+stopping boundary remains unchanged.
 
 H2-D-8 may inspect only the fixed candidate dates below, in ascending order, and
 select the first two dates that satisfy the existing H1 data-quality and
@@ -17,11 +19,22 @@ identity-absence gates.
 
 | Order | Historical session | Replay run ID |
 |---:|---|---|
-| 1 | `2026-08-03` | `h2d-2026-08-03` |
-| 2 | `2026-08-04` | `h2d-2026-08-04` |
-| 3 | `2026-08-05` | `h2d-2026-08-05` |
-| 4 | `2026-08-06` | `h2d-2026-08-06` |
-| 5 | `2026-08-07` | `h2d-2026-08-07` |
+| 1 | `2026-08-10` | `h2d-2026-08-10` |
+| 2 | `2026-08-11` | `h2d-2026-08-11` |
+| 3 | `2026-08-12` | `h2d-2026-08-12` |
+| 4 | `2026-08-13` | `h2d-2026-08-13` |
+| 5 | `2026-08-14` | `h2d-2026-08-14` |
+| 6 | `2026-08-17` | `h2d-2026-08-17` |
+| 7 | `2026-08-18` | `h2d-2026-08-18` |
+| 8 | `2026-08-19` | `h2d-2026-08-19` |
+| 9 | `2026-08-20` | `h2d-2026-08-20` |
+| 10 | `2026-08-21` | `h2d-2026-08-21` |
+| 11 | `2026-08-24` | `h2d-2026-08-24` |
+| 12 | `2026-08-25` | `h2d-2026-08-25` |
+| 13 | `2026-08-26` | `h2d-2026-08-26` |
+| 14 | `2026-08-27` | `h2d-2026-08-27` |
+| 15 | `2026-08-28` | `h2d-2026-08-28` |
+| 16 | `2026-08-31` | `h2d-2026-08-31` |
 
 This phase is target qualification only. It authorizes no historical admission
 and no evidence write.
