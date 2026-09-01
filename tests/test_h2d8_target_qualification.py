@@ -16,6 +16,7 @@ def _payload(day: str, *, gap_seconds: int = 5,
         "execution_stage": "PREFLIGHT_REJECTED" if rejected else "PREFLIGHT_ONLY",
         "data_status": "DATA_INCOMPLETE" if rejected else "DATA_COMPLETE",
         "data_reason_codes": ["COIN_OPEN_EDGE_GAP"] if rejected else [],
+        "quote_counts": [("COIN", 1), ("QQQ", 1)],
         "quote_coverage": [{
             "symbol": "COIN",
             "max_gap_ns": gap_seconds * 1_000_000_000,
@@ -37,6 +38,7 @@ def _stable_control(_timeout: float):
 
 def _execute(monkeypatch, payloads: dict[str, dict], *, calls=None):
     monkeypatch.setattr(qualifier.h1, "_qualifies_cached_result", lambda *_a, **_k: True)
+    monkeypatch.setattr(qualifier.h1, "_retrieval_proof_valid", lambda *_a, **_k: True)
     observed = calls if calls is not None else []
 
     def preflight(day, _timeout):
@@ -113,6 +115,8 @@ def test_non_absent_target_fails_before_h1(monkeypatch):
         )
     assert preflight_calls == []
     assert raised.value.pre_post_unchanged is True
+    assert raised.value.inspected[0]["status"] == "FAILED"
+    assert raised.value.inspected[0]["absence_counts"] == present
 
 
 def test_provider_or_system_error_fails_complete_phase(monkeypatch):
@@ -128,6 +132,7 @@ def test_provider_or_system_error_fails_complete_phase(monkeypatch):
         )
     assert raised.value.pre_post_unchanged is True
     assert raised.value.selected == []
+    assert raised.value.inspected[0]["status"] == "FAILED"
 
 
 def test_fails_if_evidence_control_changes(monkeypatch):
