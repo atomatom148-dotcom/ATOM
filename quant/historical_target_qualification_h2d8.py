@@ -144,6 +144,41 @@ def _coin_gap_ns(payload: dict) -> int:
     return maximum_gap
 
 
+def _honest_rejection(payload: dict, historical_session: str) -> bool:
+    counts = payload.get("quote_counts")
+    if (not isinstance(counts, (list, tuple)) or
+            any(not isinstance(row, (list, tuple)) or len(row) != 2 or
+                isinstance(row[1], bool) or not isinstance(row[1], int) or
+                row[1] < 0 for row in counts)):
+        return False
+    opened, closed = h1._session(date.fromisoformat(historical_session))
+    return h1._retrieval_proof_valid(
+        payload.get("retrieval_proof"),
+        open_ns=h1._ns(opened), close_ns=h1._ns(closed),
+        retained_count=sum(row[1] for row in counts),
+    )
+
+
+def _failed_candidate(
+    historical_session: str, replay_run_id: str,
+    absence_counts: dict[str, int] | None, reason: str,
+) -> dict:
+    return {
+        "historical_session": historical_session,
+        "replay_run_id": replay_run_id,
+        "status": "FAILED",
+        "reason_codes": [],
+        "qualification_reason_codes": [reason],
+        "result_source": None,
+        "maximum_interior_gap_seconds": None,
+        "frame_count": None,
+        "dataset_digest": None,
+        "configuration_digest": None,
+        "session_digest": None,
+        "absence_counts": absence_counts,
+    }
+
+
 def _candidate_receipt(
     historical_session: str, replay_run_id: str,
     absence_counts: dict[str, int], payload: dict,
@@ -178,7 +213,7 @@ def _candidate_receipt(
             status = "QUALIFYING"
     elif (stage == "PREFLIGHT_REJECTED" and
           data_status != "DATA_COMPLETE" and reason_codes and
-          isinstance(payload.get("retrieval_proof"), dict)):
+          _honest_rejection(payload, historical_session)):
         status = "REJECTED"
     else:
         raise TargetQualificationFailure("H2D8_PROVIDER_SYSTEM_OR_RECEIPT_ERROR")
@@ -235,11 +270,16 @@ def execute_target_qualification(
     target_reader = target_reader or _read_target_counts
     control_reader = control_reader or _read_evidence_control
     if preflight_runner is None:
-        from quant.historical_replay import AlpacaHistoricalSipReader
-        reader = AlpacaHistoricalSipReader.from_environment()
-        preflight_runner = lambda day, timeout: _run_preflight(
-            reader, day, timeout,
-        )
+        reader = None
+
+        def default_preflight(day: str, timeout: float) -> dict:
+            nonlocal reader
+            if reader is None:
+                from quant.historical_replay import AlpacaHistoricalSipReader
+                reader = AlpacaHistoricalSipReader.from_environment()
+            return _run_preflight(reader, day, timeout)
+
+        preflight_runner = default_preflight
 
     started = time.monotonic()
     deadline = started + timeout_seconds
@@ -248,19 +288,39 @@ def execute_target_qualification(
     before = control_reader(_remaining(deadline))
     try:
         for historical_session, replay_run_id in FROZEN_TARGETS:
-            counts = target_reader(
-                historical_session, replay_run_id, _remaining(deadline),
-            )
+            try:
+                counts = target_reader(
+                    historical_session, replay_run_id, _remaining(deadline),
+                )
+            except Exception as error:
+                inspected.append(_failed_candidate(
+                    historical_session, replay_run_id, None,
+                    f"H2D8_TARGET_READ_ERROR:{type(error).__name__}",
+                ))
+                raise
             if counts != _ABSENT:
+                inspected.append(_failed_candidate(
+                    historical_session, replay_run_id, counts,
+                    "H2D8_TARGET_NOT_ABSENT",
+                ))
                 raise TargetQualificationFailure(
                     f"H2D8_TARGET_NOT_ABSENT:{historical_session}"
                 )
-            payload = preflight_runner(
-                historical_session, _remaining(deadline),
-            )
-            candidate = _candidate_receipt(
-                historical_session, replay_run_id, counts, payload,
-            )
+            try:
+                payload = preflight_runner(
+                    historical_session, _remaining(deadline),
+                )
+                candidate = _candidate_receipt(
+                    historical_session, replay_run_id, counts, payload,
+                )
+            except Exception as error:
+                reason = (str(error)
+                          if isinstance(error, TargetQualificationFailure)
+                          else f"H2D8_RUNTIME_ERROR:{type(error).__name__}")
+                inspected.append(_failed_candidate(
+                    historical_session, replay_run_id, counts, reason,
+                ))
+                raise
             inspected.append(candidate)
             if candidate["status"] == "QUALIFYING":
                 selected.append(candidate)
@@ -319,12 +379,21 @@ def main(argv: Iterable[str] | None = None) -> int:
         receipt = execute_target_qualification(
             timeout_seconds=args.timeout_seconds,
         )
-    except TargetQualificationFailure as error:
+    except Exception as error:
+        if isinstance(error, TargetQualificationFailure):
+            inspected = error.inspected
+            selected = error.selected
+            pre_post_unchanged = error.pre_post_unchanged
+            elapsed_seconds = error.elapsed_seconds
+        else:
+            inspected = []
+            selected = []
+            pre_post_unchanged = False
+            elapsed_seconds = 0.0
         receipt = _receipt(
-            status="FAILED", inspected=error.inspected,
-            selected=error.selected,
-            pre_post_unchanged=error.pre_post_unchanged,
-            elapsed_seconds=error.elapsed_seconds,
+            status="FAILED", inspected=inspected, selected=selected,
+            pre_post_unchanged=pre_post_unchanged,
+            elapsed_seconds=elapsed_seconds,
         )
         receipt.update(reason=type(error).__name__, detail=str(error))
         print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
