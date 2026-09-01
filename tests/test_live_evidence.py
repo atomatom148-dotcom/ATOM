@@ -404,7 +404,7 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertIn("source_spec_version", volatility_insert_sql)
         self.assertIn("DO NOTHING", volatility_insert_sql)
         self.assertEqual(
-            insert_parameters[0][-2:],
+            insert_parameters[0][10:12],
             (DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION),
         )
 
@@ -458,7 +458,7 @@ class LiveEvidenceTests(unittest.TestCase):
                     identity = values[:5]
                     if identity not in self.forecasts:
                         self.forecasts[identity] = (
-                            self.next_forecast_id, values
+                            self.next_forecast_id, values[:13]
                         )
                         self.next_forecast_id += 1
 
@@ -552,6 +552,160 @@ class LiveEvidenceTests(unittest.TestCase):
                 resolution_enabled=False,
             )
         self.assertEqual(connection.rollbacks, 1)
+
+    def test_family_cadence_intervals_are_utc_epoch_aligned(self):
+        for horizon, seconds in zip(
+                ("30S", "1M", "5M", "15M", "30M", "1H"),
+                (30, 60, 300, 900, 1800, 3600)):
+            with self.subTest(horizon=horizon):
+                self.assertEqual(
+                    PostgresEvidenceStore._cadence_interval(
+                        horizon, float(seconds * 3) + 0.5),
+                    (float(seconds * 3), float(seconds * 4)),
+                )
+
+    def test_disabled_family_cadence_preserves_exact_insert_payloads(self):
+        store = object.__new__(PostgresEvidenceStore)
+        directional = ForecastRecord(
+            "q1_momentum", "v1", "cycle", "COIN", "30S",
+            100, 130, 101, 2, 101, source_as_of_epoch=99,
+        )
+        volatility = VolatilityForecastRecord(
+            "q3_volatility", "v1", "cycle", "COIN", "30S",
+            100, 130, 101, 3, 101,
+        )
+
+        self.assertEqual(store._cadence_parameters(directional, (
+            "q1_momentum", "v1", "cycle", "COIN", "30S",
+            100, 130, 101, 2, 101, DATA_SCHEMA_VERSION,
+            SOURCE_SPEC_VERSION, 99,
+        )), (
+            "q1_momentum", "v1", "cycle", "COIN", "30S",
+            100, 130, 101, 2, 101, DATA_SCHEMA_VERSION,
+            SOURCE_SPEC_VERSION, 99, True,
+            "q1_momentum", "v1", "COIN", "30S", 90.0, 120.0,
+        ))
+        self.assertEqual(store._cadence_parameters(volatility, (
+            "q3_volatility", "v1", "cycle", "COIN", "30S",
+            100, 130, 101, 3, 101, DATA_SCHEMA_VERSION,
+            SOURCE_SPEC_VERSION,
+        )), (
+            "q3_volatility", "v1", "cycle", "COIN", "30S",
+            100, 130, 101, 3, 101, DATA_SCHEMA_VERSION,
+            SOURCE_SPEC_VERSION, True,
+            "q3_volatility", "v1", "COIN", "30S", 90.0, 120.0,
+        ))
+
+    def test_enabled_family_cadence_is_database_restart_safe(self):
+        class Cursor:
+            def __init__(self):
+                self.buckets = set()
+                self.directional = []
+                self.volatility = []
+                self.statements = []
+
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def executemany(self, statement, parameters):
+                normalized = " ".join(statement.split())
+                self.statements.append(normalized)
+                target = (self.volatility if
+                          "INSERT INTO volatility_forecasts" in normalized
+                          else self.directional)
+                payload_size = (12 if target is self.volatility else 13)
+                for values in parameters:
+                    key = (
+                        "volatility" if target is self.volatility else "directional",
+                        *values[-6:],
+                    )
+                    cadence_bypassed = values[-7]
+                    if cadence_bypassed or key not in self.buckets:
+                        self.buckets.add(key)
+                        target.append(values[:payload_size])
+
+        class Connection:
+            def __init__(self, cursor): self._cursor = cursor
+            def cursor(self): return self._cursor
+            def commit(self): pass
+
+        cursor = Cursor()
+        connection = Connection(cursor)
+
+        def restarted_store():
+            store = object.__new__(PostgresEvidenceStore)
+            store._database_url = "postgresql://test"
+            store._connect = None
+            store._connection = connection
+            store._family_cadence_enabled = True
+            store._record_publication_proofs = lambda *_args, **_kwargs: None
+            return store
+
+        def uncapped_store():
+            store = restarted_store()
+            store._family_cadence_enabled = False
+            return store
+
+        def rows(cutoff):
+            cycle = f"COIN:{cutoff}"
+            return (
+                ForecastRecord(
+                    "q1_momentum", "v1", cycle, "COIN", "30S",
+                    cutoff, cutoff + 30, 100, 2, cutoff + 1,
+                ),
+                VolatilityForecastRecord(
+                    "q3_volatility", "v1", cycle, "COIN", "30S",
+                    cutoff, cutoff + 30, 100, 3, cutoff + 1,
+                ),
+            )
+
+        first_directional, first_volatility = rows(100)
+        restarted_store().record_cycle_and_resolve(
+            (first_directional,), observation_epoch=100,
+            observation_midpoint=100, resolution_symbol="COIN",
+            volatility_forecasts=(first_volatility,), resolution_enabled=False,
+        )
+        same_directional, same_volatility = rows(119)
+        restarted_store().record_cycle_and_resolve(
+            (same_directional,), observation_epoch=119,
+            observation_midpoint=100, resolution_symbol="COIN",
+            volatility_forecasts=(same_volatility,), resolution_enabled=False,
+        )
+        next_directional, next_volatility = rows(120)
+        restarted_store().record_cycle_and_resolve(
+            (next_directional,), observation_epoch=120,
+            observation_midpoint=100, resolution_symbol="COIN",
+            volatility_forecasts=(next_volatility,), resolution_enabled=False,
+        )
+
+        self.assertEqual(len(cursor.directional), 2)
+        self.assertEqual(len(cursor.volatility), 2)
+        self.assertEqual(
+            [row[5] for row in cursor.directional], [100, 120])
+        self.assertEqual(
+            [row[5] for row in cursor.volatility], [100, 120])
+        self.assertTrue(all(
+            "OR NOT EXISTS" in statement for statement in cursor.statements))
+        self.assertEqual(cursor.directional[0][0:10], (
+            "q1_momentum", "v1", "COIN:100", "COIN", "30S",
+            100, 130, 100, 2, 101,
+        ))
+
+        parity_cursor = Cursor()
+        connection._cursor = parity_cursor
+        uncapped_store().record_cycle_and_resolve(
+            (first_directional,), observation_epoch=100,
+            observation_midpoint=100, resolution_symbol="COIN",
+            volatility_forecasts=(first_volatility,), resolution_enabled=False,
+        )
+        uncapped_store().record_cycle_and_resolve(
+            (same_directional,), observation_epoch=119,
+            observation_midpoint=100, resolution_symbol="COIN",
+            volatility_forecasts=(same_volatility,), resolution_enabled=False,
+        )
+        self.assertEqual(
+            [row[5] for row in parity_cursor.directional], [100, 119])
+        self.assertEqual(
+            [row[5] for row in parity_cursor.volatility], [100, 119])
 
     def test_store_contract_has_no_update_or_delete_api(self):
         self.assertFalse(hasattr(EvidenceStore, "update"))
