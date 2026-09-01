@@ -30,7 +30,7 @@ import threading
 import time
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 
 from .v9_sim1_contract import SimulationTradeIntent
 from .v9_sim4_entry import (
@@ -198,6 +198,10 @@ class Sim4AuthorityError(RuntimeError):
 
 class Sim4ProtocolError(RuntimeError):
     """AuthX, websocket, or quote input failed closed."""
+
+
+class Sim4AuthenticationError(Sim4ProtocolError):
+    """AuthX or websocket authentication failed closed."""
 
 
 class Sim4GenerationFailed(RuntimeError):
@@ -443,7 +447,10 @@ def validate_provider_event_ns(value: object) -> int:
 def _finite_binary64(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise Sim4ProtocolError(f"{name} must be numeric")
-    converted = float(value)
+    try:
+        converted = float(value)
+    except OverflowError as error:
+        raise Sim4ProtocolError(f"{name} must be finite") from error
     if not math.isfinite(converted):
         raise Sim4ProtocolError(f"{name} must be finite")
     return converted
@@ -506,16 +513,7 @@ def _default_token_requester(
     lets the connect and remaining read budget be applied independently.
     """
 
-    parsed = urlsplit(url)
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname is None
-        or parsed.hostname != "authx.alpaca.markets"
-        or parsed.port not in {None, 443}
-        or parsed.path != "/v1/oauth2/token"
-        or parsed.query
-        or parsed.fragment
-    ):
+    if url != SIM4_AUTHX_TOKEN_URL:
         raise Sim4ProtocolError("invalid AuthX token endpoint")
     absolute_deadline = time.monotonic() + total_timeout
 
@@ -526,7 +524,7 @@ def _default_token_requester(
         return remaining
 
     connection = http.client.HTTPSConnection(
-        parsed.hostname,
+        "authx.alpaca.markets",
         443,
         timeout=connect_timeout,
         context=ssl.create_default_context(),
@@ -536,7 +534,9 @@ def _default_token_requester(
         if connection.sock is None:
             raise OSError("AuthX TLS socket unavailable")
         connection.sock.settimeout(remaining_budget())
-        connection.request("POST", parsed.path, body=body, headers=dict(headers))
+        connection.request(
+            "POST", "/v1/oauth2/token", body=body, headers=dict(headers)
+        )
         connection.sock.settimeout(remaining_budget())
         response = connection.getresponse()
         remaining_budget()
@@ -554,7 +554,7 @@ def _default_token_requester(
             response_body.extend(chunk)
             if len(response_body) > response_limit:
                 raise Sim4ProtocolError("AuthX token response exceeds 16 KiB")
-        return response.status, url, bytes(response_body)
+        return response.status, SIM4_AUTHX_TOKEN_URL, bytes(response_body)
     finally:
         connection.close()
 
@@ -775,14 +775,20 @@ def _authentication_ack(items: Sequence[Mapping[str, object]]) -> bool:
                for item in items)
 
 
-def _subscription_ack(items: Sequence[Mapping[str, object]]) -> bool:
-    for item in items:
+def _subscription_ack_index(
+    items: Sequence[Mapping[str, object]],
+) -> int | None:
+    for index, item in enumerate(items):
         if item.get("T") != "subscription":
             continue
         quotes = item.get("quotes")
         if isinstance(quotes, list) and quotes == [SIM4_SYMBOL]:
-            return True
-    return False
+            return index
+    return None
+
+
+def _subscription_ack(items: Sequence[Mapping[str, object]]) -> bool:
+    return _subscription_ack_index(items) is not None
 
 
 def _is_receive_timeout(error: BaseException) -> bool:
@@ -927,7 +933,7 @@ class SIPWebSocketReceiver:
         stream: object,
         predicate: Callable[[Sequence[Mapping[str, object]]], bool],
         deadline: float,
-    ) -> None:
+    ) -> tuple[Mapping[str, object], ...]:
         while not self._stop.is_set():
             if self._monotonic() >= deadline:
                 raise Sim4ProtocolError("websocket acknowledgement timed out")
@@ -944,11 +950,31 @@ class SIPWebSocketReceiver:
             if self._monotonic() >= deadline:
                 raise Sim4ProtocolError("websocket acknowledgement timed out")
             if predicate(items):
-                return
+                return tuple(items)
         raise Sim4ProtocolError("websocket receiver stopped")
 
+    def _process_stream_items(
+        self, items: Sequence[Mapping[str, object]],
+    ) -> None:
+        for item in items:
+            if item.get("T") == "q":
+                try:
+                    parsed = parse_sip_quote_message(item)
+                except Sim4ProtocolError:
+                    self._telemetry.increment("quote_invalid")
+                    continue
+                try:
+                    self._quote_callback(parsed)
+                except BaseException:
+                    self._telemetry.increment("quote_invalid")
+            elif item.get("T") == "error":
+                raise Sim4ProtocolError("SIP stream returned an error")
+
     def _connect_once(self) -> float:
-        token = self._token_client.fetch()
+        try:
+            token = self._token_client.fetch()
+        except BaseException:
+            raise Sim4AuthenticationError("AuthX token acquisition failed") from None
         stream = None
         stable_started: float | None = None
         self._last_connection_stable_seconds = 0.0
@@ -963,19 +989,32 @@ class SIPWebSocketReceiver:
             with self._socket_lock:
                 self._socket = stream
             stream.settimeout(SIM4_WEBSOCKET_RECEIVE_TIMEOUT_SECONDS)
-            self._recv_until(
-                stream,
-                _authentication_ack,
-                self._monotonic() + SIM4_WEBSOCKET_ACK_TIMEOUT_SECONDS,
-            )
-            stream.send(SIM4_SUBSCRIPTION_PAYLOAD)
-            self._recv_until(
-                stream,
-                _subscription_ack,
-                self._monotonic() + SIM4_WEBSOCKET_ACK_TIMEOUT_SECONDS,
-            )
+            try:
+                self._recv_until(
+                    stream,
+                    _authentication_ack,
+                    self._monotonic() + SIM4_WEBSOCKET_ACK_TIMEOUT_SECONDS,
+                )
+                stream.send(SIM4_SUBSCRIPTION_PAYLOAD)
+                subscription_items = self._recv_until(
+                    stream,
+                    _subscription_ack,
+                    self._monotonic() + SIM4_WEBSOCKET_ACK_TIMEOUT_SECONDS,
+                )
+            except BaseException:
+                raise Sim4AuthenticationError(
+                    "websocket authentication failed"
+                ) from None
+            subscription_index = _subscription_ack_index(subscription_items)
+            if subscription_index is None:
+                raise Sim4AuthenticationError(
+                    "websocket subscription acknowledgement is missing"
+                )
             stable_started = self._monotonic()
             self._ready.set()
+            self._process_stream_items(
+                subscription_items[subscription_index + 1:]
+            )
             while not self._stop.is_set():
                 try:
                     items = _decode_frame(stream.recv())
@@ -983,19 +1022,7 @@ class SIPWebSocketReceiver:
                     if _is_receive_timeout(error):
                         continue
                     raise Sim4ProtocolError("SIP receive failed") from None
-                for item in items:
-                    if item.get("T") == "q":
-                        try:
-                            parsed = parse_sip_quote_message(item)
-                        except Sim4ProtocolError:
-                            self._telemetry.increment("quote_invalid")
-                            continue
-                        try:
-                            self._quote_callback(parsed)
-                        except BaseException:
-                            self._telemetry.increment("quote_invalid")
-                    elif item.get("T") == "error":
-                        raise Sim4ProtocolError("SIP stream returned an error")
+                self._process_stream_items(items)
             return self._monotonic() - stable_started
         finally:
             if stable_started is not None:
@@ -1017,6 +1044,9 @@ class SIPWebSocketReceiver:
             stable_seconds = 0.0
             try:
                 stable_seconds = self._connect_once()
+            except Sim4AuthenticationError:
+                stable_seconds = self._last_connection_stable_seconds
+                self._telemetry.increment("auth_failures")
             except BaseException:
                 stable_seconds = self._last_connection_stable_seconds
                 self._telemetry.increment("socket_failures")
@@ -1610,19 +1640,43 @@ class SimulationEntryWorker:
     def _discover_publication(
         self, published: PublishedSimulationIntent,
     ) -> PublicationRecord:
-        if self._anchor is None:
-            raise Sim4GenerationFailed("publication discovered before runtime anchor")
-        # Store decoding has already validated sidecar, intent JSON/hash,
-        # relational columns, and project installation.  This is the exact
-        # discovery point, before any yield or pending insertion.
-        discovered = self._anchor.derived_epoch_ns(self._monotonic_ns())
-        return PublicationRecord(
-            published.publication_seq,
-            published.publication_at,
-            published.horizon_order,
-            published.intent,
-            discovered,
-        )
+        # Share the quote/deadline mutex so a timely actionable discovery is
+        # registered before any later strict-greater deadline observation.
+        # No database work occurs while this mutex is held.
+        with self._admission_lock:
+            if self._anchor is None:
+                raise Sim4GenerationFailed(
+                    "publication discovered before runtime anchor"
+                )
+            discovered = self._anchor.derived_epoch_ns(self._monotonic_ns())
+            publication = PublicationRecord(
+                published.publication_seq,
+                published.publication_at,
+                published.horizon_order,
+                published.intent,
+                discovered,
+            )
+            if published.intent.status == "ACTIONABLE":
+                if self._runtime_started_at is None:
+                    raise Sim4GenerationFailed("runtime start is unavailable")
+                deadline_ns = (
+                    _datetime_to_epoch_nanoseconds(publication.publication_at)
+                    + 2_000_000_000
+                )
+                if discovered <= deadline_ns:
+                    forced = (
+                        "SKIPPED_RESTART_GAP"
+                        if publication.publication_at <= self._runtime_started_at
+                        else None
+                    )
+                    self._remember_pending(
+                        PendingIntent(
+                            publication,
+                            deadline_ns,
+                            forced_status_after_deadline=forced,
+                        )
+                    )
+            return publication
 
     def _load_target_page(self, store: SimulationEntryStore) -> None:
         target = self._target
@@ -1726,6 +1780,7 @@ class SimulationEntryWorker:
         intent = publication.intent
         existing = self._existing_entry(store, intent)
         if existing is not None:
+            self._pending.pop(intent.intent_id, None)
             return True
         if intent.status == "NO_TRADE":
             self._terminalize(store, publication, "SKIPPED_NO_TRADE")
@@ -1757,6 +1812,7 @@ class SimulationEntryWorker:
         if closure is not None and closure.publication_fence is not None:
             if publication.publication_seq > closure.publication_fence:
                 self._terminalize(store, publication, "SKIPPED_WINDOW_EXPIRED")
+                self._pending.pop(intent.intent_id, None)
                 return True
             if intent.intent_id not in closure.candidates:
                 # The immutable local candidate set was completed before the
@@ -2086,6 +2142,13 @@ class SimulationEntryWorker:
                 cached_closure = self._deadline_closures.get(due)
                 if cached_closure is not None:
                     target = self._target
+                    processed_deadline_page = False
+                    if (
+                        target is not None
+                        and not self._ordinary_since_slice
+                        and self._drain_one_quote_event()
+                    ):
+                        continue
                     if (
                         target is not None
                         and target.retry_not_before_monotonic is not None
@@ -2097,7 +2160,9 @@ class SimulationEntryWorker:
                         cached_deadline_retry_waiting = True
                     else:
                         if target is not None:
-                            self._process_target_page(store)
+                            processed_deadline_page = self._process_target_page(
+                                store
+                            )
                         elif (
                             cached_closure.publication_fence is not None
                             and cached_closure.publication_fence > self._checkpoint_last
@@ -2110,6 +2175,11 @@ class SimulationEntryWorker:
                             self._evict_quotes_after_deadlines(
                                 self._anchor.derived_epoch_ns(self._monotonic_ns())
                             )
+                        if (
+                            processed_deadline_page
+                            and self._target is not None
+                        ):
+                            self._drain_one_quote_event()
                         # The first immutable watermark/fence pair drives all
                         # later work for D; never sample a replacement watermark.
                         continue
@@ -2136,8 +2206,11 @@ class SimulationEntryWorker:
                             self._begin_due_deadline(
                                 due, sampled=(greater, now_ns, watermark),
                             )
+                        processed_deadline_page = False
                         if self._target is not None:
-                            self._process_target_page(store)
+                            processed_deadline_page = self._process_target_page(
+                                store
+                            )
                         elif (
                             self._deadline_closures[due].publication_fence is not None
                             and self._deadline_closures[due].publication_fence
@@ -2150,6 +2223,11 @@ class SimulationEntryWorker:
                         completed = self._complete_deadline_if_reconciled(store, due)
                         if completed:
                             self._evict_quotes_after_deadlines(now_ns)
+                        if (
+                            processed_deadline_page
+                            and self._target is not None
+                        ):
+                            self._drain_one_quote_event()
                         continue
                     if now_ns == due:
                         boundary_recheck = True
