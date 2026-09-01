@@ -36,7 +36,7 @@ ATOM_COIN_MARKET_USERNAME = Coin service APP_USERNAME
 ATOM_COIN_MARKET_PASSWORD = Coin service APP_PASSWORD
 ```
 
-These values are prerequisites, not activation switches. They may authenticate only the exact HTTPS origin and exact `$NDX` quote route above. The bridge must reject redirects rather than forwarding credentials to another origin or to HTTP. Credentials must never be logged, returned by an API, committed to GitHub, or reused for any account, order, execution, Level II, or trading path.
+These values are prerequisites, not activation switches. They may authenticate only the exact HTTPS origin and exact `$NDX` quote route above. The bridge must reject redirects rather than forwarding credentials to another origin or to HTTP. Credentials must never be logged, returned by an API, committed to GitHub, or reused for any account, order, execution, Level II, or trading path. Missing or rejected service credentials must fail closed to honest NDX unavailability; anonymous fallback is forbidden.
 
 The authorized destination is only the existing NDX benchmark/display handoff already represented by the live market state's `NDX` input.
 
