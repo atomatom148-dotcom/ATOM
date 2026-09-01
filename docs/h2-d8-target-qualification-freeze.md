@@ -6,17 +6,22 @@
 
 ## Decision
 
+**Narrow amendment — September 1, 2026:** The original July 27–31 window
+produced zero qualifying targets. Replace only that exhausted window with the
+next five regular sessions below. Every other H2-D-8 rule and stopping boundary
+remains unchanged.
+
 H2-D-8 may inspect only the fixed candidate dates below, in ascending order, and
 select the first two dates that satisfy the existing H1 data-quality and
 identity-absence gates.
 
 | Order | Historical session | Replay run ID |
 |---:|---|---|
-| 1 | `2026-07-27` | `h2d-2026-07-27` |
-| 2 | `2026-07-28` | `h2d-2026-07-28` |
-| 3 | `2026-07-29` | `h2d-2026-07-29` |
-| 4 | `2026-07-30` | `h2d-2026-07-30` |
-| 5 | `2026-07-31` | `h2d-2026-07-31` |
+| 1 | `2026-08-03` | `h2d-2026-08-03` |
+| 2 | `2026-08-04` | `h2d-2026-08-04` |
+| 3 | `2026-08-05` | `h2d-2026-08-05` |
+| 4 | `2026-08-06` | `h2d-2026-08-06` |
+| 5 | `2026-08-07` | `h2d-2026-08-07` |
 
 This phase is target qualification only. It authorizes no historical admission
 and no evidence write.
