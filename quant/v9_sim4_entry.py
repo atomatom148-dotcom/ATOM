@@ -933,7 +933,7 @@ class SimulationEntryStore:
         cursor.execute("SELECT pg_advisory_xact_lock(%s::bigint)",
                        (horizon_advisory_lock_key(intent.horizon),))
         lock_row = cursor.fetchone()
-        if lock_row is not None and lock_row not in ((None,),):
+        if lock_row is not None and lock_row not in ((None,), ("",)):
             raise SimulationEntryStateError("horizon advisory-lock result is malformed")
         return self.get_entry_for_intent_on_cursor(
             cursor, intent.intent_id, expected_intent=intent)

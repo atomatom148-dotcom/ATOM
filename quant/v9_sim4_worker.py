@@ -1505,7 +1505,7 @@ class SimulationEntryWorker:
             cursor.execute("SET LOCAL statement_timeout = '6000ms'")
             cursor.execute(_DEADLINE_LOCK_SQL, (SIM4_ACTIVATION_LOCK_KEY,))
             lock_row = cursor.fetchone()
-            if lock_row not in (None, (None,), [None]):
+            if lock_row not in (None, (None,), [None], ("",)):
                 raise Sim4AuthorityError("deadline closure lock result is malformed")
             cursor.execute(_FENCE_READER_SQL)
             fence = self._read_nonnegative_fence(cursor.fetchone())
