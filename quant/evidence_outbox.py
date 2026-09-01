@@ -14,7 +14,7 @@ from queue import Empty, Full, Queue
 import shlex
 import threading
 import time
-from typing import Callable
+from typing import Callable, Mapping
 from urllib.parse import urlparse
 
 from .evidence import ForecastRecord as RawForecastRecord, VolatilityForecastRecord
@@ -153,19 +153,28 @@ def _iter_v4_state_pages(cursor):
             return
 
 
-def _prepare_v4_state_evidence(
+def _prepare_v4_state_evidence_sets(
         connection, *, symbol: str, state_as_of: datetime,
-        cohorts: dict[str, tuple[str, str]], governed: Callable,
-) -> _PreparedV4StateEvidence:
-    """Stream all eligible history and retain the frozen overlap sample only."""
+        cohorts: dict[str, tuple[str, str]],
+        governed_sets: Mapping[str, Callable],
+) -> dict[str, _PreparedV4StateEvidence]:
+    """Stream history once and independently retain each governed sample."""
+
+    if not governed_sets:
+        raise ValueError("at least one governed evidence set is required")
 
     cohort_scope, cohort_params = _v4_cohort_scope(cohorts)
-    selected_pairs: list[tuple[V4ForecastRecord, V4OutcomeRecord]] = []
-    selected_ids = {horizon: [] for horizon in HORIZONS}
-    raw_counts = {horizon: 0 for horizon in HORIZONS}
-    first_cutoffs = {horizon: None for horizon in HORIZONS}
-    last_cutoffs = {horizon: None for horizon in HORIZONS}
-    next_cutoffs = {horizon: None for horizon in HORIZONS}
+    accumulators = {
+        name: {
+            "selected_pairs": [],
+            "selected_ids": {horizon: [] for horizon in HORIZONS},
+            "raw_counts": {horizon: 0 for horizon in HORIZONS},
+            "first_cutoffs": {horizon: None for horizon in HORIZONS},
+            "last_cutoffs": {horizon: None for horizon in HORIZONS},
+            "next_cutoffs": {horizon: None for horizon in HORIZONS},
+        }
+        for name in governed_sets
+    }
 
     cursor = _open_v4_state_cursor(connection)
     cursor_closed = False
@@ -197,44 +206,50 @@ def _prepare_v4_state_evidence(
                     raise RuntimeError("V4_STATE_EVIDENCE_HORIZON_INVALID")
                 horizon_page = tuple(horizon_page_iter)
                 cohort_id, cohort_hash = cohorts[horizon]
-                governed_page = tuple(governed(
-                    horizon=horizon,
-                    cohort_id=cohort_id,
-                    cohort_hash=cohort_hash,
-                    symbol=symbol,
-                    state_as_of=state_as_of,
-                    pairs=horizon_page,
-                ))
-                page_selection = select_non_overlapping(governed_page)
-                raw_counts[horizon] += page_selection.raw_resolved_n
+                for name, governed in governed_sets.items():
+                    accumulator = accumulators[name]
+                    governed_page = tuple(governed(
+                        horizon=horizon,
+                        cohort_id=cohort_id,
+                        cohort_hash=cohort_hash,
+                        symbol=symbol,
+                        state_as_of=state_as_of,
+                        pairs=horizon_page,
+                    ))
+                    page_selection = select_non_overlapping(governed_page)
+                    accumulator["raw_counts"][horizon] += \
+                        page_selection.raw_resolved_n
 
-                threshold = next_cutoffs[horizon]
-                if threshold is not None:
-                    selectable = tuple(
-                        pair for pair in governed_page
-                        if pair[0].cutoff_at >= threshold)
-                    page_selection = select_non_overlapping(selectable)
-                else:
-                    selectable = governed_page
-                if not page_selection.selected_ids:
-                    continue
+                    threshold = accumulator["next_cutoffs"][horizon]
+                    if threshold is not None:
+                        selectable = tuple(
+                            pair for pair in governed_page
+                            if pair[0].cutoff_at >= threshold)
+                        page_selection = select_non_overlapping(selectable)
+                    else:
+                        selectable = governed_page
+                    if not page_selection.selected_ids:
+                        continue
 
-                ids = set(page_selection.selected_ids)
-                selected_page = tuple(
-                    pair for pair in selectable
-                    if pair[0].forecast_record_id in ids)
-                selected_pairs.extend(selected_page)
-                selected_ids[horizon].extend(page_selection.selected_ids)
-                if first_cutoffs[horizon] is None:
-                    first_cutoffs[horizon] = page_selection.first_cutoff
-                last_cutoffs[horizon] = page_selection.last_cutoff
-                last_selected_id = page_selection.selected_ids[-1]
-                last_selected = next(
-                    pair[0] for pair in reversed(selected_page)
-                    if pair[0].forecast_record_id == last_selected_id)
-                next_cutoffs[horizon] = (
-                    last_selected.cutoff_at +
-                    timedelta(seconds=last_selected.horizon_seconds))
+                    ids = set(page_selection.selected_ids)
+                    selected_page = tuple(
+                        pair for pair in selectable
+                        if pair[0].forecast_record_id in ids)
+                    accumulator["selected_pairs"].extend(selected_page)
+                    accumulator["selected_ids"][horizon].extend(
+                        page_selection.selected_ids)
+                    if accumulator["first_cutoffs"][horizon] is None:
+                        accumulator["first_cutoffs"][horizon] = \
+                            page_selection.first_cutoff
+                    accumulator["last_cutoffs"][horizon] = \
+                        page_selection.last_cutoff
+                    last_selected_id = page_selection.selected_ids[-1]
+                    last_selected = next(
+                        pair[0] for pair in reversed(selected_page)
+                        if pair[0].forecast_record_id == last_selected_id)
+                    accumulator["next_cutoffs"][horizon] = (
+                        last_selected.cutoff_at +
+                        timedelta(seconds=last_selected.horizon_seconds))
 
         close = getattr(cursor, "close", None)
         if callable(close):
@@ -253,16 +268,36 @@ def _prepare_v4_state_evidence(
         if not cursor_closed and callable(close):
             close()
 
-    selections = tuple(
-        (horizon, OverlapSelection(
-            raw_counts[horizon], len(selected_ids[horizon]),
-            first_cutoffs[horizon], last_cutoffs[horizon],
-            tuple(selected_ids[horizon]),
-            canonical_sha256(tuple(selected_ids[horizon])),
-        ))
-        for horizon in HORIZONS
-    )
-    return _PreparedV4StateEvidence(tuple(selected_pairs), selections)
+    return {
+        name: _PreparedV4StateEvidence(
+            tuple(accumulator["selected_pairs"]),
+            tuple(
+                (horizon, OverlapSelection(
+                    accumulator["raw_counts"][horizon],
+                    len(accumulator["selected_ids"][horizon]),
+                    accumulator["first_cutoffs"][horizon],
+                    accumulator["last_cutoffs"][horizon],
+                    tuple(accumulator["selected_ids"][horizon]),
+                    canonical_sha256(tuple(
+                        accumulator["selected_ids"][horizon])),
+                ))
+                for horizon in HORIZONS
+            ),
+        )
+        for name, accumulator in accumulators.items()
+    }
+
+
+def _prepare_v4_state_evidence(
+        connection, *, symbol: str, state_as_of: datetime,
+        cohorts: dict[str, tuple[str, str]], governed: Callable,
+) -> _PreparedV4StateEvidence:
+    """Stream all eligible history and retain the frozen overlap sample only."""
+
+    return _prepare_v4_state_evidence_sets(
+        connection, symbol=symbol, state_as_of=state_as_of,
+        cohorts=cohorts, governed_sets={"evidence": governed},
+    )["evidence"]
 
 
 def _governed_v4b_evidence(*, horizon: str, cohort_id: str,
@@ -379,6 +414,18 @@ class PostgresV4BStateBuilder:
                 cohorts: dict[str, tuple[str, str]]) -> None:
         self._candidate = (symbol, state_as_of, dict(cohorts))
 
+    def build_and_publish_prepared(
+            self, prepared: _PreparedV4StateEvidence) -> str:
+        if self._candidate is None:
+            return "SKIPPED_NO_CANDIDATE"
+        symbol, state_as_of, cohorts = self._candidate
+        state = build_accuracy_state(
+            symbol=symbol, state_as_of=state_as_of,
+            cohorts=cohorts, evidence=prepared.evidence,
+            overlap_selections=prepared.selection_map(),
+        )
+        return self._store.insert(state, self._clock())
+
     def build_and_publish(self) -> str:
         if self._candidate is None:
             return "SKIPPED_NO_CANDIDATE"
@@ -390,12 +437,7 @@ class PostgresV4BStateBuilder:
             cohorts=cohorts,
             governed=_governed_v4b_evidence,
         )
-        state = build_accuracy_state(
-            symbol=symbol, state_as_of=state_as_of,
-            cohorts=cohorts, evidence=prepared.evidence,
-            overlap_selections=prepared.selection_map(),
-        )
-        return self._store.insert(state, self._clock())
+        return self.build_and_publish_prepared(prepared)
 
 
 class PostgresV4CStateBuilder:
@@ -418,6 +460,15 @@ class PostgresV4CStateBuilder:
                 cohorts: dict[str, tuple[str, str]]) -> None:
         self._candidate = (symbol, state_as_of, dict(cohorts))
 
+    def build_and_publish_prepared(
+            self, prepared: _PreparedV4StateEvidence) -> str:
+        if self._candidate is None:
+            return "SKIPPED_NO_CANDIDATE"
+        symbol, state_as_of, cohorts = self._candidate
+        state = self._build_state(
+            symbol, state_as_of, cohorts, prepared.evidence)
+        return self._store.insert(state, self._clock())
+
     def build_and_publish(self) -> str:
         if self._candidate is None:
             return "SKIPPED_NO_CANDIDATE"
@@ -429,9 +480,7 @@ class PostgresV4CStateBuilder:
             cohorts=cohorts,
             governed=_governed_v4c_evidence,
         )
-        state = self._build_state(
-            symbol, state_as_of, cohorts, prepared.evidence)
-        return self._store.insert(state, self._clock())
+        return self.build_and_publish_prepared(prepared)
 
     @staticmethod
     def _build_state(symbol, state_as_of, cohorts, evidence):
@@ -543,8 +592,13 @@ class PostgresV4StateBuilder:
             raise ValueError("compact builder is not bound to the shared connection")
         if bool(getattr(self._connection, "autocommit", False)):
             raise ValueError("atomic V4 state publication requires autocommit disabled")
+        self._candidate = None
 
     def prepare(self, **candidate) -> None:
+        self._candidate = (
+            candidate["symbol"], candidate["state_as_of"],
+            dict(candidate["cohorts"]),
+        )
         self._accuracy_builder.prepare(**candidate)
         self._compact_builder.prepare(**candidate)
 
@@ -577,13 +631,39 @@ class PostgresV4StateBuilder:
                 close = getattr(cursor, "close", None)
                 if callable(close):
                     close()
-            accuracy = self._accuracy_builder.build_and_publish()
+            shared_build = (
+                self._candidate is not None and
+                callable(getattr(
+                    self._accuracy_builder,
+                    "build_and_publish_prepared", None)) and
+                callable(getattr(
+                    self._compact_builder,
+                    "build_and_publish_prepared", None))
+            )
+            if shared_build:
+                symbol, state_as_of, cohorts = self._candidate
+                prepared = _prepare_v4_state_evidence_sets(
+                    proxy, symbol=symbol, state_as_of=state_as_of,
+                    cohorts=cohorts,
+                    governed_sets={
+                        "accuracy": _governed_v4b_evidence,
+                        "compact": _governed_v4c_evidence,
+                    },
+                )
+                accuracy = self._accuracy_builder.build_and_publish_prepared(
+                    prepared["accuracy"])
+            else:
+                accuracy = self._accuracy_builder.build_and_publish()
             if accuracy not in {"INSERT", "IDEMPOTENT"}:
                 rollback = getattr(connection, "rollback", None)
                 if callable(rollback):
                     rollback()
                 return accuracy
-            compact = self._compact_builder.build_and_publish()
+            if shared_build:
+                compact = self._compact_builder.build_and_publish_prepared(
+                    prepared["compact"])
+            else:
+                compact = self._compact_builder.build_and_publish()
             if compact not in {"INSERT", "IDEMPOTENT"}:
                 rollback = getattr(connection, "rollback", None)
                 if callable(rollback):
