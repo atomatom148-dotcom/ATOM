@@ -54,7 +54,8 @@ recorded by hash in the final receipt; no redundant metrics table is added.
 
 ## Completion receipt
 
-The single frozen retry passed on August 31, 2026.
+The completed gate was one exact idempotent persistence retry. It passed on
+August 31, 2026.
 
 | Result | Exact value |
 |---|---|
