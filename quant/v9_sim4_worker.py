@@ -17,7 +17,6 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
-import http.client
 import json
 import logging
 import math
@@ -30,7 +29,6 @@ import threading
 import time
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
-from urllib.parse import urlencode
 
 from .v9_sim1_contract import SimulationTradeIntent
 from .v9_sim4_entry import (
@@ -53,6 +51,8 @@ SIM4_DATABASE_URL_ENV = "ATOM_V9_SIM4_DATABASE_URL"
 SIM_PROJECT_REF_ENV = "ATOM_V9_SIM_PROJECT_REF"
 AUTHX_CLIENT_ID_ENV = "ATOM_V9_SIM4_ALPACA_AUTHX_CLIENT_ID"
 AUTHX_CLIENT_SECRET_ENV = "ATOM_V9_SIM4_ALPACA_AUTHX_CLIENT_SECRET"
+PAPER_API_KEY_ID_ENV = "ATOM_V9_SIM4_ALPACA_PAPER_API_KEY_ID"
+PAPER_API_SECRET_KEY_ENV = "ATOM_V9_SIM4_ALPACA_PAPER_API_SECRET_KEY"
 AUTHX_ATTESTATION_ID_ENV = "ATOM_V9_SIM4_ALPACA_PROVISIONING_ATTESTATION_ID"
 AUTHX_ATTESTATION_SHA256_ENV = (
     "ATOM_V9_SIM4_ALPACA_PROVISIONING_ATTESTATION_SHA256"
@@ -60,7 +60,6 @@ AUTHX_ATTESTATION_SHA256_ENV = (
 
 SIM4_QUOTE_SOURCE_SPEC = "ATOM_TRUE_V9_SIM4_ALPACA_SIP_QUOTE_1"
 SIM4_WEBSOCKET_URL = "wss://stream.data.alpaca.markets/v2/sip"
-SIM4_AUTHX_TOKEN_URL = "https://authx.alpaca.markets/v1/oauth2/token"
 SIM4_SUBSCRIPTION_PAYLOAD = '{"action":"subscribe","quotes":["COIN"]}'
 SIM4_SYMBOL = "COIN"
 SIM4_RUNTIME_ROLE = "atom_v9_sim_entry_runtime"
@@ -80,9 +79,6 @@ SIM4_PUBLIC_STOP_JOIN_SECONDS = 1.000
 SIM4_TELEMETRY_LOG_INTERVAL_SECONDS = 1.000
 SIM4_DATABASE_CONNECT_TIMEOUT_SECONDS = 5
 
-SIM4_TOKEN_CONNECT_TIMEOUT_SECONDS = 5.0
-SIM4_TOKEN_TOTAL_TIMEOUT_SECONDS = 10.0
-SIM4_TOKEN_RESPONSE_MAX_BYTES = 16 * 1024
 SIM4_WEBSOCKET_CONNECT_TIMEOUT_SECONDS = 10.0
 SIM4_WEBSOCKET_ACK_TIMEOUT_SECONDS = 10.0
 SIM4_WEBSOCKET_RECEIVE_TIMEOUT_SECONDS = 1.0
@@ -178,6 +174,8 @@ FORBIDDEN_ENVIRONMENT_NAMES = frozenset({
     "ACCOUNT_ENDPOINT",
     "ORDER_ENDPOINT",
     "ORDERS_ENDPOINT",
+    AUTHX_CLIENT_ID_ENV,
+    AUTHX_CLIENT_SECRET_ENV,
 })
 
 _OWNER_SQL = "SELECT pg_try_advisory_lock(%s::bigint)"
@@ -198,11 +196,11 @@ class Sim4AuthorityError(RuntimeError):
 
 
 class Sim4ProtocolError(RuntimeError):
-    """AuthX, websocket, or quote input failed closed."""
+    """Websocket or quote input failed closed."""
 
 
 class Sim4AuthenticationError(Sim4ProtocolError):
-    """AuthX or websocket authentication failed closed."""
+    """Websocket authentication failed closed."""
 
 
 class Sim4GenerationFailed(RuntimeError):
@@ -228,10 +226,25 @@ class _Connection(Protocol):
 class SimulationWorkerConfig:
     database_url: str
     project_ref: str
-    authx_client_id: str
-    authx_client_secret: str
+    paper_api_key_id: str = field(repr=False)
+    paper_api_secret_key: str = field(repr=False)
     provisioning_attestation_id: str
     provisioning_attestation_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class PaperTradingCredentials:
+    key_id: str = field(repr=False)
+    secret_key: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.key_id, str)
+            or not self.key_id
+            or not isinstance(self.secret_key, str)
+            or not self.secret_key
+        ):
+            raise Sim4ConfigurationError("paper Trading API credentials are required")
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,8 +314,8 @@ def load_sim4_config(environ: Mapping[str, str] | None = None) -> SimulationWork
     project_ref = _required_nonempty(values, SIM_PROJECT_REF_ENV)
     database_url = _required_nonempty(values, SIM4_DATABASE_URL_ENV)
     validate_sim4_database_url(database_url, project_ref)
-    client_id = _required_nonempty(values, AUTHX_CLIENT_ID_ENV)
-    client_secret = _required_nonempty(values, AUTHX_CLIENT_SECRET_ENV)
+    paper_api_key_id = _required_nonempty(values, PAPER_API_KEY_ID_ENV)
+    paper_api_secret_key = _required_nonempty(values, PAPER_API_SECRET_KEY_ENV)
     attestation_id = _required_nonempty(values, AUTHX_ATTESTATION_ID_ENV)
     attestation_sha256 = _required_nonempty(values, AUTHX_ATTESTATION_SHA256_ENV)
     if _SHA256_RE.fullmatch(attestation_sha256) is None:
@@ -312,8 +325,8 @@ def load_sim4_config(environ: Mapping[str, str] | None = None) -> SimulationWork
     return SimulationWorkerConfig(
         database_url=database_url,
         project_ref=project_ref,
-        authx_client_id=client_id,
-        authx_client_secret=client_secret,
+        paper_api_key_id=paper_api_key_id,
+        paper_api_secret_key=paper_api_secret_key,
         provisioning_attestation_id=attestation_id,
         provisioning_attestation_sha256=attestation_sha256,
     )
@@ -484,156 +497,6 @@ def parse_sip_quote_message(item: object) -> ParsedSIPQuote:
     if bid <= 0.0 or ask < bid or bid_size < 0.0 or ask_size < 0.0:
         raise Sim4ProtocolError("SIP quote values are invalid")
     return ParsedSIPQuote(provider_event_ns, bid, ask, bid_size, ask_size)
-
-
-@dataclass(frozen=True, slots=True)
-class AuthXToken:
-    access_token: str = field(repr=False)
-    expires_in: int
-
-
-class _HTTPSResponse(Protocol):
-    status: int
-    def read(self, amount: int | None = None) -> bytes: ...
-
-
-TokenRequester = Callable[[str, bytes, Mapping[str, str], float, float, int], object]
-
-
-def _default_token_requester(
-    url: str,
-    body: bytes,
-    headers: Mapping[str, str],
-    connect_timeout: float,
-    total_timeout: float,
-    response_limit: int,
-) -> tuple[int, str, bytes]:
-    """Issue the one redirect-free HTTPS token request.
-
-    ``http.client`` is used deliberately: it does not follow redirects, and it
-    lets the connect and remaining read budget be applied independently.
-    """
-
-    if url != SIM4_AUTHX_TOKEN_URL:
-        raise Sim4ProtocolError("invalid AuthX token endpoint")
-    absolute_deadline = time.monotonic() + total_timeout
-
-    def remaining_budget() -> float:
-        remaining = absolute_deadline - time.monotonic()
-        if remaining <= 0.0:
-            raise TimeoutError("AuthX token request timed out")
-        return remaining
-
-    connection = http.client.HTTPSConnection(
-        "authx.alpaca.markets",
-        443,
-        timeout=connect_timeout,
-        context=ssl.create_default_context(),
-    )
-    try:
-        connection.connect()
-        if connection.sock is None:
-            raise OSError("AuthX TLS socket unavailable")
-        connection.sock.settimeout(remaining_budget())
-        connection.request(
-            "POST", "/v1/oauth2/token", body=body, headers=dict(headers)
-        )
-        connection.sock.settimeout(remaining_budget())
-        response = connection.getresponse()
-        remaining_budget()
-        response_body = bytearray()
-        while True:
-            if connection.sock is None:
-                raise OSError("AuthX TLS socket unavailable")
-            connection.sock.settimeout(remaining_budget())
-            chunk = response.read1(min(4096, response_limit + 1 - len(response_body)))
-            # A read that began in budget but completed at/after the absolute
-            # deadline is late and cannot be accepted.
-            remaining_budget()
-            if not chunk:
-                break
-            response_body.extend(chunk)
-            if len(response_body) > response_limit:
-                raise Sim4ProtocolError("AuthX token response exceeds 16 KiB")
-        return response.status, SIM4_AUTHX_TOKEN_URL, bytes(response_body)
-    finally:
-        connection.close()
-
-
-class AuthXTokenClient:
-    """Fetch and validate a short-lived data-only Broker AuthX token."""
-
-    def __init__(
-        self,
-        client_id: str,
-        client_secret: str,
-        *,
-        requester: TokenRequester | None = None,
-    ) -> None:
-        if not isinstance(client_id, str) or not client_id:
-            raise Sim4ConfigurationError("AuthX client ID is required")
-        if not isinstance(client_secret, str) or not client_secret:
-            raise Sim4ConfigurationError("AuthX client secret is required")
-        self._client_id = client_id
-        self._client_secret = client_secret
-        self._requester = requester or _default_token_requester
-
-    def fetch(self) -> AuthXToken:
-        body = urlencode((
-            ("grant_type", "client_credentials"),
-            ("client_id", self._client_id),
-            ("client_secret", self._client_secret),
-        )).encode("ascii")
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Content-Length": str(len(body)),
-        }
-        try:
-            raw = self._requester(
-                SIM4_AUTHX_TOKEN_URL,
-                body,
-                headers,
-                SIM4_TOKEN_CONNECT_TIMEOUT_SECONDS,
-                SIM4_TOKEN_TOTAL_TIMEOUT_SECONDS,
-                SIM4_TOKEN_RESPONSE_MAX_BYTES,
-            )
-            if (
-                not isinstance(raw, tuple)
-                or len(raw) != 3
-                or isinstance(raw[0], bool)
-                or not isinstance(raw[0], int)
-                or not isinstance(raw[1], str)
-                or not isinstance(raw[2], (bytes, bytearray))
-            ):
-                raise Sim4ProtocolError("AuthX requester returned an invalid response")
-            status, final_url, response_body = raw
-            if len(response_body) > SIM4_TOKEN_RESPONSE_MAX_BYTES:
-                raise Sim4ProtocolError("AuthX token response exceeds 16 KiB")
-            if status != 200 or final_url != SIM4_AUTHX_TOKEN_URL:
-                raise Sim4ProtocolError("AuthX token response was not an exact HTTP 200")
-            payload = json.loads(bytes(response_body).decode("utf-8"))
-            if not isinstance(payload, dict):
-                raise Sim4ProtocolError("AuthX token response must be a JSON object")
-            access_token = payload.get("access_token")
-            token_type = payload.get("token_type")
-            expires_in = payload.get("expires_in")
-            if not isinstance(access_token, str) or not access_token:
-                raise Sim4ProtocolError("AuthX response lacks an access token")
-            if not isinstance(token_type, str) or token_type.lower() != "bearer":
-                raise Sim4ProtocolError("AuthX token type is not Bearer")
-            if (
-                isinstance(expires_in, bool)
-                or not isinstance(expires_in, int)
-                or expires_in <= 0
-            ):
-                raise Sim4ProtocolError("AuthX token lifetime is invalid")
-            return AuthXToken(access_token, expires_in)
-        except Sim4ProtocolError:
-            raise
-        except BaseException as error:
-            # The original exception may embed a URL or request body.  Never
-            # chain it into logs or telemetry.
-            raise Sim4ProtocolError("AuthX token request failed closed") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -873,7 +736,7 @@ class SIPWebSocketReceiver:
 
     def __init__(
         self,
-        token_client: AuthXTokenClient,
+        credentials: PaperTradingCredentials,
         quote_callback: Callable[[ParsedSIPQuote], bool],
         *,
         websocket_factory: Callable[..., object] | None = None,
@@ -890,7 +753,7 @@ class SIPWebSocketReceiver:
 
             def websocket_factory(url: str, **options: object) -> object:
                 return create_connection(url, class_=bounded_class, **options)
-        self._token_client = token_client
+        self._credentials = credentials
         self._quote_callback = quote_callback
         self._websocket_factory = websocket_factory
         self._monotonic = monotonic
@@ -972,17 +835,12 @@ class SIPWebSocketReceiver:
                 raise Sim4ProtocolError("SIP stream returned an error")
 
     def _connect_once(self) -> float:
-        try:
-            token = self._token_client.fetch()
-        except BaseException:
-            raise Sim4AuthenticationError("AuthX token acquisition failed") from None
         stream = None
         stable_started: float | None = None
         self._last_connection_stable_seconds = 0.0
         try:
             stream = self._websocket_factory(
                 SIM4_WEBSOCKET_URL,
-                header=[f"Authorization: Bearer {token.access_token}"],
                 timeout=SIM4_WEBSOCKET_CONNECT_TIMEOUT_SECONDS,
                 redirect_limit=0,
                 sslopt={"cert_reqs": ssl.CERT_REQUIRED},
@@ -991,6 +849,11 @@ class SIPWebSocketReceiver:
                 self._socket = stream
             stream.settimeout(SIM4_WEBSOCKET_RECEIVE_TIMEOUT_SECONDS)
             try:
+                stream.send(json.dumps({
+                    "action": "auth",
+                    "key": self._credentials.key_id,
+                    "secret": self._credentials.secret_key,
+                }, separators=(",", ":")))
                 self._recv_until(
                     stream,
                     _authentication_ack,
@@ -1131,7 +994,7 @@ class SimulationEntryWorker:
         self,
         connection_factory: Callable[[], _Connection],
         project_ref: str,
-        token_client: AuthXTokenClient,
+        credentials: PaperTradingCredentials,
         *,
         utc_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
@@ -1150,7 +1013,7 @@ class SimulationEntryWorker:
             raise TypeError("worker clocks must be callable")
         self._connection_factory = connection_factory
         self._project_ref = project_ref
-        self._token_client = token_client
+        self._credentials = credentials
         self._utc_clock = utc_clock
         self._monotonic_ns = monotonic_ns
         self._monotonic = monotonic
@@ -1159,7 +1022,7 @@ class SimulationEntryWorker:
         self.telemetry = telemetry or Sim4Telemetry()
         if receiver_factory is None:
             receiver_factory = lambda callback: SIPWebSocketReceiver(
-                token_client,
+                credentials,
                 callback,
                 websocket_factory=websocket_factory,
                 monotonic=monotonic,
@@ -1201,7 +1064,6 @@ class SimulationEntryWorker:
         config: SimulationWorkerConfig,
         *,
         connection_factory: Callable[[], _Connection] | None = None,
-        token_requester: TokenRequester | None = None,
         websocket_factory: Callable[..., object] | None = None,
         **kwargs: object,
     ) -> "SimulationEntryWorker":
@@ -1213,15 +1075,14 @@ class SimulationEntryWorker:
                     config.database_url,
                     connect_timeout=SIM4_DATABASE_CONNECT_TIMEOUT_SECONDS,
                 )
-        token_client = AuthXTokenClient(
-            config.authx_client_id,
-            config.authx_client_secret,
-            requester=token_requester,
+        credentials = PaperTradingCredentials(
+            config.paper_api_key_id,
+            config.paper_api_secret_key,
         )
         return cls(
             connection_factory,
             config.project_ref,
-            token_client,
+            credentials,
             websocket_factory=websocket_factory,
             **kwargs,
         )
@@ -2544,7 +2405,6 @@ def main(
     *,
     stop_event: threading.Event | None = None,
     connection_factory: Callable[[], _Connection] | None = None,
-    token_requester: TokenRequester | None = None,
     websocket_factory: Callable[..., object] | None = None,
     install_signal_handlers: bool = True,
 ) -> int:
@@ -2563,7 +2423,6 @@ def main(
     worker = SimulationEntryWorker.from_config(
         config,
         connection_factory=connection_factory,
-        token_requester=token_requester,
         websocket_factory=websocket_factory,
     )
     telemetry_snapshot = _fail_closed_telemetry_snapshot(worker.telemetry)

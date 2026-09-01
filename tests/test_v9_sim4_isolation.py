@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import threading
+import traceback
 from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -65,6 +66,15 @@ POSTGRES_BOOTSTRAP_TEST_NAME = (
 SIM_PROJECT_REF = "abcdefghijklmnopqrst"
 PRODUCTION_PROJECT_REF = "zyxwvutsrqponmlkjihg"
 WORKER_T0 = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+PAPER_API_KEY_ID = "paper-data-key-id"
+PAPER_API_SECRET_KEY = "paper-data-secret-key"
+
+
+def paper_credentials():
+    return worker.PaperTradingCredentials(
+        PAPER_API_KEY_ID,
+        PAPER_API_SECRET_KEY,
+    )
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -253,7 +263,7 @@ def make_authoritative_worker(
     runtime = worker.SimulationEntryWorker(
         lambda: connection,
         SIM_PROJECT_REF,
-        object(),
+        paper_credentials(),
         utc_clock=lambda: WORKER_T0,
         monotonic_ns=monotonic_ns,
         monotonic=monotonic,
@@ -510,6 +520,8 @@ def test_web_contains_no_worker_runtime_or_quote_source_authority():
     assert "simulator_connection_factory = _isolated_simulator_connection_factory(" in source
     assert set(web._SIMULATOR_WORKER_CREDENTIAL_ENVS) == {
         worker.SIM4_DATABASE_URL_ENV,
+        worker.PAPER_API_KEY_ID_ENV,
+        worker.PAPER_API_SECRET_KEY_ENV,
         worker.AUTHX_CLIENT_ID_ENV,
         worker.AUTHX_CLIENT_SECRET_ENV,
         worker.AUTHX_ATTESTATION_ID_ENV,
@@ -522,8 +534,8 @@ def valid_worker_environment(**changes):
         worker.SIM4_ENABLED_ENV: "true",
         worker.SIM4_DATABASE_URL_ENV: direct_dsn(SIM_ENTRY_RUNTIME_ROLE),
         worker.SIM_PROJECT_REF_ENV: SIM_PROJECT_REF,
-        worker.AUTHX_CLIENT_ID_ENV: "restricted-data-client",
-        worker.AUTHX_CLIENT_SECRET_ENV: "restricted-data-secret",
+        worker.PAPER_API_KEY_ID_ENV: PAPER_API_KEY_ID,
+        worker.PAPER_API_SECRET_KEY_ENV: PAPER_API_SECRET_KEY,
         worker.AUTHX_ATTESTATION_ID_ENV: "provisioning-record-1",
         worker.AUTHX_ATTESTATION_SHA256_ENV: "a" * 64,
     }
@@ -557,7 +569,6 @@ def test_disabled_worker_main_performs_no_database_or_network_io(value, monkeypa
         environment,
         stop_event=stop_event,
         connection_factory=forbidden,
-        token_requester=forbidden,
         websocket_factory=forbidden,
         install_signal_handlers=False,
     ) == 0
@@ -646,22 +657,73 @@ def test_enabled_main_logs_failure_aggregates_without_authority_or_secrets(
     rendered = records[0]
     for forbidden in (
         environment[worker.SIM4_DATABASE_URL_ENV],
-        environment[worker.AUTHX_CLIENT_ID_ENV],
-        environment[worker.AUTHX_CLIENT_SECRET_ENV],
+        environment[worker.PAPER_API_KEY_ID_ENV],
+        environment[worker.PAPER_API_SECRET_KEY_ENV],
         environment[worker.AUTHX_ATTESTATION_ID_ENV],
         environment[worker.AUTHX_ATTESTATION_SHA256_ENV],
     ):
         assert forbidden not in rendered
 
 
-def test_worker_config_uses_only_entry_role_dsn_and_exact_authx_attestation_names():
+def test_worker_config_uses_only_exact_paper_key_pair_and_existing_attestation():
     config = worker.load_sim4_config(valid_worker_environment())
     assert config.database_url == direct_dsn(SIM_ENTRY_RUNTIME_ROLE)
     assert config.project_ref == SIM_PROJECT_REF
-    assert config.authx_client_id == "restricted-data-client"
-    assert config.authx_client_secret == "restricted-data-secret"
+    assert config.paper_api_key_id == PAPER_API_KEY_ID
+    assert config.paper_api_secret_key == PAPER_API_SECRET_KEY
     assert config.provisioning_attestation_id == "provisioning-record-1"
     assert config.provisioning_attestation_sha256 == "a" * 64
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        worker.SIM4_DATABASE_URL_ENV,
+        worker.SIM_PROJECT_REF_ENV,
+        worker.PAPER_API_KEY_ID_ENV,
+        worker.PAPER_API_SECRET_KEY_ENV,
+        worker.AUTHX_ATTESTATION_ID_ENV,
+        worker.AUTHX_ATTESTATION_SHA256_ENV,
+    ),
+)
+@pytest.mark.parametrize("value", (None, ""))
+def test_worker_requires_every_exact_setting_without_fallback(name, value):
+    values = valid_worker_environment()
+    if value is None:
+        del values[name]
+    else:
+        values[name] = value
+
+    with pytest.raises(worker.Sim4ConfigurationError, match=re.escape(name)):
+        worker.load_sim4_config(values)
+
+
+@pytest.mark.parametrize(
+    ("missing_name", "fallback_name"),
+    (
+        (worker.PAPER_API_KEY_ID_ENV, "APCA_API_KEY_ID"),
+        (worker.PAPER_API_SECRET_KEY_ENV, "APCA_API_SECRET_KEY"),
+        (worker.PAPER_API_KEY_ID_ENV, worker.AUTHX_CLIENT_ID_ENV),
+        (worker.PAPER_API_SECRET_KEY_ENV, worker.AUTHX_CLIENT_SECRET_ENV),
+    ),
+)
+def test_worker_rejects_standard_and_legacy_credential_fallbacks(
+        missing_name, fallback_name):
+    values = valid_worker_environment()
+    del values[missing_name]
+    values[fallback_name] = "forbidden-fallback"
+
+    with pytest.raises(worker.Sim4ConfigurationError, match="forbidden authority"):
+        worker.load_sim4_config(values)
+
+
+def test_paper_credentials_and_config_hide_key_pair_from_repr():
+    credentials = paper_credentials()
+    config = worker.load_sim4_config(valid_worker_environment())
+
+    for rendered in (repr(credentials), repr(config)):
+        assert PAPER_API_KEY_ID not in rendered
+        assert PAPER_API_SECRET_KEY not in rendered
 
 
 def test_default_worker_connection_attempt_has_fixed_five_second_timeout(
@@ -695,8 +757,18 @@ def test_worker_has_no_database_url_or_publisher_fallback():
         worker.load_sim4_config(values)
 
 
-def test_enabled_worker_rejects_forbidden_authority_before_external_io():
-    values = valid_worker_environment(DATABASE_URL="")
+@pytest.mark.parametrize(
+    "name",
+    (
+        "DATABASE_URL",
+        worker.AUTHX_CLIENT_ID_ENV,
+        worker.AUTHX_CLIENT_SECRET_ENV,
+    ),
+)
+@pytest.mark.parametrize("value", ("forbidden-secret", ""))
+def test_enabled_worker_rejects_forbidden_authority_before_external_io(
+        name, value):
+    values = valid_worker_environment(**{name: value})
     stop_event = threading.Event()
     stop_event.set()
     calls = []
@@ -710,7 +782,6 @@ def test_enabled_worker_rejects_forbidden_authority_before_external_io():
             values,
             stop_event=stop_event,
             connection_factory=forbidden,
-            token_requester=forbidden,
             websocket_factory=forbidden,
             install_signal_handlers=False,
         )
@@ -724,10 +795,17 @@ def test_enabled_worker_rejects_forbidden_authority_before_external_io():
         "ATOM_V9_SIM_DATABASE_URL",
         "SUPABASE_SERVICE_ROLE_KEY",
         "ATOM_V9_V4_WRITER_DATABASE_URL",
+        worker.AUTHX_CLIENT_ID_ENV,
+        worker.AUTHX_CLIENT_SECRET_ENV,
+        "APCA_API_KEY_ID",
+        "APCA_API_SECRET_KEY",
+        "APCA_API_BASE_URL",
         "ALPACA_API_KEY",
         "ALPACA_SECRET_KEY",
+        "ALPACA_BASE_URL",
         "ALPACA_BROKER_BASE_URL",
         "BROKER_ACCOUNT_ID",
+        "ACCOUNT_ENDPOINT",
         "ORDER_ENDPOINT",
         "MASSIVE_API_KEY",
         "HISTORICAL_EVIDENCE_DATABASE_URL",
@@ -778,15 +856,28 @@ def test_worker_source_has_no_production_runtime_or_trading_import_surface():
     )
     for forbidden in (
         "quant.web", "quant.live_market", "quant.v9_production",
-        "quant.evidence", "quant.evidence_outbox", "alpaca_trade_api",
+        "quant.evidence", "quant.evidence_outbox", "http", "urllib",
+        "requests", "alpaca", "alpaca_trade_api",
     ):
         assert not any(name == forbidden or name.startswith(forbidden + ".")
                        for name in imported)
     for forbidden_endpoint in (
-        "paper-api.alpaca.markets", "api.alpaca.markets/v2/account",
-        "api.alpaca.markets/v2/orders", "/v2/positions",
+        "authx.alpaca.markets", "paper-api.alpaca.markets",
+        "api.alpaca.markets", "broker-api.alpaca.markets",
+        "/v2/account", "/v2/positions", "/v2/orders", "/v2/assets",
+        "trade_updates",
     ):
         assert forbidden_endpoint not in source
+    for forbidden_surface in (
+        "SIM4_AUTHX_TOKEN_URL", "AuthXToken", "AuthXTokenClient",
+        "TokenRequester", "_default_token_requester", "Authorization: Bearer",
+    ):
+        assert forbidden_surface not in source
+    assert worker.SIM4_WEBSOCKET_URL == (
+        "wss://stream.data.alpaca.markets/v2/sip")
+    assert source.count(worker.SIM4_WEBSOCKET_URL) == 1
+    assert worker.SIM4_SUBSCRIPTION_PAYLOAD == (
+        '{"action":"subscribe","quotes":["COIN"]}')
 
 
 def test_deadline_terminalizes_before_checkpoint_and_releases_closure_transaction():
@@ -1722,7 +1813,7 @@ def test_worker_retries_flapping_sip_readiness_on_same_receiver():
     runtime = worker.SimulationEntryWorker(
         lambda: object(),
         SIM_PROJECT_REF,
-        object(),
+        paper_credentials(),
         utc_clock=lambda: WORKER_T0,
         monotonic_ns=lambda: 1,
         receiver_factory=lambda _callback: receiver,
@@ -1744,9 +1835,9 @@ def test_worker_retries_flapping_sip_readiness_on_same_receiver():
          {"T": "subscription", "quotes": ["COIN"]}),
     ),
 )
-def test_authx_ack_same_frame_error_wins(predicate, ack):
+def test_auth_ack_same_frame_error_wins(predicate, ack):
     receiver = worker.SIPWebSocketReceiver(
-        object(), lambda _quote: True,
+        paper_credentials(), lambda _quote: True,
         websocket_factory=lambda *args, **kwargs: None,
         monotonic=lambda: 0.0,
     )
@@ -1758,7 +1849,7 @@ def test_authx_ack_same_frame_error_wins(predicate, ack):
             receiver._recv_until(stream, predicate, 10.0)
 
 
-def test_authx_ack_returning_at_deadline_is_rejected_after_receive():
+def test_auth_ack_returning_at_deadline_is_rejected_after_receive():
     samples = iter((9.999, 10.0))
 
     class Stream:
@@ -1767,7 +1858,7 @@ def test_authx_ack_returning_at_deadline_is_rejected_after_receive():
             return json.dumps([{"T": "success", "msg": "authenticated"}])
 
     receiver = worker.SIPWebSocketReceiver(
-        object(), lambda _quote: True,
+        paper_credentials(), lambda _quote: True,
         websocket_factory=lambda *args, **kwargs: None,
         monotonic=lambda: next(samples),
     )
@@ -1775,35 +1866,7 @@ def test_authx_ack_returning_at_deadline_is_rejected_after_receive():
         receiver._recv_until(Stream(), worker._authentication_ack, 10.0)
 
 
-def test_authx_token_failure_counts_as_auth_not_socket():
-    class TokenClient:
-        @staticmethod
-        def fetch():
-            raise RuntimeError("credential rejected")
-
-    telemetry = worker.Sim4Telemetry()
-    receiver = worker.SIPWebSocketReceiver(
-        TokenClient(),
-        lambda _quote: True,
-        websocket_factory=lambda *_args, **_kwargs: pytest.fail(
-            "token failure opened a websocket"),
-        wait=lambda _seconds: True,
-        telemetry=telemetry,
-    )
-
-    receiver._run()
-
-    snapshot = telemetry.snapshot()
-    assert snapshot["auth_failures"] == 1
-    assert snapshot["socket_failures"] == 0
-
-
-def test_websocket_handshake_failure_counts_as_auth_not_socket():
-    class TokenClient:
-        @staticmethod
-        def fetch():
-            return worker.AuthXToken("data-only-token", 30)
-
+def test_paper_auth_frame_failure_counts_as_auth_not_socket():
     class Stream:
         closed = False
 
@@ -1812,8 +1875,13 @@ def test_websocket_handshake_failure_counts_as_auth_not_socket():
             return None
 
         @staticmethod
+        def send(_payload):
+            raise RuntimeError(
+                f"credential rejected {PAPER_API_KEY_ID} {PAPER_API_SECRET_KEY}")
+
+        @staticmethod
         def recv():
-            return '[{"T":"error","msg":"denied"}]'
+            raise AssertionError("failed auth send reached receive")
 
         def close(self):
             self.closed = True
@@ -1821,10 +1889,9 @@ def test_websocket_handshake_failure_counts_as_auth_not_socket():
     telemetry = worker.Sim4Telemetry()
     stream = Stream()
     receiver = worker.SIPWebSocketReceiver(
-        TokenClient(),
+        paper_credentials(),
         lambda _quote: True,
         websocket_factory=lambda *_args, **_kwargs: stream,
-        monotonic=lambda: 0.0,
         wait=lambda _seconds: True,
         telemetry=telemetry,
     )
@@ -1834,6 +1901,52 @@ def test_websocket_handshake_failure_counts_as_auth_not_socket():
     snapshot = telemetry.snapshot()
     assert snapshot["auth_failures"] == 1
     assert snapshot["socket_failures"] == 0
+    assert PAPER_API_KEY_ID not in repr(snapshot)
+    assert PAPER_API_SECRET_KEY not in repr(snapshot)
+    assert stream.closed is True
+
+
+def test_paper_auth_denial_hides_secrets_from_exception_and_fails_closed():
+    class Stream:
+        closed = False
+        sent = []
+
+        @staticmethod
+        def settimeout(_timeout):
+            return None
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+        def recv(self):
+            return json.dumps([{
+                "T": "error",
+                "msg": f"denied {PAPER_API_KEY_ID} {PAPER_API_SECRET_KEY}",
+            }])
+
+        def close(self):
+            self.closed = True
+
+    stream = Stream()
+    receiver = worker.SIPWebSocketReceiver(
+        paper_credentials(),
+        lambda _quote: True,
+        websocket_factory=lambda *_args, **_kwargs: stream,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(worker.Sim4AuthenticationError) as captured:
+        receiver._connect_once()
+
+    rendered = "".join(traceback.format_exception(
+        type(captured.value), captured.value, captured.value.__traceback__))
+    assert PAPER_API_KEY_ID not in rendered
+    assert PAPER_API_SECRET_KEY not in rendered
+    assert "denied" not in rendered
+    assert stream.sent == [
+        '{"action":"auth","key":"paper-data-key-id",'
+        '"secret":"paper-data-secret-key"}',
+    ]
     assert stream.closed is True
 
 
@@ -1846,7 +1959,7 @@ def test_numeric_quote_overflow_rejects_only_the_bad_item():
     admitted = []
     telemetry = worker.Sim4Telemetry()
     receiver = worker.SIPWebSocketReceiver(
-        object(), admitted.append, telemetry=telemetry)
+        paper_credentials(), admitted.append, telemetry=telemetry)
 
     receiver._process_stream_items((invalid, valid))
 
@@ -1855,17 +1968,13 @@ def test_numeric_quote_overflow_rejects_only_the_bad_item():
     assert telemetry.snapshot()["quote_invalid"] == 1
 
 
-def test_subscription_ack_frame_preserves_following_quote_without_third_recv():
+def test_exact_paper_auth_frame_precedes_ack_then_unchanged_coin_subscription():
     quote = {
         "T": "q", "S": "COIN", "bp": 100, "ap": 101,
         "bs": 2, "as": 3, "t": "2026-09-01T12:00:00.000000001Z",
     }
 
-    class TokenClient:
-        @staticmethod
-        def fetch():
-            return worker.AuthXToken("data-only-token", 30)
-
+    events = []
     class Stream:
         def __init__(self):
             self.frames = iter((
@@ -1878,20 +1987,20 @@ def test_subscription_ack_frame_preserves_following_quote_without_third_recv():
             self.recv_calls = 0
             self.closed = False
 
-        @staticmethod
-        def settimeout(_timeout):
-            return None
+        def settimeout(self, timeout):
+            events.append(("timeout", timeout))
 
         def recv(self):
+            events.append(("recv", self.recv_calls))
             self.recv_calls += 1
             return next(self.frames)
 
-        @staticmethod
-        def send(payload):
-            assert payload == worker.SIM4_SUBSCRIPTION_PAYLOAD
+        def send(self, payload):
+            events.append(("send", payload))
 
         def close(self):
             self.closed = True
+            events.append(("close",))
 
     stream = Stream()
     admitted = []
@@ -1902,9 +2011,16 @@ def test_subscription_ack_frame_preserves_following_quote_without_third_recv():
         receiver.stop()
         return True
 
+    def open_socket(url, **kwargs):
+        events.append(("connect", url, kwargs))
+        assert "header" not in kwargs
+        assert PAPER_API_KEY_ID not in repr(kwargs)
+        assert PAPER_API_SECRET_KEY not in repr(kwargs)
+        return stream
+
     receiver = worker.SIPWebSocketReceiver(
-        TokenClient(), admit,
-        websocket_factory=lambda *_args, **_kwargs: stream,
+        paper_credentials(), admit,
+        websocket_factory=open_socket,
         monotonic=lambda: 0.0,
     )
 
@@ -1914,6 +2030,23 @@ def test_subscription_ack_frame_preserves_following_quote_without_third_recv():
         datetime_to_epoch_nanoseconds(WORKER_T0) + 1)
     assert stream.recv_calls == 2
     assert stream.closed is True
+    exact_auth = (
+        '{"action":"auth","key":"paper-data-key-id",'
+        '"secret":"paper-data-secret-key"}'
+    )
+    assert events == [
+        ("connect", worker.SIM4_WEBSOCKET_URL, {
+            "timeout": worker.SIM4_WEBSOCKET_CONNECT_TIMEOUT_SECONDS,
+            "redirect_limit": 0,
+            "sslopt": {"cert_reqs": worker.ssl.CERT_REQUIRED},
+        }),
+        ("timeout", worker.SIM4_WEBSOCKET_RECEIVE_TIMEOUT_SECONDS),
+        ("send", exact_auth),
+        ("recv", 0),
+        ("send", worker.SIM4_SUBSCRIPTION_PAYLOAD),
+        ("recv", 1),
+        ("close",),
+    ]
 
 
 @pytest.mark.parametrize("as_bytes", (False, True))
@@ -1969,7 +2102,7 @@ def test_websocket_message_cap_uses_utf8_bytes_before_decode_and_both_recv_paths
     monkeypatch.setattr(worker.json, "loads", real_json_loads)
 
     receiver = worker.SIPWebSocketReceiver(
-        object(), lambda _quote: True,
+        paper_credentials(), lambda _quote: True,
         websocket_factory=lambda *args, **kwargs: None,
         monotonic=lambda: 0.0,
     )
@@ -1980,11 +2113,6 @@ def test_websocket_message_cap_uses_utf8_bytes_before_decode_and_both_recv_paths
     live_oversize = b"[" + (
         b" " * (worker.SIM4_WEBSOCKET_MESSAGE_MAX_BYTES - 1)) + b"]"
 
-    class TokenClient:
-        @staticmethod
-        def fetch():
-            return worker.AuthXToken("data-only-token", 30)
-
     class LiveStream:
         def __init__(self):
             self.frames = iter((
@@ -1993,6 +2121,7 @@ def test_websocket_message_cap_uses_utf8_bytes_before_decode_and_both_recv_paths
                 live_oversize,
             ))
             self.closed = False
+            self.payloads = []
 
         @staticmethod
         def settimeout(_timeout):
@@ -2001,16 +2130,15 @@ def test_websocket_message_cap_uses_utf8_bytes_before_decode_and_both_recv_paths
         def recv(self):
             return next(self.frames)
 
-        @staticmethod
-        def send(payload):
-            assert payload == worker.SIM4_SUBSCRIPTION_PAYLOAD
+        def send(self, payload):
+            self.payloads.append(payload)
 
         def close(self):
             self.closed = True
 
     live_stream = LiveStream()
     receiver = worker.SIPWebSocketReceiver(
-        TokenClient(), lambda _quote: True,
+        paper_credentials(), lambda _quote: True,
         websocket_factory=lambda *args, **kwargs: live_stream,
         monotonic=lambda: 0.0,
     )
@@ -2018,6 +2146,11 @@ def test_websocket_message_cap_uses_utf8_bytes_before_decode_and_both_recv_paths
         receiver._connect_once()
     assert live_stream.closed is True
     assert receiver.ready_event.is_set() is False
+    assert live_stream.payloads == [
+        '{"action":"auth","key":"paper-data-key-id",'
+        '"secret":"paper-data-secret-key"}',
+        worker.SIM4_SUBSCRIPTION_PAYLOAD,
+    ]
 
 
 def test_default_websocket_transport_caps_frame_length_and_fragment_aggregate(
@@ -2032,7 +2165,8 @@ def test_default_websocket_transport_caps_frame_length_and_fragment_aggregate(
         return sentinel
 
     monkeypatch.setattr(websocket, "create_connection", create_connection)
-    receiver = worker.SIPWebSocketReceiver(object(), lambda _quote: True)
+    receiver = worker.SIPWebSocketReceiver(
+        paper_credentials(), lambda _quote: True)
     assert receiver._websocket_factory(
         worker.SIM4_WEBSOCKET_URL, timeout=10.0) is sentinel
     assert len(calls) == 1
@@ -2101,178 +2235,6 @@ def test_default_websocket_transport_caps_frame_length_and_fragment_aggregate(
         ))
     assert stream.cont_frame.cont_data is None
     assert stream.cont_frame.recving_frames is None
-
-
-def test_authx_http_request_uses_one_absolute_total_deadline(monkeypatch):
-    clock = SimpleNamespace(now=0.0)
-    instances = []
-
-    class Socket:
-        def __init__(self):
-            self.timeouts = []
-
-        def settimeout(self, timeout):
-            self.timeouts.append(timeout)
-
-    class Response:
-        status = 200
-
-        @staticmethod
-        def read1(_amount):
-            clock.now += 3.0
-            return b'{}'
-
-    class Connection:
-        def __init__(self, host, port, *, timeout, context):
-            assert (host, port, timeout) == (
-                "authx.alpaca.markets", 443,
-                worker.SIM4_TOKEN_CONNECT_TIMEOUT_SECONDS,
-            )
-            assert context is fake_context
-            self.sock = Socket()
-            self.closed = False
-            instances.append(self)
-
-        def connect(self):
-            clock.now += 2.0
-
-        def request(self, method, path, *, body, headers):
-            assert (method, path, body, headers) == (
-                "POST", "/v1/oauth2/token", b"request", {"X-Test": "1"})
-            clock.now += 2.0
-
-        @staticmethod
-        def getresponse():
-            clock.now += 3.0
-            return Response()
-
-        def close(self):
-            self.closed = True
-
-    fake_context = object()
-    monkeypatch.setattr(worker.time, "monotonic", lambda: clock.now)
-    monkeypatch.setattr(worker.ssl, "create_default_context", lambda: fake_context)
-    monkeypatch.setattr(worker.http.client, "HTTPSConnection", Connection)
-
-    with pytest.raises(TimeoutError, match="timed out"):
-        worker._default_token_requester(
-            worker.SIM4_AUTHX_TOKEN_URL,
-            b"request",
-            {"X-Test": "1"},
-            worker.SIM4_TOKEN_CONNECT_TIMEOUT_SECONDS,
-            worker.SIM4_TOKEN_TOTAL_TIMEOUT_SECONDS,
-            worker.SIM4_TOKEN_RESPONSE_MAX_BYTES,
-        )
-
-    assert instances[0].sock.timeouts == [8.0, 6.0, 3.0]
-    assert instances[0].closed is True
-
-
-def test_authx_http_request_rejects_every_nonliteral_endpoint_before_io(
-        monkeypatch):
-    monkeypatch.setattr(
-        worker.http.client,
-        "HTTPSConnection",
-        lambda *_args, **_kwargs: pytest.fail(
-            "nonliteral AuthX endpoint reached the network"),
-    )
-
-    with pytest.raises(worker.Sim4ProtocolError, match="invalid AuthX"):
-        worker._default_token_requester(
-            worker.SIM4_AUTHX_TOKEN_URL + "?redirect=https://example.com",
-            b"request",
-            {},
-            worker.SIM4_TOKEN_CONNECT_TIMEOUT_SECONDS,
-            worker.SIM4_TOKEN_TOTAL_TIMEOUT_SECONDS,
-            worker.SIM4_TOKEN_RESPONSE_MAX_BYTES,
-        )
-
-
-def test_authx_client_forwards_exact_endpoint_budgets_and_response_cap():
-    calls = []
-
-    def requester(url, body, headers, connect_timeout, total_timeout, limit):
-        calls.append((url, body, headers, connect_timeout, total_timeout, limit))
-        return (
-            200,
-            url,
-            b'{"access_token":"token","token_type":"Bearer","expires_in":30}',
-        )
-
-    token = worker.AuthXTokenClient(
-        "client", "secret", requester=requester).fetch()
-
-    assert token.access_token == "token"
-    assert calls[0][0] == worker.SIM4_AUTHX_TOKEN_URL
-    assert calls[0][3:] == (
-        5.0,
-        10.0,
-        16 * 1024,
-    )
-    assert calls[0][2]["Content-Length"] == str(len(calls[0][1]))
-
-
-@pytest.mark.parametrize(
-    ("last_chunk", "expected_error"),
-    ((b"", None), (b"x", "exceeds 16 KiB")),
-)
-def test_authx_http_response_has_exact_16_kib_cap(
-        monkeypatch, last_chunk, expected_error):
-    chunks = deque([b"a" * 4096] * 4 + [last_chunk])
-    read_amounts = []
-
-    class Socket:
-        @staticmethod
-        def settimeout(_timeout):
-            return None
-
-    class Response:
-        status = 200
-
-        @staticmethod
-        def read1(amount):
-            read_amounts.append(amount)
-            return chunks.popleft()
-
-    class Connection:
-        def __init__(self, *_args, **_kwargs):
-            self.sock = Socket()
-
-        @staticmethod
-        def connect():
-            return None
-
-        @staticmethod
-        def request(*_args, **_kwargs):
-            return None
-
-        @staticmethod
-        def getresponse():
-            return Response()
-
-        @staticmethod
-        def close():
-            return None
-
-    monkeypatch.setattr(worker.time, "monotonic", lambda: 0.0)
-    monkeypatch.setattr(worker.http.client, "HTTPSConnection", Connection)
-
-    call = lambda: worker._default_token_requester(
-        worker.SIM4_AUTHX_TOKEN_URL,
-        b"request",
-        {},
-        worker.SIM4_TOKEN_CONNECT_TIMEOUT_SECONDS,
-        worker.SIM4_TOKEN_TOTAL_TIMEOUT_SECONDS,
-        worker.SIM4_TOKEN_RESPONSE_MAX_BYTES,
-    )
-    if expected_error is not None:
-        with pytest.raises(worker.Sim4ProtocolError, match=expected_error):
-            call()
-    else:
-        status, final_url, response_body = call()
-        assert (status, final_url) == (200, worker.SIM4_AUTHX_TOKEN_URL)
-        assert response_body == b"a" * worker.SIM4_TOKEN_RESPONSE_MAX_BYTES
-    assert read_amounts == [4096, 4096, 4096, 4096, 1]
 
 
 def test_entry_contract_has_no_environment_network_or_connection_opening_surface():
