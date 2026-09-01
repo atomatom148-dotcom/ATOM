@@ -68,8 +68,11 @@ The single frozen admission passed on commit
 | Outcome writes | `57,168` |
 | Manifest writes | `1` |
 | Artifact SHA-256 | `661218b81b6c7b4b51700d5138e218b9d8e3ae4acc626dfa7de9d4d2c6510d31` |
+| Manifest SHA-256 | `37dd439ab90048ef552fda52ccebc928fc221e1e2af94792f24e11b293663658` |
 | Forecast SHA-256 | `e5b7395acbf0647b2f2b26086b69a3930ba9bbc0d8fb30f3003effcbe9ff98ff` |
 | Outcome SHA-256 | `1f456b3e32747ab0b7a47ee9abe82e07bf7341d02923f1589fe243617bf03a62` |
+| Metric SHA-256 | `204bb34317cb05faad447171791525f9f9da56f11e8bfa359867595d391a611f` |
+| Scoring SHA-256 | `a49437306ef951c775202ee383f1978236b11cf1f55f8a8c075708554b11a36c` |
 | Control SHA-256 | `725b8f3820e1cf6474464527b24d2d304c9bd5eaf0fdfc40e8f3c243bcaf6871` |
 | Peak RSS | `344,548 KiB` |
 | Elapsed | `3247.929675s` |
