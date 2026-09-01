@@ -12,9 +12,9 @@ from typing import Iterable, Mapping, Sequence
 from quant.v9_v1_contract import HORIZONS, HORIZON_SECONDS
 from quant.v9_v3_synthesis import V3HorizonResult
 from quant.v9_v4a_evidence import (CONTRACT_VERSION, EVIDENCE_VERSION,
-    ForecastRecord, OutcomeRecord, OVERLAP_METHOD_VERSION, canonical_sha256,
-    select_non_overlapping, _canonical, _decanonical, _close_if_supported,
-    _commit_if_supported, _rollback_if_supported)
+    ForecastRecord, OutcomeRecord, OverlapSelection, OVERLAP_METHOD_VERSION,
+    canonical_sha256, select_non_overlapping, _canonical, _decanonical,
+    _close_if_supported, _commit_if_supported, _rollback_if_supported)
 
 STATE_VERSION = "ATOM_TRUE_V9_V4B_ACCURACY_1"
 MODEL_VERSION = "ATOM_TRUE_V9_V4"
@@ -133,20 +133,60 @@ class AccuracyState:
     horizon_states: tuple[HorizonAccuracyState, ...]
 
 
+def governed_accuracy_evidence(
+        horizon: str, cohort_id: str, cohort_hash: str, as_of: datetime,
+        pairs: Sequence[tuple[ForecastRecord, OutcomeRecord]],
+) -> tuple[tuple[ForecastRecord, OutcomeRecord], ...]:
+    """Return the frozen V4B evidence subset for one exact horizon cohort."""
+
+    return tuple((f, o) for f, o in pairs
+                 if f.horizon == horizon and f.cohort_id == cohort_id and
+                 f.cohort_hash == cohort_hash and
+                 f.contract_version == CONTRACT_VERSION and
+                 f.evidence_version == EVIDENCE_VERSION and
+                 o.contract_version == CONTRACT_VERSION and
+                 o.evidence_version == EVIDENCE_VERSION and o.proof_eligible and
+                 o.target_timing_status != "UNVERIFIED" and f.cutoff_at <= as_of and
+                 o.forecast_record_id == f.forecast_record_id and
+                 isinstance(f.expected_return_bps, (int, float)) and
+                 isinstance(o.actual_return_bps, (int, float)) and
+                 not isinstance(f.expected_return_bps, bool) and
+                 not isinstance(o.actual_return_bps, bool) and
+                 math.isfinite(f.expected_return_bps) and
+                 math.isfinite(o.actual_return_bps))
+
+
 def _horizon_state(horizon: str, cohort_id: str, cohort_hash: str, as_of: datetime,
-                   pairs: Sequence[tuple[ForecastRecord, OutcomeRecord]]) -> HorizonAccuracyState:
-    valid = [(f,o) for f,o in pairs if f.horizon == horizon and f.cohort_id == cohort_id and
-             f.cohort_hash == cohort_hash and f.contract_version == CONTRACT_VERSION and
-             f.evidence_version == EVIDENCE_VERSION and o.contract_version == CONTRACT_VERSION and
-             o.evidence_version == EVIDENCE_VERSION and o.proof_eligible and
-             o.target_timing_status != "UNVERIFIED" and f.cutoff_at <= as_of and
-             o.forecast_record_id == f.forecast_record_id and
-             isinstance(f.expected_return_bps, (int,float)) and
-             isinstance(o.actual_return_bps, (int,float)) and
-             not isinstance(f.expected_return_bps, bool) and
-             not isinstance(o.actual_return_bps, bool) and
-             math.isfinite(f.expected_return_bps) and math.isfinite(o.actual_return_bps)]
-    selection = select_non_overlapping(valid)
+                   pairs: Sequence[tuple[ForecastRecord, OutcomeRecord]], *,
+                   overlap_selection: OverlapSelection | None = None,
+                   ) -> HorizonAccuracyState:
+    valid = governed_accuracy_evidence(
+        horizon, cohort_id, cohort_hash, as_of, pairs)
+    calculated_selection = select_non_overlapping(valid)
+    if overlap_selection is None:
+        selection = calculated_selection
+    else:
+        calculated_identity = (
+            calculated_selection.non_overlapping_n,
+            calculated_selection.first_cutoff,
+            calculated_selection.last_cutoff,
+            calculated_selection.selected_ids,
+            calculated_selection.selected_digest,
+            calculated_selection.method_version,
+        )
+        supplied_identity = (
+            overlap_selection.non_overlapping_n,
+            overlap_selection.first_cutoff,
+            overlap_selection.last_cutoff,
+            overlap_selection.selected_ids,
+            overlap_selection.selected_digest,
+            overlap_selection.method_version,
+        )
+        if calculated_identity != supplied_identity:
+            raise ValueError("preselected V4B evidence changed frozen overlap identity")
+        if overlap_selection.raw_resolved_n < calculated_selection.raw_resolved_n:
+            raise ValueError("preselected V4B raw evidence count is invalid")
+        selection = overlap_selection
     ids = set(selection.selected_ids)
     selected = sorted(((f,o) for f,o in valid if f.forecast_record_id in ids),
                       key=lambda pair:(pair[0].cutoff_at,pair[0].forecast_record_id))
@@ -186,11 +226,19 @@ def _horizon_state(horizon: str, cohort_id: str, cohort_hash: str, as_of: dateti
 
 def build_accuracy_state(*, symbol: str, state_as_of: datetime,
                          cohorts: Mapping[str, tuple[str,str]],
-                         evidence: Iterable[tuple[ForecastRecord,OutcomeRecord]]) -> AccuracyState:
+                         evidence: Iterable[tuple[ForecastRecord,OutcomeRecord]],
+                         overlap_selections: Mapping[str, OverlapSelection] | None = None,
+                         ) -> AccuracyState:
     if tuple(cohorts) != HORIZONS:
         raise ValueError("cohorts must contain exactly six canonical horizons in order")
+    if overlap_selections is not None and tuple(overlap_selections) != HORIZONS:
+        raise ValueError("overlap selections must contain exactly six canonical horizons in order")
     pairs = tuple(evidence)
-    horizons = tuple(_horizon_state(h,*cohorts[h],state_as_of,pairs) for h in HORIZONS)
+    horizons = tuple(_horizon_state(
+        h, *cohorts[h], state_as_of, pairs,
+        overlap_selection=(None if overlap_selections is None
+                           else overlap_selections[h]),
+    ) for h in HORIZONS)
     cohort_id = "v9v4statecohort:" + canonical_sha256(tuple(cohorts[h] for h in HORIZONS))
     shell = AccuracyState("","",STATE_VERSION,MODEL_VERSION,symbol,cohort_id,state_as_of,horizons)
     payload = {k:v for k,v in asdict(shell).items() if k not in ("state_id","state_hash")}

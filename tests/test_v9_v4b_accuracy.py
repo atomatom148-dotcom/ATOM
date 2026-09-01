@@ -8,12 +8,15 @@ import pytest
 
 from quant.v9_v1_contract import HORIZONS, HORIZON_SECONDS
 from quant.v9_v3_synthesis import V3HorizonResult
-from quant.v9_v4a_evidence import ForecastRecord, OutcomeRecord, canonical_sha256, _canonical
+from quant.v9_v4a_evidence import (
+    ForecastRecord, OutcomeRecord, canonical_sha256, select_non_overlapping,
+    _canonical,
+)
 from quant.v9_v4b_accuracy import (
     BETA_X_TOLERANCE, JEFFREYS_METHOD, MODEL_VERSION, STATE_VERSION,
     AccuracyStateStore, build_accuracy_state,
     effective_n, final_numbers, inverse_regularized_incomplete_beta,
-    regularized_incomplete_beta,
+    governed_accuracy_evidence, regularized_incomplete_beta,
 )
 
 UTC = timezone.utc
@@ -143,6 +146,45 @@ def test_unverified_evidence_excluded_and_horizons_degrade_independently():
     state=build_accuracy_state(symbol="COIN",state_as_of=NOW+timedelta(days=1),cohorts=cohorts(),evidence=[pair])
     assert all(h.status == "UNAVAILABLE" for h in state.horizon_states)
     assert state.horizon_states[0].non_overlapping_n == 0
+
+
+def test_preselected_overlap_preserves_frozen_accuracy_state_exactly():
+    evidence = []
+    for index in range(5):
+        cutoff = NOW + timedelta(seconds=30 * index)
+        item = replace(
+            forecast("1M", index, 1.0),
+            cutoff_at=cutoff,
+            target_endpoint=cutoff + timedelta(seconds=60),
+        )
+        evidence.append((item, outcome(item, float(index + 1))))
+    as_of = NOW + timedelta(hours=1)
+    full = build_accuracy_state(
+        symbol="COIN", state_as_of=as_of,
+        cohorts=cohorts(), evidence=evidence,
+    )
+    selections = {}
+    selected_evidence = []
+    for horizon in HORIZONS:
+        cohort_id, cohort_hash = cohorts()[horizon]
+        governed = governed_accuracy_evidence(
+            horizon, cohort_id, cohort_hash, as_of, evidence)
+        selection = select_non_overlapping(governed)
+        selections[horizon] = selection
+        selected_ids = set(selection.selected_ids)
+        selected_evidence.extend(
+            pair for pair in governed
+            if pair[0].forecast_record_id in selected_ids)
+
+    streamed = build_accuracy_state(
+        symbol="COIN", state_as_of=as_of, cohorts=cohorts(),
+        evidence=selected_evidence, overlap_selections=selections,
+    )
+
+    assert streamed == full
+    assert streamed.state_hash == full.state_hash
+    assert streamed.horizon_states[1].raw_resolved_n == 5
+    assert streamed.horizon_states[1].non_overlapping_n == 3
 
 
 def test_effective_n_ips_and_metric_specific_sequences():

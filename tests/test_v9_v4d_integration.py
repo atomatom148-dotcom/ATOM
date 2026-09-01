@@ -12,7 +12,7 @@ from quant.v9_v2d_evidence_state import DirectionalCalibrationState
 from quant.v9_v3_synthesis import CANONICAL_FAMILIES
 from quant.v9_v4a_evidence import (
     _canonical, build_forecast, build_outcome, canonical_sha256,
-    canonical_target_identity,
+    canonical_target_identity, select_non_overlapping,
 )
 from quant.v9_v4c_predictive import (
     PROBABILITY_STATE_VERSION, CompactHorizonState, build_v4c_state,
@@ -23,10 +23,12 @@ from quant.v9_v4d_integration import (
 )
 from quant.evidence_outbox import (
     EVIDENCE_RECOVERY_CYCLE_QUERY_CHUNK, EVIDENCE_RECOVERY_OUTCOME_LIMIT,
-    V4_STATE_BUILD_EVIDENCE_LIMIT,
+    V4_STATE_BUILD_QUERY_CHUNK,
     EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork, TerminalDeliveryError,
     PostgresV4BStateBuilder, PostgresV4CStateBuilder, PostgresV4StateBuilder,
-    V4StateBuildWorker, V4StateCacheRefresher,
+    V4StateBuildWorker, V4StateCacheRefresher, _decode_v4_state_row,
+    _iter_v4_state_pages,
+    _prepare_v4_state_evidence,
 )
 from quant.history import MidpointObservation
 from quant.live_market import LiveMarketState
@@ -1825,6 +1827,16 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
         target_resolved_at=forecast.target_endpoint,
         actual_return_bps=2.0,
     )
+    row = (
+        forecast.horizon, forecast.cutoff_at,
+        forecast.forecast_record_hash,
+        json.dumps(_canonical(asdict(forecast))),
+        outcome.outcome_record_hash,
+        json.dumps(_canonical(asdict(outcome))),
+        forecast.forecast_record_id, forecast.forecast_record_hash,
+        NOW, forecast.target_endpoint, True,
+        "POST_COMMIT_DB_OBSERVATION_V1",
+    )
 
     class Cursor:
         def execute(self, sql, params):
@@ -1832,19 +1844,13 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
             assert "o.created_at<=%s" in sql
             proof_filter = "o.record_json->>'proof_eligible'='true'"
             assert proof_filter in sql
-            assert sql.index(proof_filter) < sql.index("LIMIT %s")
             assert "f.record_json->>'cohort_id'=%s" in sql
             assert "f.record_json->>'cohort_hash'=%s" in sql
-            assert "read_forecast_commit_proof" in sql and "LIMIT %s" in sql
+            assert "read_forecast_commit_proof" in sql and "LIMIT" not in sql
+            assert "ORDER BY f.horizon, f.cutoff_at" in sql
             self.params = params
         def fetchall(self):
-            return ((forecast.forecast_record_hash,
-                     json.dumps(_canonical(asdict(forecast))),
-                     outcome.outcome_record_hash,
-                     json.dumps(_canonical(asdict(outcome))),
-                     forecast.forecast_record_id, forecast.forecast_record_hash,
-                     NOW, forecast.target_endpoint, True,
-                     "POST_COMMIT_DB_OBSERVATION_V1"),)
+            return (row,)
         def close(self): pass
     class Connection(_WorkerConnection):
         def __init__(self): self.cursor_value = Cursor()
@@ -1868,41 +1874,251 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
     builder.prepare(symbol="COIN", state_as_of=as_of, cohorts=cohorts)
 
     assert builder.build_and_publish() == "INSERT"
-    assert captured == {"symbol": "COIN", "state_as_of": as_of,
-                        "cohorts": cohorts, "evidence": ((forecast, outcome),)}
+    assert captured["symbol"] == "COIN"
+    assert captured["state_as_of"] == as_of
+    assert captured["cohorts"] == cohorts
+    assert captured["evidence"] == ((forecast, outcome),)
+    selections = captured["overlap_selections"]
+    assert tuple(selections) == HORIZONS
+    assert selections[forecast.horizon].raw_resolved_n == 1
+    assert selections[forecast.horizon].selected_ids == (
+        forecast.forecast_record_id,)
+    assert all(
+        selection.raw_resolved_n == 0
+        for horizon, selection in selections.items()
+        if horizon != forecast.horizon)
     assert connection.cursor_value.params == (
         "COIN", as_of, as_of,
         *(value for horizon in HORIZONS for value in (horizon, *cohorts[horizon])),
-        V4_STATE_BUILD_EVIDENCE_LIMIT + 1,
     )
     assert store.calls == [(state, NOW + timedelta(minutes=2))]
+    with pytest.raises(
+            RuntimeError, match="V4_STATE_EVIDENCE_RELATIONAL_MISMATCH"):
+        _decode_v4_state_row(("1H", *row[1:]))
 
 
-@pytest.mark.parametrize(
-    "builder_type", (PostgresV4BStateBuilder, PostgresV4CStateBuilder))
-def test_postgres_v4_builders_fail_closed_above_current_evidence_bound(
-        builder_type):
+def test_v4_state_pages_continue_past_former_total_evidence_bound(monkeypatch):
+    total = 65_537
+
     class Cursor:
-        def execute(self, _sql, _params): pass
-        def fetchall(self):
-            return (None,) * (V4_STATE_BUILD_EVIDENCE_LIMIT + 1)
-        def close(self): pass
-    class Connection(_WorkerConnection):
-        def cursor(self): return Cursor()
+        def __init__(self):
+            self.index = 0
+            self.calls = 0
 
-    inserted = []
-    store = SimpleNamespace(
-        insert=lambda *_args: inserted.append(True) or "INSERT")
-    builder = builder_type(Connection(), state_store=store)
-    builder.prepare(
-        symbol="COIN", state_as_of=NOW,
-        cohorts={horizon: ("cohort", "a" * 64) for horizon in HORIZONS},
+        def fetchmany(self, size):
+            assert size == V4_STATE_BUILD_QUERY_CHUNK
+            self.calls += 1
+            start = self.index
+            self.index = min(total, start + size)
+            return tuple(range(start, self.index))
+
+    def decode(index):
+        return (
+            SimpleNamespace(
+                horizon="30S",
+                cutoff_at=NOW + timedelta(microseconds=index),
+            ),
+            SimpleNamespace(),
+        )
+
+    monkeypatch.setattr("quant.evidence_outbox._decode_v4_state_row", decode)
+    cursor = Cursor()
+    page_sizes = tuple(len(page) for page in _iter_v4_state_pages(cursor))
+
+    assert sum(page_sizes) == total
+    assert max(page_sizes) <= V4_STATE_BUILD_QUERY_CHUNK
+    assert cursor.calls > total // V4_STATE_BUILD_QUERY_CHUNK
+
+
+@pytest.mark.parametrize("page_size", (1, 2, 3, 4_096))
+@pytest.mark.parametrize(
+    ("stored_horizon_seconds", "offsets"),
+    ((60, (0, 30, 60)), (30, (0, 30))),
+)
+def test_streamed_overlap_selection_matches_frozen_whole_history(
+        monkeypatch, page_size, stored_horizon_seconds, offsets):
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None,
+        compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "unused",
+        cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    base = next(
+        item.forecast for item in calculated.persistence
+        if item.forecast.horizon == "1M")
+    base = replace(base, predictive_variance_bps2=4.0)
+    pairs = []
+    for index, offset in enumerate(offsets):
+        cutoff = NOW + timedelta(seconds=offset)
+        forecast = replace(
+            base,
+            forecast_record_id=f"stream-f-{index}",
+            forecast_record_hash=f"{index + 1:064x}",
+            cutoff_at=cutoff,
+            target_endpoint=cutoff + timedelta(
+                seconds=stored_horizon_seconds),
+            horizon_seconds=stored_horizon_seconds,
+            cycle_id=f"stream-cycle-{index}",
+            persisted_at=cutoff,
+            persistence_proof_eligible=True,
+        )
+        outcome = build_outcome(
+            forecast=forecast,
+            target_identity=canonical_target_identity(forecast),
+            previous_observation_at=forecast.target_endpoint - timedelta(seconds=1),
+            endpoint_observation_at=forecast.target_endpoint,
+            target_resolved_at=forecast.target_endpoint,
+            actual_return_bps=2.0,
+        )
+        pairs.append((forecast, outcome))
+
+    class Cursor:
+        def __init__(self):
+            self.index = 0
+
+        def execute(self, _sql, _params):
+            pass
+
+        def fetchmany(self, size):
+            assert size == page_size
+            start = self.index
+            self.index = min(len(pairs), start + size)
+            return tuple(pairs[start:self.index])
+
+        def close(self):
+            pass
+
+    class Connection(_WorkerConnection):
+        def __init__(self):
+            self.cursor_value = Cursor()
+
+        def cursor(self, *args, **kwargs):
+            return self.cursor_value
+
+    monkeypatch.setattr(
+        "quant.evidence_outbox.V4_STATE_BUILD_QUERY_CHUNK", page_size)
+    monkeypatch.setattr(
+        "quant.evidence_outbox._decode_v4_state_row", lambda row: row)
+    cohorts = {
+        horizon: (base.cohort_id, base.cohort_hash)
+        for horizon in HORIZONS
+    }
+
+    prepared = _prepare_v4_state_evidence(
+        Connection(), symbol="COIN", state_as_of=NOW + timedelta(hours=1),
+        cohorts=cohorts,
+        governed=lambda **kwargs: tuple(kwargs["pairs"]),
+    )
+    expected = select_non_overlapping(pairs)
+
+    assert prepared.selection_map()["1M"] == expected
+    assert tuple(pair[0].forecast_record_id for pair in prepared.evidence) == \
+        expected.selected_ids
+    as_of = NOW + timedelta(hours=1)
+    assert PostgresV4CStateBuilder._build_state(
+        "COIN", as_of, cohorts, tuple(pairs)) == \
+        PostgresV4CStateBuilder._build_state(
+            "COIN", as_of, cohorts, prepared.evidence)
+
+
+def test_streaming_preserves_conflicting_pairs_across_fetch_boundaries(
+        monkeypatch):
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None,
+        compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "unused",
+        cutoff_midpoint=lambda _value: 100.0,
+    ).run_cycle()
+    base = next(
+        item.forecast for item in calculated.persistence
+        if item.forecast.horizon == "1M")
+
+    def make_forecast(index, offset):
+        cutoff = NOW + timedelta(seconds=offset)
+        return replace(
+            base,
+            forecast_record_id=f"conflict-f-{index}",
+            forecast_record_hash=f"{index + 1:064x}",
+            cutoff_at=cutoff,
+            target_endpoint=cutoff + timedelta(seconds=60),
+            cycle_id=f"conflict-cycle-{index}",
+            persisted_at=cutoff,
+            persistence_proof_eligible=True,
+        )
+
+    first = make_forecast(0, 0)
+    later = make_forecast(1, 60)
+
+    def make_outcome(forecast, actual):
+        return build_outcome(
+            forecast=forecast,
+            target_identity=canonical_target_identity(forecast),
+            previous_observation_at=forecast.target_endpoint - timedelta(seconds=1),
+            endpoint_observation_at=forecast.target_endpoint,
+            target_resolved_at=forecast.target_endpoint,
+            actual_return_bps=actual,
+        )
+
+    first_outcome = make_outcome(first, 1.0)
+    alternate_outcome = replace(
+        first_outcome,
+        outcome_record_id="alternate-outcome",
+        outcome_record_hash="f" * 64,
+        target_identity="alternate-target",
+    )
+    pairs = (
+        (first, first_outcome),
+        (first, make_outcome(first, 2.0)),
+        (first, alternate_outcome),
+        (later, make_outcome(later, 4.0)),
     )
 
-    with pytest.raises(
-            RuntimeError, match="V4_STATE_EVIDENCE_ROW_LIMIT_EXCEEDED"):
-        builder.build_and_publish()
-    assert inserted == []
+    class Cursor:
+        def __init__(self):
+            self.index = 0
+
+        def execute(self, _sql, _params):
+            pass
+
+        def fetchmany(self, size):
+            assert size == 1
+            if self.index == len(pairs):
+                return ()
+            pair = pairs[self.index]
+            self.index += 1
+            return (pair,)
+
+        def close(self):
+            pass
+
+    class Connection(_WorkerConnection):
+        def cursor(self, *args, **kwargs):
+            return Cursor()
+
+    monkeypatch.setattr("quant.evidence_outbox.V4_STATE_BUILD_QUERY_CHUNK", 1)
+    monkeypatch.setattr(
+        "quant.evidence_outbox._decode_v4_state_row", lambda row: row)
+    cohorts = {
+        horizon: (base.cohort_id, base.cohort_hash)
+        for horizon in HORIZONS
+    }
+    prepared = _prepare_v4_state_evidence(
+        Connection(), symbol="COIN", state_as_of=NOW + timedelta(hours=1),
+        cohorts=cohorts,
+        governed=lambda **kwargs: tuple(kwargs["pairs"]),
+    )
+    expected = select_non_overlapping(pairs)
+    selected_ids = set(expected.selected_ids)
+
+    assert prepared.selection_map()["1M"] == expected
+    assert prepared.evidence == tuple(
+        pair for pair in pairs
+        if pair[0].forecast_record_id in selected_ids)
+    assert len(prepared.evidence) == 4
 
 
 def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state(monkeypatch):
@@ -1926,13 +2142,15 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
             assert "o.created_at<=%s" in sql
             proof_filter = "o.record_json->>'proof_eligible'='true'"
             assert proof_filter in sql
-            assert sql.index(proof_filter) < sql.index("LIMIT %s")
             assert "f.record_json->>'cohort_id'=%s" in sql
             assert "f.record_json->>'cohort_hash'=%s" in sql
-            assert "read_forecast_commit_proof" in sql and "LIMIT %s" in sql
+            assert "read_forecast_commit_proof" in sql and "LIMIT" not in sql
+            assert "ORDER BY f.horizon, f.cutoff_at" in sql
             self.params = params
         def fetchall(self):
-            return ((forecast.forecast_record_hash, json.dumps(_canonical(asdict(forecast))),
+            return ((forecast.horizon, forecast.cutoff_at,
+                     forecast.forecast_record_hash,
+                     json.dumps(_canonical(asdict(forecast))),
                      outcome.outcome_record_hash, json.dumps(_canonical(asdict(outcome))),
                      forecast.forecast_record_id, forecast.forecast_record_hash,
                      NOW, forecast.target_endpoint, True,
@@ -1973,7 +2191,6 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
     assert connection.cursor_value.params == (
         "COIN", as_of, as_of,
         *(value for horizon in HORIZONS for value in (horizon, *cohorts[horizon])),
-        V4_STATE_BUILD_EVIDENCE_LIMIT + 1,
     )
     assert state.horizons[0].range_status == "UNAVAILABLE"
     assert all(item.range_status == "UNAVAILABLE" for item in state.horizons)

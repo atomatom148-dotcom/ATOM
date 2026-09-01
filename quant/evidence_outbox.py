@@ -7,7 +7,8 @@ worker is never allowed to go looking for a quote with which to resolve a target
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from itertools import groupby
 import math
 from queue import Empty, Full, Queue
 import shlex
@@ -18,16 +19,21 @@ from urllib.parse import urlparse
 
 from .evidence import ForecastRecord as RawForecastRecord, VolatilityForecastRecord
 from .history import MidpointObservation
-from .v9_v4a_evidence import ForecastRecord as V4ForecastRecord, V4AWriter, canonical_target_identity
+from .v9_v4a_evidence import (
+    ForecastRecord as V4ForecastRecord,
+    OutcomeRecord as V4OutcomeRecord,
+    V4AWriter,
+    canonical_target_identity,
+)
 from .v9_v4a_evidence import (
     CONTRACT_VERSION as V4_CONTRACT_VERSION, EVIDENCE_VERSION as V4_EVIDENCE_VERSION,
-    canonical_sha256, deserialize_forecast_record, deserialize_outcome_record,
-    select_non_overlapping,
+    OverlapSelection, canonical_sha256, deserialize_forecast_record,
+    deserialize_outcome_record, select_non_overlapping,
 )
 from .v9_v4b_accuracy import (
     AccuracyStateStore, STATE_VERSION as ACCURACY_STATE_VERSION,
-    MODEL_VERSION as STATE_MODEL_VERSION,
-    build_accuracy_state,
+    MODEL_VERSION as STATE_MODEL_VERSION, build_accuracy_state,
+    governed_accuracy_evidence,
 )
 from .v9_v1_contract import HORIZONS
 from .v9_v4c_predictive import (
@@ -47,7 +53,7 @@ STATE_BUILD_SHUTDOWN_TIMEOUT_SECONDS = 20.0
 STATE_BUILD_SHUTDOWN_JOIN_GRACE_SECONDS = 0.25
 EVIDENCE_RUNTIME_LOCK_ID = int.from_bytes(b"ATOMV9EL", "big")
 EVIDENCE_RECOVERY_OUTCOME_LIMIT = 65_536
-V4_STATE_BUILD_EVIDENCE_LIMIT = 65_536
+V4_STATE_BUILD_QUERY_CHUNK = 4_096
 EVIDENCE_RECOVERY_CYCLE_QUERY_CHUNK = 4_096
 EVIDENCE_RECOVERY_PROOF_FALLBACK_DEPTH = 4
 EVIDENCE_RECOVERY_PROOF_WORK_LIMIT = 256
@@ -73,6 +79,225 @@ def _v4_cohort_scope(cohorts: dict[str, tuple[str, str]]) -> tuple[str, tuple[st
     params = tuple(value for horizon in HORIZONS
                    for value in (horizon, *cohorts[horizon]))
     return clause, params
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedV4StateEvidence:
+    """All-history overlap selection with only selected rows retained."""
+
+    evidence: tuple[tuple[V4ForecastRecord, V4OutcomeRecord], ...]
+    selections: tuple[tuple[str, OverlapSelection], ...]
+
+    def selection_map(self) -> dict[str, OverlapSelection]:
+        return dict(self.selections)
+
+
+def _open_v4_state_cursor(connection):
+    """Use a server-side cursor in production and simple test cursors locally."""
+
+    try:
+        return connection.cursor(name="atom_v4_state_evidence")
+    except TypeError:
+        return connection.cursor()
+
+
+def _decode_v4_state_row(row):
+    (stored_horizon, stored_cutoff, forecast_hash, forecast_json,
+     outcome_hash, outcome_json, proof_id, proof_hash, proof_observed_at,
+     proof_target_endpoint, proof_eligible, proof_method) = row
+    forecast = V4AWriter._apply_commit_proof(
+        deserialize_forecast_record(
+            forecast_json, expected_hash=str(forecast_hash)),
+        (proof_id, proof_hash, proof_observed_at, proof_target_endpoint,
+         proof_eligible, proof_method),
+    )
+    if (forecast.horizon != str(stored_horizon) or
+            forecast.cutoff_at != stored_cutoff):
+        raise RuntimeError("V4_STATE_EVIDENCE_RELATIONAL_MISMATCH")
+    return (
+        forecast,
+        deserialize_outcome_record(
+            outcome_json, expected_hash=str(outcome_hash)),
+    )
+
+
+def _iter_v4_state_pages(cursor):
+    """Fetch bounded batches without splitting one horizon/cutoff identity."""
+
+    fetchmany = getattr(cursor, "fetchmany", None)
+    carry = []
+    while True:
+        if callable(fetchmany):
+            rows = tuple(fetchmany(V4_STATE_BUILD_QUERY_CHUNK))
+        else:
+            rows = tuple(cursor.fetchall())
+            fetchmany = None
+        if not rows:
+            if carry:
+                yield tuple(carry)
+            return
+
+        pairs = carry + [_decode_v4_state_row(row) for row in rows]
+        tail_key = (pairs[-1][0].horizon, pairs[-1][0].cutoff_at)
+        split = len(pairs)
+        while split and (
+                pairs[split - 1][0].horizon,
+                pairs[split - 1][0].cutoff_at) == tail_key:
+            split -= 1
+        if split:
+            yield tuple(pairs[:split])
+        carry = pairs[split:]
+        if fetchmany is None:
+            if carry:
+                yield tuple(carry)
+            return
+
+
+def _prepare_v4_state_evidence(
+        connection, *, symbol: str, state_as_of: datetime,
+        cohorts: dict[str, tuple[str, str]], governed: Callable,
+) -> _PreparedV4StateEvidence:
+    """Stream all eligible history and retain the frozen overlap sample only."""
+
+    cohort_scope, cohort_params = _v4_cohort_scope(cohorts)
+    selected_pairs: list[tuple[V4ForecastRecord, V4OutcomeRecord]] = []
+    selected_ids = {horizon: [] for horizon in HORIZONS}
+    raw_counts = {horizon: 0 for horizon in HORIZONS}
+    first_cutoffs = {horizon: None for horizon in HORIZONS}
+    last_cutoffs = {horizon: None for horizon in HORIZONS}
+    next_cutoffs = {horizon: None for horizon in HORIZONS}
+
+    cursor = _open_v4_state_cursor(connection)
+    cursor_closed = False
+    try:
+        cursor.execute(
+            f"""SELECT f.horizon, f.cutoff_at,
+                      f.forecast_record_hash, f.record_json,
+                      o.outcome_record_hash, o.record_json,
+                      p.forecast_record_id, p.forecast_record_hash,
+                      p.commit_observed_at, p.target_endpoint,
+                      p.proof_eligible, p.proof_method
+               FROM public.atom_v9_v4_forecasts AS f
+               JOIN public.atom_v9_v4_outcomes AS o
+                 USING (forecast_record_id)
+               JOIN LATERAL atom_v9_internal.read_forecast_commit_proof(
+                   f.forecast_record_id
+               ) AS p ON p.proof_eligible
+               WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
+                 AND o.record_json->>'proof_eligible'='true'
+                 AND ({cohort_scope})
+               ORDER BY f.horizon, f.cutoff_at, f.forecast_record_id,
+                        o.created_at, o.outcome_record_id""",
+            (symbol, state_as_of, state_as_of, *cohort_params),
+        )
+        for page in _iter_v4_state_pages(cursor):
+            for horizon, horizon_page_iter in groupby(
+                    page, key=lambda pair: pair[0].horizon):
+                if horizon not in cohorts:
+                    raise RuntimeError("V4_STATE_EVIDENCE_HORIZON_INVALID")
+                horizon_page = tuple(horizon_page_iter)
+                cohort_id, cohort_hash = cohorts[horizon]
+                governed_page = tuple(governed(
+                    horizon=horizon,
+                    cohort_id=cohort_id,
+                    cohort_hash=cohort_hash,
+                    symbol=symbol,
+                    state_as_of=state_as_of,
+                    pairs=horizon_page,
+                ))
+                page_selection = select_non_overlapping(governed_page)
+                raw_counts[horizon] += page_selection.raw_resolved_n
+
+                threshold = next_cutoffs[horizon]
+                if threshold is not None:
+                    selectable = tuple(
+                        pair for pair in governed_page
+                        if pair[0].cutoff_at >= threshold)
+                    page_selection = select_non_overlapping(selectable)
+                else:
+                    selectable = governed_page
+                if not page_selection.selected_ids:
+                    continue
+
+                ids = set(page_selection.selected_ids)
+                selected_page = tuple(
+                    pair for pair in selectable
+                    if pair[0].forecast_record_id in ids)
+                selected_pairs.extend(selected_page)
+                selected_ids[horizon].extend(page_selection.selected_ids)
+                if first_cutoffs[horizon] is None:
+                    first_cutoffs[horizon] = page_selection.first_cutoff
+                last_cutoffs[horizon] = page_selection.last_cutoff
+                last_selected_id = page_selection.selected_ids[-1]
+                last_selected = next(
+                    pair[0] for pair in reversed(selected_page)
+                    if pair[0].forecast_record_id == last_selected_id)
+                next_cutoffs[horizon] = (
+                    last_selected.cutoff_at +
+                    timedelta(seconds=last_selected.horizon_seconds))
+
+        close = getattr(cursor, "close", None)
+        if callable(close):
+            close()
+            cursor_closed = True
+        commit = getattr(connection, "commit", None)
+        if callable(commit):
+            commit()
+    except Exception:
+        rollback = getattr(connection, "rollback", None)
+        if callable(rollback):
+            rollback()
+        raise
+    finally:
+        close = getattr(cursor, "close", None)
+        if not cursor_closed and callable(close):
+            close()
+
+    selections = tuple(
+        (horizon, OverlapSelection(
+            raw_counts[horizon], len(selected_ids[horizon]),
+            first_cutoffs[horizon], last_cutoffs[horizon],
+            tuple(selected_ids[horizon]),
+            canonical_sha256(tuple(selected_ids[horizon])),
+        ))
+        for horizon in HORIZONS
+    )
+    return _PreparedV4StateEvidence(tuple(selected_pairs), selections)
+
+
+def _governed_v4b_evidence(*, horizon: str, cohort_id: str,
+                            cohort_hash: str, symbol: str,
+                            state_as_of: datetime, pairs):
+    del symbol
+    return governed_accuracy_evidence(
+        horizon, cohort_id, cohort_hash, state_as_of, pairs)
+
+
+def _governed_v4c_evidence(*, horizon: str, cohort_id: str,
+                            cohort_hash: str, symbol: str,
+                            state_as_of: datetime, pairs):
+    return tuple((forecast, outcome) for forecast, outcome in pairs if
+        forecast.horizon == horizon and forecast.cohort_id == cohort_id and
+        forecast.cohort_hash == cohort_hash and forecast.symbol == symbol and
+        forecast.contract_version == V4_CONTRACT_VERSION and
+        forecast.evidence_version == V4_EVIDENCE_VERSION and
+        outcome.contract_version == V4_CONTRACT_VERSION and
+        outcome.evidence_version == V4_EVIDENCE_VERSION and
+        forecast.evidence_origin == "PRODUCTION" and
+        forecast.persistence_proof_eligible is True and outcome.proof_eligible and
+        outcome.target_timing_status == "VERIFIED" and
+        outcome.forecast_record_id == forecast.forecast_record_id and
+        forecast.cutoff_at <= state_as_of and
+        outcome.target_resolved_at <= state_as_of and
+        forecast.expected_return_bps is not None and
+        forecast.predictive_variance_bps2 is not None and
+        outcome.actual_return_bps is not None and
+        all(isinstance(value, (int, float)) and not isinstance(value, bool) and
+            math.isfinite(value) for value in (
+                forecast.expected_return_bps,
+                forecast.predictive_variance_bps2,
+                outcome.actual_return_bps)) and
+        forecast.predictive_variance_bps2 > 0)
 
 
 class TerminalDeliveryError(RuntimeError):
@@ -158,61 +383,17 @@ class PostgresV4BStateBuilder:
         if self._candidate is None:
             return "SKIPPED_NO_CANDIDATE"
         symbol, state_as_of, cohorts = self._candidate
-        cohort_scope, cohort_params = _v4_cohort_scope(cohorts)
-        cursor = self._connection.cursor()
-        try:
-            cursor.execute(
-                f"""SELECT f.forecast_record_hash, f.record_json,
-                          o.outcome_record_hash, o.record_json,
-                          p.forecast_record_id, p.forecast_record_hash,
-                          p.commit_observed_at, p.target_endpoint,
-                          p.proof_eligible, p.proof_method
-                   FROM public.atom_v9_v4_forecasts AS f
-                   JOIN public.atom_v9_v4_outcomes AS o
-                     USING (forecast_record_id)
-                   JOIN LATERAL atom_v9_internal.read_forecast_commit_proof(
-                       f.forecast_record_id
-                   ) AS p ON p.proof_eligible
-                   WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
-                     AND o.record_json->>'proof_eligible'='true'
-                     AND ({cohort_scope})
-                   ORDER BY f.cutoff_at, f.forecast_record_id,
-                            o.created_at, o.outcome_record_id
-                   LIMIT %s""",
-                (symbol, state_as_of, state_as_of, *cohort_params,
-                 V4_STATE_BUILD_EVIDENCE_LIMIT + 1),
-            )
-            rows = tuple(cursor.fetchall())
-            if len(rows) > V4_STATE_BUILD_EVIDENCE_LIMIT:
-                raise RuntimeError("V4_STATE_EVIDENCE_ROW_LIMIT_EXCEEDED")
-            commit = getattr(self._connection, "commit", None)
-            if callable(commit):
-                commit()
-        except Exception:
-            rollback = getattr(self._connection, "rollback", None)
-            if callable(rollback):
-                rollback()
-            raise
-        finally:
-            close = getattr(cursor, "close", None)
-            if callable(close):
-                close()
-        evidence = tuple(
-            (V4AWriter._apply_commit_proof(
-                deserialize_forecast_record(
-                    forecast_json, expected_hash=str(forecast_hash)),
-                (proof_id, proof_hash, proof_observed_at, proof_target_endpoint,
-                 proof_eligible, proof_method),
-             ),
-             deserialize_outcome_record(
-                 outcome_json, expected_hash=str(outcome_hash)))
-            for (forecast_hash, forecast_json, outcome_hash, outcome_json,
-                 proof_id, proof_hash, proof_observed_at, proof_target_endpoint,
-                 proof_eligible, proof_method) in rows
+        prepared = _prepare_v4_state_evidence(
+            self._connection,
+            symbol=symbol,
+            state_as_of=state_as_of,
+            cohorts=cohorts,
+            governed=_governed_v4b_evidence,
         )
         state = build_accuracy_state(
             symbol=symbol, state_as_of=state_as_of,
-            cohorts=cohorts, evidence=evidence,
+            cohorts=cohorts, evidence=prepared.evidence,
+            overlap_selections=prepared.selection_map(),
         )
         return self._store.insert(state, self._clock())
 
@@ -241,59 +422,15 @@ class PostgresV4CStateBuilder:
         if self._candidate is None:
             return "SKIPPED_NO_CANDIDATE"
         symbol, state_as_of, cohorts = self._candidate
-        cohort_scope, cohort_params = _v4_cohort_scope(cohorts)
-        cursor = self._connection.cursor()
-        try:
-            cursor.execute(
-                f"""SELECT f.forecast_record_hash, f.record_json,
-                          o.outcome_record_hash, o.record_json,
-                          p.forecast_record_id, p.forecast_record_hash,
-                          p.commit_observed_at, p.target_endpoint,
-                          p.proof_eligible, p.proof_method
-                   FROM public.atom_v9_v4_forecasts AS f
-                   JOIN public.atom_v9_v4_outcomes AS o
-                     USING (forecast_record_id)
-                   JOIN LATERAL atom_v9_internal.read_forecast_commit_proof(
-                       f.forecast_record_id
-                   ) AS p ON p.proof_eligible
-                   WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
-                     AND o.record_json->>'proof_eligible'='true'
-                     AND ({cohort_scope})
-                   ORDER BY f.cutoff_at, f.forecast_record_id,
-                            o.created_at, o.outcome_record_id
-                   LIMIT %s""",
-                (symbol, state_as_of, state_as_of, *cohort_params,
-                 V4_STATE_BUILD_EVIDENCE_LIMIT + 1),
-            )
-            rows = tuple(cursor.fetchall())
-            if len(rows) > V4_STATE_BUILD_EVIDENCE_LIMIT:
-                raise RuntimeError("V4_STATE_EVIDENCE_ROW_LIMIT_EXCEEDED")
-            commit = getattr(self._connection, "commit", None)
-            if callable(commit):
-                commit()
-        except Exception:
-            rollback = getattr(self._connection, "rollback", None)
-            if callable(rollback):
-                rollback()
-            raise
-        finally:
-            close = getattr(cursor, "close", None)
-            if callable(close):
-                close()
-        evidence = tuple(
-            (V4AWriter._apply_commit_proof(
-                deserialize_forecast_record(
-                    forecast_json, expected_hash=str(forecast_hash)),
-                (proof_id, proof_hash, proof_observed_at, proof_target_endpoint,
-                 proof_eligible, proof_method),
-             ),
-             deserialize_outcome_record(
-                 outcome_json, expected_hash=str(outcome_hash)))
-            for (forecast_hash, forecast_json, outcome_hash, outcome_json,
-                 proof_id, proof_hash, proof_observed_at, proof_target_endpoint,
-                 proof_eligible, proof_method) in rows
+        prepared = _prepare_v4_state_evidence(
+            self._connection,
+            symbol=symbol,
+            state_as_of=state_as_of,
+            cohorts=cohorts,
+            governed=_governed_v4c_evidence,
         )
-        state = self._build_state(symbol, state_as_of, cohorts, evidence)
+        state = self._build_state(
+            symbol, state_as_of, cohorts, prepared.evidence)
         return self._store.insert(state, self._clock())
 
     @staticmethod
@@ -304,27 +441,14 @@ class PostgresV4CStateBuilder:
         selected_all = []
         for horizon in HORIZONS:
             cohort_id, cohort_hash = cohorts[horizon]
-            governed = tuple((forecast, outcome) for forecast, outcome in evidence if
-                forecast.horizon == horizon and forecast.cohort_id == cohort_id and
-                forecast.cohort_hash == cohort_hash and forecast.symbol == symbol and
-                forecast.contract_version == V4_CONTRACT_VERSION and
-                forecast.evidence_version == V4_EVIDENCE_VERSION and
-                outcome.contract_version == V4_CONTRACT_VERSION and
-                outcome.evidence_version == V4_EVIDENCE_VERSION and
-                forecast.evidence_origin == "PRODUCTION" and
-                forecast.persistence_proof_eligible is True and outcome.proof_eligible and
-                outcome.target_timing_status == "VERIFIED" and
-                outcome.forecast_record_id == forecast.forecast_record_id and
-                forecast.cutoff_at <= state_as_of and outcome.target_resolved_at <= state_as_of and
-                forecast.expected_return_bps is not None and
-                forecast.predictive_variance_bps2 is not None and
-                outcome.actual_return_bps is not None and
-                all(isinstance(value, (int, float)) and not isinstance(value, bool) and
-                    math.isfinite(value) for value in (
-                        forecast.expected_return_bps,
-                        forecast.predictive_variance_bps2,
-                        outcome.actual_return_bps)) and
-                forecast.predictive_variance_bps2 > 0)
+            governed = _governed_v4c_evidence(
+                horizon=horizon,
+                cohort_id=cohort_id,
+                cohort_hash=cohort_hash,
+                symbol=symbol,
+                state_as_of=state_as_of,
+                pairs=evidence,
+            )
             selection = select_non_overlapping(governed)
             selected_ids = set(selection.selected_ids)
             selected = tuple(sorted(
