@@ -1,8 +1,8 @@
 # H2-D-7 one-session historical-admission freeze
 
-**Status:** LAW — implementation authorized; execution not yet passed  
-**Current runtime:** H2-D-6 passed and the benchmark worker is suspended  
-**Next gate:** one new certified session through the existing sequential path
+**Status:** COMPLETE — exact frozen execution passed  
+**Current runtime:** benchmark restored to `sleep infinity` and suspended  
+**Next gate:** a separate read-only target-qualification freeze
 
 ## Decision
 
@@ -55,6 +55,29 @@ resolver, and score-reader credentials remain authoritative.
 It changes no V9 mathematics, thresholds, behavior, outputs, quant-family code,
 live service, production evidence, Render or Supabase tier, or broker authority.
 Replay remains sequential. Parallel replay and continuous replay remain off.
+
+## Completion receipt
+
+The single frozen admission passed on commit
+`9d389083ac6b8ffd81f4ba236bf9cbca163a6d36`.
+
+| Result | Exact value |
+|---|---|
+| Frames | `9,528` |
+| Forecast writes | `686,016` |
+| Outcome writes | `57,168` |
+| Manifest writes | `1` |
+| Artifact SHA-256 | `661218b81b6c7b4b51700d5138e218b9d8e3ae4acc626dfa7de9d4d2c6510d31` |
+| Forecast SHA-256 | `e5b7395acbf0647b2f2b26086b69a3930ba9bbc0d8fb30f3003effcbe9ff98ff` |
+| Outcome SHA-256 | `1f456b3e32747ab0b7a47ee9abe82e07bf7341d02923f1589fe243617bf03a62` |
+| Control SHA-256 | `725b8f3820e1cf6474464527b24d2d304c9bd5eaf0fdfc40e8f3c243bcaf6871` |
+| Peak RSS | `344,548 KiB` |
+| Elapsed | `3247.929675s` |
+| New-date admission | `true` |
+| Continuous / parallel replay | `false / false` |
+
+The exact writer, resolver, and reader roles passed. Existing evidence was not
+rewritten or deleted.
 
 ## Stopping rule
 
