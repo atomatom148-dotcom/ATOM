@@ -610,6 +610,22 @@ def test_fail_closed_logging_is_fixed_aggregate_and_ignores_success_churn():
     assert records[-1] == "SIM4_FAIL_CLOSED status=FAILED counter_delta=0"
 
 
+def test_fail_closed_failure_class_logging_never_includes_exception_message():
+    records = []
+    logger = SimpleNamespace(
+        warning=lambda message, *args: records.append(message % args))
+    secret = "postgres://runtime:secret@example.invalid/postgres"
+
+    worker._log_fail_closed_failure_class(
+        worker.Sim4AuthorityError(secret), logger=logger,
+    )
+
+    assert records == [
+        "SIM4_FAIL_CLOSED failure_class=Sim4AuthorityError"
+    ]
+    assert secret not in records[0]
+
+
 def test_enabled_main_logs_failure_aggregates_without_authority_or_secrets(
         monkeypatch):
     records = []

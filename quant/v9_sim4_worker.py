@@ -125,6 +125,7 @@ SIM4_HORIZON_ORDER = MappingProxyType({
 MAX_SIGNED_BIGINT = (1 << 63) - 1
 _PROJECT_REF_RE = re.compile(r"[a-z0-9]{20}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_FAILURE_CLASS_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 _RFC3339_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})[Tt]"
     r"(?P<time>\d{2}:\d{2}:\d{2})"
@@ -598,6 +599,21 @@ def _log_fail_closed_telemetry_changes(
     except Exception:
         pass
     return current
+
+
+def _log_fail_closed_failure_class(
+    error: BaseException, *, logger: Any | None = None,
+) -> None:
+    """Log only a bounded exception class name, never its message or values."""
+
+    failure_class = type(error).__name__
+    if _FAILURE_CLASS_RE.fullmatch(failure_class) is None:
+        failure_class = "UnknownFailure"
+    try:
+        target = _SIM4_LOGGER if logger is None else logger
+        target.warning("SIM4_FAIL_CLOSED failure_class=%s", failure_class)
+    except Exception:
+        pass
 
 
 def _decode_frame(value: object) -> list[Mapping[str, object]]:
@@ -2315,10 +2331,11 @@ class SimulationEntryWorker:
             if activation_fence is None:
                 return
             self._ready_loop(store, activation_fence)
-        except BaseException:
+        except BaseException as error:
             self._generation_failed = True
             with self._admission_lock:
                 self._admission_enabled = False
+            _log_fail_closed_failure_class(error)
             self._set_state("FAILED")
         finally:
             with self._admission_lock:
