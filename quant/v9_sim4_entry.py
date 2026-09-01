@@ -707,6 +707,7 @@ class PublicationCursor:
 @dataclass(frozen=True, slots=True)
 class PublishedSimulationIntent:
     publication_seq: int
+    admitted_at: datetime
     publication_at: datetime
     horizon_order: int
     intent: SimulationTradeIntent
@@ -714,6 +715,7 @@ class PublishedSimulationIntent:
     def __post_init__(self) -> None:
         _integer("publication_seq", self.publication_seq, minimum=1,
                  maximum=POSTGRES_BIGINT_MAX)
+        _utc_datetime("admitted_at", self.admitted_at)
         publication = _utc_datetime("publication_at", self.publication_at)
         if not isinstance(self.intent, SimulationTradeIntent):
             raise ValueError("intent must be a SimulationTradeIntent")
@@ -985,7 +987,8 @@ class SimulationEntryStore:
         page_limit = _integer("limit", limit, minimum=1,
                               maximum=SIM4_RECONCILIATION_PAGE_SIZE)
         select = (
-            "SELECT p.publication_seq, p.publication_at, p.horizon_order, "
+            "SELECT p.publication_seq, p.admitted_at, p.publication_at, "
+            "p.horizon_order, "
             + ", ".join("i." + name for name in _INTENT_COLUMNS)
             + " FROM public.atom_v9_sim_intent_publications p "
             "JOIN public.atom_v9_sim_intents i ON i.intent_id = p.intent_id "
@@ -1012,11 +1015,12 @@ class SimulationEntryStore:
         if len(rows) > page_limit:
             raise SimulationEntryRowInvalidError("publication page exceeds bounded limit")
         for row in rows:
-            if row is None or len(row) != 3 + len(_INTENT_COLUMNS):
+            if row is None or len(row) != 4 + len(_INTENT_COLUMNS):
                 raise SimulationEntryRowInvalidError("publication row has invalid shape")
-            intent = self._decode_intent_columns(row[3:])
+            intent = self._decode_intent_columns(row[4:])
             try:
-                published = PublishedSimulationIntent(row[0], row[1], row[2], intent)
+                published = PublishedSimulationIntent(
+                    row[0], row[1], row[2], row[3], intent)
             except (TypeError, ValueError) as error:
                 raise SimulationEntryRowInvalidError("publication row is invalid") from error
             if published.publication_seq > fence:
