@@ -683,6 +683,43 @@ class SimulationEntryStoreTests(unittest.TestCase):
         self.assertEqual(parameters, ("COIN", "30S", "1M", "5M", "15M",
                                       "30M", "1H"))
 
+    def test_horizon_lock_accepts_only_postgres_void_representations(self):
+        intent = build_intent()
+        existing = build_simulation_entry_record(
+            intent=intent, entry_status="SKIPPED_WINDOW_EXPIRED")
+        for lock_rows in ([], [(None,)], [("",)]):
+            with self.subTest(lock_rows=lock_rows):
+                cursor = ScriptedCursor([
+                    ("current_user", self.authority()),
+                    ("pg_advisory_xact_lock", lock_rows),
+                    ("WHERE intent_id", [entry_row(existing)]),
+                ])
+                store = SimulationEntryStore(
+                    FakeConnection(cursor), project_ref=PROJECT_REF)
+                self.assertEqual(
+                    store.get_existing_entry_in_transaction(cursor, intent),
+                    existing)
+                self.assertIn("current_user", cursor.executed[0][0])
+                lock_sql, lock_parameters = cursor.executed[1]
+                self.assertEqual(lock_sql,
+                                 "SELECT pg_advisory_xact_lock(%s::bigint)")
+                self.assertEqual(lock_parameters,
+                                 (horizon_advisory_lock_key("30S"),))
+                self.assertIn("WHERE intent_id", cursor.executed[2][0])
+                self.assertEqual(len(cursor.executed), 3)
+        for lock_rows in ([("x",)], [(True,)], [(0,)], [(None, None)],
+                          [("", "")], [[None]]):
+            with self.subTest(lock_rows=lock_rows):
+                cursor = ScriptedCursor([
+                    ("current_user", self.authority()),
+                    ("pg_advisory_xact_lock", lock_rows),
+                ])
+                store = SimulationEntryStore(
+                    FakeConnection(cursor), project_ref=PROJECT_REF)
+                with self.assertRaises(SimulationEntryStateError):
+                    store.get_existing_entry_in_transaction(cursor, intent)
+                self.assertEqual(len(cursor.executed), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
