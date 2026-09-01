@@ -83,11 +83,11 @@ def test_selects_first_two_qualifying_targets_then_stops(monkeypatch):
     calls = []
     receipt = _execute(monkeypatch, payloads, calls=calls)
 
-    assert calls == ["2026-07-27", "2026-07-28"]
+    assert calls == ["2026-08-03", "2026-08-04"]
     assert receipt["status"] == "PASSED"
     assert receipt["selected_sessions"] == calls
     assert receipt["selected_replay_run_ids"] == [
-        "h2d-2026-07-27", "h2d-2026-07-28",
+        "h2d-2026-08-03", "h2d-2026-08-04",
     ]
     assert len(receipt["inspected_candidates"]) == 2
     assert receipt["manifest_writes"] == 0
@@ -101,12 +101,12 @@ def test_selects_first_two_qualifying_targets_then_stops(monkeypatch):
 
 def test_skips_honest_market_data_rejection_in_fixed_order(monkeypatch):
     payloads = {day: _payload(day) for day, _run_id in qualifier.FROZEN_TARGETS}
-    payloads["2026-07-27"] = _payload("2026-07-27", rejected=True)
+    payloads["2026-08-03"] = _payload("2026-08-03", rejected=True)
     calls = []
     receipt = _execute(monkeypatch, payloads, calls=calls)
 
-    assert calls == ["2026-07-27", "2026-07-28", "2026-07-29"]
-    assert receipt["selected_sessions"] == ["2026-07-28", "2026-07-29"]
+    assert calls == ["2026-08-03", "2026-08-04", "2026-08-05"]
+    assert receipt["selected_sessions"] == ["2026-08-04", "2026-08-05"]
     rejected = receipt["inspected_candidates"][0]
     assert rejected["status"] == "REJECTED"
     assert rejected["reason_codes"] == ["COIN_INSUFFICIENT_QUOTES"]
@@ -116,7 +116,7 @@ def test_skips_honest_market_data_rejection_in_fixed_order(monkeypatch):
 
 def test_independent_five_second_gate_rejects_six_seconds(monkeypatch):
     payloads = {day: _payload(day) for day, _run_id in qualifier.FROZEN_TARGETS}
-    payloads["2026-07-27"] = _payload("2026-07-27", gap_seconds=6)
+    payloads["2026-08-03"] = _payload("2026-08-03", gap_seconds=6)
     receipt = _execute(monkeypatch, payloads)
 
     rejected = receipt["inspected_candidates"][0]
@@ -126,13 +126,13 @@ def test_independent_five_second_gate_rejects_six_seconds(monkeypatch):
         "H2D8_COIN_INTERIOR_GAP",
     ]
     assert rejected["maximum_interior_gap_seconds"] == 6
-    assert receipt["selected_sessions"] == ["2026-07-28", "2026-07-29"]
+    assert receipt["selected_sessions"] == ["2026-08-04", "2026-08-05"]
 
 
 def test_over_gap_receipt_still_requires_valid_lineage(monkeypatch):
     payloads = {day: _payload(day) for day, _run_id in qualifier.FROZEN_TARGETS}
-    payloads["2026-07-27"] = _payload("2026-07-27", gap_seconds=6)
-    payloads["2026-07-27"]["configuration_digest"] = "0" * 64
+    payloads["2026-08-03"] = _payload("2026-08-03", gap_seconds=6)
+    payloads["2026-08-03"]["configuration_digest"] = "0" * 64
     with pytest.raises(
         qualifier.TargetQualificationFailure, match="LINEAGE_OR_RECEIPT_ERROR",
     ):
@@ -141,7 +141,7 @@ def test_over_gap_receipt_still_requires_valid_lineage(monkeypatch):
 
 def test_qualifying_receipt_requires_expected_preflight_run_id(monkeypatch):
     payloads = {day: _payload(day) for day, _run_id in qualifier.FROZEN_TARGETS}
-    payloads["2026-07-27"]["replay_run_id"] = "h1-preflight-wrong"
+    payloads["2026-08-03"]["replay_run_id"] = "h1-preflight-wrong"
     with pytest.raises(
         qualifier.TargetQualificationFailure, match="LINEAGE_OR_RECEIPT_ERROR",
     ):
@@ -183,8 +183,8 @@ def test_provider_or_system_error_fails_complete_phase(monkeypatch):
 
 def test_rejected_receipt_with_lineage_drift_fails_closed(monkeypatch):
     payloads = {day: _payload(day) for day, _run_id in qualifier.FROZEN_TARGETS}
-    payloads["2026-07-27"] = _payload("2026-07-27", rejected=True)
-    payloads["2026-07-27"]["runner_version"] = "drifted"
+    payloads["2026-08-03"] = _payload("2026-08-03", rejected=True)
+    payloads["2026-08-03"]["runner_version"] = "drifted"
     with pytest.raises(
         qualifier.TargetQualificationFailure,
         match="PROVIDER_SYSTEM_OR_RECEIPT_ERROR",
@@ -272,7 +272,7 @@ def test_default_preflight_enforces_and_clears_deadline(monkeypatch):
     with pytest.raises(
         qualifier.TargetQualificationFailure, match="PREFLIGHT_TIMEOUT",
     ):
-        qualifier._run_preflight(object(), "2026-07-27", 2.5)
+        qualifier._run_preflight(object(), "2026-08-03", 2.5)
     assert timer_calls == [
         (signal.ITIMER_REAL, 2.5), (signal.ITIMER_REAL, 0),
     ]
@@ -348,11 +348,11 @@ def test_scope_stays_read_only_and_outside_v9():
     assert "resolve_outcomes" not in source
     assert "INSERT " not in source
     assert qualifier.FROZEN_TARGETS == (
-        ("2026-07-27", "h2d-2026-07-27"),
-        ("2026-07-28", "h2d-2026-07-28"),
-        ("2026-07-29", "h2d-2026-07-29"),
-        ("2026-07-30", "h2d-2026-07-30"),
-        ("2026-07-31", "h2d-2026-07-31"),
+        ("2026-08-03", "h2d-2026-08-03"),
+        ("2026-08-04", "h2d-2026-08-04"),
+        ("2026-08-05", "h2d-2026-08-05"),
+        ("2026-08-06", "h2d-2026-08-06"),
+        ("2026-08-07", "h2d-2026-08-07"),
     )
 
 
