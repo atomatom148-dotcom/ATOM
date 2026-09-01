@@ -1605,7 +1605,9 @@ class SimulationEntryWorker:
             raise Sim4AuthorityError("periodic capture produced no fence")
         return fence
 
-    def _capture_deadline_publication_fence(self) -> int:
+    def _capture_deadline_publication_fence(
+        self, closing_deadline_ns: int,
+    ) -> int:
         cursor = self._begin_transaction()
         success = False
         try:
@@ -1617,6 +1619,9 @@ class SimulationEntryWorker:
                 raise Sim4AuthorityError("deadline closure lock result is malformed")
             cursor.execute(_FENCE_READER_SQL)
             fence = self._read_nonnegative_fence(cursor.fetchone())
+            self._freeze_crossed_deadlines_under_lock(
+                closing_deadline_ns, fence,
+            )
             success = True
             return fence
         except BaseException:
@@ -2032,6 +2037,69 @@ class SimulationEntryWorker:
             self._terminalize(store, pending.publication, status)
             self._pending.pop(pending.publication.intent.intent_id, None)
 
+    def _deadline_candidate_snapshot(
+        self, deadline_ns: int, watermark: int,
+    ) -> tuple[dict[str, object | None], tuple[SimulationExecutableQuote, ...]]:
+        self._drain_through(watermark)
+        admitted_quotes = tuple(
+            envelope.quote
+            for envelope in self._quotes
+            if (
+                envelope.admission_sequence <= watermark
+                and isinstance(envelope.quote, SimulationExecutableQuote)
+            )
+        )
+        due = [
+            pending
+            for pending in self._pending.values()
+            if (
+                pending.deadline_epoch_ns == deadline_ns
+                and pending.forced_status_after_deadline is None
+            )
+        ]
+        candidates: dict[str, object | None] = {}
+        for pending in due:
+            intent_id = pending.publication.intent.intent_id
+            candidates[intent_id] = select_executable_quote(
+                pending.publication.intent,
+                admitted_quotes,
+            )
+            pending.admission_watermark = watermark
+            pending.selected_quote = candidates[intent_id]
+        return candidates, admitted_quotes
+
+    def _freeze_crossed_deadlines_under_lock(
+        self, closing_deadline_ns: int, publication_fence: int,
+    ) -> None:
+        # The exclusive handoff lock is still held by the caller.  Any
+        # publisher queued after a crossed boundary must remain outside that
+        # deadline's immutable fence when this transaction releases it.
+        deadlines = sorted({
+            pending.deadline_epoch_ns
+            for pending in self._pending.values()
+            if (
+                pending.forced_status_after_deadline is None
+                and pending.deadline_epoch_ns != closing_deadline_ns
+                and pending.deadline_epoch_ns not in self._deadline_closures
+            )
+        })
+        for deadline_ns in deadlines:
+            greater, _, watermark = self._deadline_sample(deadline_ns)
+            if not greater:
+                break
+            candidates, admitted_quotes = self._deadline_candidate_snapshot(
+                deadline_ns, watermark,
+            )
+            if not candidates:
+                continue
+            self._deadline_closures[deadline_ns] = DeadlineClosure(
+                deadline_ns,
+                watermark,
+                candidates,
+                publication_fence,
+                admitted_quotes=admitted_quotes,
+            )
+
     def _begin_due_deadline(
         self,
         deadline_ns: int,
@@ -2048,29 +2116,12 @@ class SimulationEntryWorker:
             if self._target is None
             else self._target.retry_not_before_monotonic
         )
-        self._drain_through(watermark)
-        admitted_quotes = tuple(
-            envelope.quote
-            for envelope in self._quotes
-            if (
-                envelope.admission_sequence <= watermark
-                and isinstance(envelope.quote, SimulationExecutableQuote)
-            )
+        candidates, admitted_quotes = self._deadline_candidate_snapshot(
+            deadline_ns, watermark,
         )
-        due = [pending for pending in self._pending.values()
-               if pending.deadline_epoch_ns == deadline_ns
-               and pending.forced_status_after_deadline is None]
-        candidates: dict[str, object | None] = {}
-        for pending in due:
-            candidates[pending.publication.intent.intent_id] = select_executable_quote(
-                pending.publication.intent,
-                admitted_quotes,
-            )
-            pending.admission_watermark = watermark
-            pending.selected_quote = candidates[pending.publication.intent.intent_id]
         # Freeze the complete local quote input before the blocking DB closure;
         # rows not yet paged can derive only from this bounded snapshot.
-        fence = self._capture_deadline_publication_fence()
+        fence = self._capture_deadline_publication_fence(deadline_ns)
         closure = DeadlineClosure(
             deadline_ns,
             watermark,
