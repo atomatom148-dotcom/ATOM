@@ -249,6 +249,9 @@ CREATE TABLE public.atom_v9_sim_intent_publications (
     publication_seq bigint PRIMARY KEY CHECK (publication_seq > 0),
     intent_id text UNIQUE NOT NULL
         REFERENCES public.atom_v9_sim_intents (intent_id) ON DELETE RESTRICT,
+    admitted_at timestamptz NOT NULL CHECK (
+        admitted_at NOT IN ('-infinity'::timestamptz, 'infinity'::timestamptz)
+    ),
     publication_at timestamptz NOT NULL,
     horizon_order smallint NOT NULL CHECK (horizon_order BETWEEN 1 AND 6)
 );
@@ -522,12 +525,14 @@ BEGIN
     INSERT INTO public.atom_v9_sim_intent_publications (
         publication_seq,
         intent_id,
+        admitted_at,
         publication_at,
         horizon_order
     )
     VALUES (
         next_publication_seq,
         NEW.intent_id,
+        pg_catalog.clock_timestamp(),
         NEW.eligible_at,
         mapped_horizon_order
     );
