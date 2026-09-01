@@ -1065,6 +1065,7 @@ class SIPWebSocketReceiver:
 @dataclass(frozen=True, slots=True)
 class PublicationRecord:
     publication_seq: int
+    admitted_at: datetime
     publication_at: datetime
     horizon_order: int
     intent: SimulationTradeIntent
@@ -1667,6 +1668,7 @@ class SimulationEntryWorker:
             discovered = self._anchor.derived_epoch_ns(self._monotonic_ns())
             publication = PublicationRecord(
                 published.publication_seq,
+                published.admitted_at,
                 published.publication_at,
                 published.horizon_order,
                 published.intent,
@@ -1679,7 +1681,11 @@ class SimulationEntryWorker:
                     _datetime_to_epoch_nanoseconds(publication.publication_at)
                     + 2_000_000_000
                 )
-                if discovered <= deadline_ns:
+                if (
+                    discovered <= deadline_ns
+                    and publication.admitted_at
+                    <= publication.publication_at + timedelta(seconds=2)
+                ):
                     forced = (
                         "SKIPPED_RESTART_GAP"
                         if publication.publication_at <= self._runtime_started_at
@@ -1727,6 +1733,7 @@ class SimulationEntryWorker:
                     preserved = known.publication
                     if (
                         preserved.publication_seq != row.publication_seq
+                        or preserved.admitted_at != row.admitted_at
                         or preserved.publication_at != row.publication_at
                         or preserved.horizon_order != row.horizon_order
                         or preserved.intent != row.intent
@@ -1819,6 +1826,19 @@ class SimulationEntryWorker:
                 )
             )
             return False
+        if publication.admitted_at > (
+            publication.publication_at + timedelta(seconds=2)
+        ):
+            # ``admitted_at`` is stamped by the publication trigger only
+            # after it acquires the shared database handoff lock.  It closes
+            # the otherwise unobservable local-clock-sample to COMMIT gap:
+            # a row admitted after D cannot use D's retained quote even if a
+            # delayed fence later includes its sequence.
+            self._terminalize(
+                store, publication, "SKIPPED_WINDOW_EXPIRED"
+            )
+            self._pending.pop(intent.intent_id, None)
+            return True
         closure = self._deadline_closures.get(deadline_ns)
         if closure is not None and closure.publication_fence is not None:
             if publication.publication_seq > closure.publication_fence:
