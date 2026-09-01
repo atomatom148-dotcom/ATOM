@@ -126,6 +126,13 @@ MAX_SIGNED_BIGINT = (1 << 63) - 1
 _PROJECT_REF_RE = re.compile(r"[a-z0-9]{20}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _FAILURE_CLASS_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+_FAILURE_STAGES = frozenset({
+    "OWNER_ACQUISITION",
+    "STARTUP_VERIFICATION",
+    "SIP_READINESS",
+    "ACTIVATION_CAPTURE",
+    "READY_LOOP",
+})
 _RFC3339_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})[Tt]"
     r"(?P<time>\d{2}:\d{2}:\d{2})"
@@ -602,16 +609,21 @@ def _log_fail_closed_telemetry_changes(
 
 
 def _log_fail_closed_failure_class(
-    error: BaseException, *, logger: Any | None = None,
+    error: BaseException, stage: str, *, logger: Any | None = None,
 ) -> None:
-    """Log only a bounded exception class name, never its message or values."""
+    """Log only fixed stage/class names, never exception messages or values."""
 
     failure_class = type(error).__name__
     if _FAILURE_CLASS_RE.fullmatch(failure_class) is None:
         failure_class = "UnknownFailure"
+    safe_stage = stage if stage in _FAILURE_STAGES else "UNKNOWN"
     try:
         target = _SIM4_LOGGER if logger is None else logger
-        target.warning("SIM4_FAIL_CLOSED failure_class=%s", failure_class)
+        target.warning(
+            "SIM4_FAIL_CLOSED stage=%s failure_class=%s",
+            safe_stage,
+            failure_class,
+        )
     except Exception:
         pass
 
@@ -2296,6 +2308,7 @@ class SimulationEntryWorker:
 
     def _run(self) -> None:
         store: SimulationEntryStore | None = None
+        failure_stage = "OWNER_ACQUISITION"
         try:
             self._set_state("STANDBY")
             while not self._stop_requested.is_set() and self._owner_connection is None:
@@ -2308,9 +2321,12 @@ class SimulationEntryWorker:
             if self._stop_requested.is_set() or self._owner_connection is None:
                 return
             self._set_state("RECOVERING")
+            failure_stage = "STARTUP_VERIFICATION"
             store = self._verify_startup()
+            failure_stage = "SIP_READINESS"
             if not self._wait_for_sip_readiness():
                 return
+            failure_stage = "ACTIVATION_CAPTURE"
             activation_fence = None
             while not self._stop_requested.is_set() and activation_fence is None:
                 try:
@@ -2330,12 +2346,13 @@ class SimulationEntryWorker:
                     self._stop_wait(SIM4_RUNTIME_OWNER_RETRY_SECONDS)
             if activation_fence is None:
                 return
+            failure_stage = "READY_LOOP"
             self._ready_loop(store, activation_fence)
         except BaseException as error:
             self._generation_failed = True
             with self._admission_lock:
                 self._admission_enabled = False
-            _log_fail_closed_failure_class(error)
+            _log_fail_closed_failure_class(error, failure_stage)
             self._set_state("FAILED")
         finally:
             with self._admission_lock:
