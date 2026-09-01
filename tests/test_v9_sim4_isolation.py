@@ -664,6 +664,28 @@ def test_worker_config_uses_only_entry_role_dsn_and_exact_authx_attestation_name
     assert config.provisioning_attestation_sha256 == "a" * 64
 
 
+def test_default_worker_connection_attempt_has_fixed_five_second_timeout(
+        monkeypatch):
+    import psycopg
+
+    config = worker.load_sim4_config(valid_worker_environment())
+    sentinel = object()
+    calls = []
+
+    def connect(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+    runtime = worker.SimulationEntryWorker.from_config(config)
+
+    assert runtime._connection_factory() is sentinel
+    assert calls == [(
+        (config.database_url,),
+        {"connect_timeout": worker.SIM4_DATABASE_CONNECT_TIMEOUT_SECONDS},
+    )]
+
+
 def test_worker_has_no_database_url_or_publisher_fallback():
     values = valid_worker_environment()
     del values[worker.SIM4_DATABASE_URL_ENV]
@@ -937,6 +959,56 @@ def test_deadline_rebuilds_from_checkpoint_and_preserves_known_timely_discovery(
     assert store.kwargs["after_completed_publication_seq"] == 4
     assert store.kwargs["captured_publication_fence"] == 9
     assert store.kwargs["after"] is None
+
+
+def test_deadline_fence_late_page_uses_frozen_quote_snapshot(monkeypatch):
+    known_intent = build_worker_intent(45)
+    later_page_intent = build_worker_intent(46)
+    deadline_ns = datetime_to_epoch_nanoseconds(WORKER_T0) + 2_000_000_000
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(
+        connection, monotonic_ns=lambda: deadline_ns + 1)
+    quote = build_worker_quote()
+    runtime._quotes.append(worker.AdmissionEnvelope(1, quote))
+    runtime._last_drained_sequence = 1
+    known = worker.PublicationRecord(
+        16, WORKER_T0, 1, known_intent, deadline_ns - 1)
+    runtime._pending[known_intent.intent_id] = worker.PendingIntent(
+        known, deadline_ns)
+    monkeypatch.setattr(
+        runtime, "_capture_deadline_publication_fence", lambda: 17)
+
+    assert runtime._begin_due_deadline(
+        deadline_ns, sampled=(True, deadline_ns + 1, 1))
+    closure = runtime._deadline_closures[deadline_ns]
+    assert closure.admitted_quotes == (quote,)
+
+    runtime._target.cursor = known.semantic_key
+    terminal = []
+
+    class Store:
+        @staticmethod
+        def load_publication_page_on_cursor(_cursor, **kwargs):
+            assert kwargs["after"] is not None
+            return (PublishedSimulationIntent(
+                17, WORKER_T0, 1, later_page_intent),)
+
+        @staticmethod
+        def get_existing_entry_in_transaction(_cursor, _intent):
+            return None
+
+        @staticmethod
+        def terminalize_in_transaction(
+                _cursor, intent, *, requested_status, quote):
+            terminal.append((intent.intent_id, requested_status, quote))
+            return INSERTED, SimpleNamespace(intent_id=intent.intent_id)
+
+    store = Store()
+    runtime._load_target_page(store)
+    later_page = runtime._target.page[0]
+    assert later_page.discovered_epoch_ns > deadline_ns
+    assert runtime._classify_publication(store, later_page)
+    assert terminal == [(later_page_intent.intent_id, "ENTERED", quote)]
 
 
 def test_page_discovery_registers_all_timely_intents_before_database_yield(
@@ -1402,6 +1474,43 @@ def test_existing_terminal_is_read_and_validated_only_after_horizon_lock():
     )
     assert "WHERE intent_id = %s" in cursor.executions[2][0]
     assert cursor.executions[2][1] == (intent.intent_id,)
+
+
+def test_worker_retries_flapping_sip_readiness_on_same_receiver():
+    class FlappingReady:
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, _timeout):
+            self.waits += 1
+            return True
+
+        def is_set(self):
+            return self.waits >= 2
+
+    class Receiver:
+        def __init__(self):
+            self.ready_event = FlappingReady()
+            self.starts = 0
+
+        def start(self):
+            self.starts += 1
+
+    receiver = Receiver()
+    runtime = worker.SimulationEntryWorker(
+        lambda: object(),
+        SIM_PROJECT_REF,
+        object(),
+        utc_clock=lambda: WORKER_T0,
+        monotonic_ns=lambda: 1,
+        receiver_factory=lambda _callback: receiver,
+    )
+
+    assert runtime._wait_for_sip_readiness()
+    assert receiver.starts == 1
+    assert receiver.ready_event.waits == 2
+    assert runtime._anchor is not None
+    assert runtime._admission_enabled is True
 
 
 @pytest.mark.parametrize(
