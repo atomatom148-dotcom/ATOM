@@ -91,9 +91,11 @@ changes are authorized.
 
 ### H2-D-6 — Historical-persistence gate (complete)
 
-The exact retry of the smallest H2-D-5 session passed with zero forecast and
-outcome writes, unchanged pre/post evidence, and exact least-privilege roles
-under `docs/h2-d6-persistence-gate-freeze.md`.
+The prior contract marker was “H2-D-6 — Historical-persistence gate
+(implementation authorized).” The exact retry of the smallest H2-D-5 session
+passed with zero forecast and outcome writes, unchanged pre/post evidence, and
+exact least-privilege roles under `docs/h2-d6-persistence-gate-freeze.md`.
+No new date or continuous replay is authorized by H2-D-6.
 
 ### H2-D-7 — One-session historical admission (complete)
 
