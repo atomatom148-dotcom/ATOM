@@ -20,6 +20,7 @@ from .evidence_outbox import (
     PostgresV4CStateBuilder,
     PostgresV4StateBuilder,
     V4StateBuildWorker,
+    _transient_database_error,
 )
 from .v9_v4d_integration import OfflineStateBuildScheduler, OperationalMetrics
 
@@ -82,50 +83,67 @@ def run(*, database_url: str, stop_event: threading.Event,
 
     interval = max(5.0, float(poll_seconds))
     while not stop_event.is_set():
-        lease_connection = connect(database_url)
-        if not _try_acquire_lease(lease_connection):
-            lease_connection.close()
-            stop_event.wait(interval)
-            continue
-
-        metrics = OperationalMetrics()
-        state_connection = connect(database_url)
-        reader = EvidenceLedgerWorker(
-            EvidenceOutbox(metrics=metrics),
-            evidence_store=PostgresEvidenceStore(
-                database_url, connection=lease_connection),
-            connection=lease_connection,
-            connect=connect,
-            database_url=database_url,
-            metrics=metrics,
-            load_pending=False,
-        )
-        accuracy_builder = PostgresV4BStateBuilder(state_connection)
-        compact_builder = PostgresV4CStateBuilder(state_connection)
-        state_builder = PostgresV4StateBuilder(
-            accuracy_builder, compact_builder, connection=state_connection)
-        scheduler = OfflineStateBuildScheduler(
-            state_builder.build_and_publish, metrics=metrics)
-        worker = V4StateBuildWorker(
-            state_builder,
-            scheduler,
-            connection=state_connection,
-            connect=connect,
-            database_url=database_url,
-            metrics=metrics,
-        )
-        worker.start()
+        lease_connection = None
+        state_connection = None
+        reader = None
+        worker = None
+        started = False
         try:
+            lease_connection = connect(database_url)
+            if not _try_acquire_lease(lease_connection):
+                lease_connection.close()
+                lease_connection = None
+                stop_event.wait(interval)
+                continue
+            state_connection = connect(database_url)
+            metrics = OperationalMetrics()
+            reader = EvidenceLedgerWorker(
+                EvidenceOutbox(metrics=metrics),
+                evidence_store=PostgresEvidenceStore(
+                    database_url, connection=lease_connection),
+                connection=lease_connection,
+                connect=connect,
+                database_url=database_url,
+                metrics=metrics,
+                load_pending=False,
+            )
+            accuracy_builder = PostgresV4BStateBuilder(state_connection)
+            compact_builder = PostgresV4CStateBuilder(state_connection)
+            state_builder = PostgresV4StateBuilder(
+                accuracy_builder, compact_builder, connection=state_connection)
+            scheduler = OfflineStateBuildScheduler(
+                state_builder.build_and_publish, metrics=metrics)
+            worker = V4StateBuildWorker(
+                state_builder,
+                scheduler,
+                connection=state_connection,
+                connect=connect,
+                database_url=database_url,
+                metrics=metrics,
+            )
+            worker.start()
+            started = True
             while not stop_event.is_set():
                 _submit_recovery_builds(
                     reader, worker, now=datetime.now(timezone.utc))
                 stop_event.wait(interval)
-        except Exception:
-            if not stop_event.is_set():
+        except Exception as error:
+            if (not stop_event.is_set() and
+                    (started or _transient_database_error(error))):
                 stop_event.wait(min(interval, 5.0))
+            elif not stop_event.is_set():
+                raise
         finally:
-            worker.close()
-            reader.close()
+            try:
+                if worker is not None:
+                    worker.close()
+                elif state_connection is not None:
+                    state_connection.close()
+            finally:
+                if reader is not None:
+                    reader.close()
+                elif lease_connection is not None:
+                    lease_connection.close()
 
 
 def main() -> None:
