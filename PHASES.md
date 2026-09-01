@@ -26,24 +26,38 @@ Calibration / Truth credit from eligible resolves only. Still no broker.
 
 ## Read-only Schwab market-data phases
 
-### S0 — Freeze amendment
+### S0 — Freeze amendment (complete)
 Authorize only the isolated read-only source boundary. No code or deployment.
 
-### S1 — Disabled backend worker
+### S1 — Disabled backend worker (complete)
 Add deterministic NDX, `NASDAQ_BOOK`, OAuth, freshness, deduplication, and
 transient-publication contracts. The worker remains disabled by default. No UI
 or quant-family input changes.
 
-### S2 — Live source proof
-After S1 verification, authorize and observe one Schwab connection. NDX may use
-its existing independent seam; Level II remains observer-only.
+### S2A — NDX production activation (authorized)
+After the controlling S2 activation freeze and deterministic bridge checks,
+merge and deploy the read-only Schwab NDX bridge through the existing
+independent NDX benchmark/display seam. Enable only with
+`ATOM_SCHWAB_NDX_ENABLED=true`. Stale or invalid NDX must become honestly
+unavailable. No V9 mathematics, evidence, Truth credit, broker, account, order,
+execution, or trading authority changes are authorized.
+
+COIN Level II proof is not a prerequisite for S2A and cannot block NDX
+activation.
+
+### S2B — COIN Level II market-hours proof (pending)
+Level II remains observer-only and must pass its own separate regular-market-
+hours proof. S2A success grants no Q5, family, V2/V3/V4, evidence, outcome,
+Truth-credit, simulator, broker, account, order, execution, or trading use to
+Level II.
 
 ### S3 — Optional Q5 successor
 Only after sufficient causal Top-3 evidence, consider a separate freeze for a
-new Q5 version and evidence lineage. S3 is not authorized by S0.
+new Q5 version and evidence lineage. S3 is not authorized by S0, S1, S2A, or
+S2B.
 
-**Rule:** Only S1 becomes authorized after S0 is merged. Do not implement S2 or
-S3 early.
+**Rule:** S2A is authorized only through the existing NDX benchmark/display
+seam. S2B remains a separate observer-only proof. Do not implement S3 early.
 
 ## Historical replay performance phases
 
