@@ -925,7 +925,8 @@ def test_deadline_rebuilds_from_checkpoint_and_preserves_known_timely_discovery(
     runtime._pending[intent.intent_id] = worker.PendingIntent(known, deadline_ns)
     capture_calls = []
 
-    def capture():
+    def capture(closing_deadline_ns):
+        assert closing_deadline_ns == deadline_ns
         capture_calls.append(True)
         return 9
 
@@ -976,7 +977,7 @@ def test_deadline_fence_late_page_uses_frozen_quote_snapshot(monkeypatch):
     runtime._pending[known_intent.intent_id] = worker.PendingIntent(
         known, deadline_ns)
     monkeypatch.setattr(
-        runtime, "_capture_deadline_publication_fence", lambda: 17)
+        runtime, "_capture_deadline_publication_fence", lambda _deadline: 17)
 
     assert runtime._begin_due_deadline(
         deadline_ns, sampled=(True, deadline_ns + 1, 1))
@@ -1009,6 +1010,91 @@ def test_deadline_fence_late_page_uses_frozen_quote_snapshot(monkeypatch):
     assert later_page.discovered_epoch_ns > deadline_ns
     assert runtime._classify_publication(store, later_page)
     assert terminal == [(later_page_intent.intent_id, "ENTERED", quote)]
+
+
+def test_blocking_deadline_lock_freezes_later_crossing_before_commit(
+        monkeypatch):
+    first_deadline = datetime_to_epoch_nanoseconds(
+        WORKER_T0 + timedelta(seconds=2))
+    second_publication_at = WORKER_T0 + timedelta(seconds=1)
+    second_deadline = datetime_to_epoch_nanoseconds(
+        second_publication_at + timedelta(seconds=2))
+    third_publication_at = WORKER_T0 + timedelta(milliseconds=1500)
+    third_deadline = datetime_to_epoch_nanoseconds(
+        third_publication_at + timedelta(seconds=2))
+    connection = WorkerTransactionConnection(((None,), (3,)))
+    runtime = make_authoritative_worker(connection)
+    first_intent = build_worker_intent(49)
+    second_intent = build_worker_intent(
+        50, eligible_at=second_publication_at)
+    third_intent = build_worker_intent(
+        51, eligible_at=third_publication_at)
+    runtime._pending[first_intent.intent_id] = worker.PendingIntent(
+        worker.PublicationRecord(
+            1, WORKER_T0, 1, first_intent, first_deadline - 1),
+        first_deadline,
+    )
+    runtime._pending[second_intent.intent_id] = worker.PendingIntent(
+        worker.PublicationRecord(
+            2, second_publication_at, 1, second_intent,
+            second_deadline - 1,
+        ),
+        second_deadline,
+    )
+    runtime._pending[third_intent.intent_id] = worker.PendingIntent(
+        worker.PublicationRecord(
+            3, third_publication_at, 1, third_intent,
+            third_deadline - 1,
+        ),
+        third_deadline,
+    )
+    quote = build_simulation_executable_quote(
+        source_spec=SIM4_QUOTE_SOURCE_SPEC,
+        symbol="COIN",
+        provider_event_ns=(
+            datetime_to_epoch_nanoseconds(second_publication_at) + 1
+        ),
+        accepted_at=second_publication_at + timedelta(microseconds=1),
+        bid=100.0,
+        ask=100.25,
+        bid_size=2.0,
+        ask_size=3.0,
+    )
+    runtime._quotes.append(worker.AdmissionEnvelope(1, quote))
+    runtime._last_drained_sequence = 1
+
+    def sample(deadline_ns):
+        assert deadline_ns in {second_deadline, third_deadline}
+        return True, third_deadline + 1, 1
+
+    monkeypatch.setattr(runtime, "_deadline_sample", sample)
+    original_commit = connection.commit
+
+    def commit():
+        # COMMIT releases the exclusive handoff lock.  D2 must already own
+        # the same immutable fence before a queued publisher can proceed;
+        # every additional crossed deadline must be frozen as well.
+        assert second_deadline in runtime._deadline_closures
+        assert third_deadline in runtime._deadline_closures
+        assert first_deadline not in runtime._deadline_closures
+        original_commit()
+
+    monkeypatch.setattr(connection, "commit", commit)
+
+    assert runtime._begin_due_deadline(
+        first_deadline,
+        sampled=(True, first_deadline + 1, 1),
+    )
+
+    first_closure = runtime._deadline_closures[first_deadline]
+    second_closure = runtime._deadline_closures[second_deadline]
+    third_closure = runtime._deadline_closures[third_deadline]
+    assert first_closure.publication_fence == 3
+    assert second_closure.publication_fence == 3
+    assert third_closure.publication_fence == 3
+    assert second_closure.admission_watermark == 1
+    assert second_closure.candidates[second_intent.intent_id] == quote
+    assert connection.commits == 1
 
 
 def test_page_discovery_registers_all_timely_intents_before_database_yield(
@@ -1524,7 +1610,7 @@ def test_later_deadline_is_fenced_while_earlier_closure_retries(monkeypatch):
     monkeypatch.setattr(runtime, "_new_target", new_target)
     monkeypatch.setattr(runtime, "_begin_due_deadline", begin)
     monkeypatch.setattr(
-        runtime, "_capture_deadline_publication_fence", lambda: 2)
+        runtime, "_capture_deadline_publication_fence", lambda _deadline: 2)
 
     runtime._ready_loop(object(), 1)
 
