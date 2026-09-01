@@ -1,0 +1,254 @@
+name: Deliver S2A NDX repair
+
+on:
+  push:
+    branches:
+      - codex/s2a-ndx-repair
+
+permissions:
+  contents: write
+
+jobs:
+  deliver:
+    if: github.event.head_commit.message == 'Deliver S2A NDX repair through one-shot workflow'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply bounded repair and focused tests
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          source_path = Path("quant/live_market.py")
+          source = source_path.read_text(encoding="utf-8")
+
+          old_imports = "from urllib.error import HTTPError\nfrom urllib.request import Request, urlopen\n"
+          new_imports = (
+              "from urllib.error import HTTPError\n"
+              "from urllib.request import HTTPRedirectHandler, Request, build_opener\n"
+              "from urllib.request import urlopen as _stdlib_urlopen\n"
+          )
+          if source.count(old_imports) != 1:
+              raise SystemExit("unexpected urllib import shape")
+          source = source.replace(old_imports, new_imports, 1)
+
+          constants = (
+              'COIN_MARKET_USERNAME_ENV = "ATOM_COIN_MARKET_USERNAME"\n'
+              'COIN_MARKET_PASSWORD_ENV = "ATOM_COIN_MARKET_PASSWORD"\n'
+          )
+          delivery = constants + '''\n\nclass _RejectRedirects(HTTPRedirectHandler):
+              """Reject every redirect before Basic credentials can be forwarded."""
+
+              def redirect_request(self, request, fp, code, message, headers, newurl):
+                  raise HTTPError(
+                      request.full_url, code, "Schwab NDX redirect rejected", headers, fp,
+                  )
+
+
+          _SCHWAB_NDX_OPENER = build_opener(_RejectRedirects())
+
+
+          def urlopen(resource, *args, **kwargs):
+              """Use the no-redirect opener only for the frozen Schwab NDX route."""
+
+              request_url = getattr(resource, "full_url", resource)
+              if request_url == SCHWAB_NDX_QUOTE_URL:
+                  return _SCHWAB_NDX_OPENER.open(resource, *args, **kwargs)
+              return _stdlib_urlopen(resource, *args, **kwargs)
+          '''
+          if source.count(constants) != 1:
+              raise SystemExit("unexpected Coin credential constant shape")
+          source = source.replace(constants, delivery, 1)
+
+          old_symbol = (
+              '    symbol = payload.get("symbol")\n'
+              '    if not isinstance(symbol, str) or symbol.upper() not in {"NDX", "$NDX"}:\n'
+          )
+          new_symbol = (
+              '    symbol = payload.get("symbol")\n'
+              '    if not isinstance(symbol, str) or symbol != "$NDX":\n'
+          )
+          if source.count(old_symbol) != 1:
+              raise SystemExit("unexpected Schwab wrapper symbol check")
+          source = source.replace(old_symbol, new_symbol, 1)
+
+          old_response = (
+              '            with urlopen(request, timeout=10) as response:\n'
+              '                payload = json.load(response)\n'
+              '            received_at_epoch = time.time()\n'
+          )
+          new_response = (
+              '            with urlopen(request, timeout=10) as response:\n'
+              '                response_url = getattr(response, "geturl", None)\n'
+              '                final_url = (response_url() if callable(response_url)\n'
+              '                             else SCHWAB_NDX_QUOTE_URL)\n'
+              '                if final_url != SCHWAB_NDX_QUOTE_URL:\n'
+              '                    raise ValueError("Schwab NDX response URL changed")\n'
+              '                payload = json.load(response)\n'
+              '            received_at_epoch = time.time()\n'
+          )
+          if source.count(old_response) != 1:
+              raise SystemExit("unexpected Schwab response block")
+          source = source.replace(old_response, new_response, 1)
+          source_path.write_text(source, encoding="utf-8")
+
+          test_path = Path("tests/test_s2a_ndx_activation_repair.py")
+          test_path.write_text('''"""Focused tests for the bounded S2A NDX activation repair."""
+
+          from __future__ import annotations
+
+          from io import BytesIO
+          import json
+          import os
+          import unittest
+          from unittest.mock import patch
+          from urllib.error import HTTPError
+          from urllib.request import Request
+
+          import quant.live_market as live_market
+          from quant.live_market import LiveMarketState
+
+
+          def _payload(*, symbol: str = "$NDX") -> dict[str, object]:
+              return {
+                  "ok": True,
+                  "mode": "READ ONLY",
+                  "symbol": symbol,
+                  "data": {
+                      "$NDX": {
+                          "symbol": "$NDX",
+                          "quote": {
+                              "lastPrice": 23_812.125,
+                              "tradeTime": 100_000,
+                              "quoteTime": 100_500,
+                          },
+                      },
+                  },
+              }
+
+
+          class _Response(BytesIO):
+              def __init__(self, payload: object, *, final_url: str):
+                  super().__init__(json.dumps(payload).encode("utf-8"))
+                  self._final_url = final_url
+
+              def geturl(self) -> str:
+                  return self._final_url
+
+
+          class S2ANDXActivationRepairTests(unittest.TestCase):
+              def test_wrapper_requires_exact_frozen_symbol(self):
+                  price, event_epoch = live_market.parse_schwab_ndx_quote(
+                      _payload(), received_at_epoch=101.0,
+                  )
+                  self.assertEqual(price, 23_812.125)
+                  self.assertEqual(event_epoch, 100.0)
+
+                  for symbol in ("NDX", "$ndx", "COIN"):
+                      with self.subTest(symbol=symbol):
+                          with self.assertRaisesRegex(ValueError, "wrong symbol"):
+                              live_market.parse_schwab_ndx_quote(
+                                  _payload(symbol=symbol), received_at_epoch=101.0,
+                              )
+
+              def test_exact_route_uses_only_the_no_redirect_opener(self):
+                  request = Request(
+                      live_market.SCHWAB_NDX_QUOTE_URL,
+                      headers={"Authorization": "Basic opaque"},
+                  )
+                  sentinel = object()
+                  with patch.object(
+                      live_market._SCHWAB_NDX_OPENER, "open", return_value=sentinel,
+                  ) as secure_open, patch.object(
+                      live_market, "_stdlib_urlopen",
+                  ) as standard_open:
+                      result = live_market.urlopen(request, timeout=10)
+
+                  self.assertIs(result, sentinel)
+                  secure_open.assert_called_once_with(request, timeout=10)
+                  standard_open.assert_not_called()
+
+              def test_other_routes_keep_the_existing_standard_opener(self):
+                  sentinel = object()
+                  with patch.object(
+                      live_market, "_stdlib_urlopen", return_value=sentinel,
+                  ) as standard_open, patch.object(
+                      live_market._SCHWAB_NDX_OPENER, "open",
+                  ) as secure_open:
+                      result = live_market.urlopen(
+                          "https://example.invalid/quote", timeout=3,
+                      )
+
+                  self.assertIs(result, sentinel)
+                  standard_open.assert_called_once_with(
+                      "https://example.invalid/quote", timeout=3,
+                  )
+                  secure_open.assert_not_called()
+
+              def test_redirect_handler_rejects_before_a_second_request(self):
+                  request = Request(live_market.SCHWAB_NDX_QUOTE_URL)
+                  with self.assertRaisesRegex(HTTPError, "redirect rejected"):
+                      live_market._RejectRedirects().redirect_request(
+                          request, None, 302, "Found", {},
+                          "https://example.invalid/steal",
+                      )
+
+              def test_missing_credentials_fail_closed_without_a_request(self):
+                  state = LiveMarketState(clock=lambda: 101.0)
+                  with patch.dict(os.environ, {}, clear=True), patch.object(
+                      live_market, "urlopen",
+                  ) as opened, patch.object(
+                      live_market.time, "sleep", side_effect=RuntimeError("stop"),
+                  ), patch("builtins.print"):
+                      with self.assertRaisesRegex(RuntimeError, "stop"):
+                          live_market.poll_schwab_ndx(state)
+
+                  opened.assert_not_called()
+                  self.assertIsNone(state.cross_asset_state().ndx_price)
+
+              def test_changed_response_url_is_unavailable_and_secret_safe(self):
+                  state = LiveMarketState(clock=lambda: 101.0)
+                  response = _Response(
+                      _payload(), final_url="https://example.invalid/redirected",
+                  )
+                  username = "private-reader-name"
+                  password = "private-reader-password"
+                  with patch.dict(os.environ, {
+                      live_market.COIN_MARKET_USERNAME_ENV: username,
+                      live_market.COIN_MARKET_PASSWORD_ENV: password,
+                  }, clear=True), patch.object(
+                      live_market, "urlopen", return_value=response,
+                  ) as opened, patch.object(
+                      live_market.time, "sleep", side_effect=RuntimeError("stop"),
+                  ), patch("builtins.print") as printed:
+                      with self.assertRaisesRegex(RuntimeError, "stop"):
+                          live_market.poll_schwab_ndx(state)
+
+                  opened.assert_called_once()
+                  rendered = " ".join(str(call) for call in printed.call_args_list)
+                  self.assertNotIn(username, rendered)
+                  self.assertNotIn(password, rendered)
+                  self.assertIsNone(state.cross_asset_state().ndx_price)
+
+
+          if __name__ == "__main__":
+              unittest.main()
+          ''', encoding="utf-8")
+          PY
+
+          python -m py_compile quant/live_market.py tests/test_s2a_ndx_activation_repair.py
+          python -m pytest tests/test_s2a_ndx_activation_repair.py tests/test_live_market.py tests/test_g2_cross_asset.py -q
+
+      - name: Commit the repair and remove this delivery workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/s2a-repair-delivery.yml
+          git add quant/live_market.py tests/test_s2a_ndx_activation_repair.py
+          git commit -m "Complete bounded S2A NDX activation repair"
+          git push origin HEAD:codex/s2a-ndx-repair
