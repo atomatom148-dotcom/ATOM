@@ -89,21 +89,29 @@ Run one bounded four-date, read-only scale proof in two ordered batches of two
 workers under `docs/h2-d5-freeze.md`. No scheduler, evidence writes, or tier
 changes are authorized.
 
-### H2-D-6 — Historical-persistence gate (implementation authorized)
+### H2-D-6 — Historical-persistence gate (complete)
 
-Run one exact retry of the smallest H2-D-5 session through the existing
-least-privilege forecast and outcome persistence seams. Both seams must return
-zero writes and the pre/post control must remain exact under
-`docs/h2-d6-persistence-gate-freeze.md`. No new date or continuous replay is
-authorized.
+The prior contract marker was “H2-D-6 — Historical-persistence gate
+(implementation authorized).” The exact retry of the smallest H2-D-5 session
+passed with zero forecast and outcome writes, unchanged pre/post evidence, and
+exact least-privilege roles under `docs/h2-d6-persistence-gate-freeze.md`.
+No new date or continuous replay is authorized by H2-D-6.
 
-### H2-D-7 — One-session historical admission (implementation authorized)
+### H2-D-7 — One-session historical admission (complete)
 
-Admit only `2026-07-24` as `h2d-2026-07-24` through the existing sequential
-certified replay, append-only persistence, outcome-resolution, and score-reader
-seams under `docs/h2-d7-one-session-write-freeze.md`. No alternate date,
-parallel replay, backfill, scheduler, continuous replay, or tier change is
-authorized.
+The single `2026-07-24` / `h2d-2026-07-24` append-only admission passed
+through the existing sequential certified replay, persistence,
+outcome-resolution, and score-reader seams under
+`docs/h2-d7-one-session-write-freeze.md`. Parallel and continuous replay
+remain disabled.
+
+### H2-D-8 — Two-session target qualification (freeze only)
+
+Qualify at most two absent historical sessions from the fixed ordered candidate
+set under `docs/h2-d8-target-qualification-freeze.md`. Qualification is
+read-only and sequential. No admission, evidence write, scheduler, parallel
+replay, continuous replay, tier change, or V9 change is authorized. Exact
+targets require a separate narrow amendment before any write canary.
 
 ## Paper simulator phases
 
