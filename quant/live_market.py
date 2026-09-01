@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -58,6 +59,8 @@ SCHWAB_NDX_QUOTE_URL = (
     "https://coin-market-api.onrender.com/schwab/quote/%24NDX"
 )
 SCHWAB_NDX_ENABLED_ENV = "ATOM_SCHWAB_NDX_ENABLED"
+COIN_MARKET_USERNAME_ENV = "ATOM_COIN_MARKET_USERNAME"
+COIN_MARKET_PASSWORD_ENV = "ATOM_COIN_MARKET_PASSWORD"
 MAX_NDX_AGE_SECONDS = 10.0
 HISTORY_SECONDS = 3600.0
 MARKET_DISPLAY_FETCH_SECONDS = 0.25
@@ -1483,9 +1486,19 @@ def poll_schwab_ndx(state: LiveMarketState, *, interval: float = 1.0,
 
     while stop_event is None or not stop_event.is_set():
         try:
+            username = os.environ.get(COIN_MARKET_USERNAME_ENV, "")
+            password = os.environ.get(COIN_MARKET_PASSWORD_ENV, "")
+            if not username or not password:
+                raise RuntimeError("Coin market service credentials unavailable")
+            authorization = base64.b64encode(
+                f"{username}:{password}".encode("utf-8")
+            ).decode("ascii")
             request = Request(
                 SCHWAB_NDX_QUOTE_URL,
-                headers={"Accept": "application/json"},
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Basic {authorization}",
+                },
             )
             with urlopen(request, timeout=10) as response:
                 payload = json.load(response)

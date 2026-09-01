@@ -14,6 +14,7 @@ from quant.live_market import (
     BTC_SOURCE_TIMEOUT_SECONDS, MAX_BTC_AGE_SECONDS,
     ALPACA_NDX_LATEST_VALUE_URL, MARKET_DISPLAY_FETCH_SECONDS, LiveMarketState,
     MASSIVE_NDX_SNAPSHOT_URL, alpaca_btc_stream_url, parse_alpaca_ndx_value,
+    COIN_MARKET_PASSWORD_ENV, COIN_MARKET_USERNAME_ENV,
     SCHWAB_NDX_ENABLED_ENV, SCHWAB_NDX_QUOTE_URL,
     parse_alpaca_timestamp, parse_massive_ndx_snapshot, parse_schwab_ndx_quote,
     poll_alpaca, poll_alpaca_g2, poll_massive_ndx, poll_schwab_ndx,
@@ -1270,7 +1271,10 @@ class LiveMarketTests(unittest.TestCase):
             },
         }).encode())
 
-        with patch(
+        with patch.dict(os.environ, {
+            COIN_MARKET_USERNAME_ENV: "atom-reader",
+            COIN_MARKET_PASSWORD_ENV: "secret",
+        }), patch(
             "quant.live_market.urlopen", return_value=response,
         ) as urlopen, patch(
             "quant.live_market.time.time", return_value=101.0,
@@ -1283,6 +1287,10 @@ class LiveMarketTests(unittest.TestCase):
         request = urlopen.call_args.args[0]
         self.assertEqual(request.full_url, SCHWAB_NDX_QUOTE_URL)
         self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(
+            request.get_header("Authorization"),
+            "Basic YXRvbS1yZWFkZXI6c2VjcmV0",
+        )
         self.assertEqual(state.cross_asset_state().ndx_price, 23_812.125)
 
     def test_schwab_ndx_poller_expires_stale_value_to_unavailable(self):
@@ -1306,7 +1314,10 @@ class LiveMarketTests(unittest.TestCase):
             },
         }).encode())
 
-        with patch(
+        with patch.dict(os.environ, {
+            COIN_MARKET_USERNAME_ENV: "atom-reader",
+            COIN_MARKET_PASSWORD_ENV: "secret",
+        }), patch(
             "quant.live_market.urlopen", return_value=response,
         ), patch(
             "quant.live_market.time.time", return_value=101.0,
