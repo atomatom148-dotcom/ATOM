@@ -1013,6 +1013,8 @@ def main(*, simulator_connection_factory: Callable | None = None,
         ledger_connection = runtime_connect(database_url)
         external_state_builder = (
             os.environ.get("ATOM_V4_STATE_BUILDER_EXTERNAL", "0") == "1")
+        family_cadence_enabled = (
+            os.environ.get("ATOM_FAMILY_EVIDENCE_CADENCE_ENABLED", "0") == "1")
         cache_refresher = V4StateCacheRefresher(
             compact_store=V4CStateStore(ledger_connection),
             accuracy_store=AccuracyStateStore(ledger_connection),
@@ -1036,7 +1038,8 @@ def main(*, simulator_connection_factory: Callable | None = None,
         sim3 = _start_sim3(simulator_connection_factory, simulator_utc_clock)
         ledger_worker = EvidenceLedgerWorker(
             outbox, evidence_store=PostgresEvidenceStore(
-                database_url, connection=ledger_connection),
+                database_url, connection=ledger_connection,
+                family_cadence_enabled=family_cadence_enabled),
             connection=ledger_connection,
             connect=runtime_connect, database_url=database_url,
             metrics=metrics, cache_refresher=cache_refresher,
