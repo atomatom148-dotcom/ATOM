@@ -1,6 +1,6 @@
 # E-1 read-only evidence scorecard freeze
 
-**Status:** LAW — documentation-only freeze, amended by E-1A and E-1B; read-only implementation authorized only after E-1B merges and migration 030 is applied  
+**Status:** LAW — documentation-only freeze, amended by E-1A, E-1B, and E-1C; read-only implementation authorized only after E-1C merges and migration 030 (as corrected by E-1C) is applied  
 **Current runtime:** V9 thin, V4 worker, and SIM-4 worker on `main`; Family Evidence Cadence active since August 31  
 **Next gate:** E-2 pre-registered single-hypothesis evaluation (separate amendment, not authorized here)
 
@@ -26,15 +26,24 @@ merged head. This amendment dispositions every thread, applies the owner's
 review notes, and freezes the one narrow privilege exception E-1 needs. E-1 is
 gross candidate screening only: `cost_bps` is frozen at exactly `0.0`.
 
-**E-1B amendment — September 2, 2026:** E-1A named `supabase_read_only_user`
-as the reader credential. That role is platform-managed: its password is set
-by Supabase, is not exposed to the owner, and cannot be reset by `postgres`
-(no admin option), so no receipt can be run with it. The owner chose, from two
-presented options, to reuse the existing dedicated read-only role
-`atom_historical_score_reader`, whose credential is already provisioned on the
-benchmark worker. E-1B changes only the credential, the row-level-security
-rule that follows from it, and the privileges migration `030` may apply.
-Every statistic, boundary, and label in this freeze is unchanged.
+**E-1B amendment — September 2, 2026 (superseded by E-1C):** E-1A named
+`supabase_read_only_user` as the reader credential. That role is
+platform-managed: its password is set by Supabase, is not exposed to the
+owner, and cannot be reset by `postgres` (no admin option), so no receipt can
+be run with it. E-1B replaced the credential with the shared role
+`atom_historical_score_reader` and introduced full-read verification in place
+of `BYPASSRLS`.
+
+**E-1C amendment — September 2, 2026:** The owner directed that E-1 must use a
+dedicated read-only role and credential, and that reuse of
+`atom_historical_score_reader` is not authorized. E-1C changes only the
+credential and the privileges migration `030` may apply. It preserves E-1B's
+full-read verification, `rls_full_read_verified`, `current_user` in the
+receipt, and the no-`BYPASSRLS` design. Migration `030` as merged under E-1B
+was never applied to production (its first application attempt deadlocked
+against the live writer and rolled back; verified unchanged at 13:54 UTC) and
+must be corrected to this text before any application. Every statistic,
+boundary, and label in this freeze is unchanged.
 
 ## Scope
 
@@ -199,34 +208,41 @@ dependency beyond the Python standard library and the already-pinned
 
 Database access is one explicitly read-only `REPEATABLE READ` transaction for
 the entire run, with a per-statement timeout of at most `60s`, using the
-existing credential `atom_historical_score_reader`: the `LOGIN`, `NOINHERIT`,
-`NOBYPASSRLS`, non-superuser role created by
-`supabase/migrations/20260826144639_create_historical_replay_outcomes.sql`,
-already provisioned on the benchmark worker as `HISTORICAL_SCORE_DATABASE_URL`,
-holding no `INSERT`, `UPDATE`, or `DELETE` privilege on any table. Its existing
-`SELECT` on the three `atom_historical_replay_*` tables and every H2-D contract
-that reads through it are unchanged.
+dedicated E-1 credential `atom_e1_scorecard_reader`: a `LOGIN`, `NOINHERIT`,
+`NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOREPLICATION`, `NOBYPASSRLS` role
+created by migration `030` with no password, used for nothing but E-1 reads,
+holding no `INSERT`, `UPDATE`, or `DELETE` privilege on any table.
+`atom_historical_score_reader` is not used, not granted anything, and not
+named by any E-1 policy; every H2-D contract that reads through it is
+untouched.
 
-Because that role cannot bypass row-level security, migration `030` grants it
+Because the role cannot bypass row-level security, migration `030` grants it
 a permissive `USING (true)` `SELECT` policy on each of the four evidence
-tables, and the reader verifies full read before reading anything. For each of
-the four tables it asserts `has_table_privilege(current_user, table, 'SELECT')`,
-that `pg_policies` holds a `SELECT` policy whose `roles` include
-`current_user` with `permissive = 'PERMISSIVE'` and `qual = 'true'`, and that
-no restrictive `SELECT` policy on that table applies to `current_user`. The
-receipt records `rls_full_read_verified = true`. The reader refuses any
+tables, and the reader verifies full read before reading anything. It first
+asserts `current_user = 'atom_e1_scorecard_reader'` and refuses any other
+credential. Then, for each of the four tables, it asserts
+`has_table_privilege(current_user, table, 'SELECT')`, that `pg_policies` holds
+a `SELECT` policy whose `roles` include `current_user` with
+`permissive = 'PERMISSIVE'` and `qual = 'true'`, and that no restrictive
+`SELECT` policy on that table applies to `current_user`. The receipt records
+`rls_full_read_verified = true` and `current_user`. The reader refuses any
 credential that holds a write privilege on the four evidence tables and
 refuses any credential that fails full-read verification, because a
 policy-filtered read would score an empty ledger as if it were evidence. The
-credential value never leaves Render: the benchmark worker's start command
-passes `HISTORICAL_SCORE_DATABASE_URL` into
-`ATOM_E1_SCORECARD_READONLY_DATABASE_URL` for the reader process, and the
-reader reads only that variable. All counts, both layer reads, and every
-proof-seam call observe that one snapshot, and the receipt records
-`pg_current_snapshot()`. The reader must not be run during regular XNYS
-session hours; there is no override. Forecast, outcome, manifest, persistence,
-receipt, and every other write must remain `0`. Existing evidence may not be
-deleted, rewritten, repaired, or backfilled.
+reader reads only `ATOM_E1_SCORECARD_READONLY_DATABASE_URL`. All counts, both
+layer reads, and every proof-seam call observe that one snapshot, and the
+receipt records `pg_current_snapshot()`. The reader must not be run during
+regular XNYS session hours; there is no override. Forecast, outcome, manifest,
+persistence, receipt, and every other write must remain `0`. Existing
+evidence may not be deleted, rewritten, repaired, or backfilled.
+
+The credential is provisioned by the owner and never held by the operator:
+after migration `030` creates the role, the owner sets its password with
+`ALTER ROLE atom_e1_scorecard_reader WITH PASSWORD '…'` in the Supabase SQL
+editor and sets `ATOM_E1_SCORECARD_READONLY_DATABASE_URL` on the benchmark
+worker to `postgresql://atom_e1_scorecard_reader:…@<direct host>:5432/postgres`.
+The direct host, not the pooler, is required so the `REPEATABLE READ` snapshot
+holds for the whole run.
 
 Implementation is limited to one module (`quant/evidence_scorecard.py`), one
 command-line entry point, and tests. Statistics, including the bootstrap, are
@@ -240,8 +256,8 @@ E-1's two proof seams are `STABLE`, `SECURITY DEFINER` functions owned by
 `atom_v9_proof_owner` with `search_path = pg_catalog`. `PUBLIC`, `anon`,
 `authenticated`, and `service_role` cannot execute them and must remain unable
 to. The four evidence tables and the schema `atom_v9_internal` are owned by
-`postgres`, so table grants, policies, and schema usage need no ownership
-handoff; only function grants do.
+`postgres`, so role creation, table grants, policies, and schema usage need no
+ownership handoff; only function grants do.
 
 Production state verified on September 2, 2026 (PostgreSQL 17.6):
 `pg_auth_members` holds exactly one row for member `postgres` in role
@@ -256,59 +272,62 @@ migration transaction and never touches the `supabase_admin` row. This is the
 same pattern migration `027` uses and verifies.
 
 **Migration `029` (E-1A, applied September 2, 2026):** granted `EXECUTE` on
-both proof readers to `supabase_read_only_user`. E-1B supersedes that
+both proof readers to `supabase_read_only_user`. E-1C supersedes that
 credential; `030` withdraws those two grants so exactly one E-1 credential
 exists.
 
-**Migration `030` (E-1B):** authorizes exactly the following, as one
-transaction in this order, and nothing else:
+**Migration `030` (E-1C; the E-1B text of `030` was never applied and is
+replaced by this):** authorizes exactly the following, as one transaction in
+this order, and nothing else:
 
 ```sql
--- migrations/030_authorize_e1_scorecard_score_reader.sql
+-- migrations/030_authorize_e1_scorecard_reader.sql
 -- One transaction. Every ASSERT is a DO block that RAISEs on failure,
--- rolling back everything.
+-- rolling back everything. Must be applied only while the evidence
+-- writer is idle (00:00–08:00 UTC); a lock conflict aborts and rolls back.
 
 -- 1. ASSERT starting state:
---    atom_historical_score_reader exists with LOGIN, NOSUPERUSER,
---    NOBYPASSRLS; holds no INSERT, UPDATE, or DELETE on any table; holds
---    SELECT on exactly atom_historical_replay_forecasts,
---    atom_historical_replay_outcomes, atom_historical_replay_runs and on
---    no other table; holds no USAGE on atom_v9_internal; has no policy on
---    any of the four evidence tables; the four evidence tables and the
---    schema atom_v9_internal are owned by postgres; the postgres
---    membership row in atom_v9_proof_owner is exactly as in 029 step 1;
---    supabase_read_only_user can execute exactly the two 029 functions
---    and no other function in atom_v9_internal.
+--    no role named atom_e1_scorecard_reader exists; the four evidence
+--    tables and the schema atom_v9_internal are owned by postgres; the
+--    postgres membership row in atom_v9_proof_owner is exactly as in 029
+--    step 1; supabase_read_only_user can execute exactly the two 029
+--    functions and no other function in atom_v9_internal;
+--    atom_historical_score_reader holds SELECT on exactly the three
+--    atom_historical_replay_* tables, no USAGE on atom_v9_internal, and
+--    can execute no function in atom_v9_internal.
 
--- 2. Schema usage and table reads (postgres owns these; no handoff).
-GRANT USAGE ON SCHEMA atom_v9_internal TO atom_historical_score_reader;
+-- 2. The dedicated role, with no password (owner sets it afterwards).
+CREATE ROLE atom_e1_scorecard_reader WITH LOGIN NOINHERIT NOSUPERUSER
+  NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 
+-- 3. Schema usage and table reads (postgres owns these; no handoff).
+GRANT USAGE ON SCHEMA atom_v9_internal TO atom_e1_scorecard_reader;
 GRANT SELECT ON public.forecasts, public.forecast_outcomes,
                 public.atom_v9_v4_forecasts, public.atom_v9_v4_outcomes
-TO atom_historical_score_reader;
+TO atom_e1_scorecard_reader;
 
--- 3. One permissive full-read SELECT policy per evidence table.
+-- 4. One permissive full-read SELECT policy per evidence table.
 CREATE POLICY forecasts_e1_scorecard_select
-  ON public.forecasts FOR SELECT TO atom_historical_score_reader USING (true);
+  ON public.forecasts FOR SELECT TO atom_e1_scorecard_reader USING (true);
 CREATE POLICY forecast_outcomes_e1_scorecard_select
-  ON public.forecast_outcomes FOR SELECT TO atom_historical_score_reader USING (true);
+  ON public.forecast_outcomes FOR SELECT TO atom_e1_scorecard_reader USING (true);
 CREATE POLICY atom_v9_v4_forecasts_e1_scorecard_select
-  ON public.atom_v9_v4_forecasts FOR SELECT TO atom_historical_score_reader USING (true);
+  ON public.atom_v9_v4_forecasts FOR SELECT TO atom_e1_scorecard_reader USING (true);
 CREATE POLICY atom_v9_v4_outcomes_e1_scorecard_select
-  ON public.atom_v9_v4_outcomes FOR SELECT TO atom_historical_score_reader USING (true);
+  ON public.atom_v9_v4_outcomes FOR SELECT TO atom_e1_scorecard_reader USING (true);
 
--- 4. Temporary handoff for the proof-owner functions (as 029 step 2).
+-- 5. Temporary handoff for the proof-owner functions (as 029 step 2).
 GRANT atom_v9_proof_owner TO postgres WITH INHERIT TRUE, SET FALSE;
 
--- 5. Move the two EXECUTE grants from the superseded credential.
+-- 6. Move the two EXECUTE grants from the superseded credential.
 GRANT EXECUTE ON FUNCTION
   atom_v9_internal.read_forecast_commit_proof(text)
-TO atom_historical_score_reader;
+TO atom_e1_scorecard_reader;
 GRANT EXECUTE ON FUNCTION
   atom_v9_internal.read_legacy_evidence_publications_for_records(
     text, timestamptz, bigint[]
   )
-TO atom_historical_score_reader;
+TO atom_e1_scorecard_reader;
 REVOKE EXECUTE ON FUNCTION
   atom_v9_internal.read_forecast_commit_proof(text)
 FROM supabase_read_only_user;
@@ -318,29 +337,31 @@ REVOKE EXECUTE ON FUNCTION
   )
 FROM supabase_read_only_user;
 
--- 6. Remove only the temporary row (as 029 step 4).
+-- 7. Remove only the temporary row (as 029 step 4).
 REVOKE atom_v9_proof_owner FROM postgres GRANTED BY postgres;
 
--- 7. ASSERT final state: the membership state from step 1 holds
---    exactly; atom_historical_score_reader holds SELECT on the four
---    evidence tables and the three historical tables and on no other
---    table, holds no INSERT, UPDATE, or DELETE anywhere, holds USAGE on
---    atom_v9_internal, can execute exactly the two authorized functions
---    and no other function in atom_v9_internal, and is named by exactly
---    one permissive SELECT policy with qual true on each evidence table;
---    supabase_read_only_user can execute no function in
---    atom_v9_internal; PUBLIC, anon, authenticated, and service_role can
---    execute neither function and hold no SELECT on the four evidence
---    tables; every pre-existing policy on the four tables is unchanged.
+-- 8. ASSERT final state: the membership state from step 1 holds
+--    exactly; atom_e1_scorecard_reader exists with exactly the role
+--    attributes in step 2 and no password, holds SELECT on exactly the
+--    four evidence tables and on no other table, holds no INSERT, UPDATE,
+--    DELETE, or TRUNCATE anywhere, holds USAGE on atom_v9_internal, can
+--    execute exactly the two authorized functions and no other function
+--    in atom_v9_internal, and is named by exactly one permissive SELECT
+--    policy with qual true on each evidence table; supabase_read_only_user
+--    can execute no function in atom_v9_internal;
+--    atom_historical_score_reader is exactly as in step 1; PUBLIC, anon,
+--    authenticated, and service_role can execute neither function and
+--    hold no SELECT on the four evidence tables; every pre-existing policy
+--    on the four tables is unchanged and the total is fifteen.
 
--- 8. Any failed assertion RAISEs; the whole transaction rolls back.
+-- 9. Any failed assertion RAISEs; the whole transaction rolls back.
 ```
 
-Net membership change: none. Net credential change: none — no role is
-created, no password is set or reset. Migration `030` contains only that
-authorization. A third function grant, any privilege for any other role, any
-`BYPASSRLS` attribute, any change to an existing policy, or any
-default-privilege change is not authorized.
+Net membership change: none. One role is created; no password is set by the
+migration. Migration `030` contains only that authorization. A third function
+grant, any privilege for any other role, any change to
+`atom_historical_score_reader`, any `BYPASSRLS` attribute, any change to an
+existing policy, or any default-privilege change is not authorized.
 
 ## Receipt and stopping rule
 
@@ -358,8 +379,8 @@ Each run emits one JSON receipt to standard output containing:
   `expected_false_candidates`, `multiplicity_budget_exceeded`, and
   `usable_for_e2`;
 - `forecast_writes=0`, `outcome_writes=0`, `evidence_writes=0`,
-  `read_only=true`, `rls_full_read_verified=true`, and the reader's
-  `current_user`;
+  `read_only=true`, `rls_full_read_verified=true`, and
+  `current_user = atom_e1_scorecard_reader`;
 - a SHA-256 over the canonical JSON of everything above.
 
 The receipt is evidence about evidence. It is not itself stored in the ledger
@@ -369,19 +390,23 @@ least ten regular sessions is produced and reviewed. A receipt with
 baseline for E-2. That receipt is the baseline for E-2 only when
 `usable_for_e2 = true`.
 
-## Order of work after E-1B merges
+## Order of work after E-1C merges
 
-1. Migration `030` in its own PR under the merge gate, then applied once as a
-   single transaction through the migration runner.
-2. Implementation in its own PR under the merge gate, including the full-read
-   verification above.
-3. One receipt, after hours, on the suspended benchmark worker: the owner sets
-   the start command to
-   `ATOM_E1_SCORECARD_READONLY_DATABASE_URL="$HISTORICAL_SCORE_DATABASE_URL" python -m quant.evidence_scorecard --recent-sessions 10; sleep infinity`,
-   resumes the service, the receipt is captured from the service logs, and
-   the owner restores `sleep infinity` and suspends the service. The
-   operator holds no tool that changes a start command or resumes a service.
-No receipt, E-2, or E-3 work begins before all three, in that order.
+1. Migration `030` corrected to this text in its own PR under the merge gate;
+   applied once, as a single transaction, through the migration runner, only
+   while the evidence writer is idle (00:00–08:00 UTC).
+2. The owner sets the role's password and provisions
+   `ATOM_E1_SCORECARD_READONLY_DATABASE_URL` on the benchmark worker, and sets
+   its start command to
+   `python -m quant.evidence_scorecard --recent-sessions 10; sleep infinity`.
+3. Implementation, including the exact-role and full-read verification above,
+   in its own PR under the merge gate.
+4. One receipt, after hours, on the benchmark worker; the receipt is captured
+   from the service logs; the owner restores `sleep infinity` and suspends the
+   service. The operator holds no tool that changes a start command, sets a
+   password, or resumes a service.
+No receipt, E-2, or E-3 work begins before all four, in that order. Nothing
+is applied or deployed until the corrected chain is green.
 
 ## What E-1 does not authorize
 
