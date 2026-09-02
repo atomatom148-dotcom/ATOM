@@ -16,17 +16,20 @@ Do not rely on chat memory as authority.
 
 ## Precedence
 
-1. Explicit current owner decision
+1. Latest applicable owner-approved freeze or amendment authored by ChatGPT Pro
 2. `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1.md` for role, innovation,
    workflow, evidence, and final-audit authority
 3. Latest merged phase-specific freeze/amendment
 4. `SIMULATION_FREEZE.md` for simulator work
 5. `FREEZE.md`
 6. `PHASES.md`
-7. Existing implementation
+7. Explicit current owner operational instruction, only within items 1–6
+8. Existing implementation
 
 The narrowest applicable restriction controls. Existing code does not override
-a freeze.
+a freeze. An owner objective or request that would cross a frozen boundary must
+be expressed through a later owner-approved ChatGPT Pro freeze or amendment
+before execution.
 
 ## Startup statement
 
@@ -133,4 +136,4 @@ Update this section only by owner-approved documentation change.
 - Freeze documents tell it what is legally authorized.
 - `PHASES.md` tells it where the program currently is.
 - The owner's explicit approval decides whether the next boundary may be
-  crossed.
+  crossed through the applicable freeze or amendment.
