@@ -160,14 +160,18 @@ No phase in this section changes V9 mathematics, families, synthesis,
 evidence, simulator behavior, or trading authority; any such change requires
 its own freeze.
 
-### E-1 — Read-only evidence scorecard (freeze only)
+### E-1 — Read-only evidence scorecard (freeze amended by E-1A; migration and implementation pending)
 
 One single-process, read-only reader over FAMILY and V9 evidence with
 statistics fixed in advance under `docs/e-1-evidence-scorecard-freeze.md`:
-independent epoch-aligned windows, ties and abstentions excluded and reported,
-hit rate with z, signed bps with t, correlation, magnitude calibration, an
-echoed cost line, and `INSUFFICIENT` / `NOISE` / `CANDIDATE` labels with a fixed
-`|z| >= 3.0` guard. Emits a receipt. Authorizes nothing.
+proof-admissible windows selected by horizon spacing inside regular hours,
+mutually exclusive window kinds with ties as zero in economic metrics, hit rate
+with descriptive z, gross signed bps (`cost_bps` frozen at `0.0`), correlation,
+magnitude calibration, a 200,000-resample session-clustered bootstrap, and
+`INSUFFICIENT` / `NOISE` / `CANDIDATE` labels on the `0.999` interval. Reads
+through the existing proof seams under exactly two `EXECUTE` grants applied by
+migration `029`. Emits a receipt. Authorizes nothing else. Order of work:
+E-1A merge, migration `029`, implementation, one receipt — each its own PR.
 
 ### E-2 — Pre-registered single hypothesis (not authorized)
 
@@ -177,7 +181,7 @@ with the E-1 receipt as baseline. Evaluate it once on the frozen sessions.
 
 ### E-3 — Cost model (not authorized)
 
-Measure COIN realized spread and a fixed slippage assumption from existing
+Measure COIN quoted spread and a fixed slippage assumption from existing
 quotes only. Produces the `cost_bps` input for later phases.
 
 ### E-4 — Driver and universe candidates (not authorized)
