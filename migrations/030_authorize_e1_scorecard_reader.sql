@@ -5,13 +5,17 @@
 -- "Authorized privilege exception", "Migration 030". This file contains
 -- only that authorization and replaces the never-applied E-1B text. Apply
 -- as ONE transaction (Supabase MCP apply_migration, or psql with an explicit
--- BEGIN/COMMIT around the whole file), only while the evidence writer is
--- idle (00:00-08:00 UTC). Every assertion RAISEs; a raised exception rolls
--- back everything.
+-- BEGIN/COMMIT around the whole file). It may run at any hour, must fail
+-- closed on contention, and rolls back atomically on any assertion/statement
+-- failure. It must never pause, restart, degrade, or alter the live evidence
+-- writer.
 --
 -- Net membership change: none. One role is created with no password; the
 -- owner sets the password afterwards. No BYPASSRLS. No existing policy is
 -- altered. atom_historical_score_reader is not touched.
+
+SET LOCAL lock_timeout = '500ms';
+SET LOCAL statement_timeout = '15s';
 
 -- 1. Assert the exact starting state.
 DO $e1c_assert_start$
