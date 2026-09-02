@@ -26,7 +26,7 @@ from typing import Iterable, Iterator, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 CONTRACT = "docs/e-1-evidence-scorecard-freeze.md"
-CODE_VERSION = "ATOM-E1-SCORECARD-4"
+CODE_VERSION = "ATOM-E1-SCORECARD-5"
 
 LAYER_FAMILY = "FAMILY"
 LAYER_V9 = "V9"
@@ -135,12 +135,12 @@ def is_rth_window(cutoff_epoch: float, horizon: str) -> bool:
 
 def window_kind(row: Row) -> str:
     forecast = _finite(row.forecast_bps)
-    if forecast is None or forecast == 0.0:
+    if forecast is None or not forecast:          # exactly 0 (finite guaranteed above)
         return KIND_ABSTAIN
     outcome = _finite(row.outcome_bps)
     if not row.outcome_eligible or outcome is None:
         return KIND_INVALID_OUTCOME
-    if outcome == 0.0:
+    if not outcome:                               # exactly 0
         return KIND_TIE
     return KIND_DECIDED
 
@@ -343,7 +343,7 @@ def cell_metrics(
         forecasts_econ.append(forecast)
         outcomes_econ.append(outcome)
         if kind == KIND_DECIDED:
-            hit = 1 if math.copysign(1.0, forecast) == math.copysign(1.0, outcome) else 0
+            hit = 1 if (forecast > 0.0) == (outcome > 0.0) else 0   # both nonzero here
             hit_sums[session] = hit_sums.get(session, 0.0) + hit
             hit_counts[session] = hit_counts.get(session, 0) + 1
             hits_all.append(hit)
