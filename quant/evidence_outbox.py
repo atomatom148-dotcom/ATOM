@@ -23,6 +23,7 @@ from .v9_v4a_evidence import (
     ForecastRecord as V4ForecastRecord,
     OutcomeRecord as V4OutcomeRecord,
     V4AWriter,
+    build_outcome,
     canonical_target_identity,
 )
 from .v9_v4a_evidence import (
@@ -1028,7 +1029,8 @@ class EvidenceLedgerWorker:
                  state_build_submit: Callable | None = None,
                  simulation_submit: Callable | None = None,
                  load_pending: bool = True,
-                 wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+                 wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 batch_enabled: bool = False):
         self._validate_runtime_database_url(database_url)
         if connection is None:
             if connect is None:
@@ -1043,6 +1045,9 @@ class EvidenceLedgerWorker:
         self._cache_refresher = cache_refresher
         self._state_build_submit = state_build_submit
         self._simulation_submit = simulation_submit
+        # L-1 (docs/l-1-evidence-ledger-throughput-freeze.md): with the gate off
+        # every existing code path executes unchanged.
+        self._batch_enabled = bool(batch_enabled)
         self._pending: list[V4ForecastRecord] = (
             self._load_pending() if load_pending else [])
         self._handoff_anchor: MidpointObservation | None = None
@@ -1901,6 +1906,95 @@ class EvidenceLedgerWorker:
         self.metrics.set_status(
             "evidence_ledger_worker.last_terminal_failure", reason)
 
+    # ------------------------------------------------------------------
+    # L-1 evidence ledger throughput (docs/l-1-evidence-ledger-throughput-
+    # freeze.md).  Both helpers are reached only when the gate is on and the
+    # writer exposes the batch methods; every statement, parameter, lock,
+    # status, ordering rule, and conflict disposition is the per-record one.
+    # ------------------------------------------------------------------
+
+    def _batched_outcomes_enabled(self) -> bool:
+        return (self._batch_enabled and
+                callable(getattr(self._writer, "persist_outcomes", None)))
+
+    def _batched_forecasts_enabled(self) -> bool:
+        return (self._batch_enabled and
+                callable(getattr(self._writer, "persist_forecasts", None)) and
+                callable(getattr(
+                    self._writer, "record_forecast_commit_proofs", None)))
+
+    def _resolve_due_batched(self, due: list[V4ForecastRecord], *,
+                             previous: MidpointObservation,
+                             current: MidpointObservation,
+                             item: QuoteEvidenceWork, cycle_cohorts,
+                             state_candidates) -> None:
+        """Resolve one bracket's due forecasts through one outcome transaction."""
+
+        started = time.perf_counter()
+        previous_observation_at = datetime.fromtimestamp(
+            previous.event_epoch, timezone.utc)
+        endpoint_observation_at = datetime.fromtimestamp(
+            current.event_epoch, timezone.utc)
+        outcomes = tuple(build_outcome(
+            forecast=forecast,
+            target_identity=canonical_target_identity(forecast),
+            endpoint_observation_at=endpoint_observation_at,
+            target_resolved_at=item.received_at,
+            actual_return_bps=10_000.0 * math.log(
+                current.midpoint / forecast.cutoff_midpoint),
+            previous_observation_at=previous_observation_at,
+        ) for forecast in due)
+        outcome_created_at = self._clock()
+        results = self._writer.persist_outcomes(outcomes, outcome_created_at)
+        self.metrics.observe("outcome_resolution_latency_ms",
+                             (time.perf_counter() - started) * 1000)
+        for forecast, (write_status, _stored) in zip(due, results):
+            self.metrics.increment(
+                "outcome_resolution." + (write_status or "UNKNOWN"))
+            if write_status == "INSERT":
+                cohorts = cycle_cohorts.get(self._cycle_key(forecast))
+                if cohorts is not None:
+                    cohort_key = tuple(
+                        (horizon, *cohorts[horizon]) for horizon in HORIZONS)
+                    existing = state_candidates.get(cohort_key)
+                    if existing is None or outcome_created_at > existing[1]:
+                        state_candidates[cohort_key] = (
+                            forecast.symbol, outcome_created_at)
+            if write_status == "OUTCOME_CONFLICT":
+                raise TerminalDeliveryError("OUTCOME_CONFLICT")
+
+    def _persist_forecasts_batched(self, item: QuoteEvidenceWork, *,
+                                   finalized: list, remaining: list,
+                                   pending_ids: set) -> None:
+        """Persist the exact six through one transaction and one proof pass."""
+
+        results = self._writer.persist_forecasts(item.v4, self._clock())
+        conflict = None
+        entries: list[list] = []
+        for forecast, (write_status, stored) in zip(item.v4, results):
+            if write_status in {
+                    "FORECAST_DUPLICATE_CONFLICT", "OUTCOME_CONFLICT"}:
+                conflict = write_status
+                break
+            entries.append([forecast, write_status, stored])
+        provable = [entry for entry in entries
+                    if entry[1] in {"INSERT", "IDEMPOTENT"}]
+        if provable:
+            proven = self._writer.record_forecast_commit_proofs(
+                tuple(entry[2] for entry in provable))
+            for entry, stored in zip(provable, proven):
+                entry[2] = stored
+        for forecast, write_status, stored in entries:
+            status = ("INSERTED" if write_status == "INSERT" else write_status)
+            finalized.append(FinalizedV4PersistenceResult(
+                forecast.horizon, status, stored))
+            if (stored.persistence_proof_eligible is True and
+                    stored.forecast_record_id not in pending_ids):
+                remaining.append(stored)
+                pending_ids.add(stored.forecast_record_id)
+        if conflict is not None:
+            raise TerminalDeliveryError(conflict)
+
     def process(self, item: QuoteEvidenceWork) -> None:
         """Process exactly one bracket; callers may retry this same item."""
         started = time.perf_counter()
@@ -1956,6 +2050,8 @@ class EvidenceLedgerWorker:
                 )
                 cycle_cohorts = self._complete_cycles_cohorts(
                     resolution_forecasts)
+            batched_outcomes = self._batched_outcomes_enabled()
+            due: list[V4ForecastRecord] = []
             for forecast in self._pending:
                 endpoint = forecast.target_endpoint.timestamp()
                 if endpoint > current.event_epoch:
@@ -1964,6 +2060,9 @@ class EvidenceLedgerWorker:
                     # A missing exact bracket is intentionally never reconstructed.
                     continue
                 elif not gap:
+                    if batched_outcomes:
+                        due.append(forecast)
+                        continue
                     cohorts = cycle_cohorts.get(self._cycle_key(forecast))
                     outcome_created_at = self._clock()
                     resolve_outcome(
@@ -1987,6 +2086,11 @@ class EvidenceLedgerWorker:
                                 forecast.symbol, outcome_created_at)
                     if self._writer.last_write_status == "OUTCOME_CONFLICT":
                         raise TerminalDeliveryError("OUTCOME_CONFLICT")
+            if batched_outcomes and due:
+                self._resolve_due_batched(
+                    due, previous=previous, current=current, item=item,
+                    cycle_cohorts=cycle_cohorts,
+                    state_candidates=state_candidates)
         else:
             remaining.extend(self._pending)
         # The legacy raw ledger operation is wholly worker-owned.  Its capture
@@ -2000,7 +2104,14 @@ class EvidenceLedgerWorker:
         )
         pending_ids = {record.forecast_record_id for record in remaining}
         finalized = []
-        for forecast in item.v4:
+        if self._batched_forecasts_enabled():
+            self._persist_forecasts_batched(
+                item, finalized=finalized, remaining=remaining,
+                pending_ids=pending_ids)
+            forecasts_to_persist = ()
+        else:
+            forecasts_to_persist = item.v4
+        for forecast in forecasts_to_persist:
             stored = self._writer.persist_forecast(forecast, self._clock())
             write_status = self._writer.last_write_status
             if write_status in {
