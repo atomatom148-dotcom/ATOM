@@ -1,7 +1,7 @@
-"""E-1 read-only evidence scorecard (E-1A, E-1B).
+"""E-1 read-only evidence scorecard (E-1A, E-1B, E-1C).
 
 Controlling law: ``docs/e-1-evidence-scorecard-freeze.md`` as amended by
-E-1A and E-1B. Every statistic, count, selection rule, label, and guard below is fixed
+E-1A, E-1B, and E-1C. Every statistic, count, selection rule, label, and guard below is fixed
 by that document. The reader streams existing evidence through one explicitly
 read-only ``REPEATABLE READ`` transaction, hydrates admissibility only through
 the two authorized proof seams, computes the frozen statistics as pure
@@ -26,7 +26,7 @@ from typing import Iterable, Iterator, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 CONTRACT = "docs/e-1-evidence-scorecard-freeze.md"
-CODE_VERSION = "ATOM-E1-SCORECARD-3"
+CODE_VERSION = "ATOM-E1-SCORECARD-4"
 
 LAYER_FAMILY = "FAMILY"
 LAYER_V9 = "V9"
@@ -55,7 +55,7 @@ OUTCOME_RESOLUTION_BOUND_SECONDS = 5.0
 STATEMENT_TIMEOUT_MS = 60_000
 PROOF_BATCH = 65_536
 READONLY_URL_ENV = "ATOM_E1_SCORECARD_READONLY_DATABASE_URL"
-READONLY_ROLE = "atom_historical_score_reader"
+READONLY_ROLE = "atom_e1_scorecard_reader"
 
 LABEL_INSUFFICIENT = "INSUFFICIENT"
 LABEL_NOISE = "NOISE"
@@ -754,8 +754,9 @@ def read_and_select(database_url: str, sessions: Sequence[date]):
     """Stream both layers inside one read-only REPEATABLE READ snapshot.
 
     Returns ``(selectors, rows_read, proof_rows, snapshot, current_user,
-    wall_seconds)``. Refuses a credential that holds a write privilege on the
-    four evidence tables or fails full-read verification on any of them.
+    wall_seconds)``. Refuses any credential other than the dedicated E-1 role,
+    any credential that holds a write privilege on the four evidence tables,
+    and any credential that fails full-read verification on any of them.
     """
 
     import psycopg
@@ -783,6 +784,7 @@ def read_and_select(database_url: str, sessions: Sequence[date]):
             with connection.cursor() as cursor:
                 cursor.execute(GUARD_SQL, {"tables": list(EVIDENCE_TABLES)})
                 current_user, can_write, snapshot, as_of = cursor.fetchone()
+                verify_reader_identity(current_user)
                 if can_write:
                     raise SystemExit(
                         f"E-1 reader refused: {current_user!r} holds a write privilege")
@@ -833,6 +835,14 @@ def read_and_select(database_url: str, sessions: Sequence[date]):
 
     return (selectors, rows_read, proof_rows, str(snapshot), str(current_user),
             time.monotonic() - started)
+
+
+def verify_reader_identity(current_user: object) -> None:
+    """Refuse any credential other than the dedicated E-1 role (E-1C)."""
+
+    if str(current_user) != READONLY_ROLE:
+        raise SystemExit(
+            f"E-1 reader refused: {current_user!r} is not {READONLY_ROLE!r}")
 
 
 def verify_full_read(current_user: object, rows: Sequence[Sequence[object]]) -> None:
