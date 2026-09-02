@@ -612,6 +612,192 @@ class V4AWriter:
         finally:
             _close_if_supported(cursor)
 
+    # ------------------------------------------------------------------
+    # L-1 evidence ledger throughput (docs/l-1-evidence-ledger-throughput-
+    # freeze.md).  The three batch methods below issue exactly the statements
+    # the per-record methods above issue, in the same order with the same
+    # parameters, and commit once per batch.  They add no statement text and
+    # change no record content, hash, identity, status, or conflict rule.
+    # ------------------------------------------------------------------
+
+    def persist_forecasts(self, records: Iterable[ForecastRecord],
+                          persisted_at: datetime,
+                          ) -> tuple[tuple[str, ForecastRecord], ...]:
+        """Persist an ordered forecast batch in one transaction.
+
+        Returns ``(write_status, stored)`` per record in order.  The first
+        terminal duplicate conflict ends the batch: the preceding records are
+        committed exactly as ``persist_forecast`` would have committed them one
+        by one, the conflicting record is returned with that status, and later
+        records are not attempted.
+        """
+        ordered = tuple(records)
+        results: list[tuple[str, ForecastRecord]] = []
+        committed = False
+        cursor = self.connection.cursor()
+        try:
+            for record in ordered:
+                stored = self._without_commit_proof(record)
+                cursor.execute(
+                    "SELECT pg_catalog.pg_advisory_xact_lock(%s)",
+                    (self._logical_lock_id("FORECAST", record.logical_key),),
+                )
+                cursor.execute("SELECT forecast_record_hash, record_json FROM atom_v9_v4_forecasts WHERE symbol=%s AND cutoff_at=%s AND horizon=%s AND cycle_id=%s AND v3_model_version=%s", record.logical_key)
+                rows = tuple(cursor.fetchall())
+                hashes = tuple(row[0] for row in rows)
+                distinct_hashes = set(hashes)
+                if len(distinct_hashes) > 1:
+                    self.last_write_status = "FORECAST_DUPLICATE_CONFLICT"
+                    results.append((self.last_write_status, replace(
+                        stored, persistence_proof_eligible=False,
+                        persistence_reason="FORECAST_DUPLICATE_CONFLICT")))
+                    break
+                if record.forecast_record_hash in distinct_hashes:
+                    self.last_write_status = "IDEMPOTENT"
+                    original = next(row for row in rows if row[0] == record.forecast_record_hash)
+                    if len(original) > 1 and original[1] is not None:
+                        try:
+                            stored = self._without_commit_proof(deserialize_forecast_record(
+                                original[1], expected_hash=record.forecast_record_hash))
+                        except Exception:
+                            # The per-record path commits before it deserializes;
+                            # keep the already-written prefix durable exactly as
+                            # that path would, then surface the same error.
+                            _commit_if_supported(self.connection)
+                            committed = True
+                            raise
+                    results.append(("IDEMPOTENT", stored))
+                    continue
+                if distinct_hashes:
+                    self.last_write_status = "FORECAST_DUPLICATE_CONFLICT"
+                    results.append((self.last_write_status, replace(
+                        stored, persistence_proof_eligible=False,
+                        persistence_reason="FORECAST_DUPLICATE_CONFLICT")))
+                    break
+                self.last_write_status = "INSERT"
+                cursor.execute("INSERT INTO atom_v9_v4_forecasts (forecast_record_id, forecast_record_hash, symbol, cutoff_at, target_endpoint, horizon, cycle_id, v3_model_version, record_json, persisted_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                               (record.forecast_record_id, record.forecast_record_hash,
+                                record.symbol, record.cutoff_at, record.target_endpoint, record.horizon,
+                                record.cycle_id, record.v3_model_version,
+                                json.dumps(_canonical(asdict(stored)), sort_keys=True), persisted_at))
+                results.append(("INSERT", stored))
+            _commit_if_supported(self.connection)
+            committed = True
+            return tuple(results)
+        except Exception:
+            if not committed:
+                _rollback_if_supported(self.connection)
+            raise
+        finally:
+            _close_if_supported(cursor)
+
+    def record_forecast_commit_proofs(
+            self, records: Iterable[ForecastRecord]) -> tuple[ForecastRecord, ...]:
+        """Observe an ordered batch of committed forecasts in one later transaction.
+
+        One statement calls the existing ``record_forecast_commit_proof(text)``
+        function once per record through ``unnest ... WITH ORDINALITY`` and a
+        lateral join, ordered by ordinality.  If that statement fails for any
+        reason the transaction is rolled back and the proofs are recorded through
+        the existing per-record method in the same order, so the failure
+        disposition is identical to the per-record path.
+        """
+        ordered = tuple(records)
+        if not ordered:
+            return ()
+        cursor = self.connection.cursor()
+        try:
+            try:
+                cursor.execute(
+                    "SELECT p.forecast_record_id, p.forecast_record_hash, "
+                    "p.commit_observed_at, p.target_endpoint, p.proof_eligible, "
+                    "p.proof_method "
+                    "FROM unnest(%s::text[]) WITH ORDINALITY "
+                    "AS requested(forecast_record_id, proof_order) "
+                    "JOIN LATERAL atom_v9_internal.record_forecast_commit_proof("
+                    "requested.forecast_record_id) AS p ON true "
+                    "ORDER BY requested.proof_order",
+                    ([record.forecast_record_id for record in ordered],),
+                )
+                rows = tuple(cursor.fetchall())
+                if len(rows) != len(ordered):
+                    raise RuntimeError("BATCHED_COMMIT_PROOF_ROW_COUNT_MISMATCH")
+                _commit_if_supported(self.connection)
+            except Exception:
+                _rollback_if_supported(self.connection)
+                _close_if_supported(cursor)
+                cursor = None
+                return tuple(self.record_forecast_commit_proof(record)
+                             for record in ordered)
+        finally:
+            if cursor is not None:
+                _close_if_supported(cursor)
+        return tuple(self._apply_commit_proof(record, row)
+                     for record, row in zip(ordered, rows))
+
+    def persist_outcomes(self, records: Iterable[OutcomeRecord],
+                         created_at: datetime,
+                         ) -> tuple[tuple[str, OutcomeRecord], ...]:
+        """Persist an ordered outcome batch in one transaction.
+
+        Returns ``(write_status, stored)`` per record in order.  The first
+        ``OUTCOME_CONFLICT`` ends the batch: the preceding outcomes are committed
+        exactly as ``persist_outcome`` would have committed them one by one, the
+        conflicting outcome is returned with that status, and later outcomes are
+        not attempted.
+        """
+        ordered = tuple(records)
+        results: list[tuple[str, OutcomeRecord]] = []
+        committed = False
+        cursor = self.connection.cursor()
+        try:
+            for record in ordered:
+                stored = replace(record, created_at=created_at)
+                cursor.execute(
+                    "SELECT pg_catalog.pg_advisory_xact_lock(%s)",
+                    (self._logical_lock_id("OUTCOME", record.logical_key),),
+                )
+                cursor.execute("SELECT outcome_record_hash, record_json FROM atom_v9_v4_outcomes WHERE forecast_record_id=%s AND target_identity=%s", record.logical_key)
+                rows = tuple(cursor.fetchall())
+                hashes = tuple(row[0] for row in rows)
+                distinct_hashes = set(hashes)
+                if len(distinct_hashes) > 1:
+                    self.last_write_status = "OUTCOME_CONFLICT"
+                    results.append((self.last_write_status, stored))
+                    break
+                if record.outcome_record_hash in distinct_hashes:
+                    self.last_write_status = "IDEMPOTENT"
+                    original = next(row for row in rows if row[0] == record.outcome_record_hash)
+                    if len(original) > 1 and original[1] is not None:
+                        try:
+                            stored = deserialize_outcome_record(
+                                original[1], expected_hash=record.outcome_record_hash)
+                        except Exception:
+                            _commit_if_supported(self.connection)
+                            committed = True
+                            raise
+                    results.append(("IDEMPOTENT", stored))
+                    continue
+                if distinct_hashes:
+                    self.last_write_status = "OUTCOME_CONFLICT"
+                    results.append((self.last_write_status, stored))
+                    break
+                self.last_write_status = "INSERT"
+                cursor.execute("INSERT INTO atom_v9_v4_outcomes (outcome_record_id, outcome_record_hash, forecast_record_id, target_identity, record_json, created_at) VALUES (%s,%s,%s,%s,%s,%s)",
+                               (record.outcome_record_id, record.outcome_record_hash,
+                                record.forecast_record_id, record.target_identity,
+                                json.dumps(_canonical(asdict(stored)), sort_keys=True), created_at))
+                results.append(("INSERT", stored))
+            _commit_if_supported(self.connection)
+            committed = True
+            return tuple(results)
+        except Exception:
+            if not committed:
+                _rollback_if_supported(self.connection)
+            raise
+        finally:
+            _close_if_supported(cursor)
+
 
 def _close_if_supported(value: object) -> None:
     close = getattr(value, "close", None)
