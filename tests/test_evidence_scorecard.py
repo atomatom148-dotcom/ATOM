@@ -364,14 +364,14 @@ def test_receipt_fields_and_hash():
                 "expected_false_candidates": 0.0, "multiplicity_budget_exceeded": False,
                 "usable_for_e2": True},
         rows_read={"forecasts": 1}, proof_rows={"DIRECTIONAL_FORECAST": 1},
-        snapshot="100:100:", current_user="atom_historical_score_reader",
+        snapshot="100:100:", current_user="atom_e1_scorecard_reader",
         query_wall_seconds=0.5,
         generated_at=datetime(2026, 9, 2, 3, 0, tzinfo=timezone.utc))
     body = {k: v for k, v in receipt.items() if k != "sha256"}
     assert receipt["sha256"] == hashlib.sha256(sc.canonical_json(body).encode()).hexdigest()
     assert (receipt["forecast_writes"], receipt["outcome_writes"], receipt["evidence_writes"],
             receipt["read_only"], receipt["rls_full_read_verified"]) == (0, 0, 0, True, True)
-    assert receipt["current_user"] == "atom_historical_score_reader"
+    assert receipt["current_user"] == "atom_e1_scorecard_reader"
     assert receipt["cost_bps"] == 0.0 and receipt["snapshot"] == "100:100:"
     assert receipt["bootstrap"]["resamples"] == 200_000 and receipt["bootstrap"]["seed"] == 0
     assert receipt["classification"]["multiplicity_budget"] == 100
@@ -386,6 +386,7 @@ def test_frozen_constants():
     assert sc.FALSE_CANDIDATE_RATE == pytest.approx(0.0005)
     assert sc.OUTCOME_RESOLUTION_BOUND_SECONDS == 5.0
     assert sc.READONLY_URL_ENV != "DATABASE_URL"
+    assert sc.READONLY_ROLE == "atom_e1_scorecard_reader"
 
 
 def test_module_sql_and_source_contain_no_write_paths():
@@ -399,6 +400,8 @@ def test_module_sql_and_source_contain_no_write_paths():
     assert "connection.read_only = True" in source
     assert "rolbypassrls" not in source and "BYPASSRLS" not in source.replace("full-read", "")
     assert "verify_full_read(current_user" in source
+    assert "verify_reader_identity(current_user)" in source
+    assert "atom_historical_score_reader" not in source
     assert "IsolationLevel.REPEATABLE_READ" in source
     assert "statement_timeout={STATEMENT_TIMEOUT_MS}" in source and sc.STATEMENT_TIMEOUT_MS <= 60_000
     assert "read_legacy_evidence_publications_for_cohorts" not in source
@@ -424,7 +427,7 @@ def test_main_emits_receipt_from_read_seam(monkeypatch, capsys):
     selectors = sc.select_cells([_row(_epoch(TUESDAY, 9, 30), 2.0, 3.0, key="a")])
     monkeypatch.setattr(sc, "read_and_select", lambda url, sessions: (
         selectors, {"forecasts": 1}, {"DIRECTIONAL_FORECAST": 1}, "1:1:",
-        "atom_historical_score_reader", 0.01))
+        "atom_e1_scorecard_reader", 0.01))
     original_score_cells = sc.score_cells
     monkeypatch.setattr(sc, "score_cells",
                         lambda s, **kw: original_score_cells(s, resamples=5))
@@ -432,7 +435,7 @@ def test_main_emits_receipt_from_read_seam(monkeypatch, capsys):
     receipt = json.loads(capsys.readouterr().out)
     assert receipt["sessions"] == ["2026-09-01"] and receipt["cost_bps"] == 0.0
     assert receipt["read_only"] is True and receipt["rls_full_read_verified"] is True
-    assert receipt["current_user"] == "atom_historical_score_reader"
+    assert receipt["current_user"] == "atom_e1_scorecard_reader"
     assert len(receipt["cells"]) == 1
     assert receipt["cells"][0]["label"] == sc.LABEL_INSUFFICIENT
     assert receipt["cells"][0]["classification_reason"] is None
@@ -452,3 +455,11 @@ def test_verify_full_read_refuses_anything_short_of_permissive_true_policy():
         rows = bad + [r for r in ok if r[0] != "public.forecasts"]
         with pytest.raises(SystemExit):
             sc.verify_full_read("reader", rows)
+
+
+def test_verify_reader_identity_accepts_only_the_dedicated_role():
+    sc.verify_reader_identity("atom_e1_scorecard_reader")
+    for other in ("postgres", "atom_historical_score_reader", "supabase_read_only_user",
+                  "atom_v9_v4_runtime", ""):
+        with pytest.raises(SystemExit):
+            sc.verify_reader_identity(other)
