@@ -1,7 +1,7 @@
 {
   "decision_id": "ATOM-AI-ROLE-AUTHORITY-FREEZE-1",
   "version": "1.0",
-  "receipt_revision": 2,
+  "receipt_revision": 3,
   "status": "FROZEN_OWNER_APPROVED",
   "effective_date": "2026-09-02",
   "document_title": "ATOM AI Role, Innovation, and Improvement Authority Freeze",
@@ -40,9 +40,13 @@
     "sonarcloud_quality_gate": "SUCCESS_ZERO_NEW_ISSUES",
     "unresolved_material_threads": 0
   },
-  "review_rule": "Final-head independent review is required. If a named reviewer is unavailable, the Owner may designate a substitute reviewer on the final intended head; reviewer unavailability is not a review waiver.",
-  "amended_by": [
-    "ATOM-AI-ROLE-AUTHORITY-FREEZE-1A"
+  "review_rule": "Final-head independent review and every required green check are mandatory. If a named reviewer is unavailable, the Owner may designate a substitute reviewer on the final intended head. Reviewer unavailability is not a review waiver and creates no check waiver or substitution.",
+  "amendment_chain": [
+    {
+      "decision_id": "ATOM-AI-ROLE-AUTHORITY-FREEZE-1A",
+      "effectivity": "FROZEN_AT_OWNER_APPROVED_MERGE_COMMIT",
+      "effect": "Clarifies Owner operational authority, subject-matter precedence, sole-author continuity, reviewer substitution, and mandatory green checks without changing technical behavior."
+    }
   ],
-  "next_action": "The governance freeze remains active. Amendment 1A clarifies Owner operational authority, subject-matter precedence, and review substitution. No runtime deployment accompanies either governance document."
+  "next_action": "The base governance freeze remains active. Amendment 1A controls only from its Owner-approved merge commit. No runtime deployment accompanies either governance document."
 }
