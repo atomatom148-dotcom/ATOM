@@ -97,7 +97,7 @@ E-1.
    `TIE + DECIDED`.
 3. **Session counts.** `n_sessions` is the number of scored sessions in which
    the cell has at least one economic window; it is the bootstrap cluster count
-   and the value the ten-session classification gate reads. `n_decided_sessions`
+   and the value the ten-session eligibility minimum reads. `n_decided_sessions`
    is the number of scored sessions in which the cell has at least one decided
    window; it is used only by the hit-rate bootstrap. Requested sessions that
    contribute no window to a cell are not counted for that cell.
@@ -146,22 +146,33 @@ E-1.
    may affect classification before the separately authorized E-3 cost model.
    Bid/ask alone is quoted spread and must not be labeled realized or effective
    spread; E-1 measures no spread.
-7. **Classification.** Each cell receives exactly one label:
-   - `INSUFFICIENT` if `n_economic < 100` or `n_sessions < 10`;
-   - `CANDIDATE` if not insufficient and the `0.999` session-clustered
-     bootstrap interval for `mean_signed_bps` lies entirely above `0`;
-   - `NOISE` otherwise.
-   The `0.999` interval is the fixed multiplicity guard for every cell that is
-   not `INSUFFICIENT`, in both layers, FAMILY and V9-cohort alike. The receipt
-   reports `n_cells_eligible`, the count of such cells across both layers, and
-   `expected_false_candidates = n_cells_eligible * 0.0005`. If
-   `n_cells_eligible` exceeds `100`, the multiplicity budget is exceeded: the
-   receipt sets `multiplicity_budget_exceeded = true`, every eligible cell is
-   labeled `NOISE`, and no `CANDIDATE` may be assigned in that receipt. The
-   level and the budget are not tunable per run. No cell may be labeled `EDGE`,
-   `TRADEABLE`, or any positive claim. `CANDIDATE` means only "eligible for a
-   pre-registered E-2 test." Negative intervals confer no label and authorize
-   no sign-flip.
+7. **Classification and multiplicity budget.** A cell is **eligible** when it
+   satisfies both classification minimums: `n_economic >= 100` and
+   `n_sessions >= 10`. `INSUFFICIENT` cells are those that are not eligible;
+   they keep that label and never consume the budget.
+   The multiplicity budget is exactly `100` eligible cells across the complete
+   receipt, both layers, FAMILY and V9-cohort alike. The receipt reports
+   `n_cells_eligible`, `multiplicity_budget = 100`, and
+   `expected_false_candidates = n_cells_eligible * 0.0005`. Exactly `100`
+   eligible cells is permitted.
+   When `n_cells_eligible <= 100`, each eligible cell receives exactly one
+   label: `CANDIDATE` if the `0.999` session-clustered bootstrap interval for
+   `mean_signed_bps` lies entirely above `0`, otherwise `NOISE`. The `0.999`
+   interval is the fixed guard for every eligible cell.
+   When `n_cells_eligible > 100`, the budget is exceeded: every descriptive
+   statistic and every interval is preserved and reported unchanged; the
+   receipt sets `multiplicity_budget_exceeded = true` and records the
+   eligible-cell count and the cap; every `CANDIDATE` classification is
+   withheld; no eligible cell is relabeled `NOISE`, because that would be
+   statistically misleading; each eligible cell's `label` is `null` with
+   `classification_reason = MULTIPLICITY_BUDGET_EXCEEDED`; and the receipt is
+   unusable for promotion or E-2 inference (`usable_for_e2 = false`).
+   The level, the budget, and this behavior are fixed. No dynamic cap,
+   automatic threshold adjustment, or phase expansion. Expansion to more
+   symbols requires a separately pre-registered multiplicity phase. No cell may
+   be labeled `EDGE`, `TRADEABLE`, or any positive claim. `CANDIDATE` means
+   only "eligible for a pre-registered E-2 test." Negative intervals confer no
+   label and authorize no sign-flip.
 8. **No selection after looking.** The reader scores every cell in the layer.
    It has no family, horizon, cohort, or date filter other than the session set.
 
@@ -282,18 +293,22 @@ Each run emits one JSON receipt to standard output containing:
 - rows read from each of the four tables, rows returned by each proof-seam
   call, and the query wall time;
 - every cell in both layers with all metrics in "Frozen statistics", both
-  bootstrap intervals, the V9 cell's `cohort_id` and `cohort_hash`, and its
-  label;
-- `n_cells_eligible`, `expected_false_candidates`, and
-  `multiplicity_budget_exceeded`;
+  bootstrap intervals, the V9 cell's `cohort_id` and `cohort_hash`, its
+  `label`, and its `classification_reason` (`null` unless the budget is
+  exceeded);
+- `n_cells_eligible`, `multiplicity_budget = 100`,
+  `expected_false_candidates`, `multiplicity_budget_exceeded`, and
+  `usable_for_e2`;
 - `forecast_writes=0`, `outcome_writes=0`, `evidence_writes=0`,
   `read_only=true`, `bypassrls=true`;
 - a SHA-256 over the canonical JSON of everything above.
 
 The receipt is evidence about evidence. It is not itself stored in the ledger
 and it authorizes nothing. E-1 is complete after the first receipt over at
-least ten regular sessions is produced and reviewed. That receipt is the
-baseline for E-2.
+least ten regular sessions is produced and reviewed. A receipt with
+`multiplicity_budget_exceeded = true` does not complete E-1 and is not a
+baseline for E-2. That receipt is the baseline for E-2 only when
+`usable_for_e2 = true`.
 
 ## Order of work after E-1A merges
 
