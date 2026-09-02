@@ -193,8 +193,13 @@ names at the time.
    head, zero unresolved material threads, green required checks.
 3. The owner sets `ATOM_EVIDENCE_LEDGER_BATCH_ENABLED=1` on `atom-v9-thin`.
    One deploy of the merged implementation commit to `atom-v9-thin` only is
-   authorized, outside 13:30–20:00 UTC. Rollback is the gate at `0` or
-   redeploying the previous commit. No other service is deployed.
+   authorized, at any hour, only when the current evidence outbox is confirmed
+   drained and restarting the sole evidence writer will discard no accepted
+   evidence; intentional ingestion loss is not authorized. Once durable
+   buffering and asynchronous draining replace the current lossy outbox under
+   their own phase, this restart-specific restriction may be removed. Rollback
+   is the gate at `0` or redeploying the previous commit. No other service is
+   deployed.
 4. An owner-approved documentation change returns the `AGENTS.md`
    active-phase pointer to E-1; the E-1 chain (migration `030`,
    implementation, receipt) resumes under its own freeze.

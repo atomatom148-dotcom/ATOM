@@ -1,6 +1,6 @@
 # E-1 read-only evidence scorecard freeze
 
-**Status:** LAW — documentation-only freeze, amended by E-1A, E-1B, and E-1C; read-only implementation authorized only after E-1C merges and migration 030 (as corrected by E-1C) is applied  
+**Status:** LAW — documentation-only freeze, amended by E-1A, E-1B, E-1C, and E-1D; read-only implementation authorized only after E-1C merges and migration 030 (as corrected by E-1C and gated by E-1D) is applied  
 **Current runtime:** V9 thin, V4 worker, and SIM-4 worker on `main`; Family Evidence Cadence active since August 31  
 **Next gate:** E-2 pre-registered single-hypothesis evaluation (separate amendment, not authorized here)
 
@@ -44,6 +44,18 @@ was never applied to production (its first application attempt deadlocked
 against the live writer and rolled back; verified unchanged at 13:54 UTC) and
 must be corrected to this text before any application. Every statistic,
 boundary, and label in this freeze is unchanged.
+
+**E-1D amendment — September 2, 2026:** The owner directed that ATOM work is
+not blocked solely by wall-clock time and that the live evidence writer is
+never paused for maintenance. E-1D replaces E-1C's fixed 00:00–08:00 UTC
+application window and its after-hours restrictions with state-based safety
+gates: migration `030` and the receipt may run at any hour once their explicit
+prerequisites pass, and any database operation that meets writer or lock
+contention fails closed within a bounded wait and never pauses, restarts,
+degrades, or interferes with the live evidence writer. The dedicated
+`atom_e1_scorecard_reader` credential, least privilege, RLS full-read
+verification, identity assertion, no-`BYPASSRLS` design, and every
+statistic, boundary, and label are unchanged.
 
 ## Scope
 
@@ -231,8 +243,11 @@ refuses any credential that fails full-read verification, because a
 policy-filtered read would score an empty ledger as if it were evidence. The
 reader reads only `ATOM_E1_SCORECARD_READONLY_DATABASE_URL`. All counts, both
 layer reads, and every proof-seam call observe that one snapshot, and the
-receipt records `pg_current_snapshot()`. The reader must not be run during
-regular XNYS session hours; there is no override. Forecast, outcome, manifest,
+receipt records `pg_current_snapshot()`. The reader may run at any hour. It
+holds only `ACCESS SHARE` locks, sets `lock_timeout` to at most `1s` so it
+never queues behind the live evidence writer, and aborts on contention rather
+than waiting; because partial sessions are excluded, a receipt taken during a
+session scores only completed sessions. Forecast, outcome, manifest,
 persistence, receipt, and every other write must remain `0`. Existing
 evidence may not be deleted, rewritten, repaired, or backfilled.
 
@@ -283,8 +298,14 @@ this order, and nothing else:
 ```sql
 -- migrations/030_authorize_e1_scorecard_reader.sql
 -- One transaction. Every ASSERT is a DO block that RAISEs on failure,
--- rolling back everything. Must be applied only while the evidence
--- writer is idle (00:00–08:00 UTC); a lock conflict aborts and rolls back.
+-- rolling back everything. May be applied at any hour (E-1D): the
+-- transaction opens with bounded, fail-closed timeouts so any lock
+-- conflict with the live evidence writer aborts and rolls back this
+-- migration; the writer is never paused, restarted, or waited on.
+
+-- 0. Bounded, fail-closed contention gate (E-1D).
+SET LOCAL lock_timeout = '500ms';
+SET LOCAL statement_timeout = '15s';
 
 -- 1. ASSERT starting state:
 --    no role named atom_e1_scorecard_reader exists; the four evidence
@@ -393,15 +414,17 @@ baseline for E-2. That receipt is the baseline for E-2 only when
 ## Order of work after E-1C merges
 
 1. Migration `030` corrected to this text in its own PR under the merge gate;
-   applied once, as a single transaction, through the migration runner, only
-   while the evidence writer is idle (00:00–08:00 UTC).
+   applied once, as a single transaction, through the migration runner, at
+   any hour. A bounded lock conflict aborts and rolls the attempt back; the
+   attempt may be repeated, at most three times and at least sixty seconds
+   apart, with no change to the live evidence writer.
 2. The owner sets the role's password and provisions
    `ATOM_E1_SCORECARD_READONLY_DATABASE_URL` on the benchmark worker, and sets
    its start command to
    `python -m quant.evidence_scorecard --recent-sessions 10; sleep infinity`.
 3. Implementation, including the exact-role and full-read verification above,
    in its own PR under the merge gate.
-4. One receipt, after hours, on the benchmark worker; the receipt is captured
+4. One receipt, at any hour once steps 1–3 pass, on the benchmark worker; the receipt is captured
    from the service logs; the owner restores `sleep infinity` and suspends the
    service. The operator holds no tool that changes a start command, sets a
    password, or resumes a service.

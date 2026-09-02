@@ -56,6 +56,48 @@ remain unchanged. The gate is disabled by default and may operate only when
 This amendment authorizes no schema, database, service, migration, deletion,
 rewrite, or historical backfill change.
 
+## Clock-independence and continuous-evidence amendment
+
+**Clock independence.** ATOM development is never blocked solely by wall-clock
+time. Documentation, implementation, CI, migrations, isolated SIM work,
+deployment, audits, and verification may proceed at any hour once their own
+safety and dependency gates pass. Only work intrinsically dependent on an
+external condition — a live-market proof that needs a regular XNYS session,
+an acceptance receipt that needs completed sessions, a restart of the sole
+evidence writer that would interrupt live ingestion — waits for that
+condition, and controlling text names the condition, never the hour. A
+database operation that meets writer or lock contention fails closed within
+a bounded wait and rolls back; it never pauses, restarts, degrades, or
+interferes with the live evidence writer beyond that bounded wait.
+
+**Continuous, loss-intolerant horizon evidence.** The horizon evidence
+pipeline — accepted COIN observations, exact-six V4 forecasts, their
+outcomes, and their commit proofs — is continuous. Valid horizon data is
+never intentionally reduced, sampled, truncated, discarded, paused, or capped
+as a throughput solution. Maintenance and development work around ingestion;
+ingestion does not stop for maintenance. Every accepted observation must
+become durable and remain available for eventual processing and scoring.
+
+**Throughput is solved in the pipeline.** Backlog and latency may occur
+temporarily; intentional evidence loss is never an acceptable pressure
+release. Remedies, in order of preference: fewer database round trips,
+semantics-preserving batching, durable buffering, asynchronous draining, and
+measured infrastructure scaling. Every remedy preserves the frozen V9
+mathematics, identities, hashes, causal rules, evidence semantics, and
+fail-closed protections, including permanent law 4: a row committed after
+its horizon matures is still never credited.
+
+This amendment states law; it redesigns nothing and authorizes no code,
+migration, deployment, or infrastructure change. Two existing mechanisms are
+named so silence cannot be read as compliance: the bounded evidence outbox
+(`EVIDENCE_OUTBOX_CAPACITY = 256`, whose full condition drops a bracket) is
+an evidence-loss mechanism that must be replaced by durable buffering and
+asynchronous draining under its own separately frozen phase and may not be
+cited as an acceptable pressure release meanwhile; the Family evidence
+cadence amendment governs only the durable write cadence of the legacy
+family ledger, is unchanged, and is not a precedent for reducing horizon
+evidence.
+
 ## Allowed pipeline
 
 ```
