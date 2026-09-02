@@ -160,7 +160,7 @@ No phase in this section changes V9 mathematics, families, synthesis,
 evidence, simulator behavior, or trading authority; any such change requires
 its own freeze.
 
-### E-1 — Read-only evidence scorecard (freeze amended by E-1A; migration and implementation pending)
+### E-1 — Read-only evidence scorecard (freeze amended by E-1A; migration and implementation pending; queued behind L-1 deployment)
 
 One single-process, read-only reader over FAMILY and V9 evidence with
 statistics fixed in advance under `docs/e-1-evidence-scorecard-freeze.md`:
@@ -172,6 +172,9 @@ magnitude calibration, a 200,000-resample session-clustered bootstrap, and
 through the existing proof seams under exactly two `EXECUTE` grants applied by
 migration `029`. Emits a receipt. Authorizes nothing else. Order of work:
 E-1A merge, migration `029`, implementation, one receipt — each its own PR.
+Owner decision September 2, 2026: the remaining E-1 chain resumes after the
+L-1 deployment and pointer change, so the receipt scores a ledger that keeps
+regular-session short horizons.
 
 ### E-2 — Pre-registered single hypothesis (not authorized)
 
@@ -198,7 +201,7 @@ Operations phases change how fast the existing ledger writes the existing
 rows. They never change what is written, how it is scored, or what counts as
 evidence.
 
-### L-1 — Evidence ledger throughput (freeze; implementation queued behind the E-1 receipt and pointer change)
+### L-1 — Evidence ledger throughput (freeze; implementation authorized on merge)
 
 Fewer database round trips for the existing ledger statements in the existing
 order under `docs/l-1-evidence-ledger-throughput-freeze.md`: the exact six
@@ -209,7 +212,8 @@ disabled by default. No mathematics, capacity, schema, role, Supabase tier, or
 Render-plan change. Acceptance is measured, not estimated: p95 persist lag
 under `5.0s` and under `5%` unscoreable regular-session 30S and 1M rows, in
 each of the first two complete sessions after activation. Order of work: this
-freeze, the E-1 receipt, the active-phase pointer change, implementation, one
-deploy of `atom-v9-thin`, the acceptance receipt — each its own PR or action.
+freeze (which moves the active-phase pointer to L-1), implementation, one
+deploy of `atom-v9-thin`, the pointer's return to E-1, the acceptance receipt
+— each its own PR or action.
 
 **Rule:** Throughput never changes evidence. Late rows stay unscoreable.
