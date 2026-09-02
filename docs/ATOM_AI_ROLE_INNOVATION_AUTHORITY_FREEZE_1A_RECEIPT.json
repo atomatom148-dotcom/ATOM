@@ -1,0 +1,30 @@
+{
+  "decision_id": "ATOM-AI-ROLE-AUTHORITY-FREEZE-1A",
+  "status": "PROPOSED_AWAITING_OWNER_APPROVAL",
+  "document_title": "ATOM AI Role, Innovation, and Improvement Authority Freeze - Amendment 1A",
+  "author_role": "ChatGPT Pro - ATOM Chief Architect and Freeze Custodian",
+  "amends": "ATOM-AI-ROLE-AUTHORITY-FREEZE-1",
+  "prepared_against_main_sha": "09b7922be7e19d11dd8816f3d3cc9e70f736509d",
+  "repository_artifact": {
+    "path": "ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A.md",
+    "git_blob_sha1": "8d1b1d1c46f1bc6457ba70ec52ff3c858532240b"
+  },
+  "accepted_findings": [
+    "Clarify that current Owner operational instructions control immediately within applicable freezes and bind ChatGPT Pro to prepare an amendment when a boundary change is requested.",
+    "Replace circular linear precedence with separate governance, technical, and operational subject domains.",
+    "Clarify that an unavailable named reviewer may be replaced by an Owner-designated independent reviewer on the final head, but final-head review may not be waived."
+  ],
+  "authorized_repository_surface": [
+    "ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A.md",
+    "AGENTS.md",
+    "docs/ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1_RECEIPT.json",
+    "docs/ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A_RECEIPT.json"
+  ],
+  "technical_effect": "None. Documentation-only governance clarification; no code, migration, source, database, Render, environment, active-phase, deployment, broker, execution, or production change.",
+  "review_rule": "Independent review is required on the final intended head. Named-reviewer unavailability permits substitution, not waiver. Every P1 and P2 must be resolved or dispositioned and material threads must be zero before Owner merge.",
+  "review_state": "PENDING_FINAL_HEAD_REVIEW",
+  "owner_approval": "PENDING",
+  "merge_authority": "OWNER_ONLY",
+  "deployment_authority": "NONE",
+  "next_action": "Open the documentation-only pull request, obtain final-head independent review and green required checks, then present for explicit Owner merge approval."
+}
