@@ -191,3 +191,25 @@ at a time. Nothing here is authorized by E-1, E-2, or E-3.
 
 **Rule:** Score before changing. No family is retired, reweighted, or
 sign-flipped on the strength of a scorecard alone.
+
+## Evidence ledger operations phases
+
+Operations phases change how fast the existing ledger writes the existing
+rows. They never change what is written, how it is scored, or what counts as
+evidence.
+
+### L-1 — Evidence ledger throughput (freeze; implementation queued behind the E-1 receipt and pointer change)
+
+Fewer database round trips for the existing ledger statements in the existing
+order under `docs/l-1-evidence-ledger-throughput-freeze.md`: the exact six
+forecasts in one transaction, one batched commit-proof observation, one
+transaction per resolved bracket, and one persistent secondary session for
+legacy publication proofs. Gated by `ATOM_EVIDENCE_LEDGER_BATCH_ENABLED=1`,
+disabled by default. No mathematics, capacity, schema, role, Supabase tier, or
+Render-plan change. Acceptance is measured, not estimated: p95 persist lag
+under `5.0s` and under `5%` unscoreable regular-session 30S and 1M rows, in
+each of the first two complete sessions after activation. Order of work: this
+freeze, the E-1 receipt, the active-phase pointer change, implementation, one
+deploy of `atom-v9-thin`, the acceptance receipt — each its own PR or action.
+
+**Rule:** Throughput never changes evidence. Late rows stay unscoreable.
