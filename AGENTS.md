@@ -189,16 +189,19 @@ action.
 
 Update this section only by Owner-approved documentation change.
 
-- Active phase: **L-1 — evidence ledger throughput**, implementation and one
-  gated deployment of `atom-v9-thin` authorized.
-- Controlling text: `docs/l-1-evidence-ledger-throughput-freeze.md`.
-- Also controlling for context: `FREEZE.md`, `SIMULATION_FREEZE.md`,
-  `PHASES.md`.
-- Queued behind L-1 step 3 and a further Owner-approved pointer change:
-  **E-1 — read-only evidence scorecard**, as amended by the latest merged E-1
-  amendment (`docs/e-1-evidence-scorecard-freeze.md`). Not authorized while
-  the pointer names L-1: migration `030`, E-1 implementation, any E-1
-  receipt, E-2, E-3, E-4.
+- Active phase: **E-1 — read-only evidence scorecard**.
+- Controlling text: `docs/e-1-evidence-scorecard-freeze.md`, including the
+  latest merged E-1C and E-1D amendments.
+- Authorized order: correct migration `030` under E-1D in PR #274; merge and
+  apply it; provision the dedicated `atom_e1_scorecard_reader` credential;
+  correct and merge the E-1 implementation in PR #270; then produce and review
+  exactly one official E-1 receipt.
+- L-1 gate activation and its single deployment are complete. Its read-only
+  acceptance receipt remains authorized after the first two complete regular
+  XNYS sessions and does not block E-1.
+- Not authorized until their own Owner-approved pointer or freeze change:
+  E-2, E-3, E-4, migration `031`, SIM-5 implementation, the SIM-5 live
+  resolution proof, SIM-6, or later work.
 
 ## What each document is for
 
