@@ -60,7 +60,7 @@ The reader scores two layers over one explicit set of regular XNYS sessions:
   and deserialization alone never establish persistence eligibility. An outcome
   is **eligible** only when its `target_timing_status` is `VERIFIED` and its
   `proof_eligible` is `True`. Distinct cohorts are never pooled; a cohort with
-  fewer than ten scored sessions is `INSUFFICIENT` by construction.
+  fewer than ten contributing sessions is `INSUFFICIENT` by construction.
 
 Sessions are supplied as explicit UTC dates and echoed in the receipt. The
 default is the most recent completed regular sessions, count supplied as an
@@ -95,10 +95,16 @@ E-1.
    every metric. Ties are excluded from directional metrics and included as
    zero in economic metrics. `n_decided` is the `DECIDED` count; `n_economic` is
    `TIE + DECIDED`.
-3. **Per-cell descriptive metrics.**
+3. **Session counts.** `n_sessions` is the number of scored sessions in which
+   the cell has at least one economic window; it is the bootstrap cluster count
+   and the value the ten-session classification gate reads. `n_decided_sessions`
+   is the number of scored sessions in which the cell has at least one decided
+   window; it is used only by the hit-rate bootstrap. Requested sessions that
+   contribute no window to a cell are not counted for that cell.
+4. **Per-cell descriptive metrics.**
    `n_rows`, `n_inadmissible`, `n_population`, `n_non_rth`,
    `n_overlap_excluded`, `n_windows`, `n_abstain`, `n_invalid_outcome`,
-   `n_ties`, `n_decided`, `n_economic`, `n_sessions`;
+   `n_ties`, `n_decided`, `n_economic`, `n_sessions`, `n_decided_sessions`;
    `hit_rate` (over decided windows) and
    `z_hit = (hit_rate - 0.5) * sqrt(n_decided) / 0.5`;
    `mean_signed_bps = mean(sign(forecast) * outcome)` over economic windows;
@@ -118,37 +124,45 @@ E-1.
    statistic are descriptive only: they are reported but never used for
    classification, because windows are serially dependent even when
    non-overlapping.
-4. **Inference.** The only inferential statistic is a session-clustered
-   percentile bootstrap. Sessions with at least one economic window are sorted
-   ascending; for each of exactly `200000` resamples, draw `n_sessions`
-   sessions with replacement using CPython `random.Random(0).choices(sessions,
-   k=n_sessions)`, seeded once per cell and consumed in order; the resampled
-   statistic is the sum of the drawn sessions' signed-bps sums divided by the
-   sum of their economic counts, which equals the mean over the pooled windows.
-   The same procedure, over sessions with at least one decided window and only
-   when `n_decided > 0`, reports `hit_rate`. Sort the resampled statistics
-   ascending and report the percentile interval whose zero-based indices are
+5. **Inference.** The only inferential statistic is a session-clustered
+   percentile bootstrap. The economic cluster population is the `n_sessions`
+   sessions with at least one economic window, sorted ascending; for each of
+   exactly `200000` resamples, draw `n_sessions` sessions with replacement using
+   CPython `random.Random(0).choices(sessions, k=n_sessions)`, seeded once per
+   cell and consumed in order; the resampled statistic is the sum of the drawn
+   sessions' signed-bps sums divided by the sum of their economic counts, which
+   equals the mean over the pooled windows. The hit-rate bootstrap uses the
+   same procedure over the `n_decided_sessions` sessions with at least one
+   decided window, drawing `k = n_decided_sessions`, only when
+   `n_decided > 0`. Sort the resampled statistics ascending and report the
+   percentile interval whose zero-based indices are
    `lower = floor((1 - level) / 2 * (B - 1))` and
    `upper = ceil((1 + level) / 2 * (B - 1))` with `B = 200000`, at
    `level = 0.999` and `level = 0.95` for `mean_signed_bps` and at `level = 0.95`
    for `hit_rate`. Bootstrap parameters are fixed here and echoed in the
    receipt.
-5. **Cost line.** `cost_bps` is frozen at exactly `0.0` for E-1 and is not an
+6. **Cost line.** `cost_bps` is frozen at exactly `0.0` for E-1 and is not an
    input. E-1 is gross candidate screening only. No nonzero or adjustable cost
    may affect classification before the separately authorized E-3 cost model.
    Bid/ask alone is quoted spread and must not be labeled realized or effective
    spread; E-1 measures no spread.
-6. **Classification.** Each cell receives exactly one label:
+7. **Classification.** Each cell receives exactly one label:
    - `INSUFFICIENT` if `n_economic < 100` or `n_sessions < 10`;
    - `CANDIDATE` if not insufficient and the `0.999` session-clustered
      bootstrap interval for `mean_signed_bps` lies entirely above `0`;
    - `NOISE` otherwise.
-   The `0.999` interval is the fixed multiple-comparison guard for the
-   approximately 66 family-by-horizon cells; it is not tunable per run. No cell
-   may be labeled `EDGE`, `TRADEABLE`, or any positive claim. `CANDIDATE` means
-   only "eligible for a pre-registered E-2 test." Negative intervals confer no
-   label and authorize no sign-flip.
-7. **No selection after looking.** The reader scores every cell in the layer.
+   The `0.999` interval is the fixed multiplicity guard for every cell that is
+   not `INSUFFICIENT`, in both layers, FAMILY and V9-cohort alike. The receipt
+   reports `n_cells_eligible`, the count of such cells across both layers, and
+   `expected_false_candidates = n_cells_eligible * 0.0005`. If
+   `n_cells_eligible` exceeds `100`, the multiplicity budget is exceeded: the
+   receipt sets `multiplicity_budget_exceeded = true`, every eligible cell is
+   labeled `NOISE`, and no `CANDIDATE` may be assigned in that receipt. The
+   level and the budget are not tunable per run. No cell may be labeled `EDGE`,
+   `TRADEABLE`, or any positive claim. `CANDIDATE` means only "eligible for a
+   pre-registered E-2 test." Negative intervals confer no label and authorize
+   no sign-flip.
+8. **No selection after looking.** The reader scores every cell in the layer.
    It has no family, horizon, cohort, or date filter other than the session set.
 
 ## Frozen boundaries
@@ -165,14 +179,18 @@ adds no dependency beyond the Python standard library and the already-pinned
 Database access is one explicitly read-only `REPEATABLE READ` transaction for
 the entire run, with a per-statement timeout of at most `60s`, using the
 existing credential `supabase_read_only_user`, which holds no `INSERT`,
-`UPDATE`, or `DELETE` privilege on any table and already holds `USAGE` on
-`atom_v9_internal` through `pg_read_all_data`. The reader refuses any credential
-that holds a write privilege on the four evidence tables. All counts, both
-layer reads, and every proof-seam call observe that one snapshot, and the
-receipt records `pg_current_snapshot()`. The reader must not be run during
-regular XNYS session hours; there is no override. Forecast, outcome, manifest,
-persistence, receipt, and every other write must remain `0`. Existing evidence
-may not be deleted, rewritten, repaired, or backfilled.
+`UPDATE`, or `DELETE` privilege on any table, already holds `USAGE` on
+`atom_v9_internal` through `pg_read_all_data`, and holds `BYPASSRLS`, which is
+required because all four evidence tables enforce row-level security whose
+SELECT policies name only the runtime and proof-owner roles. The reader refuses
+any credential that holds a write privilege on the four evidence tables and
+refuses any credential without `BYPASSRLS`, because a policy-filtered read
+would score an empty ledger as if it were evidence. All counts, both layer
+reads, and every proof-seam call observe that one snapshot, and the receipt
+records `pg_current_snapshot()`. The reader must not be run during regular XNYS
+session hours; there is no override. Forecast, outcome, manifest, persistence,
+receipt, and every other write must remain `0`. Existing evidence may not be
+deleted, rewritten, repaired, or backfilled.
 
 Implementation is limited to one module (`quant/evidence_scorecard.py`), one
 command-line entry point, and tests. Statistics, including the bootstrap, are
@@ -187,7 +205,8 @@ E-1's two proof seams are `STABLE`, `SECURITY DEFINER` functions owned by
 `atom_v9_proof_owner` and `atom_v9_v4_runtime`. `PUBLIC`, `anon`,
 `authenticated`, and `service_role` cannot execute them and must remain unable
 to. `supabase_read_only_user` already holds `USAGE` on `atom_v9_internal`
-through `pg_read_all_data`; no schema grant is needed or authorized.
+through `pg_read_all_data` and holds `BYPASSRLS`; no schema, table, or policy
+grant is needed or authorized.
 
 Production state verified on September 2, 2026 (PostgreSQL 17.6):
 `pg_auth_members` holds exactly one row for member `postgres` in role
@@ -213,9 +232,11 @@ order, and nothing else:
 -- 1. ASSERT starting state: exactly one pg_auth_members row for
 --    (member = postgres, role = atom_v9_proof_owner) with
 --    grantor = supabase_admin, admin_option = true,
---    inherit_option = false, set_option = false; and
+--    inherit_option = false, set_option = false;
 --    has_schema_privilege('supabase_read_only_user',
---    'atom_v9_internal', 'USAGE') is true.
+--    'atom_v9_internal', 'USAGE') is true;
+--    pg_roles.rolbypassrls is true for supabase_read_only_user; and
+--    supabase_read_only_user can execute no function in atom_v9_internal.
 
 -- 2. Temporary handoff: a second, postgres-grantor row.
 GRANT atom_v9_proof_owner TO postgres WITH INHERIT TRUE, SET FALSE;
@@ -263,8 +284,10 @@ Each run emits one JSON receipt to standard output containing:
 - every cell in both layers with all metrics in "Frozen statistics", both
   bootstrap intervals, the V9 cell's `cohort_id` and `cohort_hash`, and its
   label;
+- `n_cells_eligible`, `expected_false_candidates`, and
+  `multiplicity_budget_exceeded`;
 - `forecast_writes=0`, `outcome_writes=0`, `evidence_writes=0`,
-  `read_only=true`;
+  `read_only=true`, `bypassrls=true`;
 - a SHA-256 over the canonical JSON of everything above.
 
 The receipt is evidence about evidence. It is not itself stored in the ledger
