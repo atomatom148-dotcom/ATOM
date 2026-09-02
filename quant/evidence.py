@@ -139,7 +139,8 @@ class PostgresEvidenceStore:
     """psycopg v3 implementation; each observed cycle commits atomically."""
 
     def __init__(self, database_url: str, *, connection=None,
-                 family_cadence_enabled: bool = False) -> None:
+                 family_cadence_enabled: bool = False,
+                 proof_session_persistent: bool = False) -> None:
         if not database_url:
             raise ValueError("DATABASE_URL is required")
         import psycopg
@@ -148,6 +149,12 @@ class PostgresEvidenceStore:
         self._connect = psycopg.connect
         self._connection = connection
         self._family_cadence_enabled = family_cadence_enabled
+        # L-1 (docs/l-1-evidence-ledger-throughput-freeze.md): when enabled, the
+        # legacy publication proofs reuse one dedicated secondary session instead
+        # of opening a new connection every cycle.  It is still a separate
+        # session and a separate transaction from the ledger commit.
+        self._proof_session_persistent = bool(proof_session_persistent)
+        self._proof_connection = None
 
     @staticmethod
     def _cadence_interval(horizon: str, cutoff_epoch: float) -> tuple[float, float]:
@@ -169,6 +176,20 @@ class PostgresEvidenceStore:
 
         self._connection = connection
 
+    def _discard_proof_connection(self) -> None:
+        """Drop the L-1 secondary proof session; it reopens lazily next cycle."""
+
+        connection, self._proof_connection = self._proof_connection, None
+        if connection is None:
+            return
+        for name in ("rollback", "close"):
+            method = getattr(connection, name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    pass
+
     def _record_publication_proofs(
         self, forecasts: Sequence[ForecastRecord], *,
         observation_epoch: float, resolution_symbol: str,
@@ -183,50 +204,63 @@ class PostgresEvidenceStore:
         cycle_ids = tuple(sorted({
             row.cycle_id for row in (*tuple(forecasts), *tuple(volatility_forecasts))
         }))
+        persistent = getattr(self, "_proof_session_persistent", False)
+
+        def publish(connection) -> None:
+            with connection.cursor() as cursor:
+                if cycle_ids:
+                    cursor.execute(
+                        """
+                        SELECT atom_v9_internal.record_legacy_evidence_publication(
+                            'DIRECTIONAL_FORECAST', f.forecast_id)
+                        FROM public.forecasts AS f
+                        WHERE f.cycle_id = ANY(%s)
+                        """,
+                        (list(cycle_ids),),
+                    )
+                    cursor.execute(
+                        """
+                        SELECT atom_v9_internal.record_legacy_evidence_publication(
+                            'VOLATILITY_FORECAST', f.forecast_id)
+                        FROM public.volatility_forecasts AS f
+                        WHERE f.cycle_id = ANY(%s)
+                        """,
+                        (list(cycle_ids),),
+                    )
+                if resolution_enabled:
+                    cursor.execute(
+                        """
+                        SELECT atom_v9_internal.record_legacy_evidence_publication(
+                            'DIRECTIONAL_OUTCOME', o.forecast_id)
+                        FROM public.forecast_outcomes AS o
+                        JOIN public.forecasts AS f USING (forecast_id)
+                        WHERE o.resolved_epoch=%s AND f.symbol=%s
+                        """,
+                        (observation_epoch, resolution_symbol),
+                    )
+                    cursor.execute(
+                        """
+                        SELECT atom_v9_internal.record_legacy_evidence_publication(
+                            'VOLATILITY_OUTCOME', o.forecast_id)
+                        FROM public.volatility_forecast_outcomes AS o
+                        JOIN public.volatility_forecasts AS f USING (forecast_id)
+                        WHERE o.resolved_epoch=%s AND f.symbol=%s
+                        """,
+                        (observation_epoch, resolution_symbol),
+                    )
+
         try:
-            with self._connect(self._database_url) as connection:
-                with connection.cursor() as cursor:
-                    if cycle_ids:
-                        cursor.execute(
-                            """
-                            SELECT atom_v9_internal.record_legacy_evidence_publication(
-                                'DIRECTIONAL_FORECAST', f.forecast_id)
-                            FROM public.forecasts AS f
-                            WHERE f.cycle_id = ANY(%s)
-                            """,
-                            (list(cycle_ids),),
-                        )
-                        cursor.execute(
-                            """
-                            SELECT atom_v9_internal.record_legacy_evidence_publication(
-                                'VOLATILITY_FORECAST', f.forecast_id)
-                            FROM public.volatility_forecasts AS f
-                            WHERE f.cycle_id = ANY(%s)
-                            """,
-                            (list(cycle_ids),),
-                        )
-                    if resolution_enabled:
-                        cursor.execute(
-                            """
-                            SELECT atom_v9_internal.record_legacy_evidence_publication(
-                                'DIRECTIONAL_OUTCOME', o.forecast_id)
-                            FROM public.forecast_outcomes AS o
-                            JOIN public.forecasts AS f USING (forecast_id)
-                            WHERE o.resolved_epoch=%s AND f.symbol=%s
-                            """,
-                            (observation_epoch, resolution_symbol),
-                        )
-                        cursor.execute(
-                            """
-                            SELECT atom_v9_internal.record_legacy_evidence_publication(
-                                'VOLATILITY_OUTCOME', o.forecast_id)
-                            FROM public.volatility_forecast_outcomes AS o
-                            JOIN public.volatility_forecasts AS f USING (forecast_id)
-                            WHERE o.resolved_epoch=%s AND f.symbol=%s
-                            """,
-                            (observation_epoch, resolution_symbol),
-                        )
+            if persistent:
+                if self._proof_connection is None:
+                    self._proof_connection = self._connect(self._database_url)
+                publish(self._proof_connection)
+                self._proof_connection.commit()
+            else:
+                with self._connect(self._database_url) as connection:
+                    publish(connection)
         except Exception as error:
+            if persistent:
+                self._discard_proof_connection()
             # A deliberately unapplied protected migration leaves these objects
             # absent; readers then fail closed because no proof can exist.
             if getattr(error, "sqlstate", None) in {
