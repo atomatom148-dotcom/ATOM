@@ -1,8 +1,17 @@
 # L-1 evidence ledger throughput freeze
 
-**Status:** PROPOSED — documentation-only freeze; implementation is queued behind the E-1 receipt and an owner-approved active-phase pointer change  
+**Status:** PROPOSED — documentation-only freeze; implementation is authorized immediately after this freeze merges (owner re-sequenced September 2, 2026: L-1 runs ahead of the E-1 receipt)  
 **Current runtime:** `atom-v9-thin`, V4 worker, and SIM-4 worker at `941b3e2`; Family Evidence Cadence active since August 31  
-**Next gate:** E-1 receipt (separate phase, unchanged), then the pointer change, then the L-1 implementation PR under the merge gate
+**Next gate:** the L-1 implementation PR under the merge gate
+
+**Owner re-sequencing — September 2, 2026.** The original condition queued
+L-1 implementation behind the E-1 receipt and a later pointer change. The
+owner superseded that condition the same day: every regular session without
+L-1 loses the open and close 30S and 1M evidence permanently, which defeats
+the purpose of letting the quants mature. This merge therefore moves the
+`AGENTS.md` active-phase pointer to L-1. E-1 remains law as amended and
+resumes as the active phase after L-1 step 3 below; the E-1 receipt is then
+produced over a ledger that scores regular-session short horizons.
 
 ## Finding
 
@@ -142,8 +151,7 @@ reads the gate once at startup exactly as it reads
 
 ## Implementation surface
 
-After the order of work below reaches step 4, the implementation PR may change
-exactly:
+After this freeze merges, the implementation PR may change exactly:
 
 - `quant/v9_v4a_evidence.py` — the three batch methods only;
 - `quant/evidence_outbox.py` — gated calls to those methods and the
@@ -173,23 +181,26 @@ regular-session cutoffs; the share of regular-session 30S and 1M rows with
 `persisted_at > target_endpoint`; and the same table as the Finding above.
 Both acceptance criteria must hold in both sessions. If either fails, the
 owner sets the gate to `0`, the result is reported, and L-1 stops; no further
-tuning, capacity change, or second mechanism is authorized under L-1.
+tuning, capacity change, or second mechanism is authorized under L-1. The
+receipt is read-only and runs under this freeze whichever phase the pointer
+names at the time.
 
 ## Order of work
 
-1. This freeze merged by the owner under the merge gate.
-2. The E-1 receipt produced and reviewed under the E-1 freeze, unchanged.
-3. An owner-approved documentation change moving the `AGENTS.md` active-phase
-   pointer to L-1.
-4. The implementation PR under the merge gate: review on the final intended
+1. This freeze merged by the owner under the merge gate. This merge also moves
+   the `AGENTS.md` active-phase pointer to L-1.
+2. The implementation PR under the merge gate: review on the final intended
    head, zero unresolved material threads, green required checks.
-5. The owner sets `ATOM_EVIDENCE_LEDGER_BATCH_ENABLED=1` on `atom-v9-thin`.
+3. The owner sets `ATOM_EVIDENCE_LEDGER_BATCH_ENABLED=1` on `atom-v9-thin`.
    One deploy of the merged implementation commit to `atom-v9-thin` only is
    authorized, outside 13:30–20:00 UTC. Rollback is the gate at `0` or
    redeploying the previous commit. No other service is deployed.
-6. The acceptance receipt, then stop.
+4. An owner-approved documentation change returns the `AGENTS.md`
+   active-phase pointer to E-1; the E-1 chain (migration `030`,
+   implementation, receipt) resumes under its own freeze.
+5. The acceptance receipt after two complete sessions, then L-1 stops.
 
-No L-1 implementation work begins before steps 1–3, in that order.
+No E-1 implementation or receipt work runs while the pointer names L-1.
 
 ## What L-1 does not authorize
 
@@ -201,7 +212,7 @@ No L-1 implementation work begins before steps 1–3, in that order.
   or default-privilege change.
 - No Supabase tier, compute, region, pooler, or credential change.
 - No Render plan, region, instance-count, or environment change beyond the
-  gate variable set by the owner; no deployment other than the one in step 5.
+  gate variable set by the owner; no deployment other than the one in step 3.
 - No change to the V4 state worker, its rebuild cadence, the dashboard, the
   E-1 scorecard, historical replay, or any simulator phase.
 - No reconstruction, backfill, or re-scoring of unscoreable rows.
