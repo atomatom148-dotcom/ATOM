@@ -450,7 +450,7 @@ def test_market_open_workflow_scopes_credentials_and_pins_dependencies():
     ).splitlines()
     assert requirements == [
         "exchange-calendars==4.13.2",
-        "psycopg[binary]==3.3.4",
+        "psycopg[binary]==3.3.5",
         "pytest==9.1.1",
     ]
 
