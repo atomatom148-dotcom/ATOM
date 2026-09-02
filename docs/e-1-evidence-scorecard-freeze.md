@@ -111,10 +111,13 @@ E-1.
    when `n_decided < 4` the field is an empty list.
    Undefined values are `null`: `hit_rate` and `z_hit` when `n_decided = 0`;
    either correlation when fewer than two points or zero variance in either
-   input; every bootstrap interval when `n_economic = 0`. The receipt contains
-   no `NaN` or infinity anywhere. `z_hit` and any plain-standard-error statistic
-   are descriptive only: they are reported but never used for classification,
-   because windows are serially dependent even when non-overlapping.
+   input; both economic bootstrap intervals when `n_economic = 0`; and the
+   hit-rate bootstrap interval whenever `n_decided = 0`, independently of the
+   economic intervals, so a tie-only cell still produces a receipt. The receipt
+   contains no `NaN` or infinity anywhere. `z_hit` and any plain-standard-error
+   statistic are descriptive only: they are reported but never used for
+   classification, because windows are serially dependent even when
+   non-overlapping.
 4. **Inference.** The only inferential statistic is a session-clustered
    percentile bootstrap. Sessions with at least one economic window are sorted
    ascending; for each of exactly `200000` resamples, draw `n_sessions`
@@ -122,9 +125,9 @@ E-1.
    k=n_sessions)`, seeded once per cell and consumed in order; the resampled
    statistic is the sum of the drawn sessions' signed-bps sums divided by the
    sum of their economic counts, which equals the mean over the pooled windows.
-   The same procedure over sessions with at least one decided window reports
-   `hit_rate`. Sort the resampled statistics ascending and report the
-   percentile interval whose zero-based indices are
+   The same procedure, over sessions with at least one decided window and only
+   when `n_decided > 0`, reports `hit_rate`. Sort the resampled statistics
+   ascending and report the percentile interval whose zero-based indices are
    `lower = floor((1 - level) / 2 * (B - 1))` and
    `upper = ceil((1 + level) / 2 * (B - 1))` with `B = 200000`, at
    `level = 0.999` and `level = 0.95` for `mean_signed_bps` and at `level = 0.95`
@@ -162,13 +165,14 @@ adds no dependency beyond the Python standard library and the already-pinned
 Database access is one explicitly read-only `REPEATABLE READ` transaction for
 the entire run, with a per-statement timeout of at most `60s`, using the
 existing credential `supabase_read_only_user`, which holds no `INSERT`,
-`UPDATE`, or `DELETE` privilege on any table. The reader refuses any credential
-that holds such a privilege on the four evidence tables. All counts, both layer
-reads, and every proof-seam call observe that one snapshot, and the receipt
-records `pg_current_snapshot()`. The reader must not be run during regular XNYS
-session hours; there is no override. Forecast, outcome, manifest, persistence,
-receipt, and every other write must remain `0`. Existing evidence may not be
-deleted, rewritten, repaired, or backfilled.
+`UPDATE`, or `DELETE` privilege on any table and already holds `USAGE` on
+`atom_v9_internal` through `pg_read_all_data`. The reader refuses any credential
+that holds a write privilege on the four evidence tables. All counts, both
+layer reads, and every proof-seam call observe that one snapshot, and the
+receipt records `pg_current_snapshot()`. The reader must not be run during
+regular XNYS session hours; there is no override. Forecast, outcome, manifest,
+persistence, receipt, and every other write must remain `0`. Existing evidence
+may not be deleted, rewritten, repaired, or backfilled.
 
 Implementation is limited to one module (`quant/evidence_scorecard.py`), one
 command-line entry point, and tests. Statistics, including the bootstrap, are
@@ -182,16 +186,41 @@ E-1's two proof seams are `STABLE`, `SECURITY DEFINER` functions owned by
 `atom_v9_proof_owner` with `search_path = pg_catalog`, executable today only by
 `atom_v9_proof_owner` and `atom_v9_v4_runtime`. `PUBLIC`, `anon`,
 `authenticated`, and `service_role` cannot execute them and must remain unable
-to. This amendment authorizes exactly two `EXECUTE` grants, to the existing
-read-only role, applied by migration `029` and nothing else:
+to. `supabase_read_only_user` already holds `USAGE` on `atom_v9_internal`
+through `pg_read_all_data`; no schema grant is needed or authorized.
+
+Production state verified on September 2, 2026 (PostgreSQL 17.6):
+`pg_auth_members` holds exactly one row for member `postgres` in role
+`atom_v9_proof_owner`, with grantor `supabase_admin`, `admin_option = true`,
+`inherit_option = false`, `set_option = false`. The migration runner
+`postgres` is not a superuser and does not inherit the owner's privileges, so
+a bare `GRANT EXECUTE` fails. PostgreSQL records role grants per grantor: a
+grant executed by `postgres` cannot modify the `supabase_admin` row and instead
+creates a separate `postgres`-grantor row. The handoff below therefore uses a
+temporary `postgres`-grantor row that exists only inside the migration
+transaction, and never touches the `supabase_admin` row. This is the same
+pattern migration `027` uses and verifies.
+
+This amendment authorizes exactly two `EXECUTE` grants, to the existing
+read-only role, applied by migration `029` as one transaction in exactly this
+order, and nothing else:
 
 ```sql
 -- migrations/029_authorize_e1_scorecard_proof_reads.sql
--- Precondition (verified 2026-09-02): postgres is already a member of
--- atom_v9_proof_owner WITH ADMIN OPTION, INHERIT FALSE, SET FALSE. That
--- membership and its ADMIN OPTION must be identical before and after.
-GRANT atom_v9_proof_owner TO postgres WITH INHERIT TRUE;
+-- One transaction. Every ASSERT is a DO block that RAISEs on failure,
+-- rolling back everything.
 
+-- 1. ASSERT starting state: exactly one pg_auth_members row for
+--    (member = postgres, role = atom_v9_proof_owner) with
+--    grantor = supabase_admin, admin_option = true,
+--    inherit_option = false, set_option = false; and
+--    has_schema_privilege('supabase_read_only_user',
+--    'atom_v9_internal', 'USAGE') is true.
+
+-- 2. Temporary handoff: a second, postgres-grantor row.
+GRANT atom_v9_proof_owner TO postgres WITH INHERIT TRUE, SET FALSE;
+
+-- 3. The two authorized grants.
 GRANT EXECUTE ON FUNCTION
   atom_v9_internal.read_forecast_commit_proof(text)
 TO supabase_read_only_user;
@@ -202,19 +231,26 @@ GRANT EXECUTE ON FUNCTION
   )
 TO supabase_read_only_user;
 
-GRANT atom_v9_proof_owner TO postgres WITH INHERIT FALSE;
+-- 4. Remove only the temporary row; the supabase_admin row is untouched.
+REVOKE atom_v9_proof_owner FROM postgres GRANTED BY postgres;
+
+-- 5. ASSERT the exact state from step 1 holds again.
+
+-- 6. ASSERT supabase_read_only_user can EXECUTE both functions; PUBLIC,
+--    anon, authenticated, and service_role can execute neither; and no
+--    other function in atom_v9_internal is executable by
+--    supabase_read_only_user.
+
+-- 7. Any failed assertion RAISEs; the whole transaction rolls back.
 ```
 
-Migration `029` contains only that authorization, runs in one transaction,
-and must assert before commit that: `supabase_read_only_user` can execute both
-functions; `PUBLIC`, `anon`, `authenticated`, and `service_role` cannot execute
-either; and `postgres`'s membership in `atom_v9_proof_owner` shows
-`admin_option = true`, `inherit_option = false`, `set_option = false`, exactly
-as found. Any failed assertion aborts the migration. If the runner cannot
-adjust its own membership options, the migration fails closed and the
-exception must be re-authorized with a different mechanism; nothing is applied
-by hand. A third function grant, any table privilege, policy, role, schema, or
-default-privilege change is not authorized.
+Net membership change: none. The temporary row is created and removed inside
+the same transaction and is proven absent at commit. Migration `029` contains
+only that authorization. If the runner cannot create or revoke the temporary
+row, the migration fails closed and the exception must be re-authorized with a
+different mechanism; nothing is applied by hand. A third function grant, any
+table privilege, policy, role, schema, or default-privilege change is not
+authorized.
 
 ## Receipt and stopping rule
 
