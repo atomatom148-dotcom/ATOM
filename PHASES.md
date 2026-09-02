@@ -152,3 +152,38 @@ The simulator is an isolated downstream research path governed by `SIMULATION_FR
 ### SIM-9 — Database-backed market-open acceptance
 
 ### SIM-10 — Continuous evidence operation
+
+## Evidence scoring phases
+
+Scoring is read-only research over existing evidence. Each phase is separate.
+No phase in this section changes V9 mathematics, families, synthesis,
+evidence, simulator behavior, or trading authority; any such change requires
+its own freeze.
+
+### E-1 — Read-only evidence scorecard (freeze only)
+
+One single-process, read-only reader over FAMILY and V9 evidence with
+statistics fixed in advance under `docs/e-1-evidence-scorecard-freeze.md`:
+independent epoch-aligned windows, ties and abstentions excluded and reported,
+hit rate with z, signed bps with t, correlation, magnitude calibration, an
+echoed cost line, and `INSUFFICIENT` / `NOISE` / `CANDIDATE` labels with a fixed
+`|z| >= 3.0` guard. Emits a receipt. Authorizes nothing.
+
+### E-2 — Pre-registered single hypothesis (not authorized)
+
+Freeze exactly one hypothesis — family set, combination rule, horizon,
+evaluation sessions, pass/fail thresholds — before any further data is read,
+with the E-1 receipt as baseline. Evaluate it once on the frozen sessions.
+
+### E-3 — Cost model (not authorized)
+
+Measure COIN realized spread and a fixed slippage assumption from existing
+quotes only. Produces the `cost_bps` input for later phases.
+
+### E-4 — Driver and universe candidates (not authorized)
+
+Consider, each under its own freeze, one additional read-only driver or symbol
+at a time. Nothing here is authorized by E-1, E-2, or E-3.
+
+**Rule:** Score before changing. No family is retired, reweighted, or
+sign-flipped on the strength of a scorecard alone.
