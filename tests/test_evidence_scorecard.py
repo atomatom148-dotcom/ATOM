@@ -364,12 +364,14 @@ def test_receipt_fields_and_hash():
                 "expected_false_candidates": 0.0, "multiplicity_budget_exceeded": False,
                 "usable_for_e2": True},
         rows_read={"forecasts": 1}, proof_rows={"DIRECTIONAL_FORECAST": 1},
-        snapshot="100:100:", query_wall_seconds=0.5,
+        snapshot="100:100:", current_user="atom_historical_score_reader",
+        query_wall_seconds=0.5,
         generated_at=datetime(2026, 9, 2, 3, 0, tzinfo=timezone.utc))
     body = {k: v for k, v in receipt.items() if k != "sha256"}
     assert receipt["sha256"] == hashlib.sha256(sc.canonical_json(body).encode()).hexdigest()
     assert (receipt["forecast_writes"], receipt["outcome_writes"], receipt["evidence_writes"],
-            receipt["read_only"], receipt["bypassrls"]) == (0, 0, 0, True, True)
+            receipt["read_only"], receipt["rls_full_read_verified"]) == (0, 0, 0, True, True)
+    assert receipt["current_user"] == "atom_historical_score_reader"
     assert receipt["cost_bps"] == 0.0 and receipt["snapshot"] == "100:100:"
     assert receipt["bootstrap"]["resamples"] == 200_000 and receipt["bootstrap"]["seed"] == 0
     assert receipt["classification"]["multiplicity_budget"] == 100
@@ -388,13 +390,15 @@ def test_frozen_constants():
 
 def test_module_sql_and_source_contain_no_write_paths():
     source = Path(sc.__file__).read_text(encoding="utf-8")
-    for sql in (sc.GUARD_SQL, sc.FAMILY_STREAM_SQL, sc.FAMILY_PROOF_SQL,
+    for sql in (sc.GUARD_SQL, sc.RLS_FULL_READ_SQL, sc.FAMILY_STREAM_SQL, sc.FAMILY_PROOF_SQL,
                 sc.V9_STREAM_SQL, sc.V9_PROOF_SQL, *sc.COUNT_SQL.values()):
         lowered = sql.lower()
         assert not any(word in lowered for word in
                        ("insert ", "update ", "delete ", "truncate", "copy ", "alter ",
                         "drop ", "grant ", "create "))
     assert "connection.read_only = True" in source
+    assert "rolbypassrls" not in source and "BYPASSRLS" not in source.replace("full-read", "")
+    assert "verify_full_read(current_user" in source
     assert "IsolationLevel.REPEATABLE_READ" in source
     assert "statement_timeout={STATEMENT_TIMEOUT_MS}" in source and sc.STATEMENT_TIMEOUT_MS <= 60_000
     assert "read_legacy_evidence_publications_for_cohorts" not in source
@@ -419,15 +423,32 @@ def test_main_emits_receipt_from_read_seam(monkeypatch, capsys):
     monkeypatch.setattr(sc, "refuse_during_rth", lambda now=None: None)
     selectors = sc.select_cells([_row(_epoch(TUESDAY, 9, 30), 2.0, 3.0, key="a")])
     monkeypatch.setattr(sc, "read_and_select", lambda url, sessions: (
-        selectors, {"forecasts": 1}, {"DIRECTIONAL_FORECAST": 1}, "1:1:", 0.01))
+        selectors, {"forecasts": 1}, {"DIRECTIONAL_FORECAST": 1}, "1:1:",
+        "atom_historical_score_reader", 0.01))
     original_score_cells = sc.score_cells
     monkeypatch.setattr(sc, "score_cells",
                         lambda s, **kw: original_score_cells(s, resamples=5))
     assert sc.main(["--sessions", "2026-09-01"]) == 0
     receipt = json.loads(capsys.readouterr().out)
     assert receipt["sessions"] == ["2026-09-01"] and receipt["cost_bps"] == 0.0
-    assert receipt["read_only"] is True and receipt["bypassrls"] is True
+    assert receipt["read_only"] is True and receipt["rls_full_read_verified"] is True
+    assert receipt["current_user"] == "atom_historical_score_reader"
     assert len(receipt["cells"]) == 1
     assert receipt["cells"][0]["label"] == sc.LABEL_INSUFFICIENT
     assert receipt["cells"][0]["classification_reason"] is None
     assert receipt["classification"]["usable_for_e2"] is True
+
+
+def test_verify_full_read_refuses_anything_short_of_permissive_true_policy():
+    ok = [(t, True, True, False) for t in sc.EVIDENCE_TABLES]
+    sc.verify_full_read("reader", ok)
+    with pytest.raises(SystemExit):
+        sc.verify_full_read("reader", ok[:3])                       # a table missing
+    for bad in (
+        [("public.forecasts", False, True, False)],                 # no SELECT privilege
+        [("public.forecasts", True, False, False)],                 # no permissive USING (true)
+        [("public.forecasts", True, True, True)],                   # restrictive policy applies
+    ):
+        rows = bad + [r for r in ok if r[0] != "public.forecasts"]
+        with pytest.raises(SystemExit):
+            sc.verify_full_read("reader", rows)
