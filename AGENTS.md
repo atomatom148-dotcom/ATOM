@@ -111,13 +111,16 @@ action.
 
 Update this section only by owner-approved documentation change.
 
-- Active phase: **E-1 — read-only evidence scorecard**, freeze only.
-- Controlling text: `docs/e-1-evidence-scorecard-freeze.md`, as amended by the
-  latest merged E-1 amendment.
+- Active phase: **L-1 — evidence ledger throughput**, implementation and one
+  gated deployment of `atom-v9-thin` authorized.
+- Controlling text: `docs/l-1-evidence-ledger-throughput-freeze.md`.
 - Also controlling for context: `FREEZE.md`, `SIMULATION_FREEZE.md`,
   `PHASES.md`.
-- Not authorized until their own approved phases: migration `029`, E-1
-  implementation, any E-1 receipt, E-2, E-3, E-4.
+- Queued behind L-1 step 3 and a further owner-approved pointer change:
+  **E-1 — read-only evidence scorecard**, as amended by the latest merged E-1
+  amendment (`docs/e-1-evidence-scorecard-freeze.md`). Not authorized while
+  the pointer names L-1: migration `030`, E-1 implementation, any E-1
+  receipt, E-2, E-3, E-4.
 
 ## What each document is for
 
