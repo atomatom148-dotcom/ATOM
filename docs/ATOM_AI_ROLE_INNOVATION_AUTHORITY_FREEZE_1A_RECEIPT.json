@@ -1,18 +1,24 @@
 {
   "decision_id": "ATOM-AI-ROLE-AUTHORITY-FREEZE-1A",
-  "status": "PROPOSED_AWAITING_OWNER_APPROVAL",
+  "status": "FROZEN_ON_OWNER_APPROVED_MERGE",
+  "effectivity_rule": "Before merge this artifact grants no authority. At the Owner-approved merge commit it becomes controlling governance law.",
   "document_title": "ATOM AI Role, Innovation, and Improvement Authority Freeze - Amendment 1A",
   "author_role": "ChatGPT Pro - ATOM Chief Architect and Freeze Custodian",
   "amends": "ATOM-AI-ROLE-AUTHORITY-FREEZE-1",
   "prepared_against_main_sha": "09b7922be7e19d11dd8816f3d3cc9e70f736509d",
   "repository_artifact": {
     "path": "ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A.md",
-    "git_blob_sha1": "8d1b1d1c46f1bc6457ba70ec52ff3c858532240b"
+    "git_blob_sha1_at_receipt_revision": "36739eff7944f9f5b8b5c087ab9b2132ac38eb7d"
   },
-  "accepted_findings": [
-    "Clarify that current Owner operational instructions control immediately within applicable freezes and bind ChatGPT Pro to prepare an amendment when a boundary change is requested.",
-    "Replace circular linear precedence with separate governance, technical, and operational subject domains.",
-    "Clarify that an unavailable named reviewer may be replaced by an Owner-designated independent reviewer on the final head, but final-head review may not be waived."
+  "accepted_and_dispositioned_findings": [
+    "Owner operational instructions control immediately within applicable freezes and bind ChatGPT Pro to prepare an amendment when a boundary change is requested.",
+    "Circular linear precedence is replaced with separate governance, technical, and operational subject domains.",
+    "An unavailable named reviewer may be replaced by an Owner-designated independent reviewer on the final head, but final-head review may not be waived.",
+    "Every required check must be green; this amendment creates no check waiver, substitution, or bypass.",
+    "The amendment and receipt use a self-executing effectivity rule so merged law does not remain marked proposed or pending.",
+    "ChatGPT Pro remains the sole freeze author. If unavailable, boundary-crossing change is intentionally BLOCKED while already-authorized and protective Owner powers remain available.",
+    "AGENTS.md states the complete Owner operational authority and restores reviewer findings above implementation convenience.",
+    "The base freeze remains an immutable historical record; supersession is stated in this amendment and AGENTS.md rather than silently editing base text."
   ],
   "authorized_repository_surface": [
     "ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A.md",
@@ -21,10 +27,17 @@
     "docs/ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A_RECEIPT.json"
   ],
   "technical_effect": "None. Documentation-only governance clarification; no code, migration, source, database, Render, environment, active-phase, deployment, broker, execution, or production change.",
-  "review_rule": "Independent review is required on the final intended head. Named-reviewer unavailability permits substitution, not waiver. Every P1 and P2 must be resolved or dispositioned and material threads must be zero before Owner merge.",
-  "review_state": "PENDING_FINAL_HEAD_REVIEW",
-  "owner_approval": "PENDING",
-  "merge_authority": "OWNER_ONLY",
+  "adversarial_review_round_1": {
+    "reviewer": "Claude",
+    "reviewed_head": "b18270f6b4f4920c9e227709a9676a6a345e2b1e",
+    "result": "P1_NONE_P2_THREE_P3_THREE",
+    "effect": "Triggered the final correction round recorded in this receipt. This review does not cover the corrected final head."
+  },
+  "final_head_review_rule": "The corrected final intended head requires at least one independent read-only review; every P1 and P2 must be resolved or dispositioned; material threads must be zero; and every required check must be green. Named-reviewer unavailability permits substitution, not waiver. No check substitution is authorized.",
+  "review_evidence_location": "GitHub pull request #279",
+  "owner_approval_rule": "Explicit Owner approval is required before merge. The merge commit is the effectivity event.",
+  "merge_authority": "OWNER_ONLY_UNLESS_EXACTLY_DELEGATED",
   "deployment_authority": "NONE",
-  "next_action": "Open the documentation-only pull request, obtain final-head independent review and green required checks, then present for explicit Owner merge approval."
+  "base_freeze_edit_disposition": "NO_EDIT. Preserve the adopted base document; this amendment and AGENTS.md carry the explicit supersession pointer.",
+  "merge_effect": "When merged after the frozen review and check gate, Amendment 1A becomes controlling. No runtime deployment accompanies the merge."
 }
