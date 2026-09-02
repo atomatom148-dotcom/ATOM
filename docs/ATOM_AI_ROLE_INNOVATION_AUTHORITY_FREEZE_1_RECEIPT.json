@@ -1,6 +1,7 @@
 {
   "decision_id": "ATOM-AI-ROLE-AUTHORITY-FREEZE-1",
   "version": "1.0",
+  "receipt_revision": 3,
   "status": "FROZEN_OWNER_APPROVED",
   "effective_date": "2026-09-02",
   "document_title": "ATOM AI Role, Innovation, and Improvement Authority Freeze",
@@ -27,6 +28,25 @@
       "pages": 28
     }
   },
-  "review_state": "Final-head review required; Codex review request may be dispositioned by the Owner if unavailable.",
-  "next_action": "After green required checks and final-head review disposition, merge this documentation-only adoption. No runtime deployment accompanies it."
+  "adoption": {
+    "pull_request": 278,
+    "final_reviewed_head": "a7b26defb92c55197d50605580041e62c678cc23",
+    "merged_main_sha": "09b7922be7e19d11dd8816f3d3cc9e70f736509d",
+    "review_state": "COMPLETED_ON_FINAL_HEAD",
+    "independent_reviewer": "copilot-pull-request-reviewer",
+    "review_result": "APPROVAL_RECOMMENDED",
+    "circleci_test": "SUCCESS",
+    "github_analyze": "SUCCESS",
+    "sonarcloud_quality_gate": "SUCCESS_ZERO_NEW_ISSUES",
+    "unresolved_material_threads": 0
+  },
+  "review_rule": "Final-head independent review and every required green check are mandatory. If a named reviewer is unavailable, the Owner may designate a substitute reviewer on the final intended head. Reviewer unavailability is not a review waiver and creates no check waiver or substitution.",
+  "amendment_chain": [
+    {
+      "decision_id": "ATOM-AI-ROLE-AUTHORITY-FREEZE-1A",
+      "effectivity": "FROZEN_AT_OWNER_APPROVED_MERGE_COMMIT",
+      "effect": "Clarifies Owner operational authority, subject-matter precedence, sole-author continuity, reviewer substitution, and mandatory green checks without changing technical behavior."
+    }
+  ],
+  "next_action": "The base governance freeze remains active. Amendment 1A controls only from its Owner-approved merge commit. No runtime deployment accompanies either governance document."
 }
