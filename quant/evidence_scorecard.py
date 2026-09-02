@@ -1,7 +1,7 @@
-"""E-1 read-only evidence scorecard (E-1A).
+"""E-1 read-only evidence scorecard (E-1A, E-1B).
 
 Controlling law: ``docs/e-1-evidence-scorecard-freeze.md`` as amended by
-E-1A. Every statistic, count, selection rule, label, and guard below is fixed
+E-1A and E-1B. Every statistic, count, selection rule, label, and guard below is fixed
 by that document. The reader streams existing evidence through one explicitly
 read-only ``REPEATABLE READ`` transaction, hydrates admissibility only through
 the two authorized proof seams, computes the frozen statistics as pure
@@ -26,7 +26,7 @@ from typing import Iterable, Iterator, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 CONTRACT = "docs/e-1-evidence-scorecard-freeze.md"
-CODE_VERSION = "ATOM-E1-SCORECARD-2"
+CODE_VERSION = "ATOM-E1-SCORECARD-3"
 
 LAYER_FAMILY = "FAMILY"
 LAYER_V9 = "V9"
@@ -55,7 +55,7 @@ OUTCOME_RESOLUTION_BOUND_SECONDS = 5.0
 STATEMENT_TIMEOUT_MS = 60_000
 PROOF_BATCH = 65_536
 READONLY_URL_ENV = "ATOM_E1_SCORECARD_READONLY_DATABASE_URL"
-READONLY_ROLE = "supabase_read_only_user"
+READONLY_ROLE = "atom_historical_score_reader"
 
 LABEL_INSUFFICIENT = "INSUFFICIENT"
 LABEL_NOISE = "NOISE"
@@ -487,6 +487,7 @@ def build_receipt(
     rows_read: Mapping[str, int],
     proof_rows: Mapping[str, int],
     snapshot: str,
+    current_user: str,
     query_wall_seconds: float,
     generated_at: datetime,
     resamples: int = BOOTSTRAP_RESAMPLES,
@@ -519,7 +520,8 @@ def build_receipt(
         "outcome_writes": 0,
         "evidence_writes": 0,
         "read_only": True,
-        "bypassrls": True,
+        "rls_full_read_verified": True,
+        "current_user": current_user,
     }
     digest = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
     return {**body, "sha256": digest}
@@ -576,13 +578,35 @@ def batched(items: Sequence, size: int) -> Iterator[Sequence]:
 
 GUARD_SQL = """
 SELECT current_user,
-       (SELECT rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user),
        bool_or(has_table_privilege(current_user, t, 'INSERT')
                OR has_table_privilege(current_user, t, 'UPDATE')
                OR has_table_privilege(current_user, t, 'DELETE')),
        pg_catalog.pg_current_snapshot()::text,
        now()
 FROM unnest(%(tables)s::text[]) AS t
+"""
+
+RLS_FULL_READ_SQL = """
+SELECT t.qualified,
+       has_table_privilege(current_user, t.qualified, 'SELECT') AS can_select,
+       EXISTS (
+           SELECT 1 FROM pg_catalog.pg_policies AS p
+           WHERE p.schemaname = 'public' AND p.tablename = t.short
+             AND p.cmd IN ('SELECT', 'ALL') AND p.permissive = 'PERMISSIVE'
+             AND p.qual = 'true'
+             AND (current_user::name = ANY(p.roles) OR 'public'::name = ANY(p.roles))
+       ) AS permissive_full_read,
+       EXISTS (
+           SELECT 1 FROM pg_catalog.pg_policies AS p
+           WHERE p.schemaname = 'public' AND p.tablename = t.short
+             AND p.cmd IN ('SELECT', 'ALL') AND p.permissive = 'RESTRICTIVE'
+             AND (current_user::name = ANY(p.roles) OR 'public'::name = ANY(p.roles))
+       ) AS restrictive_applies
+FROM (VALUES ('public.forecasts', 'forecasts'),
+             ('public.forecast_outcomes', 'forecast_outcomes'),
+             ('public.atom_v9_v4_forecasts', 'atom_v9_v4_forecasts'),
+             ('public.atom_v9_v4_outcomes', 'atom_v9_v4_outcomes')) AS t(qualified, short)
+ORDER BY t.qualified
 """
 
 FAMILY_STREAM_SQL = """
@@ -729,9 +753,9 @@ def v9_rows(
 def read_and_select(database_url: str, sessions: Sequence[date]):
     """Stream both layers inside one read-only REPEATABLE READ snapshot.
 
-    Returns ``(selectors, rows_read, proof_rows, snapshot, wall_seconds)``.
-    Refuses a credential that holds a write privilege on the four evidence
-    tables or lacks BYPASSRLS.
+    Returns ``(selectors, rows_read, proof_rows, snapshot, current_user,
+    wall_seconds)``. Refuses a credential that holds a write privilege on the
+    four evidence tables or fails full-read verification on any of them.
     """
 
     import psycopg
@@ -758,13 +782,12 @@ def read_and_select(database_url: str, sessions: Sequence[date]):
         with connection.transaction():
             with connection.cursor() as cursor:
                 cursor.execute(GUARD_SQL, {"tables": list(EVIDENCE_TABLES)})
-                current_user, bypassrls, can_write, snapshot, as_of = cursor.fetchone()
+                current_user, can_write, snapshot, as_of = cursor.fetchone()
                 if can_write:
                     raise SystemExit(
                         f"E-1 reader refused: {current_user!r} holds a write privilege")
-                if bypassrls is not True:
-                    raise SystemExit(
-                        f"E-1 reader refused: {current_user!r} lacks BYPASSRLS")
+                cursor.execute(RLS_FULL_READ_SQL, ())
+                verify_full_read(current_user, cursor.fetchall())
 
                 rows_read: dict[str, int] = {}
                 for table, sql in COUNT_SQL.items():
@@ -808,7 +831,26 @@ def read_and_select(database_url: str, sessions: Sequence[date]):
                     for row in v9_rows(batch, proofs):
                         _feed(selectors, row)
 
-    return selectors, rows_read, proof_rows, str(snapshot), time.monotonic() - started
+    return (selectors, rows_read, proof_rows, str(snapshot), str(current_user),
+            time.monotonic() - started)
+
+
+def verify_full_read(current_user: object, rows: Sequence[Sequence[object]]) -> None:
+    """Refuse unless every evidence table is fully readable by ``current_user``.
+
+    Each row is ``(table, can_select, permissive_full_read, restrictive_applies)``
+    as returned by ``RLS_FULL_READ_SQL``. A policy-filtered read would score an
+    empty ledger as if it were evidence, so anything short of a permissive
+    ``USING (true)`` SELECT policy with no applicable restrictive policy refuses.
+    """
+
+    seen = {str(row[0]) for row in rows}
+    if seen != set(EVIDENCE_TABLES):
+        raise SystemExit("E-1 reader refused: full-read verification did not cover all four tables")
+    for table, can_select, permissive_full_read, restrictive_applies in rows:
+        if can_select is not True or permissive_full_read is not True or restrictive_applies:
+            raise SystemExit(
+                f"E-1 reader refused: {current_user!r} fails full-read verification on {table}")
 
 
 def _feed(selectors: dict, row: Row) -> None:
@@ -850,13 +892,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if any(s.weekday() >= 5 for s in sessions):
         raise SystemExit("E-1 reader refused: sessions must be weekdays")
 
-    selectors, rows_read, proof_rows, snapshot, wall = read_and_select(database_url, sessions)
+    (selectors, rows_read, proof_rows, snapshot, current_user,
+     wall) = read_and_select(database_url, sessions)
     cells = score_cells(selectors)
     budget = assign_labels(cells)
     receipt = build_receipt(
         sessions=sessions, cells=cells, budget=budget, rows_read=rows_read,
-        proof_rows=proof_rows, snapshot=snapshot, query_wall_seconds=wall,
-        generated_at=datetime.now(timezone.utc))
+        proof_rows=proof_rows, snapshot=snapshot, current_user=current_user,
+        query_wall_seconds=wall, generated_at=datetime.now(timezone.utc))
     sys.stdout.write(json.dumps(receipt, sort_keys=True, indent=2, allow_nan=False))
     sys.stdout.write("\n")
     return 0
