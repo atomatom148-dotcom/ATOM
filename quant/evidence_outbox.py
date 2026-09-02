@@ -2104,14 +2104,14 @@ class EvidenceLedgerWorker:
         )
         pending_ids = {record.forecast_record_id for record in remaining}
         finalized = []
-        if self._batched_forecasts_enabled():
+        batched_forecasts = self._batched_forecasts_enabled()
+        if batched_forecasts:
             self._persist_forecasts_batched(
                 item, finalized=finalized, remaining=remaining,
                 pending_ids=pending_ids)
-            forecasts_to_persist = ()
-        else:
-            forecasts_to_persist = item.v4
-        for forecast in forecasts_to_persist:
+        for forecast in item.v4:
+            if batched_forecasts:
+                break
             stored = self._writer.persist_forecast(forecast, self._clock())
             write_status = self._writer.last_write_status
             if write_status in {
