@@ -1,0 +1,27 @@
+{
+  "decision_id": "ATOM-AI-ROLE-AUTHORITY-FREEZE-1",
+  "version": "1.0",
+  "status": "FROZEN_OWNER_APPROVED",
+  "effective_date": "2026-09-02",
+  "document_title": "ATOM AI Role, Innovation, and Improvement Authority Freeze",
+  "author_role": "ChatGPT Pro - ATOM Chief Architect and Freeze Custodian",
+  "owner_role": "ATOM Owner",
+  "authorization_effect": "Freezes AI role authority, innovation control, implementation ownership, evidence requirements, promotion workflow, and final audit authority across ATOM.",
+  "technical_effect": "Governance only; no trading mathematics, source, persistence, broker, deployment, capital, or production behavior changed.",
+  "pages_pdf": 28,
+  "artifacts": {
+    "ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1.md": {
+      "sha256": "fef764c8ae6bdf390cf3604cc63ddb96f890c85edc4f888998cc927defea00ff",
+      "bytes": 31297
+    },
+    "ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1.docx": {
+      "sha256": "a647ac2255152cdb8180446dc81654d0afe4e1e999d2e58ac51b85571b93845b",
+      "bytes": 54020
+    },
+    "ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1.pdf": {
+      "sha256": "00f8914698887cb33060c37352a64d3e5363294d53e4ea631bfd501949060168",
+      "bytes": 342472
+    }
+  },
+  "next_action": "Documentation-only repository adoption may be prepared by Codex under an exact ChatGPT Pro implementation contract; no technical implementation accompanies it."
+}
