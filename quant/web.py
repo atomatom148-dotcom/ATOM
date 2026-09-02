@@ -1031,6 +1031,12 @@ def _restore_shutdown_handlers(previous: dict[int, object]) -> None:
         signal.signal(signal_number, handler)
 
 
+def _evidence_ledger_batch_enabled(environ: Mapping[str, str]) -> bool:
+    """L-1 gate: batching is active only when the value is exactly "1"."""
+
+    return environ.get("ATOM_EVIDENCE_LEDGER_BATCH_ENABLED", "0") == "1"
+
+
 def _start_v2(
     database_url: str,
     metrics: OperationalMetrics,
@@ -1106,6 +1112,7 @@ def main(*, simulator_connection_factory: Callable | None = None,
             os.environ.get("ATOM_V4_STATE_BUILDER_EXTERNAL", "0") == "1")
         family_cadence_enabled = (
             os.environ.get("ATOM_FAMILY_EVIDENCE_CADENCE_ENABLED", "0") == "1")
+        ledger_batch_enabled = _evidence_ledger_batch_enabled(os.environ)
         cache_refresher = V4StateCacheRefresher(
             compact_store=V4CStateStore(ledger_connection),
             accuracy_store=AccuracyStateStore(ledger_connection),
@@ -1130,13 +1137,15 @@ def main(*, simulator_connection_factory: Callable | None = None,
         ledger_worker = EvidenceLedgerWorker(
             outbox, evidence_store=PostgresEvidenceStore(
                 database_url, connection=ledger_connection,
-                family_cadence_enabled=family_cadence_enabled),
+                family_cadence_enabled=family_cadence_enabled,
+                proof_session_persistent=ledger_batch_enabled),
             connection=ledger_connection,
             connect=runtime_connect, database_url=database_url,
             metrics=metrics, cache_refresher=cache_refresher,
             state_build_submit=(state_build_worker.submit
                                 if state_build_worker is not None else None),
             simulation_submit=sim3.submit if sim3 is not None else None,
+            batch_enabled=ledger_batch_enabled,
         )
         ledger_worker.start()
         state = LiveMarketState(evidence_outbox=outbox,
