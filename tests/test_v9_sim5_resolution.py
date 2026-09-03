@@ -1031,6 +1031,10 @@ class SimulationResolutionStoreTests(unittest.TestCase):
             "record_json #>> '{exit_quote,provider_event_ns}' = exit_quote_event_ns::text",
             NORMALIZED_RESOLUTION_MIGRATION_SQL,
         )
+        self.assertLess(
+            RESOLUTION_MIGRATION_SQL.index("'GRANT atom_v9_sim_owner TO %I'"),
+            RESOLUTION_MIGRATION_SQL.index("'REVOKE atom_v9_sim_owner FROM %I'"),
+        )
 
 
 if __name__ == "__main__":
