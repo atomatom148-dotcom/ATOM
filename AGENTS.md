@@ -207,26 +207,25 @@ action.
 
 Update this section only by Owner-approved documentation change.
 
-- Active phase: **Level II durable depth capture — implementation**.
-- Controlling text: `ATOM_LEVEL2_DEPTH_CAPTURE_FREEZE_1.md` at the Owner-approved
-  merge of PR #288, plus `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1B.md` for
-  implementation-owner delegation.
-- Named implementation owner: **Claude** for this Level II capture job only.
-- Authorized order: implement the smallest default-off observer-only durable
-  capture path and one isolated append-only table; add only the required
-  least-privilege migration, tests, deterministic receipt/health proof, and
-  activation gate; final-head independent review; every required check green;
-  Owner merge; then apply the approved migration and activate only the Level II
-  capture gate.
-- E-1 remains preserved and may resume after this bounded Level II capture job;
-  no E-1 mathematics, scorecard statistics, reader roles, or evidence semantics
-  may change during this phase.
-- L-1 remains unchanged. Its read-only acceptance receipt remains authorized
-  when its required session evidence is mature and does not block this bounded
-  Level II capture job.
-- Not authorized by this pointer: E-2, E-3, E-4, drift-adjusted benchmarking,
-  S3, Q5 changes, family/V9/SIM use of Level II, broker/trading authority,
-  additional market-data sources, new services, or unrelated credentials.
+- Active phase: **SIM-5 — six-horizon causal resolution**.
+- Controlling text: `docs/sim-4a-exact-sim5-resolution-freeze.md`, plus the
+  existing merged simulator freezes it explicitly preserves.
+- Implementation owner: **Codex**.
+- Authorized order: documentation freeze/pointer merge; one Codex SIM-5
+  implementation PR; independent final-head review and green required checks;
+  Owner merge; apply migration `031` once to the isolated simulator project;
+  enable `ATOM_V9_SIM5_ENABLED=true` on the existing SIM-4 worker; deploy the
+  exact merged SHA; capture deployment proof and then live causal resolution
+  acceptance when market evidence is available.
+- E-1 is complete and its official receipt is preserved at
+  `docs/e-1-official-scorecard-receipt-2026-09-03.json`.
+- Level II durable capture remains separately authorized observer-only work and
+  does not feed or block SIM-5.
+- L-1 acceptance remains separately authorized when its required sessions are
+  mature and does not block SIM-5.
+- Not authorized: E-2, E-3, E-4, SIM-6 or later simulator phases, Level-II
+  mathematical use, V9/family changes, new services/roles/credentials/sources,
+  broker/account/order authority, or live-capital trading.
 
 ## What each document is for
 
