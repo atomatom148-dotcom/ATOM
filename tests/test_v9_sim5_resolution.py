@@ -44,6 +44,11 @@ from quant.v9_sim5_resolution import (
     sim5_enabled,
     validate_resolution_matches_entry,
 )
+from quant.v9_sim4_worker import (
+    PaperTradingCredentials,
+    PendingResolution,
+    SimulationEntryWorker,
+)
 
 
 UTC = timezone.utc
@@ -436,6 +441,62 @@ class SimulationResolutionContractTests(unittest.TestCase):
             intent=build_intent(final_bps=0.0), entry_status="SKIPPED_NO_TRADE")
         with self.assertRaises(ValueError):
             validate_resolution_matches_entry(resolution, skipped)
+
+    def test_worker_retains_running_minimum_exit_quote_across_closed_window(self):
+        entry = build_entry()
+        target, deadline = target_and_deadline(entry)
+        target_ns = datetime_to_epoch_nanoseconds(target)
+        worker = SimulationEntryWorker(
+            lambda: object(),
+            "abcdefghijklmnopqrst",
+            PaperTradingCredentials("key", "secret"),
+            monotonic_ns=lambda: 0,
+            monotonic=lambda: 0.0,
+            sim5_enabled=True,
+        )
+        pending = PendingResolution(
+            entry=entry,
+            target_at=target,
+            target_epoch_ns=target_ns,
+            deadline_at=deadline,
+            deadline_epoch_ns=datetime_to_epoch_nanoseconds(deadline),
+        )
+        worker._pending_resolutions[entry.entry_id] = pending
+
+        incumbent = build_quote(
+            provider_event_ns=target_ns + 2000,
+            accepted_at=target + timedelta(microseconds=20),
+            bid=101.0,
+            ask=101.5,
+        )
+        replacement = build_quote(
+            provider_event_ns=target_ns + 3000,
+            accepted_at=target + timedelta(microseconds=10),
+            bid=102.0,
+            ask=102.5,
+        )
+        too_late = build_quote(
+            provider_event_ns=datetime_to_epoch_nanoseconds(deadline) + 1,
+            accepted_at=deadline + timedelta(microseconds=1),
+            bid=103.0,
+            ask=103.5,
+        )
+
+        worker._offer_quote_to_pending_resolutions(incumbent)
+        self.assertEqual(pending.selected_quote, incumbent)
+
+        worker._offer_quote_to_pending_resolutions(replacement)
+        self.assertEqual(pending.selected_quote, replacement)
+
+        worker._offer_quote_to_pending_resolutions(too_late)
+        self.assertEqual(pending.selected_quote, replacement)
+
+        resolution = build_simulation_resolution_record(
+            entry=entry,
+            exit_quote=pending.selected_quote,
+        )
+        expected = build_simulation_resolution_record(entry=entry, exit_quote=replacement)
+        self.assertEqual(resolution, expected)
 
     def test_sim5_enabled_gate_exact_lowercase_true(self):
         self.assertEqual(SIM5_ENABLED_ENV, "ATOM_V9_SIM5_ENABLED")

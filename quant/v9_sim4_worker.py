@@ -2033,22 +2033,25 @@ class SimulationEntryWorker:
         Freeze section 9: the worker "consumes the same accepted SIP quote
         once and may offer that immutable quote to both the SIM-4 entry
         selector and the SIM-5 resolver."  Ordering matches SIM-4 selection
-        exactly via the shared ``select_exit_quote`` helper; only the first
-        (earliest-admitted) valid exit quote is ever kept, since a pending
-        resolution already holding one is skipped.
+        exactly via the shared ``select_exit_quote`` helper; each pending
+        resolution keeps the deterministic running minimum valid exit quote by
+        ``(accepted_at, provider_event_ns, quote_id)`` across its full closed
+        resolution window.
         """
 
         if not self._pending_resolutions:
             return
         for pending in self._pending_resolutions.values():
-            if pending.selected_quote is not None:
-                continue
             selected = select_exit_quote(
                 decision=pending.entry.decision,
                 resolution_target_at=pending.target_at,
                 resolution_deadline_at=pending.deadline_at,
                 entry_quote=pending.entry.quote,
-                quotes=(quote,),
+                quotes=(
+                    (quote,)
+                    if pending.selected_quote is None
+                    else (pending.selected_quote, quote)
+                ),
             )
             if selected is not None:
                 pending.selected_quote = selected
