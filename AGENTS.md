@@ -240,9 +240,12 @@ Update this section only by Owner-approved documentation change.
 - Level II durable capture remains separately authorized observer-only work and
   does not feed or block SIM-5.
 - L-1 acceptance remains separately authorized when its required sessions are
-  mature and does not block SIM-5.
+  mature and does not take or block the SIM-5 pointer.
+- Owner-approved L-2 state-cache read-reduction work remains separately
+  authorized alongside SIM-5 and does not take or block the SIM-5 pointer.
 - Not authorized: E-2, E-3, E-4, SIM-6 or later simulator phases, Level-II
-  mathematical use, V9/family changes, new services/roles/credentials/sources,
+  mathematical use, V9/family changes except the exact L-2 implementation
+  surface, new services/roles/credentials/sources,
   broker/account/order authority, or live-capital trading.
 
 ## What each document is for
@@ -252,7 +255,7 @@ Update this section only by Owner-approved documentation change.
   amendments control AI roles, Owner operational authority, innovation,
   implementation ownership, review substitution, evidence, and final audits.
 - Technical freeze documents tell the operator what the system is legally
-  authorized to do.
+authorized to do.
 - `PHASES.md` tells it where the program currently is.
 - The Owner's explicit approval decides whether the next boundary may be
   crossed through the applicable controlling freeze or amendment.
