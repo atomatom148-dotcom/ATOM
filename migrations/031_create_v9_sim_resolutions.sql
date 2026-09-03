@@ -154,6 +154,9 @@ CREATE TABLE public.atom_v9_sim_resolutions (
             AND exit_quote_source_spec = 'ATOM_TRUE_V9_SIM4_ALPACA_SIP_QUOTE_1'
             AND exit_quote_event_ns IS NOT NULL
             AND exit_quote_event_ns >= 0
+            AND exit_quote_event_ns BETWEEN
+                (((EXTRACT(EPOCH FROM resolution_target_at) * 1000000)::bigint) * 1000)
+                AND (((EXTRACT(EPOCH FROM resolution_deadline_at) * 1000000)::bigint) * 1000)
             AND exit_quote_accepted_at IS NOT NULL
             AND exit_quote_accepted_at NOT IN (
                 '-infinity'::timestamptz, 'infinity'::timestamptz
@@ -185,6 +188,68 @@ CREATE TABLE public.atom_v9_sim_resolutions (
     ),
     CONSTRAINT atom_v9_sim_resolutions_record_json_check CHECK (
         jsonb_typeof(record_json) = 'object'
+        AND jsonb_object_length(record_json) = 24
+        AND record_json ?& ARRAY[
+            'contract_version', 'canonicalization_version',
+            'simulator_version', 'resolution_id', 'resolution_hash', 'mode',
+            'symbol', 'instrument', 'entry_id', 'entry_hash',
+            'source_cycle_id', 'cutoff_at', 'horizon', 'horizon_seconds',
+            'decision', 'entry_quote_id', 'entry_quote_hash', 'entry_price',
+            'resolution_target_at', 'resolution_deadline_at',
+            'resolution_status', 'exit_quote', 'exit_price', 'return_bps'
+        ]
+        AND record_json ->> 'contract_version' = contract_version
+        AND record_json ->> 'canonicalization_version' = canonicalization_version
+        AND record_json ->> 'simulator_version' = simulator_version
+        AND record_json ->> 'resolution_id' = resolution_id
+        AND record_json ->> 'resolution_hash' = resolution_hash
+        AND record_json ->> 'mode' = mode
+        AND record_json ->> 'symbol' = symbol
+        AND record_json ->> 'instrument' = instrument
+        AND record_json ->> 'entry_id' = entry_id
+        AND record_json ->> 'entry_hash' = entry_hash
+        AND record_json ->> 'source_cycle_id' = source_cycle_id
+        AND record_json #>> '{cutoff_at,$timestamp_utc}' =
+            to_char(cutoff_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+        AND record_json ->> 'horizon' = horizon
+        AND record_json ->> 'horizon_seconds' = horizon_seconds::text
+        AND record_json ->> 'decision' = decision
+        AND record_json ->> 'entry_quote_id' = entry_quote_id
+        AND record_json ->> 'entry_quote_hash' = entry_quote_hash
+        AND record_json #>> '{resolution_target_at,$timestamp_utc}' =
+            to_char(
+                resolution_target_at AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            )
+        AND record_json #>> '{resolution_deadline_at,$timestamp_utc}' =
+            to_char(
+                resolution_deadline_at AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            )
+        AND record_json ->> 'resolution_status' = resolution_status
+        AND (
+            (
+                resolution_status = 'RESOLVED'
+                AND jsonb_typeof(record_json -> 'exit_quote') = 'object'
+                AND record_json #>> '{exit_quote,quote_id}' = exit_quote_id
+                AND record_json #>> '{exit_quote,quote_hash}' = exit_quote_hash
+                AND record_json #>> '{exit_quote,source_spec}' = exit_quote_source_spec
+                AND record_json #>> '{exit_quote,provider_event_ns}' = exit_quote_event_ns::text
+                AND record_json #>> '{exit_quote,accepted_at,$timestamp_utc}' =
+                    to_char(
+                        exit_quote_accepted_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+                    )
+            )
+            OR (
+                resolution_status IN (
+                    'UNRESOLVED_WINDOW_EXPIRED', 'UNRESOLVED_OBSERVATION_GAP'
+                )
+                AND record_json -> 'exit_quote' = 'null'::jsonb
+                AND record_json -> 'exit_price' = 'null'::jsonb
+                AND record_json -> 'return_bps' = 'null'::jsonb
+            )
+        )
     )
 );
 

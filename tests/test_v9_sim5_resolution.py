@@ -2,6 +2,7 @@ from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 import json
 import math
+from pathlib import Path
 import unittest
 
 from quant.v9_sim1_contract import build_simulation_trade_intent
@@ -50,6 +51,7 @@ from quant.v9_sim5_resolution import (
     validate_resolution_matches_entry,
 )
 from quant.v9_sim4_worker import (
+    MonotonicUTCAnchor,
     PaperTradingCredentials,
     PendingResolution,
     SimulationEntryWorker,
@@ -58,6 +60,11 @@ from quant.v9_sim4_worker import (
 
 UTC = timezone.utc
 T0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
+ROOT = Path(__file__).resolve().parents[1]
+RESOLUTION_MIGRATION_SQL = (
+    ROOT / "migrations" / "031_create_v9_sim_resolutions.sql"
+).read_text(encoding="utf-8")
+NORMALIZED_RESOLUTION_MIGRATION_SQL = " ".join(RESOLUTION_MIGRATION_SQL.split())
 
 
 def build_intent(**changes):
@@ -503,6 +510,87 @@ class SimulationResolutionContractTests(unittest.TestCase):
         expected = build_simulation_resolution_record(entry=entry, exit_quote=replacement)
         self.assertEqual(resolution, expected)
 
+    def test_worker_observation_proof_stops_at_deadline(self):
+        target = T0 + timedelta(seconds=29)
+        cutoff = target - timedelta(seconds=30)
+        deadline = target + timedelta(seconds=RESOLUTION_WINDOW_SECONDS)
+        target_ns = datetime_to_epoch_nanoseconds(target)
+        deadline_ns = datetime_to_epoch_nanoseconds(deadline)
+        elapsed_to_deadline_ns = deadline_ns - target_ns
+
+        def build_worker():
+            samples = {"now_ns": 0}
+            worker = SimulationEntryWorker(
+                lambda: object(),
+                "abcdefghijklmnopqrst",
+                PaperTradingCredentials("key", "secret"),
+                monotonic_ns=lambda: samples["now_ns"],
+                monotonic=lambda: samples["now_ns"] / 1_000_000_000,
+                sim5_enabled=True,
+            )
+            worker._anchor = MonotonicUTCAnchor(
+                monotonic_ns=0,
+                utc_epoch_us=target_ns // 1000,
+            )
+            terminal = []
+            worker._terminalize_resolution = (
+                lambda entry, exit_quote=None, unresolved_status=None:
+                terminal.append((entry.entry_id, exit_quote, unresolved_status))
+            )
+            return worker, samples, terminal
+
+        worker, samples, terminal = build_worker()
+        expired_entry = build_entry(
+            cutoff_at=cutoff,
+            eligible_at=cutoff + timedelta(seconds=1),
+            source_cycle_id="cycle-expired",
+        )
+        worker._pending_resolutions[expired_entry.entry_id] = PendingResolution(
+            entry=expired_entry,
+            target_at=target,
+            target_epoch_ns=target_ns,
+            deadline_at=deadline,
+            deadline_epoch_ns=deadline_ns,
+        )
+        worker._on_sip_observation(True)
+        samples["now_ns"] = elapsed_to_deadline_ns + 1
+        worker._on_sip_observation(False)
+        self.assertTrue(
+            worker._pending_resolutions[expired_entry.entry_id].observed_through_deadline
+        )
+        samples["now_ns"] = elapsed_to_deadline_ns + 10
+        worker._terminalize_due_resolutions(deadline_ns)
+        self.assertEqual(
+            terminal,
+            [(expired_entry.entry_id, None, "UNRESOLVED_WINDOW_EXPIRED")],
+        )
+
+        worker, samples, terminal = build_worker()
+        gap_entry = build_entry(
+            cutoff_at=cutoff,
+            eligible_at=cutoff + timedelta(seconds=1),
+            source_cycle_id="cycle-gap",
+        )
+        worker._pending_resolutions[gap_entry.entry_id] = PendingResolution(
+            entry=gap_entry,
+            target_at=target,
+            target_epoch_ns=target_ns,
+            deadline_at=deadline,
+            deadline_epoch_ns=deadline_ns,
+        )
+        worker._on_sip_observation(True)
+        samples["now_ns"] = elapsed_to_deadline_ns - 1
+        worker._on_sip_observation(False)
+        self.assertFalse(
+            worker._pending_resolutions[gap_entry.entry_id].observed_through_deadline
+        )
+        samples["now_ns"] = elapsed_to_deadline_ns + 10
+        worker._terminalize_due_resolutions(deadline_ns)
+        self.assertEqual(
+            terminal,
+            [(gap_entry.entry_id, None, "UNRESOLVED_OBSERVATION_GAP")],
+        )
+
     def test_sim5_enabled_gate_exact_lowercase_true(self):
         self.assertEqual(SIM5_ENABLED_ENV, "ATOM_V9_SIM5_ENABLED")
         self.assertTrue(sim5_enabled({SIM5_ENABLED_ENV: "true"}))
@@ -776,6 +864,43 @@ class SimulationResolutionStoreTests(unittest.TestCase):
             SimulationResolutionStore(FakeConnection(bad_pid_cursor))._verify_authority_on_cursor(
                 bad_pid_cursor)
 
+    def test_decode_row_rejects_hash_payload_and_window_tamper(self):
+        entry = build_entry()
+        target, deadline = target_and_deadline(entry)
+        exit_quote = build_quote(
+            provider_event_ns=datetime_to_epoch_nanoseconds(target) + 1,
+            accepted_at=target + timedelta(microseconds=1),
+            bid=101.0,
+            ask=101.5,
+        )
+        resolution = build_simulation_resolution_record(entry=entry, exit_quote=exit_quote)
+
+        bad_hash_payload = json.loads(serialize_simulation_resolution_record(resolution))
+        bad_hash_payload["resolution_hash"] = "f" * 64
+        bad_hash_payload["resolution_id"] = RESOLUTION_ID_PREFIX + ("f" * 64)
+        bad_hash_row = list(resolution_row(resolution))
+        bad_hash_row[0] = bad_hash_payload["resolution_id"]
+        bad_hash_row[1] = bad_hash_payload["resolution_hash"]
+        bad_hash_row[-1] = bad_hash_payload
+        with self.assertRaises(SimulationResolutionRowInvalidError):
+            SimulationResolutionStore._decode_resolution_row(tuple(bad_hash_row))
+
+        bad_payload_row = list(resolution_row(resolution))
+        bad_payload = json.loads(serialize_simulation_resolution_record(resolution))
+        del bad_payload["mode"]
+        bad_payload_row[-1] = bad_payload
+        with self.assertRaises(SimulationResolutionRowInvalidError):
+            SimulationResolutionStore._decode_resolution_row(tuple(bad_payload_row))
+
+        invalid_event_ns = datetime_to_epoch_nanoseconds(deadline) + 1
+        bad_window_payload = json.loads(serialize_simulation_resolution_record(resolution))
+        bad_window_payload["exit_quote"]["provider_event_ns"] = invalid_event_ns
+        bad_window_row = list(resolution_row(resolution))
+        bad_window_row[24] = invalid_event_ns
+        bad_window_row[-1] = bad_window_payload
+        with self.assertRaises(SimulationResolutionRowInvalidError):
+            SimulationResolutionStore._decode_resolution_row(tuple(bad_window_row))
+
     def test_store_lookup_and_requery_paths(self):
         entry = build_entry()
         target, _ = target_and_deadline(entry)
@@ -831,6 +956,28 @@ class SimulationResolutionStoreTests(unittest.TestCase):
                 entry,
                 exit_quote=exit_quote,
             )
+
+    def test_migration_enforces_resolution_payload_and_window_integrity(self):
+        self.assertIn(
+            "exit_quote_event_ns BETWEEN (((EXTRACT(EPOCH FROM resolution_target_at) * 1000000)::bigint) * 1000) AND (((EXTRACT(EPOCH FROM resolution_deadline_at) * 1000000)::bigint) * 1000)",
+            NORMALIZED_RESOLUTION_MIGRATION_SQL,
+        )
+        self.assertIn(
+            "jsonb_object_length(record_json) = 24",
+            NORMALIZED_RESOLUTION_MIGRATION_SQL,
+        )
+        self.assertIn(
+            "record_json ->> 'resolution_id' = resolution_id",
+            NORMALIZED_RESOLUTION_MIGRATION_SQL,
+        )
+        self.assertIn(
+            "record_json ->> 'resolution_hash' = resolution_hash",
+            NORMALIZED_RESOLUTION_MIGRATION_SQL,
+        )
+        self.assertIn(
+            "record_json #>> '{exit_quote,provider_event_ns}' = exit_quote_event_ns::text",
+            NORMALIZED_RESOLUTION_MIGRATION_SQL,
+        )
 
 
 if __name__ == "__main__":

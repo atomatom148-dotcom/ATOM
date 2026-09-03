@@ -1051,6 +1051,7 @@ class PendingResolution:
     deadline_at: datetime
     deadline_epoch_ns: int
     selected_quote: SimulationExecutableQuote | None = None
+    observed_through_deadline: bool = False
 
 
 def quote_is_eligible(intent: SimulationTradeIntent, quote: object) -> bool:
@@ -1475,11 +1476,29 @@ class SimulationEntryWorker:
                 if self._sip_streak_start_ns is None:
                     self._sip_streak_start_ns = self._monotonic_ns()
             else:
+                if self._sip_streak_start_ns is not None and self._anchor is not None:
+                    streak_start_epoch_ns = self._anchor.derived_epoch_ns(
+                        self._sip_streak_start_ns,
+                    )
+                    streak_end_epoch_ns = self._anchor.derived_epoch_ns(
+                        self._monotonic_ns(),
+                    )
+                    for pending in self._pending_resolutions.values():
+                        if (
+                            not pending.observed_through_deadline
+                            and streak_start_epoch_ns <= pending.target_epoch_ns
+                            and streak_end_epoch_ns >= pending.deadline_epoch_ns
+                        ):
+                            pending.observed_through_deadline = True
                 self._sip_streak_start_ns = None
 
-    def _sip_observed_continuously(self, since_epoch_ns: int) -> bool:
+    def _sip_observed_continuously(
+        self,
+        since_epoch_ns: int,
+        through_epoch_ns: int,
+    ) -> bool:
         """True iff SIP has been observed without interruption since
-        ``since_epoch_ns`` through the current instant (freeze section 5).
+        ``since_epoch_ns`` through ``through_epoch_ns`` (freeze section 5).
 
         Unknown coverage is a gap: both no current streak and no anchor
         (unable to translate the streak start into epoch time) fail closed
@@ -1491,7 +1510,10 @@ class SimulationEntryWorker:
             anchor = self._anchor
         if streak_start_ns is None or anchor is None:
             return False
-        return anchor.derived_epoch_ns(streak_start_ns) <= since_epoch_ns
+        return (
+            anchor.derived_epoch_ns(streak_start_ns) <= since_epoch_ns
+            and anchor.derived_epoch_ns(self._monotonic_ns()) >= through_epoch_ns
+        )
 
     def _enable_admission_with_anchor(self) -> None:
         receiver = self._receiver
@@ -1809,22 +1831,23 @@ class SimulationEntryWorker:
         streaming in before the deadline can be tested against it.
         """
 
-        if entry.entry_status != "ENTERED" or entry.entry_id in self._pending_resolutions:
-            return
-        if len(self._pending_resolutions) >= SIM4_PENDING_RESOLUTION_CAPACITY:
-            raise Sim4GenerationFailed(
-                "bounded pending-resolution capacity exhausted"
-            )
         cutoff = entry.cutoff_at.astimezone(timezone.utc)
         target_at = cutoff + timedelta(seconds=entry.horizon_seconds)
         deadline_at = target_at + timedelta(seconds=SIM5_RESOLUTION_WINDOW_SECONDS)
-        self._pending_resolutions[entry.entry_id] = PendingResolution(
-            entry=entry,
-            target_at=target_at,
-            target_epoch_ns=_datetime_to_epoch_nanoseconds(target_at),
-            deadline_at=deadline_at,
-            deadline_epoch_ns=_datetime_to_epoch_nanoseconds(deadline_at),
-        )
+        with self._admission_lock:
+            if entry.entry_status != "ENTERED" or entry.entry_id in self._pending_resolutions:
+                return
+            if len(self._pending_resolutions) >= SIM4_PENDING_RESOLUTION_CAPACITY:
+                raise Sim4GenerationFailed(
+                    "bounded pending-resolution capacity exhausted"
+                )
+            self._pending_resolutions[entry.entry_id] = PendingResolution(
+                entry=entry,
+                target_at=target_at,
+                target_epoch_ns=_datetime_to_epoch_nanoseconds(target_at),
+                deadline_at=deadline_at,
+                deadline_epoch_ns=_datetime_to_epoch_nanoseconds(deadline_at),
+            )
 
     def _register_recovered_resolutions(
         self, occupancy: Mapping[str, SimulationEntryRecord],
@@ -2039,22 +2062,23 @@ class SimulationEntryWorker:
         resolution window.
         """
 
-        if not self._pending_resolutions:
-            return
-        for pending in self._pending_resolutions.values():
-            selected = select_exit_quote(
-                decision=pending.entry.decision,
-                resolution_target_at=pending.target_at,
-                resolution_deadline_at=pending.deadline_at,
-                entry_quote=pending.entry.quote,
-                quotes=(
-                    (quote,)
-                    if pending.selected_quote is None
-                    else (pending.selected_quote, quote)
-                ),
-            )
-            if selected is not None:
-                pending.selected_quote = selected
+        with self._admission_lock:
+            if not self._pending_resolutions:
+                return
+            for pending in self._pending_resolutions.values():
+                selected = select_exit_quote(
+                    decision=pending.entry.decision,
+                    resolution_target_at=pending.target_at,
+                    resolution_deadline_at=pending.deadline_at,
+                    entry_quote=pending.entry.quote,
+                    quotes=(
+                        (quote,)
+                        if pending.selected_quote is None
+                        else (pending.selected_quote, quote)
+                    ),
+                )
+                if selected is not None:
+                    pending.selected_quote = selected
 
     def _retain_admitted_quote(
         self,
@@ -2080,10 +2104,11 @@ class SimulationEntryWorker:
         return min((pending.deadline_epoch_ns for pending in self._pending.values()), default=None)
 
     def _due_resolution_deadline(self) -> int | None:
-        return min(
-            (pending.deadline_epoch_ns for pending in self._pending_resolutions.values()),
-            default=None,
-        )
+        with self._admission_lock:
+            return min(
+                (pending.deadline_epoch_ns for pending in self._pending_resolutions.values()),
+                default=None,
+            )
 
     def _terminalize_resolution(
         self,
@@ -2126,21 +2151,28 @@ class SimulationEntryWorker:
     def _terminalize_due_resolutions(
         self, deadline_epoch_ns: int,
     ) -> None:
-        due = sorted(
-            (
-                pending for pending in self._pending_resolutions.values()
-                if pending.deadline_epoch_ns == deadline_epoch_ns
-            ),
-            key=lambda pending: (
-                pending.target_at, pending.entry.horizon, pending.entry.entry_id,
-            ),
-        )
+        with self._admission_lock:
+            due = sorted(
+                (
+                    pending for pending in self._pending_resolutions.values()
+                    if pending.deadline_epoch_ns == deadline_epoch_ns
+                ),
+                key=lambda pending: (
+                    pending.target_at, pending.entry.horizon, pending.entry.entry_id,
+                ),
+            )
         for pending in due:
             if pending.selected_quote is not None:
                 self._terminalize_resolution(
                     pending.entry, exit_quote=pending.selected_quote,
                 )
-            elif self._sip_observed_continuously(pending.target_epoch_ns):
+            elif (
+                pending.observed_through_deadline
+                or self._sip_observed_continuously(
+                    pending.target_epoch_ns,
+                    pending.deadline_epoch_ns,
+                )
+            ):
                 self._terminalize_resolution(
                     pending.entry, unresolved_status="UNRESOLVED_WINDOW_EXPIRED",
                 )
@@ -2152,7 +2184,8 @@ class SimulationEntryWorker:
                 self._terminalize_resolution(
                     pending.entry, unresolved_status="UNRESOLVED_OBSERVATION_GAP",
                 )
-            self._pending_resolutions.pop(pending.entry.entry_id, None)
+            with self._admission_lock:
+                self._pending_resolutions.pop(pending.entry.entry_id, None)
 
     def _next_uncaptured_deadline(self) -> int | None:
         return min(
@@ -2652,8 +2685,8 @@ class SimulationEntryWorker:
             # still-open ENTERED entry through load_open_occupancy_on_cursor
             # at its own startup and fails closed to
             # UNRESOLVED_OBSERVATION_GAP unless a genuine quote arrives.
-            self._pending_resolutions.clear()
             with self._admission_lock:
+                self._pending_resolutions.clear()
                 self._sip_streak_start_ns = None
             # Only this finalizer, after the decision loop and every terminal
             # transaction are impossible, may release the owner session.
