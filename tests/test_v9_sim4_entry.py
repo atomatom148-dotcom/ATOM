@@ -706,6 +706,10 @@ class SimulationEntryStoreTests(unittest.TestCase):
             sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
         )
         self.assertIn(
+            "jsonb_array_length(jsonb_path_query_array(r.record_json, '$.*')) = 24",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
             "r.record_json ->> 'resolution_hash' = r.resolution_hash",
             sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
         )
