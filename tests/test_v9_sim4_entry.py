@@ -744,6 +744,18 @@ class SimulationEntryStoreTests(unittest.TestCase):
             "r.instrument = e.record_json ->> 'instrument'",
             sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
         )
+        self.assertIn(
+            "e.record_json #>> '{quote,provider_event_ns}' = e.quote_event_ns::text",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
+            "e.record_json #>> '{quote,accepted_at,$timestamp_utc}' = to_char(e.quote_accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
+            "e.record_json #>> '{entry_price,$float64}' = encode(float8send(e.entry_price), 'hex')",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
 
         entry1 = build_simulation_entry_record(
             intent=build_intent(), entry_status="ENTERED", quote=build_quote())

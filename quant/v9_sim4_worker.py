@@ -1476,7 +1476,11 @@ class SimulationEntryWorker:
                 if self._sip_streak_start_ns is None:
                     self._sip_streak_start_ns = self._monotonic_ns()
             else:
-                if self._sip_streak_start_ns is not None and self._anchor is not None:
+                if (
+                    self._sip_streak_start_ns is not None
+                    and self._anchor is not None
+                    and self._sip_streak_start_ns >= self._anchor.monotonic_ns
+                ):
                     streak_start_epoch_ns = self._anchor.derived_epoch_ns(
                         self._sip_streak_start_ns,
                     )
@@ -1508,7 +1512,11 @@ class SimulationEntryWorker:
         with self._admission_lock:
             streak_start_ns = self._sip_streak_start_ns
             anchor = self._anchor
-        if streak_start_ns is None or anchor is None:
+        if (
+            streak_start_ns is None
+            or anchor is None
+            or streak_start_ns < anchor.monotonic_ns
+        ):
             return False
         return (
             anchor.derived_epoch_ns(streak_start_ns) <= since_epoch_ns
@@ -1526,11 +1534,6 @@ class SimulationEntryWorker:
             self._anchor = capture_monotonic_utc_anchor(
                 self._monotonic_ns, self._utc_clock,
             )
-            if (
-                self._sip_streak_start_ns is not None
-                and self._sip_streak_start_ns < self._anchor.monotonic_ns
-            ):
-                self._sip_streak_start_ns = self._anchor.monotonic_ns
             self._admission_enabled = True
 
     def _activation_capture(self, store: SimulationEntryStore) -> int | None:

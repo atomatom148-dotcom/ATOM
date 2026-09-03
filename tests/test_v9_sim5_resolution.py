@@ -552,6 +552,37 @@ class SimulationResolutionContractTests(unittest.TestCase):
             return worker, samples, terminal
 
         worker, samples, terminal = build_worker(enable_anchor=True)
+        pre_anchor_entry = build_entry(
+            cutoff_at=cutoff,
+            eligible_at=cutoff + timedelta(seconds=1),
+            source_cycle_id="cycle-pre-anchor",
+        )
+        worker._pending_resolutions[pre_anchor_entry.entry_id] = PendingResolution(
+            entry=pre_anchor_entry,
+            target_at=target,
+            target_epoch_ns=target_ns,
+            deadline_at=deadline,
+            deadline_epoch_ns=deadline_ns,
+        )
+        samples["now_ns"] = 1
+        worker._on_sip_observation(True)
+        samples["now_ns"] = 5
+        worker._enable_admission_with_anchor()
+        self.assertEqual(worker._sip_streak_start_ns, 1)
+        self.assertFalse(worker._sip_observed_continuously(target_ns, deadline_ns))
+        samples["now_ns"] = 5 + elapsed_to_deadline_ns + 1
+        worker._on_sip_observation(False)
+        self.assertFalse(
+            worker._pending_resolutions[pre_anchor_entry.entry_id].observed_through_deadline
+        )
+        samples["now_ns"] = 5 + elapsed_to_deadline_ns + 10
+        worker._terminalize_due_resolutions(deadline_ns)
+        self.assertEqual(
+            terminal,
+            [(pre_anchor_entry.entry_id, None, "UNRESOLVED_OBSERVATION_GAP")],
+        )
+
+        worker, samples, terminal = build_worker()
         expired_entry = build_entry(
             cutoff_at=cutoff,
             eligible_at=cutoff + timedelta(seconds=1),
@@ -564,17 +595,13 @@ class SimulationResolutionContractTests(unittest.TestCase):
             deadline_at=deadline,
             deadline_epoch_ns=deadline_ns,
         )
-        samples["now_ns"] = 1
         worker._on_sip_observation(True)
-        samples["now_ns"] = 5
-        worker._enable_admission_with_anchor()
-        self.assertEqual(worker._sip_streak_start_ns, 5)
-        samples["now_ns"] = 5 + elapsed_to_deadline_ns + 1
+        samples["now_ns"] = elapsed_to_deadline_ns + 1
         worker._on_sip_observation(False)
         self.assertTrue(
             worker._pending_resolutions[expired_entry.entry_id].observed_through_deadline
         )
-        samples["now_ns"] = 5 + elapsed_to_deadline_ns + 10
+        samples["now_ns"] = elapsed_to_deadline_ns + 10
         worker._terminalize_due_resolutions(deadline_ns)
         self.assertEqual(
             terminal,
