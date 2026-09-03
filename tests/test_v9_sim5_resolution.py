@@ -1035,6 +1035,18 @@ class SimulationResolutionStoreTests(unittest.TestCase):
             RESOLUTION_MIGRATION_SQL.index("'GRANT atom_v9_sim_owner TO %I'"),
             RESOLUTION_MIGRATION_SQL.index("'REVOKE atom_v9_sim_owner FROM %I'"),
         )
+        self.assertLess(
+            RESOLUTION_MIGRATION_SQL.index("GRANT CREATE ON SCHEMA public TO atom_v9_sim_owner;"),
+            RESOLUTION_MIGRATION_SQL.index("CREATE TABLE public.atom_v9_sim_resolutions"),
+        )
+        self.assertLess(
+            RESOLUTION_MIGRATION_SQL.index("REVOKE CREATE ON SCHEMA public FROM atom_v9_sim_owner;"),
+            RESOLUTION_MIGRATION_SQL.index("'REVOKE atom_v9_sim_owner FROM %I'"),
+        )
+        self.assertLess(
+            RESOLUTION_MIGRATION_SQL.index("REVOKE CREATE ON SCHEMA public FROM atom_v9_sim_owner;"),
+            RESOLUTION_MIGRATION_SQL.index("DO $atom_v9_sim5_verify_final_authority$"),
+        )
 
 
 if __name__ == "__main__":

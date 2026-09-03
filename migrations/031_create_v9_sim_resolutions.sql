@@ -73,6 +73,8 @@ BEGIN
 END
 $atom_v9_sim5_grant_bootstrap_owner$;
 
+GRANT CREATE ON SCHEMA public TO atom_v9_sim_owner;
+
 CREATE TABLE public.atom_v9_sim_resolutions (
     resolution_id text PRIMARY KEY,
     resolution_hash text UNIQUE NOT NULL,
@@ -339,6 +341,8 @@ BEGIN
     END LOOP;
 END
 $atom_v9_sim5_revoke_optional_roles$;
+
+REVOKE CREATE ON SCHEMA public FROM atom_v9_sim_owner;
 
 DO $atom_v9_sim5_revoke_bootstrap_owner$
 BEGIN
