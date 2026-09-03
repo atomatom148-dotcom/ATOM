@@ -188,7 +188,7 @@ CREATE TABLE public.atom_v9_sim_resolutions (
     ),
     CONSTRAINT atom_v9_sim_resolutions_record_json_check CHECK (
         jsonb_typeof(record_json) = 'object'
-        AND jsonb_object_length(record_json) = 24
+        AND jsonb_array_length(jsonb_path_query_array(record_json, '$.*')) = 24
         AND record_json ?& ARRAY[
             'contract_version', 'canonicalization_version',
             'simulator_version', 'resolution_id', 'resolution_hash', 'mode',

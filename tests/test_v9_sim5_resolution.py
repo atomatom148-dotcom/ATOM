@@ -1016,7 +1016,7 @@ class SimulationResolutionStoreTests(unittest.TestCase):
             NORMALIZED_RESOLUTION_MIGRATION_SQL,
         )
         self.assertIn(
-            "jsonb_object_length(record_json) = 24",
+            "jsonb_array_length(jsonb_path_query_array(record_json, '$.*')) = 24",
             NORMALIZED_RESOLUTION_MIGRATION_SQL,
         )
         self.assertIn(
