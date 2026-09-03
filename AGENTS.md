@@ -8,8 +8,9 @@ changing external services, read completely:
 1. `AGENTS.md`
 2. `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1.md`
 3. Every amendment to that role-governance freeze present on current `main`;
-   `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A.md` governs only from its
-   Owner-approved merge commit
+   `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A.md` and
+   `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1B.md` govern only from their
+   respective Owner-approved merge commits
 4. `FREEZE.md`
 5. `SIMULATION_FREEZE.md`
 6. `PHASES.md`
@@ -29,8 +30,11 @@ implementation ownership, innovation workflow, review requirements, evidence
 governance, and final technical-audit authority.
 
 When `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A.md` is effective, its §3
-supersedes base §3. The base document remains an immutable historical adoption
-record and is not silently rewritten.
+supersedes base §3. When `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1B.md` is
+effective, its explicit delegation and Owner-author-of-record fallback clauses
+supersede conflicting sole-author and Claude-implementation restrictions in the
+base freeze and Amendment 1A. The base documents remain immutable historical
+adoption records and are not silently rewritten.
 
 A technical freeze cannot supersede governance law on those subjects unless it
 explicitly identifies and amends the role-governance decision through its
@@ -39,12 +43,11 @@ procedure.
 
 ### Technical domain
 
-The latest applicable Owner-approved ChatGPT Pro technical freeze or amendment
-controls system behavior within its named subject and scope. Among technical
-documents addressing the same subject, the explicit later amendment and the
-narrowest applicable restriction control. `SIMULATION_FREEZE.md` controls
-simulator work, then `FREEZE.md`, then `PHASES.md`, then existing
-implementation.
+The latest applicable Owner-approved technical freeze or amendment controls
+system behavior within its named subject and scope. Among technical documents
+addressing the same subject, the explicit later amendment and the narrowest
+applicable restriction control. `SIMULATION_FREEZE.md` controls simulator work,
+then `FREEZE.md`, then `PHASES.md`, then existing implementation.
 
 Governance law cannot silently change a technical formula, source, persistence
 rule, service boundary, or authority path. Such a change requires an explicit
@@ -65,21 +68,36 @@ A current Owner operational instruction controls immediately when it:
 - rejects, pauses, or permanently ends a program.
 
 When the Owner requests an action that crosses a frozen governance or technical
-boundary, that request is binding direction for ChatGPT Pro to prepare the
-required amendment. It does not silently rewrite existing law or authorize
-execution across the boundary before the amendment is Owner approved and
-merged. Protective stop and rollback authority remains immediate.
+boundary, that request is binding direction to prepare the required amendment.
+It does not silently rewrite existing law or authorize execution across the
+boundary before the amendment is Owner approved and merged. Protective stop and
+rollback authority remains immediate.
 
-### Sole freeze-author continuity
+### Freeze-author continuity and delegated drafting
 
-ChatGPT Pro remains the sole freeze and amendment author. If ChatGPT Pro is
-unavailable, the Owner and every assigned worker may continue only work already
-permitted by applicable freezes. The Owner retains immediate authority to
-reprioritize, choose among authorized options, approve or reject merges,
-authorize already-permitted deployments, stop, suspend, disable, roll back,
-revoke credentials, pause, or terminate programs. A requested boundary change
-remains `BLOCKED` until ChatGPT Pro authors the amendment and the Owner approves
-it. No substitute freeze author is implied.
+ChatGPT Pro remains the normal freeze and amendment author. Claude may prepare
+draft freeze, amendment, phase, preregistration, acceptance-gate, or research
+contract text at Owner request, but a Claude draft has zero controlling
+authority by itself.
+
+If ChatGPT Pro lacks current capacity or availability, the Owner may explicitly
+adopt a prepared draft directly and becomes the author of record. Claude remains
+the draft preparer only. The same documentation-first ordering, independent
+final-head review, required-green-check, and Owner merge requirements remain.
+Claude does not become freeze author through this path.
+
+### Claude implementation delegation
+
+Codex remains the default implementation owner. Claude may be named as the sole
+implementation owner for one exact job when ChatGPT Pro or the Owner issues a
+job card beneath controlling law naming Claude in that role. The job card must
+state the controlling freeze, exact scope, permitted and prohibited actions,
+required tests and evidence, PASS/FAIL/INVALID/BLOCKED rules, stop condition,
+and receipt. Claude receives no general implementation authority from one job.
+
+When Claude implements, Claude may not be the sole final-head reviewer. Codex,
+Copilot's pull-request reviewer, a qualified human, or the Owner must provide
+independent final-head review. Every required check remains mandatory and green.
 
 ### Cross-domain conflicts
 
@@ -149,8 +167,8 @@ independent reviewer on the final intended head. Unavailability may change the
 reviewer; it may not remove the review.
 
 No check waiver, substitution, or bypass is implied. A required check may be
-changed, removed, or replaced only by a separate Owner-approved ChatGPT Pro
-amendment that expressly identifies that check before the affected merge.
+changed, removed, or replaced only by a separate Owner-approved amendment that
+expressly identifies that check before the affected merge.
 
 A green check or "review completed" badge that covers an earlier commit, or
 that leaves material threads unresolved, is not approval. Never merge first and
@@ -189,19 +207,26 @@ action.
 
 Update this section only by Owner-approved documentation change.
 
-- Active phase: **E-1 — read-only evidence scorecard**.
-- Controlling text: `docs/e-1-evidence-scorecard-freeze.md`, including the
-  latest merged E-1C and E-1D amendments.
-- Authorized order: correct migration `030` under E-1D in PR #274; merge and
-  apply it; provision the dedicated `atom_e1_scorecard_reader` credential;
-  correct and merge the E-1 implementation in PR #270; then produce and review
-  exactly one official E-1 receipt.
-- L-1 gate activation and its single deployment are complete. Its read-only
-  acceptance receipt remains authorized after the first two complete regular
-  XNYS sessions and does not block E-1.
-- Not authorized until their own Owner-approved pointer or freeze change:
-  E-2, E-3, E-4, migration `031`, SIM-5 implementation, the SIM-5 live
-  resolution proof, SIM-6, or later work.
+- Active phase: **Level II durable depth capture — implementation**.
+- Controlling text: `ATOM_LEVEL2_DEPTH_CAPTURE_FREEZE_1.md` at the Owner-approved
+  merge of PR #288, plus `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1B.md` for
+  implementation-owner delegation.
+- Named implementation owner: **Claude** for this Level II capture job only.
+- Authorized order: implement the smallest default-off observer-only durable
+  capture path and one isolated append-only table; add only the required
+  least-privilege migration, tests, deterministic receipt/health proof, and
+  activation gate; final-head independent review; every required check green;
+  Owner merge; then apply the approved migration and activate only the Level II
+  capture gate.
+- E-1 remains preserved and may resume after this bounded Level II capture job;
+  no E-1 mathematics, scorecard statistics, reader roles, or evidence semantics
+  may change during this phase.
+- L-1 remains unchanged. Its read-only acceptance receipt remains authorized
+  when its required session evidence is mature and does not block this bounded
+  Level II capture job.
+- Not authorized by this pointer: E-2, E-3, E-4, drift-adjusted benchmarking,
+  S3, Q5 changes, family/V9/SIM use of Level II, broker/trading authority,
+  additional market-data sources, new services, or unrelated credentials.
 
 ## What each document is for
 
@@ -213,4 +238,4 @@ Update this section only by Owner-approved documentation change.
   authorized to do.
 - `PHASES.md` tells it where the program currently is.
 - The Owner's explicit approval decides whether the next boundary may be
-  crossed through the applicable ChatGPT Pro-authored freeze or amendment.
+  crossed through the applicable controlling freeze or amendment.
