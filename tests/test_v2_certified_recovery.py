@@ -78,7 +78,7 @@ def test_v2_builder_uses_exact_explicit_cutoff_for_both_evidence_queries():
     evidence_queries = connection.cursor_value.statements[2:]
     assert len(evidence_queries) == 2
     assert all(
-        parameters[5] == V2_CERTIFIED_RECOVERY_STATE_AS_OF
+        parameters[-1] == V2_CERTIFIED_RECOVERY_STATE_AS_OF
         for _sql, parameters in evidence_queries
     )
     assert connection.rollbacks == 1

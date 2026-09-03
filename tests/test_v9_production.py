@@ -524,16 +524,133 @@ def test_v2_batch_builder_uses_read_only_repeatable_read_and_closes_snapshot():
     bounded = connection.value.statements[2:]
     assert len(bounded) == 2
     assert all("LIMIT %s" in sql for sql, _params in bounded)
-    assert all(params[-1] == V2_STATE_BUILD_EVIDENCE_PAGE_SIZE
+    assert all(params[-4] == V2_STATE_BUILD_EVIDENCE_PAGE_SIZE
                for _sql, params in bounded)
+    assert bounded[0][1][-3:] == (
+        "DIRECTIONAL_FORECAST", "DIRECTIONAL_OUTCOME", NOW - 1,
+    )
+    assert bounded[1][1][-3:] == (
+        "VOLATILITY_FORECAST", "VOLATILITY_OUTCOME", NOW - 1,
+    )
     assert all("OFFSET" not in sql for sql, _params in bounded)
     assert all("o.resolved_epoch <= f.maturity_epoch + %s" in sql
                for sql, _params in bounded)
     assert all("o.resolved_epoch >= f.maturity_epoch" in sql
                for sql, _params in bounded)
-    assert all(params[4] == 5.0 for _sql, params in bounded)
+    assert all(params[2] == 5.0 for _sql, params in bounded)
+    assert all(
+        "read_legacy_evidence_publications_for_records" in sql
+        for sql, _parameters in bounded
+    )
+    assert all(
+        "read_legacy_evidence_publication(" not in sql
+        for sql, _parameters in bounded
+    )
+    assert all("JOIN LATERAL" not in sql for sql, _parameters in bounded)
+    assert all(
+        "forecast_proofs AS MATERIALIZED" in sql
+        and "outcome_proofs AS MATERIALIZED" in sql
+        and sql.count("read_legacy_evidence_publications_for_records") == 2
+        and "LEFT JOIN forecast_proofs" in sql
+        and "LEFT JOIN outcome_proofs" in sql
+        and "fp.commit_observed_at < to_timestamp(f.maturity_epoch)" in sql
+        for sql, _parameters in bounded
+    )
     assert connection.rollbacks == 1
     assert connection.value.closed and connection.closed
+
+
+def test_v2_builder_advances_raw_page_when_proofs_are_missing(monkeypatch):
+    class Cursor:
+        def __init__(self):
+            self.parameters = ()
+            self.volatility = False
+            self.directional_fetches = 0
+
+        def execute(self, sql, parameters):
+            self.parameters = parameters
+            self.volatility = "volatility_forecasts" in sql
+
+        def fetchone(self):
+            return (NOW,)
+
+        def fetchall(self):
+            if self.volatility:
+                return []
+            self.directional_fetches += 1
+            if self.directional_fetches == 1:
+                rows = []
+                for index in range(V2_STATE_BUILD_EVIDENCE_PAGE_SIZE):
+                    forecast_proof = float(index) if index % 2 == 0 else None
+                    outcome_proof = float(index + 30) if index % 2 else None
+                    rows.append((
+                        index, "q1_momentum",
+                        FORMULA_VERSION_MAP["q1_momentum"],
+                        f"cycle-{index}", "COIN", "30S", float(index),
+                        float(index + 30), 1.0, float(index),
+                        DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None, 2.0,
+                        float(index + 30), forecast_proof, outcome_proof,
+                    ))
+                return rows
+            if self.directional_fetches == 2:
+                index = V2_STATE_BUILD_EVIDENCE_PAGE_SIZE
+                return [(
+                    index, "q1_momentum",
+                    FORMULA_VERSION_MAP["q1_momentum"],
+                    f"cycle-{index}", "COIN", "30S", float(index),
+                    float(index + 30), 1.0, float(index),
+                    DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None, 2.0,
+                    float(index + 30), float(index), float(index + 30),
+                )]
+            raise AssertionError("candidate pagination must terminate")
+
+        def close(self):
+            pass
+
+    class Connection:
+        def __init__(self):
+            self.cursor_value = Cursor()
+
+        def cursor(self):
+            return self.cursor_value
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    captured = {}
+
+    def dataset(**kwargs):
+        captured[kwargs["horizon"]] = kwargs
+        return SimpleNamespace(horizon=kwargs["horizon"])
+
+    monkeypatch.setattr("quant.v9_production.build_v2a_dataset", dataset)
+    monkeypatch.setattr(
+        "quant.v9_production.build_v2b_calibration", lambda _datasets: object(),
+    )
+    monkeypatch.setattr(
+        "quant.v9_production.build_v2c_covariance", lambda *_args: object(),
+    )
+    monkeypatch.setattr(
+        "quant.v9_production.build_v2d_evidence_state",
+        lambda **_kwargs: SimpleNamespace(
+            creation_status="VALID", top_level_status="PROVISIONAL",
+        ),
+    )
+    connection = Connection()
+    builder = PostgresV2StateBuilder(
+        "postgresql://unused", connect=lambda _url: connection,
+    )
+
+    builder.build()
+
+    assert connection.cursor_value.directional_fetches == 2
+    assert builder.last_rows_materialized == 1
+    assert [row.record_id for row in captured["30S"]["observations"]] == [
+        V2_STATE_BUILD_EVIDENCE_PAGE_SIZE,
+    ]
 
 
 def test_v2_builder_materializes_provider_time_and_rejects_unproven_rows(monkeypatch):
@@ -609,7 +726,13 @@ def test_v2_builder_fails_closed_if_keyset_does_not_advance():
             return (NOW,)
         def fetchall(self):
             self.fetches += 1
-            return [(1, None, None, None, None, "30S", 1.0)] * V2_STATE_BUILD_EVIDENCE_PAGE_SIZE
+            row = (
+                1, "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"],
+                "cycle", "COIN", "30S", 1.25, 31.25, 1.0, 1.25,
+                DATA_SCHEMA_VERSION, SOURCE_SPEC_VERSION, None, 2.0, 31.25,
+                1.0, 31.0,
+            )
+            return [row] * V2_STATE_BUILD_EVIDENCE_PAGE_SIZE
         def close(self):
             pass
 
@@ -646,17 +769,19 @@ def test_v2_builder_keyset_pages_admit_all_qualified_rows(monkeypatch, row_count
             self.parameters = parameters
             self.volatility = "volatility_forecasts" in sql
             assert "OFFSET" not in sql
+            if not self.volatility and self.keys:
+                assert parameters[3:6] == self.keys[-1]
         def fetchone(self): return (NOW,)
         def fetchall(self):
             if self.volatility:
                 return []
-            after = -1 if len(self.parameters) == 7 else int(self.parameters[-3])
+            after = -1 if len(self.parameters) == 7 else int(self.parameters[5])
             first = after + 1
             stop = min(first + V2_STATE_BUILD_EVIDENCE_PAGE_SIZE, row_count)
             rows = [
                 (index, "q1_momentum", FORMULA_VERSION_MAP["q1_momentum"],
-                 f"cycle-{index}", "COIN", "30S", float(index),
-                 float(index + 30), 1.0, float(index), DATA_SCHEMA_VERSION,
+                 f"cycle-{index}", "COIN", "30S", float(2 * index) + 0.25,
+                 float(2 * index) + 30.25, 1.0, float(index), DATA_SCHEMA_VERSION,
                  SOURCE_SPEC_VERSION, None, 2.0, float(index + 30),
                  float(index), float(index + 30))
                 for index in range(first, stop)
