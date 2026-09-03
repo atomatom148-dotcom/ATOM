@@ -1,0 +1,75 @@
+{
+  "decision_id": "E-1-OFFICIAL-SCORECARD-RECEIPT-1",
+  "status": "COMPLETED",
+  "receipt_kind": "official_e1_stdout_attestation",
+  "generated_at_utc": "2026-09-03T02:11:31.463529952Z",
+  "repository_sha": "90151c29a9550bff69b53e655a8e8d06d56dda24",
+  "implementation_merge_sha": "dbc1175407ca73e6337052c502a538ce38d1b276",
+  "render": {
+    "service_name": "atom-h2d3-benchmark",
+    "service_id": "srv-daa7thgae00c73a2lmn0",
+    "instance_id": "srv-daa7thgae00c73a2lmn0-9zv6h",
+    "command": "python -m quant.evidence_scorecard --recent-sessions 10; sleep infinity",
+    "raw_receipt_source": "Render application stdout beginning 2026-09-03T02:11:31.463529952Z"
+  },
+  "database_reader": {
+    "required_role": "atom_e1_scorecard_reader",
+    "authentication": "PASS",
+    "identity_guard": "PASS",
+    "read_only_guard": "PASS"
+  },
+  "requested_sessions": [
+    "2026-08-19",
+    "2026-08-20",
+    "2026-08-21",
+    "2026-08-24",
+    "2026-08-25",
+    "2026-08-26",
+    "2026-08-27",
+    "2026-08-28",
+    "2026-08-31",
+    "2026-09-01"
+  ],
+  "frozen_bootstrap": {
+    "method": "session_clustered_percentile_ratio_of_sums",
+    "resamples": 200000,
+    "seed": 0,
+    "intervals": [0.999, 0.95],
+    "cost_bps": 0.0
+  },
+  "observed_result": {
+    "execution": "PASS",
+    "evidence_sufficiency": "MIXED_WITH_MULTIPLE_INSUFFICIENT_CELLS",
+    "thresholds_unchanged": true,
+    "rerun_performed": false,
+    "promotion_claim": "NONE"
+  },
+  "spot_checks": {
+    "v9_5m": {
+      "n_rows": 58722,
+      "n_population": 35335,
+      "n_inadmissible": 23387,
+      "n_non_rth": 15794,
+      "n_overlap_excluded": 19480,
+      "n_windows": 61,
+      "n_invalid_outcome": 13,
+      "n_ties": 1,
+      "n_abstain": 1,
+      "n_decided": 46,
+      "n_economic": 47,
+      "n_decided_sessions": 5,
+      "mean_signed_bps": 5.112608664689582,
+      "label": "INSUFFICIENT"
+    },
+    "v9_1h": {
+      "label": "INSUFFICIENT",
+      "visible_independent_window_counts": [23, 25, 27]
+    }
+  },
+  "authority": {
+    "this_file_does_not_recompute_or_replace_raw_receipt": true,
+    "raw_stdout_is_authoritative_for_full_cell_payload": true,
+    "e2_not_authorized_by_this_receipt": true,
+    "sim5_not_implemented_by_this_receipt": true
+  }
+}
