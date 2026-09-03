@@ -44,6 +44,14 @@ from .v9_sim4_entry import (
     select_executable_quote,
     validate_simulator_database_url,
 )
+from .v9_sim5_resolution import (
+    IDEMPOTENT as SIM5_IDEMPOTENT,
+    INSERTED as SIM5_INSERTED,
+    RESOLUTION_WINDOW_SECONDS as SIM5_RESOLUTION_WINDOW_SECONDS,
+    SimulationResolutionStore,
+    select_exit_quote,
+    sim5_enabled as _sim5_enabled_flag,
+)
 
 
 SIM4_ENABLED_ENV = "ATOM_V9_SIM4_ENABLED"
@@ -69,6 +77,10 @@ SIM4_CHECKPOINT_KEY = "ATOM_TRUE_V9_SIM4_RECONCILIATION_1"
 SIM4_EVENT_QUEUE_CAPACITY = 256
 SIM4_QUOTE_BUFFER_CAPACITY = 256
 SIM4_PENDING_INTENT_CAPACITY = 256
+# One open ENTERED occupant per horizon (freeze section 9: startup/recovery
+# is bounded to at most six unresolved positions, one per horizon).  Matches
+# the fixed six-entry SIM4_HORIZON_ORDER table defined below.
+SIM4_PENDING_RESOLUTION_CAPACITY = 6
 SIM4_RECONCILE_QUERY_ROWS = 16
 SIM4_RECONCILE_MAX_PAGES_PER_SLICE = 1
 SIM4_BOUNDARY_RECHECK_SECONDS = 0.001
@@ -772,9 +784,12 @@ class SIPWebSocketReceiver:
         wait: Callable[[float], bool] | None = None,
         telemetry: Sim4Telemetry | None = None,
         thread_factory: Callable[..., threading.Thread] = threading.Thread,
+        observation_callback: Callable[[bool], None] | None = None,
     ) -> None:
         if not callable(quote_callback):
             raise TypeError("quote_callback must be callable")
+        if observation_callback is not None and not callable(observation_callback):
+            raise TypeError("observation_callback must be callable")
         if websocket_factory is None:
             from websocket import create_connection
             bounded_class = _bounded_websocket_client_class()
@@ -789,6 +804,7 @@ class SIPWebSocketReceiver:
         self._wait = wait or self._stop.wait
         self._telemetry = telemetry or Sim4Telemetry()
         self._thread_factory = thread_factory
+        self._observation_callback = observation_callback
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._socket_lock = threading.Lock()
@@ -798,6 +814,14 @@ class SIPWebSocketReceiver:
     @property
     def ready_event(self) -> threading.Event:
         return self._ready
+
+    def _notify_observation(self, connected: bool) -> None:
+        if self._observation_callback is None:
+            return
+        try:
+            self._observation_callback(connected)
+        except BaseException:
+            pass
 
     def start(self) -> None:
         if self._thread is not None:
@@ -811,6 +835,7 @@ class SIPWebSocketReceiver:
     def stop(self) -> None:
         self._stop.set()
         self._ready.clear()
+        self._notify_observation(False)
         # The exact 1.000s receive timeout bounds observation.  Socket close
         # stays on the receiver thread's own finalizer so public stop cannot
         # block in a websocket close handshake.
@@ -904,6 +929,7 @@ class SIPWebSocketReceiver:
                 )
             stable_started = self._monotonic()
             self._ready.set()
+            self._notify_observation(True)
             self._process_stream_items(
                 subscription_items[subscription_index + 1:]
             )
@@ -922,6 +948,7 @@ class SIPWebSocketReceiver:
                     0.0, self._monotonic() - stable_started,
                 )
             self._ready.clear()
+            self._notify_observation(False)
             with self._socket_lock:
                 self._socket = None
             if stream is not None:
@@ -1006,6 +1033,26 @@ class DeadlineClosure:
     admitted_quotes: tuple[SimulationExecutableQuote, ...] = ()
 
 
+@dataclass(slots=True)
+class PendingResolution:
+    """One durable ENTERED entry awaiting its SIM-5 terminal resolution.
+
+    ``target_at``/``deadline_at`` are the exact closed
+    ``[target, target + 2s]`` observation window (freeze section 3),
+    computed once at registration so every quote offered while pending is
+    tested against the identical bounds ``build_simulation_resolution_record``
+    will use at commit time (freeze section 10: preserve all current
+    contract math).
+    """
+
+    entry: SimulationEntryRecord
+    target_at: datetime
+    target_epoch_ns: int
+    deadline_at: datetime
+    deadline_epoch_ns: int
+    selected_quote: SimulationExecutableQuote | None = None
+
+
 def quote_is_eligible(intent: SimulationTradeIntent, quote: object) -> bool:
     """Apply the exact inclusive two-second executable-side predicate."""
 
@@ -1032,6 +1079,7 @@ class SimulationEntryWorker:
         telemetry: Sim4Telemetry | None = None,
         wait: Callable[[float], bool] | None = None,
         thread_factory: Callable[..., threading.Thread] = threading.Thread,
+        sim5_enabled: bool = False,
     ) -> None:
         if not callable(connection_factory):
             raise TypeError("connection_factory must be callable")
@@ -1048,13 +1096,22 @@ class SimulationEntryWorker:
         self._wait = wait
         self._thread_factory = thread_factory
         self.telemetry = telemetry or Sim4Telemetry()
+        # SIM-5 freeze section 9: gated strictly behind ATOM_V9_SIM5_ENABLED.
+        # When disabled the receiver never receives an observation_callback
+        # and every SIM-5 code path below is a no-op, leaving SIM-4 behavior
+        # unchanged.
+        self._sim5_enabled = bool(sim5_enabled)
         if receiver_factory is None:
+            observation_callback = (
+                self._on_sip_observation if self._sim5_enabled else None
+            )
             receiver_factory = lambda callback: SIPWebSocketReceiver(
                 credentials,
                 callback,
                 websocket_factory=websocket_factory,
                 monotonic=monotonic,
                 telemetry=self.telemetry,
+                observation_callback=observation_callback,
             )
         self._receiver_factory = receiver_factory
 
@@ -1085,6 +1142,17 @@ class SimulationEntryWorker:
         self._last_drained_sequence = 0
         self._next_periodic_opportunity = math.inf
         self._ordinary_since_slice = True
+
+        # SIM-5 resolution state (freeze section 9).  ``_resolution_store``
+        # is built only when SIM-5 is enabled, from the same already-owned
+        # authoritative session SIM-4 uses; no second connection is opened.
+        self._resolution_store: SimulationResolutionStore | None = None
+        self._pending_resolutions: dict[str, PendingResolution] = {}
+        # Monotonic-ns instant the current unbroken SIP-observation streak
+        # began, or None while not currently observing.  Updated only from
+        # the receiver thread's observation_callback, under _admission_lock,
+        # matching admit_parsed_quote's own thread-safety convention.
+        self._sip_streak_start_ns: int | None = None
 
     @classmethod
     def from_config(
@@ -1363,6 +1431,12 @@ class SimulationEntryWorker:
             store.verify_startup_on_cursor(cursor)
         finally:
             cursor.close()
+        if self._sim5_enabled:
+            # Same already-owned authoritative session and role as SIM-4;
+            # no second connection, credential, or role is introduced.
+            self._resolution_store = SimulationResolutionStore(
+                connection, expected_backend_pid=self._owner_backend_pid,
+            )
         return store
 
     def _wait_for_sip_readiness(self) -> bool:
@@ -1385,6 +1459,39 @@ class SimulationEntryWorker:
                     continue
                 return True
         return False
+
+    def _on_sip_observation(self, connected: bool) -> None:
+        """Track the current unbroken SIP-observation streak (freeze section 5).
+
+        Called only from the receiver thread, only when SIM-5 is enabled.
+        A transition to connected opens a new streak unless one is already
+        open; any transition to disconnected (reconnect, stop, or error)
+        closes it.  This is the sole signal ``_sip_observed_continuously``
+        uses to distinguish a clean window expiry from an observation gap.
+        """
+
+        with self._admission_lock:
+            if connected:
+                if self._sip_streak_start_ns is None:
+                    self._sip_streak_start_ns = self._monotonic_ns()
+            else:
+                self._sip_streak_start_ns = None
+
+    def _sip_observed_continuously(self, since_epoch_ns: int) -> bool:
+        """True iff SIP has been observed without interruption since
+        ``since_epoch_ns`` through the current instant (freeze section 5).
+
+        Unknown coverage is a gap: both no current streak and no anchor
+        (unable to translate the streak start into epoch time) fail closed
+        to False.
+        """
+
+        with self._admission_lock:
+            streak_start_ns = self._sip_streak_start_ns
+            anchor = self._anchor
+        if streak_start_ns is None or anchor is None:
+            return False
+        return anchor.derived_epoch_ns(streak_start_ns) <= since_epoch_ns
 
     def _enable_admission_with_anchor(self) -> None:
         receiver = self._receiver
@@ -1414,7 +1521,7 @@ class SimulationEntryWorker:
             fence_row = cursor.fetchone()
             fence = self._read_nonnegative_fence(fence_row)
             checkpoint = store.load_checkpoint_on_cursor(cursor)
-            store.load_open_occupancy_on_cursor(cursor)
+            occupancy = store.load_open_occupancy_on_cursor(cursor)
             with self._admission_lock:
                 if self._anchor is None:
                     raise Sim4GenerationFailed("runtime anchor is unavailable")
@@ -1429,6 +1536,13 @@ class SimulationEntryWorker:
             self._runtime_started_epoch_ns = runtime_started_ns
             self._checkpoint_last = checkpoint.last_completed_publication_seq
             self._checkpoint_version = checkpoint.checkpoint_version
+            if self._sim5_enabled:
+                # Bounded startup/recovery of unresolved ENTERED positions
+                # (freeze section 9): load_open_occupancy_on_cursor already
+                # returns at most one durable open entry per horizon (six
+                # horizons total) and already excludes durably resolved
+                # entries, so no separate query or unbounded scan is added.
+                self._register_recovered_resolutions(occupancy)
             success = True
             return fence
         finally:
@@ -1684,6 +1798,40 @@ class SimulationEntryWorker:
         finally:
             self._end_transaction(cursor, success)
 
+    def _register_pending_resolution(self, entry: SimulationEntryRecord) -> None:
+        """Begin tracking one durable ENTERED entry for SIM-5 resolution.
+
+        Called only when SIM-5 is enabled, both for an entry this generation
+        just terminalized and for one recovered at startup.  Target/deadline
+        use the identical formula ``build_simulation_resolution_record``
+        applies at commit time (freeze section 3: closed
+        ``[target, target + 2s]``), computed here only so every SIP quote
+        streaming in before the deadline can be tested against it.
+        """
+
+        if entry.entry_status != "ENTERED" or entry.entry_id in self._pending_resolutions:
+            return
+        if len(self._pending_resolutions) >= SIM4_PENDING_RESOLUTION_CAPACITY:
+            raise Sim4GenerationFailed(
+                "bounded pending-resolution capacity exhausted"
+            )
+        cutoff = entry.cutoff_at.astimezone(timezone.utc)
+        target_at = cutoff + timedelta(seconds=entry.horizon_seconds)
+        deadline_at = target_at + timedelta(seconds=SIM5_RESOLUTION_WINDOW_SECONDS)
+        self._pending_resolutions[entry.entry_id] = PendingResolution(
+            entry=entry,
+            target_at=target_at,
+            target_epoch_ns=_datetime_to_epoch_nanoseconds(target_at),
+            deadline_at=deadline_at,
+            deadline_epoch_ns=_datetime_to_epoch_nanoseconds(deadline_at),
+        )
+
+    def _register_recovered_resolutions(
+        self, occupancy: Mapping[str, SimulationEntryRecord],
+    ) -> None:
+        for entry in occupancy.values():
+            self._register_pending_resolution(entry)
+
     def _classify_publication(
         self,
         store: SimulationEntryStore,
@@ -1740,8 +1888,10 @@ class SimulationEntryWorker:
                 else select_executable_quote(intent, closure.admitted_quotes)
             )
             requested = "ENTERED" if quote is not None else "SKIPPED_WINDOW_EXPIRED"
-            self._terminalize(store, publication, requested, quote)
+            entry = self._terminalize(store, publication, requested, quote)
             self._pending.pop(intent.intent_id, None)
+            if self._sim5_enabled and entry.entry_status == "ENTERED":
+                self._register_pending_resolution(entry)
             return True
         if publication.discovered_epoch_ns > deadline_ns:
             # Without an earlier immutable publication fence, a first-late
@@ -1877,12 +2027,40 @@ class SimulationEntryWorker:
             finally:
                 self._events.task_done()
 
+    def _offer_quote_to_pending_resolutions(self, quote: SimulationExecutableQuote) -> None:
+        """Offer one immutable admitted quote to every awaiting resolution.
+
+        Freeze section 9: the worker "consumes the same accepted SIP quote
+        once and may offer that immutable quote to both the SIM-4 entry
+        selector and the SIM-5 resolver."  Ordering matches SIM-4 selection
+        exactly via the shared ``select_exit_quote`` helper; only the first
+        (earliest-admitted) valid exit quote is ever kept, since a pending
+        resolution already holding one is skipped.
+        """
+
+        if not self._pending_resolutions:
+            return
+        for pending in self._pending_resolutions.values():
+            if pending.selected_quote is not None:
+                continue
+            selected = select_exit_quote(
+                decision=pending.entry.decision,
+                resolution_target_at=pending.target_at,
+                resolution_deadline_at=pending.deadline_at,
+                entry_quote=pending.entry.quote,
+                quotes=(quote,),
+            )
+            if selected is not None:
+                pending.selected_quote = selected
+
     def _retain_admitted_quote(
         self,
         envelope: AdmissionEnvelope,
         *,
         allow_safe_eviction: bool,
     ) -> None:
+        if self._sim5_enabled:
+            self._offer_quote_to_pending_resolutions(envelope.quote)
         if allow_safe_eviction:
             self._evict_before_ordinary_capacity_check()
         if len(self._quotes) >= SIM4_QUOTE_BUFFER_CAPACITY:
@@ -1897,6 +2075,81 @@ class SimulationEntryWorker:
 
     def _due_deadline(self) -> int | None:
         return min((pending.deadline_epoch_ns for pending in self._pending.values()), default=None)
+
+    def _due_resolution_deadline(self) -> int | None:
+        return min(
+            (pending.deadline_epoch_ns for pending in self._pending_resolutions.values()),
+            default=None,
+        )
+
+    def _terminalize_resolution(
+        self,
+        entry: SimulationEntryRecord,
+        *,
+        exit_quote: SimulationExecutableQuote | None = None,
+        unresolved_status: str | None = None,
+    ) -> None:
+        """Durably terminalize one SIM-5 resolution under its horizon lock.
+
+        Reuses the exact same ``_begin_transaction``/``_end_transaction``
+        session boundary as ``_terminalize`` and the same per-horizon
+        advisory-lock path inside ``terminalize_resolution_in_transaction``
+        (freeze section 9): "No process-local state may release a horizon
+        before the database has the terminal resolution."  The DB-level
+        anti-join already used by SIM-4 admission (freeze section 10) is
+        what actually releases the horizon the instant this commits; no
+        additional release step is needed here.
+        """
+
+        if self._resolution_store is None:
+            raise Sim4GenerationFailed("resolution store is unavailable")
+        cursor = self._begin_transaction()
+        success = False
+        try:
+            result, _resolution = self._resolution_store.terminalize_resolution_in_transaction(
+                cursor, entry, exit_quote=exit_quote, unresolved_status=unresolved_status,
+            )
+            if result not in {SIM5_INSERTED, SIM5_IDEMPOTENT}:
+                raise Sim4AuthorityError(
+                    "resolution store returned an invalid terminal result"
+                )
+            success = True
+        except BaseException:
+            self.telemetry.increment("terminal_failures")
+            raise
+        finally:
+            self._end_transaction(cursor, success)
+
+    def _terminalize_due_resolutions(
+        self, deadline_epoch_ns: int,
+    ) -> None:
+        due = sorted(
+            (
+                pending for pending in self._pending_resolutions.values()
+                if pending.deadline_epoch_ns == deadline_epoch_ns
+            ),
+            key=lambda pending: (
+                pending.target_at, pending.entry.horizon, pending.entry.entry_id,
+            ),
+        )
+        for pending in due:
+            if pending.selected_quote is not None:
+                self._terminalize_resolution(
+                    pending.entry, exit_quote=pending.selected_quote,
+                )
+            elif self._sip_observed_continuously(pending.target_epoch_ns):
+                self._terminalize_resolution(
+                    pending.entry, unresolved_status="UNRESOLVED_WINDOW_EXPIRED",
+                )
+            else:
+                # Unknown coverage is a gap, never a clean expiry (freeze
+                # section 5): worker startup after the interval began,
+                # restart, ownership loss, or a WS disconnect/reconnect gap
+                # all fail closed here rather than reconstructing coverage.
+                self._terminalize_resolution(
+                    pending.entry, unresolved_status="UNRESOLVED_OBSERVATION_GAP",
+                )
+            self._pending_resolutions.pop(pending.entry.entry_id, None)
 
     def _next_uncaptured_deadline(self) -> int | None:
         return min(
@@ -2075,8 +2328,10 @@ class SimulationEntryWorker:
             else:
                 quote = closure.candidates.get(pending.publication.intent.intent_id)
                 requested = "ENTERED" if quote is not None else "SKIPPED_WINDOW_EXPIRED"
-            self._terminalize(store, pending.publication, requested, quote)
+            entry = self._terminalize(store, pending.publication, requested, quote)
             self._pending.pop(pending.publication.intent.intent_id, None)
+            if self._sim5_enabled and entry.entry_status == "ENTERED":
+                self._register_pending_resolution(entry)
         closure.reconciliation_complete = True
         # Once the closed fence is durably checkpointed and no due pending row
         # remains, a first-late publication is independently expired by its
@@ -2131,6 +2386,13 @@ class SimulationEntryWorker:
         self._next_periodic_opportunity = self._monotonic() + SIM4_PERIODIC_CAPTURE_SECONDS
         self._set_state("READY")
         while not self._stop_requested.is_set() and not self._generation_failed:
+            if self._sim5_enabled and self._pending_resolutions and self._anchor is not None:
+                due_resolution = self._due_resolution_deadline()
+                if due_resolution is not None:
+                    resolution_now_ns = self._anchor.derived_epoch_ns(self._monotonic_ns())
+                    if resolution_now_ns >= due_resolution:
+                        self._terminalize_due_resolutions(due_resolution)
+                        continue
             boundary_recheck = False
             cached_deadline_retry_waiting = False
             capture_due = self._next_uncaptured_deadline()
@@ -2382,6 +2644,14 @@ class SimulationEntryWorker:
             self._pending.clear()
             self._deadline_closures.clear()
             self._target = None
+            # In-memory SIM-5 pending resolutions are never reconstructed by
+            # a successor generation either; a successor rediscovers any
+            # still-open ENTERED entry through load_open_occupancy_on_cursor
+            # at its own startup and fails closed to
+            # UNRESOLVED_OBSERVATION_GAP unless a genuine quote arrives.
+            self._pending_resolutions.clear()
+            with self._admission_lock:
+                self._sip_streak_start_ns = None
             # Only this finalizer, after the decision loop and every terminal
             # transaction are impossible, may release the owner session.
             connection = self._owner_connection
@@ -2458,6 +2728,7 @@ def main(
         config,
         connection_factory=connection_factory,
         websocket_factory=websocket_factory,
+        sim5_enabled=_sim5_enabled_flag(values),
     )
     telemetry_snapshot = _fail_closed_telemetry_snapshot(worker.telemetry)
     worker.start()
