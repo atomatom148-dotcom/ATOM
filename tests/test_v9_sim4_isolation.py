@@ -898,8 +898,6 @@ def test_worker_source_has_no_production_runtime_or_trading_import_surface():
     assert source.count(worker.SIM4_WEBSOCKET_URL) == 1
     assert worker.SIM4_SUBSCRIPTION_PAYLOAD == (
         '{"action":"subscribe","quotes":["COIN"]}')
-
-
 def test_deadline_terminalizes_before_checkpoint_and_releases_closure_transaction():
     intent = build_worker_intent()
     published = PublishedSimulationIntent(
