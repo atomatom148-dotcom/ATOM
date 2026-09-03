@@ -37,6 +37,11 @@ from quant.v9_sim5_resolution import (
     SimulationResolutionRowInvalidError,
     SimulationResolutionStateError,
     SimulationResolutionStore,
+    _aware_datetime,
+    _finite_float,
+    _integer,
+    _return_bps,
+    _utc_datetime,
     build_simulation_resolution_record,
     deserialize_simulation_resolution_record,
     select_exit_quote,
@@ -506,6 +511,100 @@ class SimulationResolutionContractTests(unittest.TestCase):
             self.assertFalse(sim5_enabled(environ))
         self.assertFalse(sim5_enabled({}))
 
+    def test_private_validation_helpers_fail_closed(self):
+        with self.assertRaises(ValueError):
+            _aware_datetime("cutoff_at", "not-a-datetime")
+        with self.assertRaises(ValueError):
+            _utc_datetime("cutoff_at", datetime(2026, 9, 1, 12, 0, 0))
+        with self.assertRaises(ValueError):
+            _utc_datetime("cutoff_at", T0.astimezone(timezone(timedelta(hours=1))))
+        with self.assertRaises(ValueError):
+            _integer("value", True)
+        with self.assertRaises(ValueError):
+            _integer("value", -1, minimum=0)
+        with self.assertRaises(ValueError):
+            _finite_float("value", 1)
+        with self.assertRaises(ValueError):
+            _return_bps("FLAT", 100.0, 101.0)
+        with self.assertRaises(ValueError):
+            _return_bps("LONG", 100.0, math.inf)
+
+    def test_select_and_resolution_validation_cover_remaining_edge_branches(self):
+        entry = build_entry()
+        target, deadline = target_and_deadline(entry)
+        target_ns = datetime_to_epoch_nanoseconds(target)
+        valid_exit = build_quote(
+            provider_event_ns=target_ns + 1,
+            accepted_at=target + timedelta(microseconds=1),
+            bid=101.0,
+            ask=101.5,
+        )
+        resolution = build_simulation_resolution_record(entry=entry, exit_quote=valid_exit)
+        after_deadline = build_quote(
+            provider_event_ns=datetime_to_epoch_nanoseconds(deadline) + 1,
+            accepted_at=deadline + timedelta(microseconds=1),
+            bid=103.0,
+            ask=103.5,
+        )
+        provider_after_accept = build_quote(
+            provider_event_ns=target_ns + 2_000,
+            accepted_at=target + timedelta(microseconds=1),
+            bid=104.0,
+            ask=104.5,
+        )
+
+        with self.assertRaises(ValueError):
+            select_exit_quote(
+                decision="FLAT",
+                resolution_target_at=target,
+                resolution_deadline_at=deadline,
+                entry_quote=entry.quote,
+                quotes=(valid_exit,),
+            )
+        with self.assertRaises(ValueError):
+            select_exit_quote(
+                decision="LONG",
+                resolution_target_at=target,
+                resolution_deadline_at=deadline,
+                entry_quote=object(),
+                quotes=(valid_exit,),
+            )
+        self.assertIsNone(select_exit_quote(
+            decision="LONG",
+            resolution_target_at=target,
+            resolution_deadline_at=deadline,
+            entry_quote=entry.quote,
+            quotes=(object(), provider_after_accept),
+        ))
+
+        with self.assertRaises(ValueError):
+            replace(
+                resolution,
+                resolution_target_at=target + timedelta(microseconds=1),
+            )
+        with self.assertRaises(ValueError):
+            replace(
+                resolution,
+                resolution_deadline_at=deadline + timedelta(microseconds=1),
+            )
+        with self.assertRaises(ValueError):
+            replace(resolution, exit_quote=None)
+        with self.assertRaises(ValueError):
+            replace(resolution, exit_price=0.0)
+        with self.assertRaises(ValueError):
+            replace(resolution, exit_quote=after_deadline)
+        with self.assertRaises(ValueError):
+            replace(resolution, exit_price=resolution.exit_price + 1.0)
+        with self.assertRaises(ValueError):
+            replace(resolution, return_bps=resolution.return_bps + 1.0)
+
+        unresolved = build_simulation_resolution_record(
+            entry=entry,
+            unresolved_status="UNRESOLVED_OBSERVATION_GAP",
+        )
+        with self.assertRaises(ValueError):
+            replace(unresolved, exit_price=1.0)
+
 
 class SimulationResolutionStoreTests(unittest.TestCase):
     def test_insert_resolved_acquires_horizon_lock_and_never_commits(self):
@@ -635,6 +734,103 @@ class SimulationResolutionStoreTests(unittest.TestCase):
             store.terminalize_resolution_in_transaction(
                 cursor, skipped, unresolved_status="UNRESOLVED_OBSERVATION_GAP")
         self.assertEqual(cursor.executed, [])
+
+    def test_store_validation_error_paths(self):
+        entry = build_entry()
+        target, _ = target_and_deadline(entry)
+        exit_quote = build_quote(
+            provider_event_ns=datetime_to_epoch_nanoseconds(target) + 1,
+            accepted_at=target + timedelta(microseconds=1),
+            bid=101.0,
+            ask=101.5,
+        )
+        resolution = build_simulation_resolution_record(entry=entry, exit_quote=exit_quote)
+
+        with self.assertRaises(ValueError):
+            serialize_simulation_resolution_record(object())
+        with self.assertRaises(ValueError):
+            deserialize_simulation_resolution_record("{")
+        bad_payload = json.loads(serialize_simulation_resolution_record(resolution))
+        del bad_payload["mode"]
+        with self.assertRaises(ValueError):
+            deserialize_simulation_resolution_record(bad_payload)
+        nested_bad = json.loads(serialize_simulation_resolution_record(resolution))
+        nested_bad["exit_quote"] = {"quote_id": exit_quote.quote_id}
+        with self.assertRaises(ValueError):
+            deserialize_simulation_resolution_record(nested_bad)
+
+        with self.assertRaises(TypeError):
+            SimulationResolutionStore(None)
+        with self.assertRaises(ValueError):
+            SimulationResolutionStore(FakeConnection(ScriptedCursor([])), expected_backend_pid=0)
+
+        bad_authority_cursor = ScriptedCursor([("current_user", [("role", "role")])])
+        with self.assertRaises(SimulationResolutionRoleError):
+            SimulationResolutionStore(FakeConnection(bad_authority_cursor))._verify_authority_on_cursor(
+                bad_authority_cursor)
+
+        bad_pid_cursor = ScriptedCursor([
+            ("current_user", [(SIM_ENTRY_RUNTIME_ROLE, SIM_ENTRY_RUNTIME_ROLE, True)])
+        ])
+        with self.assertRaises(SimulationResolutionRoleError):
+            SimulationResolutionStore(FakeConnection(bad_pid_cursor))._verify_authority_on_cursor(
+                bad_pid_cursor)
+
+    def test_store_lookup_and_requery_paths(self):
+        entry = build_entry()
+        target, _ = target_and_deadline(entry)
+        exit_quote = build_quote(
+            provider_event_ns=datetime_to_epoch_nanoseconds(target) + 1,
+            accepted_at=target + timedelta(microseconds=1),
+            bid=101.0,
+            ask=101.5,
+        )
+        resolution = build_simulation_resolution_record(entry=entry, exit_quote=exit_quote)
+
+        store = SimulationResolutionStore(FakeConnection(ScriptedCursor([])))
+        with self.assertRaises(ValueError):
+            store.get_resolution_for_entry_on_cursor(ScriptedCursor([]), "")
+        self.assertIsNone(store.get_resolution_for_entry_on_cursor(
+            ScriptedCursor([("WHERE entry_id", [])]),
+            entry.entry_id,
+        ))
+        mismatch_cursor = ScriptedCursor([("WHERE entry_id", [resolution_row(resolution)])])
+        with self.assertRaises(SimulationResolutionRowInvalidError):
+            store.get_resolution_for_entry_on_cursor(mismatch_cursor, "different-entry-id")
+        expected_entry_cursor = ScriptedCursor([("WHERE entry_id", [resolution_row(resolution)])])
+        with self.assertRaises(ValueError):
+            store.get_resolution_for_entry_on_cursor(
+                expected_entry_cursor,
+                entry.entry_id,
+                expected_entry=build_entry(source_cycle_id="other-cycle"),
+            )
+        with self.assertRaises(ValueError):
+            store.terminalize_resolution_in_transaction(ScriptedCursor([]), object())
+
+        cursor = ScriptedCursor([
+            ("current_user", authority()),
+            ("pg_advisory_xact_lock", [("",)]),
+            ("WHERE entry_id", []),
+            ("INSERT INTO public.atom_v9_sim_resolutions", []),
+            ("entry_id = %s OR resolution_id", [resolution_row(resolution)]),
+        ])
+        result, stored = SimulationResolutionStore(FakeConnection(cursor)).terminalize_resolution_in_transaction(
+            cursor,
+            entry,
+            exit_quote=exit_quote,
+        )
+        self.assertEqual((result, stored), (IDEMPOTENT, resolution))
+
+        bad_lock_cursor = ScriptedCursor([
+            ("current_user", authority()),
+            ("pg_advisory_xact_lock", [("x",)]),
+        ])
+        with self.assertRaises(SimulationResolutionStateError):
+            SimulationResolutionStore(FakeConnection(bad_lock_cursor)).terminalize_resolution_in_transaction(
+                bad_lock_cursor,
+                entry,
+                exit_quote=exit_quote,
+            )
 
 
 if __name__ == "__main__":
