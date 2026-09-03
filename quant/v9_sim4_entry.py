@@ -793,7 +793,7 @@ _VALID_TERMINAL_RESOLUTION_CLAUSE = (
     "AND r.resolution_status IN ('RESOLVED', 'UNRESOLVED_WINDOW_EXPIRED', "
     "'UNRESOLVED_OBSERVATION_GAP') "
     "AND jsonb_typeof(r.record_json) = 'object' "
-    "AND jsonb_object_length(r.record_json) = 24 "
+    "AND jsonb_array_length(jsonb_path_query_array(r.record_json, '$.*')) = 24 "
     "AND r.record_json ?& ARRAY['contract_version', 'canonicalization_version', "
     "'simulator_version', 'resolution_id', 'resolution_hash', 'mode', 'symbol', "
     "'instrument', 'entry_id', 'entry_hash', 'source_cycle_id', 'cutoff_at', "
