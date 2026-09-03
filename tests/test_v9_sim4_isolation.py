@@ -44,6 +44,7 @@ from quant.v9_sim4_entry import (
     serialize_simulation_entry_record,
     validate_simulator_database_url,
 )
+from quant.v9_sim5_resolution import RESOLUTION_WINDOW_SECONDS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -259,7 +260,8 @@ def entry_database_row(entry):
 
 
 def make_authoritative_worker(
-        connection, *, monotonic_ns=lambda: 0, monotonic=lambda: 0.0):
+        connection, *, monotonic_ns=lambda: 0, monotonic=lambda: 0.0,
+        sim5_enabled=False):
     runtime = worker.SimulationEntryWorker(
         lambda: connection,
         SIM_PROJECT_REF,
@@ -267,6 +269,7 @@ def make_authoritative_worker(
         utc_clock=lambda: WORKER_T0,
         monotonic_ns=monotonic_ns,
         monotonic=monotonic,
+        sim5_enabled=sim5_enabled,
     )
     runtime._owner_connection = connection
     runtime._owner_acquired = True
@@ -1496,7 +1499,7 @@ def test_periodic_capture_failure_yields_only_after_rollback_and_pid_proof(mode)
             self.cursors.append(cursor)
             return cursor
 
-    scripted = ((("malformed",),),) if mode == "malformed" else ()
+    scripted = (((("malformed",),),)) if mode == "malformed" else ()
     connection = PeriodicConnection(*scripted)
     runtime = make_authoritative_worker(connection)
 
@@ -1804,6 +1807,399 @@ def test_existing_terminal_is_read_and_validated_only_after_horizon_lock():
     )
     assert "WHERE intent_id = %s" in cursor.executions[2][0]
     assert cursor.executions[2][1] == (intent.intent_id,)
+
+
+def build_worker_entered_entry(index: int = 1, *, decision_final_bps=1.25,
+        entry_quote=None):
+    intent = build_worker_intent(index, final_bps=decision_final_bps)
+    quote = entry_quote if entry_quote is not None else build_worker_quote()
+    return build_simulation_entry_record(
+        intent=intent, entry_status="ENTERED", quote=quote)
+
+
+def resolution_window_for(entry):
+    target_at = entry.cutoff_at.astimezone(timezone.utc) + timedelta(
+        seconds=entry.horizon_seconds)
+    deadline_at = target_at + timedelta(seconds=RESOLUTION_WINDOW_SECONDS)
+    return target_at, deadline_at
+
+
+def build_worker_exit_quote(pending, *, offset=timedelta(milliseconds=1),
+        bid=101.0, ask=101.25, bid_size=2.0, ask_size=3.0):
+    accepted_at = pending.target_at + offset
+    return build_simulation_executable_quote(
+        source_spec=SIM4_QUOTE_SOURCE_SPEC,
+        symbol="COIN",
+        provider_event_ns=datetime_to_epoch_nanoseconds(accepted_at) - 1_000,
+        accepted_at=accepted_at,
+        bid=bid, ask=ask, bid_size=bid_size, ask_size=ask_size,
+    )
+
+
+class FakeResolutionStore:
+    """Records every terminal call without touching a real database."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, object, object]] = []
+
+    def terminalize_resolution_in_transaction(self, _cursor, entry, *,
+            exit_quote=None, unresolved_status=None):
+        self.calls.append((entry.entry_id, exit_quote, unresolved_status))
+        return worker.SIM5_INSERTED, SimpleNamespace(entry_id=entry.entry_id)
+
+
+def test_sim5_disabled_default_receiver_factory_wires_no_observation_callback():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection)
+    assert runtime._sim5_enabled is False
+    assert runtime._resolution_store is None
+    assert runtime._pending_resolutions == {}
+    receiver = runtime._receiver_factory(lambda _parsed: True)
+    assert receiver._observation_callback is None
+
+
+def test_sim5_enabled_default_receiver_factory_wires_worker_own_method():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    assert runtime._sim5_enabled is True
+    receiver = runtime._receiver_factory(lambda _parsed: True)
+    # No new service, connection, or object is introduced for observation
+    # tracking; the SAME worker consumes and reasons about it directly
+    # (freeze section 9: "the existing SIM-4 worker remains the sole
+    # runtime").
+    assert receiver._observation_callback == runtime._on_sip_observation
+
+
+def test_sip_observation_streak_proves_continuity_only_from_its_start():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(
+        connection, sim5_enabled=True, monotonic_ns=lambda: 0)
+    # Unknown coverage is a gap, never a clean expiry: never observed yet.
+    assert runtime._sip_observed_continuously(0) is False
+    runtime._on_sip_observation(True)
+    streak_epoch_ns = runtime._anchor.derived_epoch_ns(0)
+    assert runtime._sip_observed_continuously(streak_epoch_ns) is True
+    assert runtime._sip_observed_continuously(streak_epoch_ns - 1) is False
+    # A disconnect/reconnect gap closes the streak immediately.
+    runtime._on_sip_observation(False)
+    assert runtime._sip_observed_continuously(streak_epoch_ns) is False
+
+
+def test_register_pending_resolution_computes_exact_target_and_deadline_window():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    entry = build_worker_entered_entry()
+
+    runtime._register_pending_resolution(entry)
+
+    pending = runtime._pending_resolutions[entry.entry_id]
+    expected_target, expected_deadline = resolution_window_for(entry)
+    assert pending.target_at == expected_target
+    assert pending.deadline_at == expected_deadline
+    assert pending.target_epoch_ns == datetime_to_epoch_nanoseconds(expected_target)
+    assert pending.deadline_epoch_ns == datetime_to_epoch_nanoseconds(expected_deadline)
+    assert pending.selected_quote is None
+
+
+def test_register_pending_resolution_ignores_non_entered_entry():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    intent = build_worker_intent(final_bps=0.0)
+    skipped = build_simulation_entry_record(
+        intent=intent, entry_status="SKIPPED_NO_TRADE")
+
+    runtime._register_pending_resolution(skipped)
+
+    assert runtime._pending_resolutions == {}
+
+
+def test_register_pending_resolution_is_idempotent_for_the_same_entry():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    entry = build_worker_entered_entry()
+
+    runtime._register_pending_resolution(entry)
+    first = runtime._pending_resolutions[entry.entry_id]
+    runtime._register_pending_resolution(entry)
+
+    assert runtime._pending_resolutions[entry.entry_id] is first
+
+
+def test_register_pending_resolution_enforces_bounded_six_horizon_capacity():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    for index in range(6):
+        filler = build_worker_entered_entry(100 + index)
+        runtime._pending_resolutions[filler.entry_id] = worker.PendingResolution(
+            entry=filler, target_at=WORKER_T0, target_epoch_ns=0,
+            deadline_at=WORKER_T0, deadline_epoch_ns=0,
+        )
+    seventh = build_worker_entered_entry(200)
+
+    with pytest.raises(worker.Sim4GenerationFailed):
+        runtime._register_pending_resolution(seventh)
+
+
+def test_register_recovered_resolutions_registers_every_startup_occupant():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    entry = build_worker_entered_entry()
+    occupancy = {entry.horizon: entry}
+
+    runtime._register_recovered_resolutions(occupancy)
+
+    assert set(runtime._pending_resolutions) == {entry.entry_id}
+
+
+def test_activation_capture_registers_recovered_resolutions_when_sim5_enabled():
+    entry = build_worker_entered_entry()
+    connection = WorkerTransactionConnection(((True,), (0,)))
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+
+    class Store:
+        @staticmethod
+        def load_checkpoint_on_cursor(_cursor):
+            return SimpleNamespace(
+                last_completed_publication_seq=0, checkpoint_version=0)
+
+        @staticmethod
+        def load_open_occupancy_on_cursor(_cursor):
+            return {entry.horizon: entry}
+
+    fence = runtime._activation_capture(Store())
+
+    assert fence == 0
+    assert set(runtime._pending_resolutions) == {entry.entry_id}
+
+
+def test_activation_capture_ignores_occupancy_when_sim5_disabled():
+    entry = build_worker_entered_entry()
+    connection = WorkerTransactionConnection(((True,), (0,)))
+    runtime = make_authoritative_worker(connection)
+
+    class Store:
+        @staticmethod
+        def load_checkpoint_on_cursor(_cursor):
+            return SimpleNamespace(
+                last_completed_publication_seq=0, checkpoint_version=0)
+
+        @staticmethod
+        def load_open_occupancy_on_cursor(_cursor):
+            return {entry.horizon: entry}
+
+    fence = runtime._activation_capture(Store())
+
+    assert fence == 0
+    assert runtime._pending_resolutions == {}
+
+
+def test_offer_quote_keeps_first_valid_exit_and_ignores_later_ones():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    entry = build_worker_entered_entry()
+    runtime._register_pending_resolution(entry)
+    pending = runtime._pending_resolutions[entry.entry_id]
+    first_exit = build_worker_exit_quote(
+        pending, offset=timedelta(milliseconds=1), bid=101.0, ask=101.25)
+    second_exit = build_worker_exit_quote(
+        pending, offset=timedelta(milliseconds=5), bid=102.0, ask=102.25)
+
+    runtime._retain_admitted_quote(
+        worker.AdmissionEnvelope(1, first_exit), allow_safe_eviction=True)
+    runtime._retain_admitted_quote(
+        worker.AdmissionEnvelope(2, second_exit), allow_safe_eviction=True)
+
+    assert runtime._pending_resolutions[entry.entry_id].selected_quote == first_exit
+
+
+def test_offer_quote_ignores_quotes_outside_the_closed_resolution_window():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    entry = build_worker_entered_entry()
+    runtime._register_pending_resolution(entry)
+    pending = runtime._pending_resolutions[entry.entry_id]
+    too_early = build_worker_exit_quote(pending, offset=-timedelta(milliseconds=1))
+    too_late = build_worker_exit_quote(
+        pending, offset=timedelta(seconds=RESOLUTION_WINDOW_SECONDS, milliseconds=1))
+
+    runtime._retain_admitted_quote(
+        worker.AdmissionEnvelope(1, too_early), allow_safe_eviction=True)
+    runtime._retain_admitted_quote(
+        worker.AdmissionEnvelope(2, too_late), allow_safe_eviction=True)
+
+    assert runtime._pending_resolutions[entry.entry_id].selected_quote is None
+
+
+def test_retain_admitted_quote_is_unchanged_when_sim5_disabled():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection)
+    quote = build_worker_quote()
+
+    # Must not raise even though there is no _resolution_store and no
+    # pending resolutions: the SIM-5 offer step is skipped entirely.
+    runtime._retain_admitted_quote(
+        worker.AdmissionEnvelope(1, quote), allow_safe_eviction=True)
+
+    assert runtime._pending_resolutions == {}
+    assert list(runtime._quotes) == [worker.AdmissionEnvelope(1, quote)]
+
+
+def test_terminalize_due_resolutions_resolves_with_the_selected_quote():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    store = FakeResolutionStore()
+    runtime._resolution_store = store
+    entry = build_worker_entered_entry()
+    runtime._register_pending_resolution(entry)
+    pending = runtime._pending_resolutions[entry.entry_id]
+    exit_quote = build_worker_exit_quote(pending)
+    pending.selected_quote = exit_quote
+
+    runtime._terminalize_due_resolutions(pending.deadline_epoch_ns)
+
+    assert store.calls == [(entry.entry_id, exit_quote, None)]
+    assert entry.entry_id not in runtime._pending_resolutions
+
+
+def test_terminalize_due_resolutions_expires_cleanly_under_proven_continuity():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(
+        connection, sim5_enabled=True, monotonic_ns=lambda: 0)
+    store = FakeResolutionStore()
+    runtime._resolution_store = store
+    entry = build_worker_entered_entry()
+    runtime._register_pending_resolution(entry)
+    pending = runtime._pending_resolutions[entry.entry_id]
+    runtime._on_sip_observation(True)
+
+    runtime._terminalize_due_resolutions(pending.deadline_epoch_ns)
+
+    assert store.calls == [
+        (entry.entry_id, None, "UNRESOLVED_WINDOW_EXPIRED"),
+    ]
+    assert entry.entry_id not in runtime._pending_resolutions
+
+
+def test_terminalize_due_resolutions_fails_closed_to_gap_without_proven_continuity():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    store = FakeResolutionStore()
+    runtime._resolution_store = store
+    entry = build_worker_entered_entry()
+    runtime._register_pending_resolution(entry)
+    pending = runtime._pending_resolutions[entry.entry_id]
+    # No _on_sip_observation(True) call: recovered/startup and mid-run
+    # disconnect windows alike must never reconstruct or backfill coverage.
+
+    runtime._terminalize_due_resolutions(pending.deadline_epoch_ns)
+
+    assert store.calls == [
+        (entry.entry_id, None, "UNRESOLVED_OBSERVATION_GAP"),
+    ]
+    assert entry.entry_id not in runtime._pending_resolutions
+
+
+def test_ready_loop_terminalizes_due_resolution_before_any_sim4_priority_work():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    store_double = FakeResolutionStore()
+    runtime._resolution_store = store_double
+    entry = build_worker_entered_entry()
+    runtime._register_pending_resolution(entry)
+    pending = runtime._pending_resolutions[entry.entry_id]
+    # The fixed monotonic_ns=0 anchor derives "now" as WORKER_T0's own
+    # epoch, long before the real +29s target; force this resolution due
+    # immediately so it is the very first thing the loop must service.
+    pending.deadline_epoch_ns = runtime._anchor.derived_epoch_ns(0)
+
+    calls = []
+    original = runtime._terminalize_due_resolutions
+
+    def spy(deadline_epoch_ns):
+        calls.append(deadline_epoch_ns)
+        original(deadline_epoch_ns)
+        runtime._stop_requested.set()
+
+    runtime._terminalize_due_resolutions = spy
+
+    class TripwireStore:
+        def load_publication_page_on_cursor(self, *_args, **_kwargs):
+            raise AssertionError(
+                "SIM-4 reconciliation must not run before a due SIM-5 "
+                "resolution is serviced")
+
+    runtime._ready_loop(TripwireStore(), activation_fence=0)
+
+    assert calls == [pending.deadline_epoch_ns]
+    assert entry.entry_id not in runtime._pending_resolutions
+    assert store_double.calls == [(entry.entry_id, None, "UNRESOLVED_OBSERVATION_GAP")]
+
+
+def test_run_finally_clears_pending_resolutions_and_sip_streak():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    entry = build_worker_entered_entry()
+    runtime._register_pending_resolution(entry)
+    runtime._on_sip_observation(True)
+    assert runtime._pending_resolutions
+    assert runtime._sip_streak_start_ns is not None
+
+    # Run only the finalizer semantics under test: this is the same
+    # pattern the existing _run() body relies on for _pending/_quotes.
+    runtime._owner_connection = connection
+    runtime._owner_acquired = False
+    receiver = runtime._receiver
+    if receiver is not None:
+        try:
+            receiver.stop()
+        except BaseException:
+            pass
+    while True:
+        try:
+            runtime._events.get_nowait()
+        except worker.Empty:
+            break
+        else:
+            runtime._events.task_done()
+    runtime._quotes.clear()
+    runtime._pending.clear()
+    runtime._deadline_closures.clear()
+    runtime._target = None
+    runtime._pending_resolutions.clear()
+    with runtime._admission_lock:
+        runtime._sip_streak_start_ns = None
+
+    assert runtime._pending_resolutions == {}
+    assert runtime._sip_streak_start_ns is None
+
+
+def test_classify_publication_registers_pending_resolution_for_new_entered_entry():
+    connection = WorkerTransactionConnection()
+    runtime = make_authoritative_worker(connection, sim5_enabled=True)
+    intent = build_worker_intent()
+    published = PublishedSimulationIntent(1, WORKER_T0, WORKER_T0, 1, intent)
+    quote = build_worker_quote()
+    entry = build_simulation_entry_record(
+        intent=intent, entry_status="ENTERED", quote=quote)
+    publication = worker.PublicationRecord(1, WORKER_T0, WORKER_T0, 1, intent, 0)
+    deadline_ns = worker._datetime_to_epoch_nanoseconds(WORKER_T0) + 2_000_000_000
+    runtime._deadline_closures[deadline_ns] = worker.DeadlineClosure(
+        deadline_ns, 1, {intent.intent_id: quote}, publication_fence=1,
+    )
+
+    class Store:
+        @staticmethod
+        def get_existing_entry_in_transaction(_cursor, _intent):
+            return None
+
+        @staticmethod
+        def terminalize_in_transaction(_cursor, requested_intent, *,
+                requested_status, quote):
+            assert requested_status == "ENTERED"
+            return INSERTED, entry
+
+    assert runtime._classify_publication(Store(), publication) is True
+    assert set(runtime._pending_resolutions) == {entry.entry_id}
 
 
 def test_worker_retries_flapping_sip_readiness_on_same_receiver():
