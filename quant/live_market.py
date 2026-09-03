@@ -14,7 +14,8 @@ import threading
 import time
 from typing import Callable
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import urlopen as _stdlib_urlopen
 
 from .history import MidpointHistory, MidpointObservation
 from .g2_cross_asset import CrossAssetState, append_bounded, synchronize
@@ -61,6 +62,27 @@ SCHWAB_NDX_QUOTE_URL = (
 SCHWAB_NDX_ENABLED_ENV = "ATOM_SCHWAB_NDX_ENABLED"
 COIN_MARKET_USERNAME_ENV = "ATOM_COIN_MARKET_USERNAME"
 COIN_MARKET_PASSWORD_ENV = "ATOM_COIN_MARKET_PASSWORD"
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    """Reject every redirect before Basic credentials can be forwarded."""
+
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        raise HTTPError(
+            request.full_url, code, "Schwab NDX redirect rejected", headers, fp,
+        )
+
+
+_SCHWAB_NDX_OPENER = build_opener(_RejectRedirects())
+
+
+def urlopen(resource, *args, **kwargs):
+    """Use the no-redirect opener only for the frozen Schwab NDX route."""
+
+    request_url = getattr(resource, "full_url", resource)
+    if request_url == SCHWAB_NDX_QUOTE_URL:
+        return _SCHWAB_NDX_OPENER.open(resource, *args, **kwargs)
+    return _stdlib_urlopen(resource, *args, **kwargs)
 MAX_NDX_AGE_SECONDS = 10.0
 HISTORY_SECONDS = 3600.0
 MARKET_DISPLAY_FETCH_SECONDS = 0.25
@@ -1087,7 +1109,7 @@ def parse_schwab_ndx_quote(
     if payload.get("ok") is not True or payload.get("mode") != "READ ONLY":
         raise ValueError("Schwab NDX response is not an authorized read-only quote")
     symbol = payload.get("symbol")
-    if not isinstance(symbol, str) or symbol.upper() not in {"NDX", "$NDX"}:
+    if not isinstance(symbol, str) or symbol != "$NDX":
         raise ValueError("Schwab NDX response has the wrong symbol")
     snapshot = normalize_ndx_quote(
         payload.get("data"), received_at_epoch=received_at_epoch,
@@ -1501,6 +1523,11 @@ def poll_schwab_ndx(state: LiveMarketState, *, interval: float = 1.0,
                 },
             )
             with urlopen(request, timeout=10) as response:
+                response_url = getattr(response, "geturl", None)
+                final_url = (response_url() if callable(response_url)
+                             else SCHWAB_NDX_QUOTE_URL)
+                if final_url != SCHWAB_NDX_QUOTE_URL:
+                    raise ValueError("Schwab NDX response URL changed")
                 payload = json.load(response)
             received_at_epoch = time.time()
             price, event_epoch = parse_schwab_ndx_quote(

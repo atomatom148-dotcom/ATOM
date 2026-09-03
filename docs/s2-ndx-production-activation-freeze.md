@@ -1,7 +1,7 @@
 # ATOM TRUE V9 — S2 NDX Production Activation Freeze
 
 **Status:** LAW after merge  
-**Change type:** Documentation only  
+**Change type:** Documentation and bounded repair only  
 **Authorized operational path:** Existing independent NDX benchmark/display seam only  
 **Level II status:** Observer-only; separate market-hours proof still required
 
@@ -13,7 +13,7 @@ The activation may:
 
 1. merge the already-bounded NDX bridge after its latest-head checks and review pass;
 2. deploy the resulting `main` commit to the existing `atom-v9-thin` web service; and
-3. set only:
+3. after the static service-authentication prerequisite below is present, change only the activation switch:
 
 ```text
 ATOM_SCHWAB_NDX_ENABLED=true
@@ -21,7 +21,7 @@ ATOM_SCHWAB_NDX_ENABLED=true
 
 The bridge may replace only the existing Massive NDX poller. It may not add a new display, family input, evidence path, or decision path.
 
-## 2. Exact source and destination boundary
+## 2. Exact source, authentication, and destination boundary
 
 The authorized source is the existing read-only route:
 
@@ -29,18 +29,29 @@ The authorized source is the existing read-only route:
 https://coin-market-api.onrender.com/schwab/quote/%24NDX
 ```
 
+The Coin service protects this route with its existing private-site HTTP Basic authentication. Before NDX activation, `atom-v9-thin` must have these static, non-Schwab service-authentication mappings:
+
+```text
+ATOM_COIN_MARKET_USERNAME = Coin service APP_USERNAME
+ATOM_COIN_MARKET_PASSWORD = Coin service APP_PASSWORD
+```
+
+These values are prerequisites, not activation switches. They may authenticate only the exact HTTPS origin and exact `$NDX` quote route above. The bridge must reject redirects rather than forwarding credentials to another origin or to HTTP. Credentials must never be logged, returned by an API, committed to GitHub, or reused for any account, order, execution, Level II, or trading path. Missing or rejected service credentials must fail closed to honest NDX unavailability; anonymous fallback is forbidden.
+
 The authorized destination is only the existing NDX benchmark/display handoff already represented by the live market state's `NDX` input.
 
 The bridge must:
 
 - accept only an explicitly successful `READ ONLY` `$NDX` response;
+- require the wrapper symbol to be exactly `$NDX`;
 - preserve the provider event timestamp;
-- enforce the existing NDX freshness limit;
-- reject wrong-symbol, malformed, stale, future, or invalid values;
+- enforce the existing NDX freshness limit independently of Coin polling progress;
+- reject wrong-symbol, malformed, stale, future, redirected, or invalid values;
+- publish only NDX fields when an NDX update or expiry occurs during an in-flight COIN cycle;
 - publish honest NDX unavailability rather than zero or retained stale data; and
 - remain disabled unless the exact environment flag above is true.
 
-No Schwab credential or token moves into ATOM. The existing Coin-market-api service remains the credential-owning boundary.
+No Schwab credential or token moves into ATOM. The existing Coin-market-api service remains the Schwab credential-owning boundary.
 
 ## 3. NDX activation is independent of COIN Level II proof
 
@@ -98,10 +109,11 @@ It also creates no second NDX consumer and no second live-decision path.
 Activation is complete only when:
 
 1. the controlling implementation PR is merged from a clean latest head;
-2. repository CI and SonarQube pass;
+2. repository CI, CircleCI, and SonarQube pass;
 3. the merged commit is deployed to `atom-v9-thin`;
-4. `ATOM_SCHWAB_NDX_ENABLED=true` is set on that service; and
-5. the existing display seam shows either a fresh provider-timestamped NDX value or honest unavailability.
+4. the static Coin service-authentication mappings are present on `atom-v9-thin`;
+5. `ATOM_SCHWAB_NDX_ENABLED=true` is set on that service; and
+6. the existing display seam shows either a fresh provider-timestamped NDX value or honest unavailability.
 
 Rollback is exact and independent of Level II:
 
@@ -109,7 +121,7 @@ Rollback is exact and independent of Level II:
 ATOM_SCHWAB_NDX_ENABLED=false
 ```
 
-Rollback returns NDX selection to the prior source behavior and changes no evidence or V9 state.
+Rollback returns NDX selection to the prior source behavior and changes no evidence or V9 state. The static service-authentication prerequisites do not enable polling while this flag is false.
 
 ## 7. Scope boundary
 
