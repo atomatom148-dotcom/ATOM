@@ -1526,6 +1526,11 @@ class SimulationEntryWorker:
             self._anchor = capture_monotonic_utc_anchor(
                 self._monotonic_ns, self._utc_clock,
             )
+            if (
+                self._sip_streak_start_ns is not None
+                and self._sip_streak_start_ns < self._anchor.monotonic_ns
+            ):
+                self._sip_streak_start_ns = self._anchor.monotonic_ns
             self._admission_enabled = True
 
     def _activation_capture(self, store: SimulationEntryStore) -> int | None:

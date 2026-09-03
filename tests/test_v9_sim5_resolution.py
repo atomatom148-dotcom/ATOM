@@ -518,20 +518,32 @@ class SimulationResolutionContractTests(unittest.TestCase):
         deadline_ns = datetime_to_epoch_nanoseconds(deadline)
         elapsed_to_deadline_ns = deadline_ns - target_ns
 
-        def build_worker():
+        def build_worker(*, enable_anchor=False):
             samples = {"now_ns": 0}
             worker = SimulationEntryWorker(
                 lambda: object(),
                 "abcdefghijklmnopqrst",
                 PaperTradingCredentials("key", "secret"),
+                utc_clock=lambda: target,
                 monotonic_ns=lambda: samples["now_ns"],
                 monotonic=lambda: samples["now_ns"] / 1_000_000_000,
                 sim5_enabled=True,
             )
-            worker._anchor = MonotonicUTCAnchor(
-                monotonic_ns=0,
-                utc_epoch_us=target_ns // 1000,
-            )
+            if enable_anchor:
+                class ReadyEvent:
+                    @staticmethod
+                    def is_set():
+                        return True
+
+                class Receiver:
+                    ready_event = ReadyEvent()
+
+                worker._receiver = Receiver()
+            else:
+                worker._anchor = MonotonicUTCAnchor(
+                    monotonic_ns=0,
+                    utc_epoch_us=target_ns // 1000,
+                )
             terminal = []
             worker._terminalize_resolution = (
                 lambda entry, exit_quote=None, unresolved_status=None:
@@ -539,7 +551,7 @@ class SimulationResolutionContractTests(unittest.TestCase):
             )
             return worker, samples, terminal
 
-        worker, samples, terminal = build_worker()
+        worker, samples, terminal = build_worker(enable_anchor=True)
         expired_entry = build_entry(
             cutoff_at=cutoff,
             eligible_at=cutoff + timedelta(seconds=1),
@@ -552,13 +564,17 @@ class SimulationResolutionContractTests(unittest.TestCase):
             deadline_at=deadline,
             deadline_epoch_ns=deadline_ns,
         )
+        samples["now_ns"] = 1
         worker._on_sip_observation(True)
-        samples["now_ns"] = elapsed_to_deadline_ns + 1
+        samples["now_ns"] = 5
+        worker._enable_admission_with_anchor()
+        self.assertEqual(worker._sip_streak_start_ns, 5)
+        samples["now_ns"] = 5 + elapsed_to_deadline_ns + 1
         worker._on_sip_observation(False)
         self.assertTrue(
             worker._pending_resolutions[expired_entry.entry_id].observed_through_deadline
         )
-        samples["now_ns"] = elapsed_to_deadline_ns + 10
+        samples["now_ns"] = 5 + elapsed_to_deadline_ns + 10
         worker._terminalize_due_resolutions(deadline_ns)
         self.assertEqual(
             terminal,
@@ -900,6 +916,16 @@ class SimulationResolutionStoreTests(unittest.TestCase):
         bad_window_row[-1] = bad_window_payload
         with self.assertRaises(SimulationResolutionRowInvalidError):
             SimulationResolutionStore._decode_resolution_row(tuple(bad_window_row))
+
+        bad_exit_price_row = list(resolution_row(resolution))
+        bad_exit_price_row[26] = resolution.exit_price + 1.0
+        with self.assertRaises(SimulationResolutionRowInvalidError):
+            SimulationResolutionStore._decode_resolution_row(tuple(bad_exit_price_row))
+
+        bad_return_bps_row = list(resolution_row(resolution))
+        bad_return_bps_row[27] = resolution.return_bps + 1.0
+        with self.assertRaises(SimulationResolutionRowInvalidError):
+            SimulationResolutionStore._decode_resolution_row(tuple(bad_return_bps_row))
 
     def test_store_lookup_and_requery_paths(self):
         entry = build_entry()

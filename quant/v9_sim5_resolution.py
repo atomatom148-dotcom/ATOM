@@ -568,6 +568,12 @@ class SimulationResolutionStore:
         if relational != expected_exit:
             raise SimulationResolutionRowInvalidError(
                 "stored exit quote columns do not match payload")
+        if values["exit_price"] != resolution.exit_price:
+            raise SimulationResolutionRowInvalidError(
+                "stored resolution column exit_price does not match payload")
+        if values["return_bps"] != resolution.return_bps:
+            raise SimulationResolutionRowInvalidError(
+                "stored resolution column return_bps does not match payload")
         return resolution
 
     def get_resolution_for_entry_on_cursor(self, cursor, entry_id: str, *,

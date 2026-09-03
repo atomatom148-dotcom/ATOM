@@ -717,6 +717,33 @@ class SimulationEntryStoreTests(unittest.TestCase):
             "r.record_json #>> '{exit_quote,provider_event_ns}' = r.exit_quote_event_ns::text",
             sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
         )
+        self.assertIn("r.entry_hash = e.entry_hash", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn(
+            "r.source_cycle_id = e.record_json ->> 'source_cycle_id'",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
+            "r.cutoff_at = CAST(e.record_json #>> '{cutoff_at,$timestamp_utc}' AS timestamptz)",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn("r.horizon = e.horizon", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn(
+            "r.horizon_seconds = e.horizon_seconds",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn("r.decision = e.decision", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn("r.entry_quote_id = e.quote_id", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn(
+            "r.entry_quote_hash = e.quote_hash",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn("r.entry_price = e.entry_price", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn("r.mode = e.record_json ->> 'mode'", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn("r.symbol = e.symbol", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn(
+            "r.instrument = e.record_json ->> 'instrument'",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
 
         entry1 = build_simulation_entry_record(
             intent=build_intent(), entry_status="ENTERED", quote=build_quote())
