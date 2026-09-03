@@ -1499,7 +1499,7 @@ def test_periodic_capture_failure_yields_only_after_rollback_and_pid_proof(mode)
             self.cursors.append(cursor)
             return cursor
 
-    scripted = (((("malformed",),),)) if mode == "malformed" else ()
+    scripted = ((( "malformed",),),) if mode == "malformed" else ()
     connection = PeriodicConnection(*scripted)
     runtime = make_authoritative_worker(connection)
 
