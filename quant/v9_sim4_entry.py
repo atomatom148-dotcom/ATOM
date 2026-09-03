@@ -760,7 +760,20 @@ _ENTRY_COLUMNS = (
     "quote_hash", "quote_source_spec", "quote_event_ns", "quote_accepted_at",
     "entry_price", "record_json",
 )
-_ENTRY_SELECT = "SELECT " + ", ".join(_ENTRY_COLUMNS) + " FROM " + SIM_ENTRY_TABLE
+_ENTRY_SELECT = "SELECT " + ", ".join(_ENTRY_COLUMNS) + " FROM " + SIM_ENTRY_TABLE + " AS e"
+# A durably resolved entry no longer occupies its horizon (SIM-5 freeze,
+# docs/sim-4a-exact-sim5-resolution-freeze.md section 10: "minimum
+# query/locking change needed so a durably resolved entry no longer blocks
+# its horizon").  This also bounds worker startup/recovery to unresolved
+# ENTERED rows without any separate query (freeze section 9), since
+# load_open_occupancy_on_cursor is exactly the method the worker calls at
+# startup.  atom_v9_sim_resolutions does not exist before migration 031 is
+# applied and SIM-5 is activated only behind ATOM_V9_SIM5_ENABLED=true; this
+# anti-join is unconditional so it must be present the moment 031 lands.
+_ENTRY_NOT_RESOLVED_CLAUSE = (
+    " AND NOT EXISTS (SELECT 1 FROM public.atom_v9_sim_resolutions AS r "
+    "WHERE r.entry_id = e.entry_id)"
+)
 _INTENT_COLUMNS = (
     "intent_id", "intent_hash", "contract_version", "canonicalization_version",
     "simulator_version", "symbol", "horizon", "horizon_seconds", "cutoff_at",
@@ -943,8 +956,9 @@ class SimulationEntryStore:
         cursor.execute(_ENTRY_SELECT +
                        " WHERE symbol = %s "
                        "AND horizon IN (%s, %s, %s, %s, %s, %s) "
-                       "AND entry_status = 'ENTERED' "
-                       "ORDER BY horizon, publication_at, entry_id",
+                       "AND entry_status = 'ENTERED'" +
+                       _ENTRY_NOT_RESOLVED_CLAUSE +
+                       " ORDER BY horizon, publication_at, entry_id",
                        (SYMBOL, *HORIZONS))
         occupancy: dict[str, SimulationEntryRecord] = {}
         for row in self._fetchall(cursor):
@@ -1072,8 +1086,9 @@ class SimulationEntryStore:
             self, cursor, horizon: str) -> SimulationEntryRecord | None:
         cursor.execute(_ENTRY_SELECT +
                        " WHERE symbol = %s AND horizon = %s "
-                       "AND entry_status = 'ENTERED' "
-                       "ORDER BY publication_at, entry_id",
+                       "AND entry_status = 'ENTERED'" +
+                       _ENTRY_NOT_RESOLVED_CLAUSE +
+                       " ORDER BY publication_at, entry_id",
                        (SYMBOL, horizon))
         rows = self._fetchall(cursor)
         if len(rows) > 1:
