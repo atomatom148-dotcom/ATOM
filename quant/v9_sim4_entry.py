@@ -760,7 +760,166 @@ _ENTRY_COLUMNS = (
     "quote_hash", "quote_source_spec", "quote_event_ns", "quote_accepted_at",
     "entry_price", "record_json",
 )
-_ENTRY_SELECT = "SELECT " + ", ".join(_ENTRY_COLUMNS) + " FROM " + SIM_ENTRY_TABLE
+_ENTRY_SELECT = "SELECT " + ", ".join(_ENTRY_COLUMNS) + " FROM " + SIM_ENTRY_TABLE + " AS e"
+_RESOLUTION_TARGET_EPOCH_NS_SQL = (
+    "(((EXTRACT(EPOCH FROM r.resolution_target_at) * 1000000)::bigint) * 1000)"
+)
+_RESOLUTION_DEADLINE_EPOCH_NS_SQL = (
+    "(((EXTRACT(EPOCH FROM r.resolution_deadline_at) * 1000000)::bigint) * 1000)"
+)
+_VALID_TERMINAL_RESOLUTION_CLAUSE = (
+    "("
+    "r.resolution_hash ~ '^[0-9a-f]{64}$' "
+    "AND r.resolution_id = 'v9simresolution:' || r.resolution_hash "
+    "AND r.contract_version = 'ATOM_TRUE_V9_SIM5_RESOLUTION_1' "
+    "AND r.canonicalization_version = 'ATOM_TRUE_V9_SIM_CANONICAL_V4A_1' "
+    "AND r.simulator_version = 'ATOM_TRUE_V9_SIM_1' "
+    "AND r.mode = 'PAPER_ONLY' "
+    "AND r.symbol = 'COIN' "
+    "AND r.instrument = 'COIN_SHARE' "
+    "AND r.entry_hash ~ '^[0-9a-f]{64}$' "
+    "AND r.entry_id = 'v9simentry:' || r.entry_hash "
+    "AND (r.horizon, r.horizon_seconds) IN "
+    "(('30S', 30), ('1M', 60), ('5M', 300), ('15M', 900), ('30M', 1800), ('1H', 3600)) "
+    "AND r.decision IN ('LONG', 'SHORT') "
+    "AND r.entry_quote_hash ~ '^[0-9a-f]{64}$' "
+    "AND r.entry_quote_id = 'v9simquote:' || r.entry_quote_hash "
+    "AND r.entry_price > 0 "
+    "AND r.entry_price NOT IN ('NaN'::double precision, '-Infinity'::double precision, "
+    "'Infinity'::double precision) "
+    "AND r.cutoff_at NOT IN ('-infinity'::timestamptz, 'infinity'::timestamptz) "
+    "AND r.resolution_target_at = r.cutoff_at + make_interval(secs => r.horizon_seconds) "
+    "AND r.resolution_deadline_at = r.resolution_target_at + interval '2 seconds' "
+    "AND r.resolution_status IN ('RESOLVED', 'UNRESOLVED_WINDOW_EXPIRED', "
+    "'UNRESOLVED_OBSERVATION_GAP') "
+    "AND jsonb_typeof(r.record_json) = 'object' "
+    "AND jsonb_object_length(r.record_json) = 24 "
+    "AND r.record_json ?& ARRAY['contract_version', 'canonicalization_version', "
+    "'simulator_version', 'resolution_id', 'resolution_hash', 'mode', 'symbol', "
+    "'instrument', 'entry_id', 'entry_hash', 'source_cycle_id', 'cutoff_at', "
+    "'horizon', 'horizon_seconds', 'decision', 'entry_quote_id', 'entry_quote_hash', "
+    "'entry_price', 'resolution_target_at', 'resolution_deadline_at', "
+    "'resolution_status', 'exit_quote', 'exit_price', 'return_bps'] "
+    "AND r.record_json ->> 'contract_version' = r.contract_version "
+    "AND r.record_json ->> 'canonicalization_version' = r.canonicalization_version "
+    "AND r.canonicalization_version = e.canonicalization_version "
+    "AND r.record_json ->> 'simulator_version' = r.simulator_version "
+    "AND r.simulator_version = e.simulator_version "
+    "AND r.record_json ->> 'resolution_id' = r.resolution_id "
+    "AND r.record_json ->> 'resolution_hash' = r.resolution_hash "
+    "AND r.record_json ->> 'mode' = r.mode "
+    "AND r.mode = e.record_json ->> 'mode' "
+    "AND r.record_json ->> 'symbol' = r.symbol "
+    "AND r.symbol = e.symbol "
+    "AND r.record_json ->> 'instrument' = r.instrument "
+    "AND r.instrument = e.record_json ->> 'instrument' "
+    "AND r.record_json ->> 'entry_id' = r.entry_id "
+    "AND r.record_json ->> 'entry_hash' = r.entry_hash "
+    "AND r.entry_hash = e.entry_hash "
+    "AND r.record_json ->> 'source_cycle_id' = r.source_cycle_id "
+    "AND r.source_cycle_id = e.record_json ->> 'source_cycle_id' "
+    "AND r.record_json #>> '{cutoff_at,$timestamp_utc}' = "
+    "to_char(r.cutoff_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+    "AND r.cutoff_at = CAST(e.record_json #>> '{cutoff_at,$timestamp_utc}' AS timestamptz) "
+    "AND r.record_json ->> 'horizon' = r.horizon "
+    "AND r.horizon = e.horizon "
+    "AND r.record_json ->> 'horizon_seconds' = r.horizon_seconds::text "
+    "AND r.horizon_seconds = e.horizon_seconds "
+    "AND r.record_json ->> 'decision' = r.decision "
+    "AND r.decision = e.decision "
+    "AND r.record_json ->> 'entry_quote_id' = r.entry_quote_id "
+    "AND r.entry_quote_id = e.quote_id "
+    "AND r.record_json ->> 'entry_quote_hash' = r.entry_quote_hash "
+    "AND r.entry_quote_hash = e.quote_hash "
+    "AND r.entry_price = e.entry_price "
+    "AND jsonb_typeof(e.record_json) = 'object' "
+    "AND e.record_json ->> 'entry_id' = e.entry_id "
+    "AND e.record_json ->> 'entry_hash' = e.entry_hash "
+    "AND e.record_json ->> 'mode' = 'PAPER_ONLY' "
+    "AND e.record_json ->> 'symbol' = e.symbol "
+    "AND e.record_json ->> 'instrument' = 'COIN_SHARE' "
+    "AND e.record_json ->> 'intent_id' = e.intent_id "
+    "AND e.record_json ->> 'source_cycle_id' = r.source_cycle_id "
+    "AND e.record_json #>> '{cutoff_at,$timestamp_utc}' = "
+    "to_char(r.cutoff_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+    "AND e.record_json #>> '{publication_at,$timestamp_utc}' = "
+    "to_char(e.publication_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+    "AND e.record_json #>> '{entry_deadline_at,$timestamp_utc}' = "
+    "to_char(e.entry_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+    "AND e.record_json ->> 'horizon' = e.horizon "
+    "AND e.record_json ->> 'horizon_seconds' = e.horizon_seconds::text "
+    "AND e.record_json ->> 'decision' = e.decision "
+    "AND e.record_json ->> 'intent_status' = e.intent_status "
+    "AND e.record_json ->> 'entry_status' = e.entry_status "
+    "AND e.record_json ->> 'quantity_shares' = e.quantity_shares::text "
+    "AND e.record_json -> 'blocking_entry_id' = 'null'::jsonb "
+    "AND e.record_json #>> '{quote,quote_id}' = e.quote_id "
+    "AND e.record_json #>> '{quote,quote_hash}' = e.quote_hash "
+    "AND e.record_json #>> '{quote,source_spec}' = e.quote_source_spec "
+    "AND e.record_json #>> '{quote,provider_event_ns}' = e.quote_event_ns::text "
+    "AND e.record_json #>> '{quote,accepted_at,$timestamp_utc}' = "
+    "to_char(e.quote_accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+    "AND e.record_json #>> '{entry_price,$float64}' = encode(float8send(e.entry_price), 'hex') "
+    "AND r.record_json #>> '{resolution_target_at,$timestamp_utc}' = "
+    "to_char(r.resolution_target_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+    "AND r.record_json #>> '{resolution_deadline_at,$timestamp_utc}' = "
+    "to_char(r.resolution_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+    "AND r.record_json ->> 'resolution_status' = r.resolution_status "
+    "AND ("
+    "("
+    "r.resolution_status = 'RESOLVED' "
+    "AND r.exit_quote_id IS NOT NULL "
+    "AND r.exit_quote_hash ~ '^[0-9a-f]{64}$' "
+    "AND r.exit_quote_id = 'v9simquote:' || r.exit_quote_hash "
+    "AND r.exit_quote_source_spec = 'ATOM_TRUE_V9_SIM4_ALPACA_SIP_QUOTE_1' "
+    "AND r.exit_quote_event_ns IS NOT NULL "
+    "AND r.exit_quote_event_ns BETWEEN " + _RESOLUTION_TARGET_EPOCH_NS_SQL + " AND "
+    + _RESOLUTION_DEADLINE_EPOCH_NS_SQL + " "
+    "AND r.exit_quote_accepted_at IS NOT NULL "
+    "AND r.exit_quote_accepted_at NOT IN ('-infinity'::timestamptz, 'infinity'::timestamptz) "
+    "AND r.exit_quote_accepted_at BETWEEN r.resolution_target_at AND r.resolution_deadline_at "
+    "AND r.exit_price IS NOT NULL "
+    "AND r.exit_price > 0 "
+    "AND r.exit_price NOT IN ('NaN'::double precision, '-Infinity'::double precision, "
+    "'Infinity'::double precision) "
+    "AND r.return_bps IS NOT NULL "
+    "AND r.return_bps NOT IN ('NaN'::double precision, '-Infinity'::double precision, "
+    "'Infinity'::double precision) "
+    "AND jsonb_typeof(r.record_json -> 'exit_quote') = 'object' "
+    "AND r.record_json #>> '{exit_quote,quote_id}' = r.exit_quote_id "
+    "AND r.record_json #>> '{exit_quote,quote_hash}' = r.exit_quote_hash "
+    "AND r.record_json #>> '{exit_quote,source_spec}' = r.exit_quote_source_spec "
+    "AND r.record_json #>> '{exit_quote,provider_event_ns}' = r.exit_quote_event_ns::text "
+    "AND r.record_json #>> '{exit_quote,accepted_at,$timestamp_utc}' = "
+    "to_char(r.exit_quote_accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+    ") OR ("
+    "r.resolution_status IN ('UNRESOLVED_WINDOW_EXPIRED', 'UNRESOLVED_OBSERVATION_GAP') "
+    "AND r.exit_quote_id IS NULL "
+    "AND r.exit_quote_hash IS NULL "
+    "AND r.exit_quote_source_spec IS NULL "
+    "AND r.exit_quote_event_ns IS NULL "
+    "AND r.exit_quote_accepted_at IS NULL "
+    "AND r.exit_price IS NULL "
+    "AND r.return_bps IS NULL "
+    "AND r.record_json -> 'exit_quote' = 'null'::jsonb "
+    "AND r.record_json -> 'exit_price' = 'null'::jsonb "
+    "AND r.record_json -> 'return_bps' = 'null'::jsonb"
+    "))"
+    ")"
+)
+# A durably resolved entry no longer occupies its horizon (SIM-5 freeze,
+# docs/sim-4a-exact-sim5-resolution-freeze.md section 10: "minimum
+# query/locking change needed so a durably resolved entry no longer blocks
+# its horizon").  This also bounds worker startup/recovery to unresolved
+# ENTERED rows without any separate query (freeze section 9), since
+# load_open_occupancy_on_cursor is exactly the method the worker calls at
+# startup.  atom_v9_sim_resolutions does not exist before migration 031 is
+# applied and SIM-5 is activated only behind ATOM_V9_SIM5_ENABLED=true; this
+# anti-join is unconditional so it must be present the moment 031 lands.
+_ENTRY_NOT_RESOLVED_CLAUSE = (
+    " AND NOT EXISTS (SELECT 1 FROM public.atom_v9_sim_resolutions AS r "
+    "WHERE r.entry_id = e.entry_id AND " + _VALID_TERMINAL_RESOLUTION_CLAUSE + ")"
+)
 _INTENT_COLUMNS = (
     "intent_id", "intent_hash", "contract_version", "canonicalization_version",
     "simulator_version", "symbol", "horizon", "horizon_seconds", "cutoff_at",
@@ -943,8 +1102,9 @@ class SimulationEntryStore:
         cursor.execute(_ENTRY_SELECT +
                        " WHERE symbol = %s "
                        "AND horizon IN (%s, %s, %s, %s, %s, %s) "
-                       "AND entry_status = 'ENTERED' "
-                       "ORDER BY horizon, publication_at, entry_id",
+                       "AND entry_status = 'ENTERED'" +
+                       _ENTRY_NOT_RESOLVED_CLAUSE +
+                       " ORDER BY horizon, publication_at, entry_id",
                        (SYMBOL, *HORIZONS))
         occupancy: dict[str, SimulationEntryRecord] = {}
         for row in self._fetchall(cursor):
@@ -1072,8 +1232,9 @@ class SimulationEntryStore:
             self, cursor, horizon: str) -> SimulationEntryRecord | None:
         cursor.execute(_ENTRY_SELECT +
                        " WHERE symbol = %s AND horizon = %s "
-                       "AND entry_status = 'ENTERED' "
-                       "ORDER BY publication_at, entry_id",
+                       "AND entry_status = 'ENTERED'" +
+                       _ENTRY_NOT_RESOLVED_CLAUSE +
+                       " ORDER BY publication_at, entry_id",
                        (SYMBOL, horizon))
         rows = self._fetchall(cursor)
         if len(rows) > 1:

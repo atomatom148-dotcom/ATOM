@@ -4,6 +4,7 @@ import json
 import math
 import unittest
 
+from quant import v9_sim4_entry as sim4_entry_module
 from quant.v9_sim1_contract import build_simulation_trade_intent
 from quant.v9_sim4_entry import (
     ENTRY_ID_PREFIX,
@@ -682,6 +683,115 @@ class SimulationEntryStoreTests(unittest.TestCase):
         self.assertIn("ORDER BY horizon, publication_at, entry_id", sql)
         self.assertEqual(parameters, ("COIN", "30S", "1M", "5M", "15M",
                                       "30M", "1H"))
+
+    def test_horizon_release_queries_exclude_durably_resolved_entries(self):
+        # SIM-5 freeze (docs/sim-4a-exact-sim5-resolution-freeze.md,
+        # section 10): "minimum query/locking change needed so a durably
+        # resolved entry no longer blocks its horizon."  Both occupancy
+        # queries must anti-join against atom_v9_sim_resolutions by
+        # entry_id, and only a provably valid canonical terminal row may
+        # satisfy that anti-join. The base SELECT must alias the entries
+        # table so that anti-join can reference entry_id unambiguously.
+        self.assertIn(" FROM public.atom_v9_sim_entries AS e", sim4_entry_module._ENTRY_SELECT)
+        self.assertIn(
+            "NOT EXISTS (SELECT 1 FROM public.atom_v9_sim_resolutions AS r "
+            "WHERE r.entry_id = e.entry_id AND ",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn(
+            "r.resolution_id = 'v9simresolution:' || r.resolution_hash",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
+            "jsonb_typeof(r.record_json) = 'object'",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
+            "r.record_json ->> 'resolution_hash' = r.resolution_hash",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
+            "r.exit_quote_event_ns BETWEEN",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
+            "r.record_json #>> '{exit_quote,provider_event_ns}' = r.exit_quote_event_ns::text",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn("r.entry_hash = e.entry_hash", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn(
+            "r.source_cycle_id = e.record_json ->> 'source_cycle_id'",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
+            "r.cutoff_at = CAST(e.record_json #>> '{cutoff_at,$timestamp_utc}' AS timestamptz)",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn("r.horizon = e.horizon", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn(
+            "r.horizon_seconds = e.horizon_seconds",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn("r.decision = e.decision", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn("r.entry_quote_id = e.quote_id", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn(
+            "r.entry_quote_hash = e.quote_hash",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn("r.entry_price = e.entry_price", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn("r.mode = e.record_json ->> 'mode'", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn("r.symbol = e.symbol", sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE)
+        self.assertIn(
+            "r.instrument = e.record_json ->> 'instrument'",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
+            "e.record_json #>> '{quote,provider_event_ns}' = e.quote_event_ns::text",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
+            "e.record_json #>> '{quote,accepted_at,$timestamp_utc}' = to_char(e.quote_accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertIn(
+            "e.record_json #>> '{entry_price,$float64}' = encode(float8send(e.entry_price), 'hex')",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+
+        entry1 = build_simulation_entry_record(
+            intent=build_intent(), entry_status="ENTERED", quote=build_quote())
+        cursor = ScriptedCursor([
+            ("entry_status = 'ENTERED'", []),
+        ])
+        store = SimulationEntryStore(FakeConnection(cursor), project_ref=PROJECT_REF)
+        occupancy = store.load_open_occupancy_on_cursor(cursor)
+        self.assertEqual(occupancy, {})
+        sql, parameters = cursor.executed[0]
+        self.assertIn(
+            "NOT EXISTS (SELECT 1 FROM public.atom_v9_sim_resolutions AS r "
+            "WHERE r.entry_id = e.entry_id AND ", sql)
+        self.assertIn("ORDER BY horizon, publication_at, entry_id", sql)
+        self.assertEqual(parameters, ("COIN", "30S", "1M", "5M", "15M", "30M", "1H"))
+
+        cursor_keep = ScriptedCursor([
+            ("entry_status = 'ENTERED'", [entry_row(entry1)]),
+        ])
+        store_keep = SimulationEntryStore(FakeConnection(cursor_keep), project_ref=PROJECT_REF)
+        occupancy_keep = store_keep.load_open_occupancy_on_cursor(cursor_keep)
+        self.assertEqual(occupancy_keep, {"30S": entry1})
+
+        cursor2 = ScriptedCursor([
+            ("entry_status = 'ENTERED'", []),
+        ])
+        store2 = SimulationEntryStore(FakeConnection(cursor2), project_ref=PROJECT_REF)
+        blocker = store2._load_horizon_occupancy_on_cursor(cursor2, "30S")
+        self.assertIsNone(blocker)
+        sql2, parameters2 = cursor2.executed[0]
+        self.assertIn(
+            "NOT EXISTS (SELECT 1 FROM public.atom_v9_sim_resolutions AS r "
+            "WHERE r.entry_id = e.entry_id AND ", sql2)
+        self.assertIn("ORDER BY publication_at, entry_id", sql2)
+        self.assertEqual(parameters2, ("COIN", "30S"))
+        del entry1  # constructed only to prove ENTERED entries build cleanly
 
     def test_horizon_lock_accepts_only_postgres_void_representations(self):
         intent = build_intent()
