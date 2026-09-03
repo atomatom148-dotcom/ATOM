@@ -64,6 +64,15 @@ BEGIN
 END
 $atom_v9_sim5_preflight$;
 
+DO $atom_v9_sim5_grant_bootstrap_owner$
+BEGIN
+    EXECUTE pg_catalog.format(
+        'GRANT atom_v9_sim_owner TO %I',
+        CURRENT_USER
+    );
+END
+$atom_v9_sim5_grant_bootstrap_owner$;
+
 CREATE TABLE public.atom_v9_sim_resolutions (
     resolution_id text PRIMARY KEY,
     resolution_hash text UNIQUE NOT NULL,
@@ -330,6 +339,15 @@ BEGIN
     END LOOP;
 END
 $atom_v9_sim5_revoke_optional_roles$;
+
+DO $atom_v9_sim5_revoke_bootstrap_owner$
+BEGIN
+    EXECUTE pg_catalog.format(
+        'REVOKE atom_v9_sim_owner FROM %I',
+        CURRENT_USER
+    );
+END
+$atom_v9_sim5_revoke_bootstrap_owner$;
 
 DO $atom_v9_sim5_verify_final_authority$
 DECLARE
