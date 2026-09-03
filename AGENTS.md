@@ -8,8 +8,9 @@ changing external services, read completely:
 1. `AGENTS.md`
 2. `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1.md`
 3. Every amendment to that role-governance freeze present on current `main`;
-   `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A.md` and
-   `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1B.md` govern only from their
+   `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A.md`,
+   `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1B.md`, and
+   `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1C.md` govern only from their
    respective Owner-approved merge commits
 4. `FREEZE.md`
 5. `SIMULATION_FREEZE.md`
@@ -33,7 +34,10 @@ When `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1A.md` is effective, its §3
 supersedes base §3. When `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1B.md` is
 effective, its explicit delegation and Owner-author-of-record fallback clauses
 supersede conflicting sole-author and Claude-implementation restrictions in the
-base freeze and Amendment 1A. The base documents remain immutable historical
+base freeze and Amendment 1A. When `ATOM_AI_ROLE_INNOVATION_AUTHORITY_FREEZE_1C.md`
+is effective, its automatic Claude implementation-fallback rule supersedes only
+the per-job explicit-naming requirement in Amendment 1B §1 when Codex is
+objectively unavailable. The base documents remain immutable historical
 adoption records and are not silently rewritten.
 
 A technical freeze cannot supersede governance law on those subjects unless it
@@ -86,14 +90,20 @@ the draft preparer only. The same documentation-first ordering, independent
 final-head review, required-green-check, and Owner merge requirements remain.
 Claude does not become freeze author through this path.
 
-### Claude implementation delegation
+### Claude implementation continuity
 
-Codex remains the default implementation owner. Claude may be named as the sole
-implementation owner for one exact job when ChatGPT Pro or the Owner issues a
-job card beneath controlling law naming Claude in that role. The job card must
-state the controlling freeze, exact scope, permitted and prohibited actions,
-required tests and evidence, PASS/FAIL/INVALID/BLOCKED rules, stop condition,
-and receipt. Claude receives no general implementation authority from one job.
+Codex remains the default implementation owner. When Codex is objectively
+unavailable, capacity-limited, usage-limited, disconnected, or otherwise unable
+to begin or continue an already-authorized implementation job, Claude
+automatically becomes implementation owner for that exact job under Amendment
+1C. No ceremonial waiting period or fresh technical freeze is required.
+
+Claude inherits only the already-authorized implementation scope. The
+controlling freeze or job must already define the exact surface, prohibited
+actions, required tests/evidence, stop conditions, and merge/deployment gates.
+Claude may not reinterpret or widen any frozen boundary. One job still has one
+implementation owner at a time; once Claude validly assumes a job, ownership
+stays with Claude through that job unless the Owner explicitly transfers it.
 
 When Claude implements, Claude may not be the sole final-head reviewer. Codex,
 Copilot's pull-request reviewer, a qualified human, or the Owner must provide
@@ -210,12 +220,13 @@ Update this section only by Owner-approved documentation change.
 - Active phase: **SIM-5 — six-horizon causal resolution**.
 - Controlling text: `docs/sim-4a-exact-sim5-resolution-freeze.md`, plus the
   existing merged simulator freezes it explicitly preserves.
-- Implementation owner: **Codex**.
-- Authorized order: documentation freeze/pointer merge; one Codex SIM-5
-  implementation PR; independent final-head review and green required checks;
-  Owner merge; apply migration `031` once to the isolated simulator project;
-  enable `ATOM_V9_SIM5_ENABLED=true` on the existing SIM-4 worker; deploy the
-  exact merged SHA; capture deployment proof and then live causal resolution
+- Implementation owner: **Codex by default; Claude automatic fallback under
+  Amendment 1C when Codex is objectively unavailable**.
+- Authorized order: one SIM-5 implementation PR by the active implementation
+  owner; independent final-head review and green required checks; Owner merge;
+  apply migration `031` once to the isolated simulator project; enable
+  `ATOM_V9_SIM5_ENABLED=true` on the existing SIM-4 worker; deploy the exact
+  merged SHA; capture deployment proof and then live causal resolution
   acceptance when market evidence is available.
 - E-1 is complete and its official receipt is preserved at
   `docs/e-1-official-scorecard-receipt-2026-09-03.json`.
