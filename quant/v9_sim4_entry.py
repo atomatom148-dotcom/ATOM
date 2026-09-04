@@ -767,6 +767,19 @@ _RESOLUTION_TARGET_EPOCH_NS_SQL = (
 _RESOLUTION_DEADLINE_EPOCH_NS_SQL = (
     "(((EXTRACT(EPOCH FROM r.resolution_deadline_at) * 1000000)::bigint) * 1000)"
 )
+_ENTRY_PRICE_CANONICAL_TOKEN_SQL = (
+    "CASE WHEN (((get_byte(float8send(e.entry_price), 0) & 127) << 4) | "
+    "(get_byte(float8send(e.entry_price), 1) >> 4)) = 0 THEN "
+    "'0x0.' || substring(encode(float8send(e.entry_price), 'hex') FROM 4) || "
+    "'p-1022' ELSE "
+    "'0x1.' || substring(encode(float8send(e.entry_price), 'hex') FROM 4) || "
+    "'p' || CASE WHEN "
+    "(((get_byte(float8send(e.entry_price), 0) & 127) << 4) | "
+    "(get_byte(float8send(e.entry_price), 1) >> 4)) >= 1023 "
+    "THEN '+' ELSE '' END || "
+    "((((get_byte(float8send(e.entry_price), 0) & 127) << 4) | "
+    "(get_byte(float8send(e.entry_price), 1) >> 4)) - 1023)::text END"
+)
 _VALID_TERMINAL_RESOLUTION_CLAUSE = (
     "("
     "r.resolution_hash ~ '^[0-9a-f]{64}$' "
@@ -859,7 +872,8 @@ _VALID_TERMINAL_RESOLUTION_CLAUSE = (
     "AND e.record_json #>> '{quote,provider_event_ns}' = e.quote_event_ns::text "
     "AND e.record_json #>> '{quote,accepted_at,$timestamp_utc}' = "
     "to_char(e.quote_accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
-    "AND e.record_json #>> '{entry_price,$float64}' = encode(float8send(e.entry_price), 'hex') "
+    "AND e.record_json #>> '{entry_price,$float64}' = "
+    + _ENTRY_PRICE_CANONICAL_TOKEN_SQL + " "
     "AND r.record_json #>> '{resolution_target_at,$timestamp_utc}' = "
     "to_char(r.resolution_target_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
     "AND r.record_json #>> '{resolution_deadline_at,$timestamp_utc}' = "
@@ -1336,3 +1350,4 @@ class SimulationEntryStore:
             if stored == entry:
                 return IDEMPOTENT, stored
         raise SimulationEntryConflictError("entry identity is already in use")
+
