@@ -134,6 +134,7 @@ def test_read_only_identity_no_fallback_and_no_forbidden_imports(monkeypatch):
     assert not any(token in lowered for token in ("insert ", "update ", "delete ",
                                                    "truncate", "alter ", "drop ",
                                                    "grant ", "create ", "copy "))
+    assert "SELECT x.outcome_record_hash, x.record_json" in study.STREAM_SQL
     assert "connection.read_only = True" in source
     assert "holds evidence write privilege" in source
     assert study.READONLY_ROLE == "atom_e1_scorecard_reader"
