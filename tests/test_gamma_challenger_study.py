@@ -163,3 +163,44 @@ def test_frozen_split_uses_all_pre_adoption_and_first_twenty_post_sessions():
 def test_forbidden_e2_ratio_is_absent():
     source = Path(study.__file__).read_text()
     assert "abs(mu)" not in source and "abs(expected_return" not in source
+
+
+def test_one_shot_runner_uses_readonly_connection_all_horizons_and_append_only_receipts(
+        monkeypatch, tmp_path, capsys):
+    class Connection:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    calls = []
+    monkeypatch.setenv(study.READONLY_URL_ENV, "postgresql://readonly")
+    monkeypatch.setattr(study, "open_readonly_connection",
+                        lambda url: connection if url == "postgresql://readonly" else None)
+
+    def fake_read_rows(received, *, horizon, lo, hi):
+        assert received is connection
+        calls.append(horizon)
+        return ()
+
+    monkeypatch.setattr(study, "read_rows", fake_read_rows)
+    verdicts = study.run_once(
+        verified_main_sha="abc123", receipts_dir=tmp_path,
+        now=datetime(2026, 9, 5, tzinfo=timezone.utc))
+
+    assert calls == list(study.HORIZONS)
+    assert verdicts == {horizon: "INSUFFICIENT" for horizon in study.HORIZONS}
+    assert connection.closed
+    receipts = sorted(tmp_path.glob("g-1-*.json"))
+    assert len(receipts) == 12
+    assert len([path for path in receipts if "pilot" in path.name]) == 6
+    assert len([path for path in receipts if "confirmatory" in path.name]) == 6
+    with pytest.raises(SystemExit, match="refused to overwrite"):
+        study.run_once(verified_main_sha="abc123", receipts_dir=tmp_path,
+                       now=datetime(2026, 9, 5, tzinfo=timezone.utc))
+
+    monkeypatch.setattr(study, "run_once", lambda **kwargs: verdicts)
+    assert study.main(["--verified-main-sha", "abc123"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        f"{horizon}: INSUFFICIENT" for horizon in study.HORIZONS]

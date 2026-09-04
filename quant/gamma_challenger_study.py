@@ -12,8 +12,10 @@ import json
 import math
 import os
 import random
+import sys
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Mapping, Sequence
 
 from quant.evidence_scorecard import (
@@ -53,6 +55,7 @@ MIN_CALIBRATION_EFFECTIVE_N = 200.0
 MIN_HOLDOUT_SESSIONS = 20
 MIN_HOLDOUT_WINDOWS = 500
 NORMAL_90_Z = 1.6448536269514722
+ADOPTION_SESSION = date(2026, 9, 4)
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,3 +364,88 @@ def configured_database_url() -> str:
     if not value:
         raise SystemExit(f"G-1 reader refused: {READONLY_URL_ENV} is not set")
     return value
+
+
+def _write_receipt(path: Path, receipt: Mapping[str, object]) -> None:
+    """Create one immutable receipt; never replace prior evidence."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(receipt, sort_keys=True, indent=2, allow_nan=False))
+        stream.write("\n")
+
+
+def run_once(*, verified_main_sha: str, receipts_dir: Path = Path("docs"),
+             now: datetime | None = None) -> dict[str, str]:
+    """Run the frozen G-1 pilot/confirmatory study once across all horizons."""
+    upper_bound = now or datetime.now(timezone.utc)
+    if upper_bound.tzinfo is None:
+        raise ValueError("G-1 upper bound must be timezone-aware")
+    connection = open_readonly_connection(configured_database_url())
+    verdicts: dict[str, str] = {}
+    try:
+        for horizon in HORIZONS:
+            rows = read_rows(connection, horizon=horizon,
+                             lo=datetime(1970, 1, 1, tzinfo=timezone.utc),
+                             hi=upper_bound)
+            pilot_sessions, holdout_sessions = frozen_session_split(rows, ADOPTION_SESSION)
+            pilot_set, holdout_set = set(pilot_sessions), set(holdout_sessions)
+            calibration = select_windows(
+                tuple(row for row in rows if session_of(row.cutoff_epoch) in pilot_set),
+                horizon)
+            holdout = select_windows(
+                tuple(row for row in rows if session_of(row.cutoff_epoch) in holdout_set),
+                horizon)
+            fitted = fit_calibration(calibration.rows)
+            pilot_result: dict[str, object] = {
+                "counts": {
+                    "calibration_input": calibration.n_input,
+                    "calibration_windows": len(calibration.rows),
+                    "calibration_null_excluded": calibration.n_null_excluded,
+                    "calibration_inadmissible": calibration.n_inadmissible,
+                    "calibration_non_rth": calibration.n_non_rth,
+                    "calibration_overlap_excluded": calibration.n_overlap_excluded,
+                },
+                "fit": None if fitted is None else asdict(fitted),
+                "final_verdict": "INSUFFICIENT" if fitted is None else "PILOT_ONLY",
+            }
+            result = evaluate_horizon(calibration, holdout, horizon)
+            cohort_identity = ",".join(sorted({row.cohort_id for row in
+                                                calibration.rows + holdout.rows}))
+            pilot_receipt = build_receipt(
+                verified_main_sha=verified_main_sha, horizon=horizon,
+                cohort_identity=cohort_identity,
+                calibration_sessions=pilot_sessions, holdout_sessions=(),
+                result=pilot_result, current_user=READONLY_ROLE)
+            confirmatory_receipt = build_receipt(
+                verified_main_sha=verified_main_sha, horizon=horizon,
+                cohort_identity=cohort_identity,
+                calibration_sessions=pilot_sessions,
+                holdout_sessions=holdout_sessions, result=result,
+                current_user=READONLY_ROLE)
+            stem = horizon.lower()
+            pilot_path = receipts_dir / f"g-1-pilot-{stem}-{pilot_receipt['sha256']}.json"
+            confirmatory_path = receipts_dir / (
+                f"g-1-confirmatory-{stem}-{confirmatory_receipt['sha256']}.json")
+            if pilot_path.exists() or confirmatory_path.exists():
+                raise SystemExit(f"G-1 refused to overwrite existing receipt for {horizon}")
+            _write_receipt(pilot_path, pilot_receipt)
+            _write_receipt(confirmatory_path, confirmatory_receipt)
+            verdicts[horizon] = str(result["final_verdict"])
+    finally:
+        connection.close()
+    return verdicts
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if len(argv) != 2 or argv[0] != "--verified-main-sha" or not argv[1]:
+        raise SystemExit(
+            "usage: python -m quant.gamma_challenger_study --verified-main-sha SHA")
+    for horizon, verdict in run_once(verified_main_sha=argv[1]).items():
+        print(f"{horizon}: {verdict}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised through main tests.
+    raise SystemExit(main())
