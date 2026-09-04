@@ -3,7 +3,7 @@
 **Decision ID:** `ATOM-V1A-VOLATILITY-FIRST-FREEZE-1`  
 **Status:** PROPOSED CONTROLLING FREEZE — documentation only until Owner merge  
 **Program:** ATOM V9  
-**Author of record:** ChatGPT Pro  
+**Author of record:** Owner  
 **Owner authority:** Owner retains final merge, deployment, infrastructure, risk, broker, instrument, order, and capital authority.  
 **Implementation owner beneath this freeze:** Codex-class implementation labor under the controlling governance law.  
 **Original adoption base:** `main` at `ba702d510a7c9b535c96ab4c8c4325f2920d2eda`.
@@ -412,8 +412,17 @@ A preceding row that fails condition 2 is omitted from `C(w)`; it may enter
 knowledge may enter a benchmark retroactively.
 
 ```text
-unconditional(w) = arithmetic mean realized_volatility_bps over C(w)
+unconditional(w)
+= math.fsum(realized_volatility_bps over C(w) in frozen §8.1 order)
+  / len(C(w))
 ```
+
+Convert each operand to IEEE-754 binary64 Python `float`; evaluate the
+displayed `math.fsum` and division in that order. Built-in `sum`, SQL
+`AVG`, NumPy, reassociation, and every other reduction are forbidden. When
+`C(w)` is empty, do not evaluate the division. An arithmetic exception in
+the displayed reduction is treated as a non-finite mean and therefore makes
+`unconditional(w)` unavailable.
 
 `unconditional(w)` is unavailable when `C(w)` is empty or when its arithmetic
 mean is not finite and strictly positive. Thus it is unavailable for the first
@@ -446,15 +455,24 @@ durably available with its required proof by `w.cutoff_at`.
    `floor(minutes since 09:30 America/New_York at u.cutoff_at / 30)`;
    the §5.4 RTH rule gives buckets `0..12`;
 2. bucket `w` using the same expression at `w.cutoff_at`;
-3. compute `mean(log(realized_volatility_bps))` per bucket and the overall mean
-   across all rows in `P(w)`;
-4. set
-   `diurnal_factor(w) = exp(bucket_mean(bucket(w)) - overall_mean)` only when
-   `P(w)` contains at least three distinct strictly-earlier sessions and
-   `w`'s bucket contains at least two observations; otherwise set it to exactly
-   `1.0`;
+3. if `P(w)` contains fewer than three distinct strictly-earlier sessions
+   or `w`'s bucket contains fewer than two observations, set
+   `diurnal_factor(w) = 1.0`, do not evaluate any log mean or division, and
+   continue at step 5;
+4. otherwise compute each `math.log(realized_volatility_bps)` as binary64 in
+   frozen §8.1 order; for each nonempty bucket preserve that subsequence order
+   and compute `bucket_mean = math.fsum(bucket_logs) / len(bucket_logs)`;
+   compute `overall_mean = math.fsum(all_logs) / len(all_logs)` in the full
+   `P(w)` order; then set
+   `diurnal_factor(w) = math.exp(bucket_mean(bucket(w)) - overall_mean)`;
 5. use no smoothing, interpolation, parametric shape, later-session data, or row
    absent from `P(w)`.
+
+All logarithms, `math.fsum` calls, divisions, the displayed subtraction,
+`math.exp`, and the final `unconditional(w) * diurnal_factor(w)`
+multiplication execute in that displayed order with Python binary64
+`float`. Built-in `sum`, SQL `AVG`, NumPy reductions, or reassociation
+are forbidden.
 
 Exactly-zero realized magnitudes remain evaluated outcomes but are excluded from
 profile estimation because their logarithm is non-finite. Any other non-finite
@@ -677,18 +695,30 @@ The interval endpoints are direct zero-based selections of the sorted values at 
 
 ### 10.3 Mandatory benchmark-loss gates
 
-For a strictly positive forecast `f` and realized magnitude `r >= 0`, the frozen
-loss is exactly:
+For a strictly positive forecast `f` and realized magnitude `r >= 0`, the
+frozen mathematical loss is:
 
 ```text
 QLIKE(r, f) = log(f^2) + (r^2 / f^2)
 ```
 
-evaluated with `f = predicted_volatility_bps` or the benchmark value, and
-`r = realized_volatility_bps`. This form is finite at `r = 0`, which §4
-declares valid evidence, and ranks forecasts identically to the standard QLIKE,
-from which it differs only by a term independent of `f`. Lower is better. No
-alternative loss, clipping, or epsilon floor may be substituted.
+Its sole binary64 evaluation is the following underflow-safe algebraic form,
+with each line evaluated in order after converting `r` and `f` to Python
+`float`:
+
+```text
+loss_log    = 2.0 * math.log(f)
+loss_ratio  = r / f
+loss_square = loss_ratio * loss_ratio
+QLIKE       = loss_log + loss_square
+```
+
+Never evaluate `f * f` or `r * r`. The operation is finite at `r = 0`
+for every admitted positive binary64 `f` and ranks forecasts identically to
+standard QLIKE, from which it differs only by a term independent of `f`.
+Lower is better. No alternate association, library loss, clipping, decimal
+arithmetic, extended precision, or epsilon floor may be substituted. An
+arithmetic exception or non-finite row loss is handled only by §11 rule 4.
 
 For each benchmark `b` in exactly `{unconditional, seasonal}`, its gate
 population `G_b` is the regression-population rows where `b(w)` is available.
@@ -753,6 +783,12 @@ This rule governs all five displayed receipt summaries and every bootstrap
 every other aggregation are forbidden. All five summaries are `null` when
 the common gate population is empty. No sum, median, differently filtered
 population, or alternate aggregate is permitted.
+
+Every full-population candidate loss, benchmark loss, `d_b(w)`, and each of
+the five point summaries must be finite. Any arithmetic exception or
+non-finite value at that pre-bootstrap checkpoint makes the cell `INVALID`
+under §11 rule 4. A non-finite resampled gate-draw mean is instead an invalid
+attempt under the separately frozen cap rule below.
 
 When §11 permits gate inference, bootstrap `mean(d_b)` from that gate's
 population only. For each benchmark `b`, define:
@@ -821,15 +857,18 @@ Classification and inference precedence is exactly:
    fails its own 100-window or 10-session minimum => `INSUFFICIENT`, with no
    bootstrap;
 3. otherwise if full-sample OLS is rank-deficient or non-finite => `INVALID`;
-4. otherwise run the inferential bootstraps in this exact order:
+4. otherwise compute every full-population QLIKE row loss, difference, and
+   point summary under §10.3; any arithmetic exception or non-finite result =>
+   `INVALID`, with no bootstrap;
+5. otherwise run the inferential bootstraps in this exact order:
    `enc_b`, `unconditional`, `seasonal`; if any required bootstrap fails
    its valid-draw requirement, the cell is `INVALID` and every later bootstrap
    is not run;
-5. otherwise if all three conditions hold => `INFORMATIVE`:
+6. otherwise if all three conditions hold => `INFORMATIVE`:
    a. lower endpoint of `enc_b_ci_0999` is strictly greater than zero;
    b. the unconditional gate is `PASS`;
    c. the seasonal gate is `PASS`;
-6. otherwise => `NOISE`.
+7. otherwise => `NOISE`.
 
 For `INSUFFICIENT`, all three bootstrap counter triplets are zero. A gate with
 zero population is `UNAVAILABLE`; a gate with a nonzero population is
@@ -865,6 +904,9 @@ strings, and is derived solely from the final classification as follows:
     fails at least one of the positive/rank inequalities in §10;
   - `FULL_SAMPLE_OLS_NONFINITE` iff rule 3 encounters a non-finite source,
     intermediate, coefficient, or arithmetic exception under §10;
+  - `QLIKE_ARITHMETIC_NONFINITE` iff rule 4 encounters an arithmetic
+    exception or non-finite full-population loss, difference, or point
+    summary under §10.3;
   - `ENC_B_BOOTSTRAP_EXHAUSTED` iff the `enc_b` bootstrap reaches its cap
     before 200,000 valid draws;
   - `UNCONDITIONAL_GATE_BOOTSTRAP_EXHAUSTED` iff that gate reaches its cap
@@ -973,8 +1015,9 @@ At minimum tests must prove:
 - full-sample rank defect => INVALID;
 - exact evaluated, BLOCKED, pre-cell-INVALID, and
   post-evaluation-authority-INVALID schemas and canonical hashes;
-- effective DSN target/login verification, including rejection of duplicate or
-  ambient target/login parameters and every startup `options` value;
+- direct-host-only effective DSN target/login verification, including
+  rejection of every pooler, duplicate or ambient target/login parameter, and
+  startup `options` value;
 - exact six-table read/RLS/no-write authority proof including restrictive policies;
 - execution revision and V-1A merge revision binding;
 - rollback deployment target derivation from the V-1B merge's exact first
@@ -985,7 +1028,9 @@ At minimum tests must prove:
 - diurnal factor uses only strictly-earlier sessions, returns exactly `1.0` below the
   three-session / two-observation minimum, and excludes zero-magnitude windows from
   estimation only;
-- `QLIKE` is finite when the realized magnitude is exactly zero;
+- the exact underflow-safe binary64 QLIKE operation, including a smallest
+  positive subnormal forecast with zero realization, and rule-4 INVALID
+  routing for overflow, arithmetic exceptions, and non-finite point summaries;
 - a constructed full-column-rank fixture with varying `persist_20` and a
   nonconstant candidate has lower point QLIKE than `persist_1` and
   `persist_20` but does not beat `unconditional`; its completed
@@ -1000,6 +1045,8 @@ At minimum tests must prove:
   the evaluated window's `cutoff_at`, including delayed earlier-session rows;
 - later unconditional unavailability, all-zero causal history, and exact
   unconditional/seasonal gate-population reconciliation;
+- exact ordered binary64 `math.fsum(...)/len(...)` construction of the
+  unconditional mean and every seasonal log mean;
 - seasonal bucketing uses each row's exact `cutoff_at`;
 - all four rank correlations use the exact §9.1 Spearman behavior;
 - gate-specific 100-window/10-session minima and separate attempted/valid/invalid
@@ -1020,14 +1067,20 @@ At minimum tests must prove:
 - pre-read and pre-receipt rejection when `session_user` differs from the
   reader, any reader membership exists, or any frozen reader role attribute
   differs, including `rolsuper` or `rolbypassrls`;
-- pre-read and pre-receipt rejection when the reader owns the database or has
-  effective database `CREATE` or `TEMPORARY` privilege, including through
-  `PUBLIC` or implicit `pg_database_owner` authority;
+- pre-read and pre-receipt rejection when the reader owns the database, has
+  effective database `CREATE`, lacks the frozen public-only `TEMPORARY`
+  state, has any other `TEMPORARY` source, or creates a session temporary
+  schema/object;
+- catalog-wide pre-read and pre-receipt rejection of effective
+  INSERT/UPDATE/DELETE/TRUNCATE privilege on any non-system relation,
+  including a synthetic seventh production table;
 - pre-read and pre-receipt verification of `atom_v9_internal` USAGE and
   EXECUTE on exactly both proof-reader functions;
 - deterministic routing of a failed final authority recheck to the exact
   post-evaluation authority-invalid receipt, never the passing evaluated schema;
-- if migration is present, migration self-refusal and exact privilege proof.
+- the exact singleton reason code for each of the three negative schemas;
+- if migration is present, external direct-target project binding before SQL
+  transmission plus in-file self-refusal and exact privilege proof.
 
 ---
 
@@ -1107,13 +1160,16 @@ Exactly these keys:
 ```text
 current_user                         string = "atom_e1_scorecard_reader"
 session_user                         string = "atom_e1_scorecard_reader"
-dsn_login_user                       string, exact conditional value below
+dsn_login_user                       string = "atom_e1_scorecard_reader"
 dsn_identity_overrides_absent        boolean = true
 current_database                     string = "postgres"
 database_owner                       string != "atom_e1_scorecard_reader"
 database_create                      boolean = false
-database_temporary                   boolean = false
-effective_host                       string
+database_temporary                   boolean = true
+database_temporary_public_only       boolean = true
+session_temp_schema_created          boolean = false
+effective_host                       string = "db.afyiydxbjgzaiswnbcyj.supabase.co"
+effective_port                       integer = 5432
 project_binding_verified             boolean = true
 schema_public_usage                  boolean = true
 schema_public_create                 boolean = false
@@ -1126,6 +1182,7 @@ six_tables_insert                    object[string table -> boolean false]
 six_tables_update                    object[string table -> boolean false]
 six_tables_delete                    object[string table -> boolean false]
 six_tables_truncate                  object[string table -> boolean false]
+non_system_relation_write_privilege_count integer = 0
 six_tables_rls_enabled               object[string table -> boolean]
 six_tables_permissive_full_read      object[string table -> boolean true]
 six_tables_restrictive_select        object[string table -> boolean false]
@@ -1174,12 +1231,8 @@ No extra role-attribute keys.
 
 `dsn_login_user` is the normalized, percent-decoded username from the
 credential itself, before any connection is attempted. Its only permitted
-values are:
-
-- direct host: exactly `atom_e1_scorecard_reader`;
-- approved Supavisor host: exactly
-  `atom_e1_scorecard_reader.afyiydxbjgzaiswnbcyj`, following Supavisor's
-  `[DB-USER].[PROJECT-REF]` convention.
+value is exactly `atom_e1_scorecard_reader` on the required direct host.
+No Supavisor or other pooler form is authorized.
 
 It is derived from the credential, never from the mutable PostgreSQL
 `current_user` or `session_user`. `dsn_identity_overrides_absent` is
@@ -1192,13 +1245,33 @@ datname = current_database()`. It must not equal the reader.
 `database_temporary` are the effective
 `pg_catalog.has_database_privilege(current_user,current_database(),...)`
 results, including privileges inherited from `PUBLIC` and implicit
-`pg_database_owner`; both must be `false`.
+`pg_database_owner`. `database_create` must be `false`.
+
+The sole permitted `TEMPORARY` authority is the production database's
+verified existing grant to `PUBLIC`: `database_temporary = true` and
+`database_temporary_public_only = true` require that the effective
+`TEMPORARY` check passes, the effective ACL contains the `PUBLIC`
+`TEMPORARY` grant, no database ACL item grants `TEMPORARY` directly to the
+reader, the reader does not own the database, and the reader has no role
+membership. This narrow exception is session-local only; it authorizes no use.
+`session_temp_schema_created = false` requires
+`pg_catalog.pg_my_temp_schema() = 0` at both authority checks, proving this
+backend created no temporary schema or object during the run.
 
 `reader_role_memberships` is exactly the ascending UTF-8 list of role names
 from every `pg_catalog.pg_auth_members` row whose `member` is the OID of
 `atom_e1_scorecard_reader`. The only passing value is `[]`; any direct
 membership is a pre-read authority failure, regardless of `inherit_option`,
 `set_option`, or `admin_option`.
+
+`non_system_relation_write_privilege_count` is the count of
+`(pg_class.oid, privilege)` pairs for which
+`has_table_privilege(current_user, oid, privilege)` is true, with privilege
+in exactly `{INSERT, UPDATE, DELETE, TRUNCATE}`, `relkind` in exactly
+`{r, p, v, m, f}`, and the namespace excluding exactly `pg_catalog`,
+`information_schema`, and every name beginning `pg_toast` or `pg_temp`.
+All other schemas are production/non-system for this proof. The only passing
+count is `0`.
 
 ### 13.4 `bootstrap` exact object
 
@@ -1476,7 +1549,7 @@ job_id               exact job string
 contract_path        exact contract path
 generated_at_utc     UTC RFC3339 microseconds
 stage                string = "PRE_EVALUATION_AUTHORITY"
-reason_codes         array[string], sorted unique
+reason_codes         array[string] = ["PRE_EVALUATION_AUTHORITY_FAILED"]
 observed_main_sha    40-hex string | null
 expected_main_sha    40-hex string | null
 observed_v1a_merge_sha 40-hex string | null
@@ -1488,7 +1561,10 @@ read_only            boolean | null
 receipt_sha256       64 lowercase hex
 ```
 
-No `run_identity`, `cells`, metrics, or classifications exist in this schema. It cannot be published as the official evaluated receipt and cannot open V-1C.
+No `run_identity`, `cells`, metrics, or classifications exist in this
+schema. Its singleton reason code is used for every §14.1 cause; no other code
+is permitted. It cannot be published as the official evaluated receipt and
+cannot open V-1C.
 
 ### 14.2 PRE-CELL INVALID receipt
 
@@ -1507,7 +1583,7 @@ evaluation_session   YYYY-MM-DD | null
 evaluation_as_of_at  UTC RFC3339 microseconds | null
 generated_at_utc     UTC RFC3339 microseconds
 stage                string = "EVALUATION_STARTED"
-reason_codes         array[string], sorted unique
+reason_codes         array[string] = ["EVALUATION_CONSTRUCTION_FAILED"]
 reader_identity      string = "atom_e1_scorecard_reader"
 database_identity    exact §13.2 object when known | null
 authority_proof      exact §13.3 object when authority already passed | null
@@ -1518,7 +1594,10 @@ evidence_writes      integer = 0
 receipt_sha256       64 lowercase hex
 ```
 
-No fabricated `cells` or `run_identity`. Overall semantic status is `INVALID` by schema identity. It cannot become the official evaluated receipt and cannot open V-1C.
+No fabricated `cells` or `run_identity`. Its singleton reason code is used
+for every §14.2 cause; no other code is permitted. Overall semantic status is
+`INVALID` by schema identity. It cannot become the official evaluated receipt
+and cannot open V-1C.
 
 ### 14.3 POST-EVALUATION AUTHORITY INVALID receipt
 
@@ -1582,24 +1661,24 @@ The implementation must parse the supplied libpq/psycopg connection string and d
 Fail `BLOCKED` before evidence reading unless all conditions hold:
 
 - database name is exactly `postgres`;
-- direct-host form is exactly `db.afyiydxbjgzaiswnbcyj.supabase.co` and
-  the credential username is exactly `atom_e1_scorecard_reader`, **or** an
-  approved Supavisor pooler host is used and the credential username is
-  exactly
-  `atom_e1_scorecard_reader.afyiydxbjgzaiswnbcyj`;
+- direct-host form is exactly `db.afyiydxbjgzaiswnbcyj.supabase.co:5432`;
+- the credential username is exactly `atom_e1_scorecard_reader`;
 - the credential itself supplies exactly one unambiguous `user`, `host`,
-  and `dbname` value; and
+  `port`, and `dbname` value; and
 - no URI/query/conninfo, separate connect keyword argument, service file, or
   ambient libpq setting can add, replace, or redirect the verified target,
   login identity, or startup authorization state.
 
-After percent-decoding and libpq normalization, explicitly reject:
+Inspect the original credential and every alternate parameter source for
+duplicates before libpq normalization. Percent-decode each retained value once
+under the pinned parser, then normalize it. Explicitly reject:
 
 ```text
 duplicate user, host, hostaddr, port, dbname, database, service, or options keys
 any hostaddr
 any service or servicefile
 any options value
+any Supavisor, PgBouncer, dedicated-pooler, or other pooler target
 any multi-host or multi-port list
 any separate connect keyword argument for user, host, hostaddr, port, dbname,
   database, service, servicefile, or options
@@ -1613,10 +1692,13 @@ startup `options=-c role=...`, `options=-c session_authorization=...`, and
 Supabase temporary-access `options=-c jit=true` are all forbidden, regardless
 of encoding or spelling.
 
-The parsed credential login is recorded as `dsn_login_user`; it is not
-inferred from post-connect role state. If the implementation cannot prove the
-effective target and login from the pinned parser/libpq semantics, stop
-`BLOCKED`; do not connect first and infer later.
+The direct-host-only rule inherits the controlling E-1 requirement that one
+`REPEATABLE READ` snapshot hold for the whole run; V-1A does not supersede
+that connection rule. The parsed credential login is recorded as
+`dsn_login_user`; it is not inferred from post-connect role state. If the
+implementation cannot prove the effective target, port, and login from the
+pinned parser/libpq semantics, stop `BLOCKED`; do not connect first and infer
+later.
 
 ### 15.2 Conditional migration 033
 
@@ -1626,9 +1708,25 @@ If and only if FAMILY volatility tables lack required reader access, V-1B may in
 migrations/033_authorize_v1_volatility_scorecard_reader.sql
 ```
 
-It may be applied only to project `afyiydxbjgzaiswnbcyj`, database `postgres`, through an Owner-controlled SQL/migration session.
+It may be applied only to project `afyiydxbjgzaiswnbcyj`, database
+`postgres`. Before any migration SQL byte is transmitted, the
+Owner-controlled executor must pass exactly one project-binding preflight:
 
-The migration file itself must fail closed **before any GRANT/POLICY mutation** unless SQL runtime proves:
+1. **Supabase MCP:** call `get_project` for project ID
+   `afyiydxbjgzaiswnbcyj`, require returned `id` and `ref` to equal that
+   string and returned database host to equal
+   `db.afyiydxbjgzaiswnbcyj.supabase.co`, then call `apply_migration` with
+   that same exact project ID; or
+2. **direct psql:** parse the administrative DSN under all raw-source,
+   duplicate, ambient, service, `options`, multi-target, and pooler
+   prohibitions in §15.1, with the only login substitution
+   `user = postgres`; require the effective host, port, and database to be
+   exactly `db.afyiydxbjgzaiswnbcyj.supabase.co`, `5432`, and `postgres`.
+
+A dashboard/SQL-editor paste, linked-CLI default, pooler connection, unverified
+session, or any other transport is forbidden. A failed or unavailable
+preflight stops before SQL transmission. The migration file itself must then
+fail closed **before any GRANT/POLICY mutation** unless SQL runtime proves:
 
 ```text
 current_user = 'postgres'
@@ -1646,7 +1744,7 @@ public.volatility_forecast_outcomes
 
 including schema `USAGE` only if required and exact SELECT policies only if required.
 
-No new role, password, membership, writer, function, service, source, broad table grant, default privilege, or application elsewhere. Migration 033 may not alter database ownership or any database-level privilege; failure of the database-owner/`CREATE`/`TEMPORARY` checks requires a documentation-first amendment.
+No new role, password, membership, writer, function, service, source, broad table grant, default privilege, or application elsewhere. Migration 033 may not alter database ownership or any database-level privilege. A mismatch in the frozen database owner, `CREATE` state, or public-only `TEMPORARY` state requires a documentation-first amendment.
 
 ### 15.3 Six-table runtime full-read and zero-write proof
 
@@ -1665,9 +1763,13 @@ Before evidence reads, and again immediately before evaluated receipt constructi
 - `pg_catalog.has_database_privilege(current_user,current_database(),'CREATE')`
   is exactly `false`;
 - `pg_catalog.has_database_privilege(current_user,current_database(),'TEMPORARY')`
-  is exactly `false`;
-- effective target, parsed credential login, and absence of every identity
-  override already passed §15.1;
+  is exactly `true`, sourced only from the effective `PUBLIC TEMPORARY`
+  database ACL: no direct reader ACL item, database ownership, or role
+  membership may supply it;
+- `pg_catalog.pg_my_temp_schema() = 0`, both before evidence reads and at the
+  final recheck;
+- direct target, port `5432`, parsed credential login, and absence of every
+  identity override already passed §15.1;
 - schema `public` USAGE true;
 - schema `public` CREATE false;
 - schema `atom_v9_internal` USAGE true;
@@ -1676,6 +1778,8 @@ Before evidence reads, and again immediately before evaluated receipt constructi
   `atom_v9_internal.read_legacy_evidence_publications_for_records(text,timestamptz,bigint[])`;
 - SELECT true on all six tables;
 - INSERT/UPDATE/DELETE/TRUNCATE false on all six;
+- the exact §13.3 catalog-wide
+  `non_system_relation_write_privilege_count = 0`;
 - RLS enabled wherever repository law requires it;
 - at least one applicable PERMISSIVE SELECT policy gives full read (`USING (true)` semantically) for the reader on each RLS table;
 - **zero applicable RESTRICTIVE SELECT policies** for the reader, including policies applying through `PUBLIC` or any role membership;
