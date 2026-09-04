@@ -859,7 +859,10 @@ _VALID_TERMINAL_RESOLUTION_CLAUSE = (
     "AND e.record_json #>> '{quote,provider_event_ns}' = e.quote_event_ns::text "
     "AND e.record_json #>> '{quote,accepted_at,$timestamp_utc}' = "
     "to_char(e.quote_accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
-    "AND e.record_json #>> '{entry_price,$float64}' = encode(float8send(e.entry_price), 'hex') "
+    "AND CASE WHEN pg_input_is_valid(e.record_json #>> '{entry_price,$float64}', "
+    "'double precision') THEN encode(float8send(CAST(e.record_json #>> "
+    "'{entry_price,$float64}' AS double precision)), 'hex') = "
+    "encode(float8send(e.entry_price), 'hex') ELSE FALSE END "
     "AND r.record_json #>> '{resolution_target_at,$timestamp_utc}' = "
     "to_char(r.resolution_target_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
     "AND r.record_json #>> '{resolution_deadline_at,$timestamp_utc}' = "
@@ -1336,3 +1339,4 @@ class SimulationEntryStore:
             if stored == entry:
                 return IDEMPOTENT, stored
         raise SimulationEntryConflictError("entry identity is already in use")
+

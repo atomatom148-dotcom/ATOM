@@ -757,6 +757,13 @@ class SimulationEntryStoreTests(unittest.TestCase):
             sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
         )
         self.assertIn(
+            "CASE WHEN pg_input_is_valid(e.record_json #>> '{entry_price,$float64}', "
+            "'double precision') THEN encode(float8send(CAST(e.record_json #>> "
+            "'{entry_price,$float64}' AS double precision)), 'hex') = "
+            "encode(float8send(e.entry_price), 'hex') ELSE FALSE END",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertNotIn(
             "e.record_json #>> '{entry_price,$float64}' = encode(float8send(e.entry_price), 'hex')",
             sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
         )
@@ -796,6 +803,61 @@ class SimulationEntryStoreTests(unittest.TestCase):
         self.assertIn("ORDER BY publication_at, entry_id", sql2)
         self.assertEqual(parameters2, ("COIN", "30S"))
         del entry1  # constructed only to prove ENTERED entries build cleanly
+
+    def test_canonical_entry_price_token_matches_float8_in_postgres(self):
+        import os
+        from urllib.parse import urlsplit
+
+        database_url = os.environ.get("H2C_TEST_DATABASE_URL")
+        if not database_url or os.environ.get("CI") != "true":
+            self.skipTest("explicit CI PostgreSQL required")
+        try:
+            import psycopg
+        except ImportError:
+            self.skipTest("psycopg required")
+
+        parsed = urlsplit(database_url)
+        if (
+            parsed.scheme not in {"postgres", "postgresql"}
+            or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+            or parsed.port != 5432
+            or parsed.username != "postgres"
+            or parsed.path != "/postgres"
+            or parsed.query
+            or parsed.fragment
+        ):
+            self.fail("SIM-5 float-token integration requires the local CI Postgres DSN")
+
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                for entry_price in (0.1, 100.25, 177.06):
+                    with self.subTest(entry_price=entry_price):
+                        record_json = json.dumps({
+                            "entry_price": {"$float64": entry_price.hex()},
+                        })
+                        cursor.execute(
+                            "SELECT "
+                            "e.record_json #>> '{entry_price,$float64}' = "
+                            "encode(float8send(e.entry_price), 'hex'), "
+                            "CASE WHEN pg_input_is_valid(e.record_json #>> "
+                            "'{entry_price,$float64}', 'double precision') "
+                            "THEN encode(float8send(CAST(e.record_json #>> "
+                            "'{entry_price,$float64}' AS double precision)), "
+                            "'hex') = encode(float8send(e.entry_price), 'hex') "
+                            "ELSE FALSE END "
+                            "FROM (VALUES (%s::jsonb, %s::double precision)) "
+                            "AS e(record_json, entry_price)",
+                            (record_json, entry_price),
+                        )
+                        self.assertEqual(cursor.fetchone(), (False, True))
+                cursor.execute(
+                    "SELECT CASE WHEN pg_input_is_valid(%s, 'double precision') "
+                    "THEN encode(float8send(CAST(%s AS double precision)), "
+                    "'hex') = encode(float8send(%s::double precision), 'hex') "
+                    "ELSE FALSE END",
+                    ("not-a-float", "not-a-float", 177.06),
+                )
+                self.assertEqual(cursor.fetchone(), (False,))
 
     def test_horizon_lock_accepts_only_postgres_void_representations(self):
         intent = build_intent()
@@ -837,3 +899,4 @@ class SimulationEntryStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
