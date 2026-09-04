@@ -757,14 +757,16 @@ class SimulationEntryStoreTests(unittest.TestCase):
             sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
         )
         self.assertIn(
-            "CASE WHEN pg_input_is_valid(e.record_json #>> '{entry_price,$float64}', "
-            "'double precision') THEN encode(float8send(CAST(e.record_json #>> "
-            "'{entry_price,$float64}' AS double precision)), 'hex') = "
-            "encode(float8send(e.entry_price), 'hex') ELSE FALSE END",
+            "e.record_json #>> '{entry_price,$float64}' = "
+            + sim4_entry_module._ENTRY_PRICE_CANONICAL_TOKEN_SQL,
             sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
         )
         self.assertNotIn(
             "e.record_json #>> '{entry_price,$float64}' = encode(float8send(e.entry_price), 'hex')",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertNotIn(
+            "pg_input_is_valid",
             sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
         )
 
@@ -830,36 +832,39 @@ class SimulationEntryStoreTests(unittest.TestCase):
 
         with psycopg.connect(database_url, autocommit=True) as connection:
             with connection.cursor() as cursor:
-                for entry_price in (0.1, 100.25, 177.06):
+                for entry_price in (
+                    float.fromhex("0x0.0000000000001p-1022"),
+                    0.1,
+                    1.0,
+                    100.25,
+                    177.06,
+                    float.fromhex("0x1.fffffffffffffp+1023"),
+                ):
                     with self.subTest(entry_price=entry_price):
                         record_json = json.dumps({
                             "entry_price": {"$float64": entry_price.hex()},
                         })
                         cursor.execute(
                             "SELECT "
-                            "e.record_json #>> '{entry_price,$float64}' = "
+                            "e.token = "
                             "encode(float8send(e.entry_price), 'hex'), "
-                            "CASE WHEN pg_input_is_valid(e.record_json #>> "
-                            "'{entry_price,$float64}', 'double precision') "
-                            "THEN encode(float8send(CAST(e.record_json #>> "
-                            "'{entry_price,$float64}' AS double precision)), "
-                            "'hex') = encode(float8send(e.entry_price), 'hex') "
-                            "ELSE FALSE END "
-                            "FROM (VALUES (%s::jsonb, %s::double precision)) "
-                            "AS e(record_json, entry_price)",
-                            (record_json, entry_price),
+                            "e.token = "
+                            + sim4_entry_module._ENTRY_PRICE_CANONICAL_TOKEN_SQL
+                            + " FROM (VALUES (%s::text, %s::double precision)) "
+                            "AS e(token, entry_price)",
+                            (record_json["entry_price"]["$float64"], entry_price),
                         )
                         self.assertEqual(cursor.fetchone(), (False, True))
-                cursor.execute(
-                    "SELECT CASE WHEN pg_input_is_valid(e.token, 'double precision') "
-                    "THEN encode(float8send(CAST(e.token AS double precision)), "
-                    "'hex') = encode(float8send(e.entry_price), 'hex') "
-                    "ELSE FALSE END "
-                    "FROM (VALUES (%s::text, %s::double precision)) "
-                    "AS e(token, entry_price)",
-                    ("not-a-float", 177.06),
-                )
-                self.assertEqual(cursor.fetchone(), (False,))
+                for invalid_token in ("not-a-float", "177.06"):
+                    with self.subTest(invalid_token=invalid_token):
+                        cursor.execute(
+                            "SELECT e.token = "
+                            + sim4_entry_module._ENTRY_PRICE_CANONICAL_TOKEN_SQL
+                            + " FROM (VALUES (%s::text, %s::double precision)) "
+                            "AS e(token, entry_price)",
+                            (invalid_token, 177.06),
+                        )
+                        self.assertEqual(cursor.fetchone(), (False,))
 
     def test_horizon_lock_accepts_only_postgres_void_representations(self):
         intent = build_intent()
