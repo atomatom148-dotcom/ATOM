@@ -4,208 +4,249 @@
 **Status:** PROPOSED CONTROLLING FREEZE — documentation only until Owner merge  
 **Program:** ATOM V9  
 **Author of record:** ChatGPT Pro  
-**Implementation owner beneath this freeze:** Codex by default under controlling governance  
-**Owner authority:** Owner retains final merge, infrastructure, risk, broker, order, and capital authority.
+**Owner authority:** Owner retains final merge, deployment, infrastructure, risk, broker, instrument, order, and capital authority.  
+**Implementation owner beneath this freeze:** Codex-class implementation labor under the controlling governance law.  
+**Original adoption base:** `main` at `ba702d510a7c9b535c96ab4c8c4325f2920d2eda`.
 
 ---
 
-## 1. Objective, scope, and supersession
+## 1. Objective, authority, and supersession
 
-ATOM changes its primary **research evaluation target** from directional hit rate to forecasted movement magnitude / volatility.
+ATOM changes its primary **research evaluation target** from directional hit rate to future movement magnitude / realized volatility.
 
-The governing research question is:
+The V-1 research question is:
 
-> How large is the coming move, how well calibrated is that magnitude forecast, and does the forecast contain information beyond simple volatility persistence?
+> Does an existing ATOM volatility forecast contain reproducible information about future realized magnitude beyond a frozen volatility-persistence benchmark?
 
-Direction remains secondary immutable evidence. Existing directional forecasts, outcomes, receipts, lineage, and history are not deleted, rewritten, relabeled, or invalidated.
+V-1 is **not** an options-pricing, implied-volatility, profitability, trading, or capital-authorization study. A later freeze may compare a surviving volatility model with implied volatility and executable option economics; nothing in V-1 authorizes that work.
 
-This freeze supersedes, for V-1 subject matter only, conflicting choices in `docs/drafts/v-1-volatility-target-program-DRAFT.md` and the saved pre-adoption `ATOM_V1_VOLATILITY_FIRST_TRANSITION_FREEZE.md`.
+Direction remains secondary immutable evidence. Existing directional forecasts, outcomes, receipts, lineage, and evidence are not deleted, rewritten, relabeled, re-scored, or invalidated.
 
-Nothing here supersedes production V9 mathematics, SIM mathematics, broker/order boundaries, immutable evidence law, E-1 evidence-selection law, or ATOM governance.
+On Owner merge, this document supersedes, for V-1 subject matter only, conflicting metric, causal-kappa, phase, dashboard-source, publication, migration, and V-2 choices in:
+
+- `docs/drafts/v-1-volatility-target-program-DRAFT.md`;
+- saved pre-adoption `ATOM_V1_VOLATILITY_FIRST_TRANSITION_FREEZE.md`.
+
+Those sources remain historical/scouting material and carry no controlling authority for V-1 after this merge.
+
+Nothing here supersedes production V9 mathematics, SIM mathematics, broker boundaries, immutable evidence law, E-1 evidence-selection law except the explicit volatility-specific proof-kind overrides below, or ATOM AI-role/governance freezes.
+
+---
+
+## 2. Horizons, forecasters, and multiplicity
 
 V-1 evaluates exactly six horizons independently:
 
-`30S`, `1M`, `5M`, `15M`, `30M`, `1H`.
+```text
+30S
+1M
+5M
+15M
+30M
+1H
+```
 
-No pooling across horizons or lineages is permitted.
+No pooling across horizons is permitted.
+
+Exactly two forecasters are evaluated:
+
+1. **FAMILY-VOL** — existing Q3 volatility forecaster.
+2. **V9-VOL** — existing V9 predictive variance converted to calibrated dispersion with a causally reconstructed V4C kappa.
+
+The inferential budget is exactly **12 cells = 2 forecasters × 6 horizons**.
+
+No third forecaster, IV benchmark, HAR model, BTC model, Level-II model, event model, market-data source, or production family is silently added to V-1. Such ideas require a separate documentation-first research freeze.
 
 ---
 
-## 2. Frozen targets
+## 3. Exact lineage identities and deterministic cell selection
 
-### 2.1 FAMILY-VOL
+Distinct model/cohort lineages may never be pooled.
+
+### 3.1 FAMILY-VOL identity
+
+The only FAMILY-VOL lineage is:
+
+```text
+quant_id        = q3_volatility
+formula_version = realized-volatility-v1
+symbol          = COIN
+horizon         = one canonical horizon
+```
+
+A FAMILY-VOL cell identity is exactly:
+
+```text
+(quant_id, formula_version, symbol, horizon)
+```
+
+### 3.2 V9-VOL identity
+
+A V9 lineage identity is exactly:
+
+```text
+(v3_model_version, symbol, horizon, cohort_id, cohort_hash)
+```
+
+with `symbol = COIN` and decoded `evidence_origin = PRODUCTION`.
+
+For each horizon, determine the eligible V9 lineage set inside the frozen official snapshot before scoring outcomes. Select exactly one lineage using this outcome-blind rule:
+
+1. maximize the latest admissible forecast `cutoff_at` not later than `evaluation_as_of_at`;
+2. tie-break by lexicographically greatest UTF-8 tuple `(v3_model_version, cohort_id, cohort_hash)`;
+3. once selected, retain only that exact identity for the cell.
+
+All rows belonging to other V9 lineages are excluded as `n_unselected_lineage_rows`; their outcomes and metric values may not affect selection.
+
+This rule preserves exactly six V9 cells and therefore exactly 12 inferential cells total.
+
+### 3.3 Canonical cell order
+
+Canonical cell order is exactly:
+
+```text
+0  FAMILY-VOL 30S
+1  FAMILY-VOL 1M
+2  FAMILY-VOL 5M
+3  FAMILY-VOL 15M
+4  FAMILY-VOL 30M
+5  FAMILY-VOL 1H
+6  V9-VOL    30S
+7  V9-VOL    1M
+8  V9-VOL    5M
+9  V9-VOL    15M
+10 V9-VOL    30M
+11 V9-VOL    1H
+```
+
+---
+
+## 4. Frozen targets
+
+For FAMILY-VOL:
 
 ```text
 predicted_volatility_bps = forecast_volatility_bps
 realized_volatility_bps  = realized_move_bps
 ```
 
-### 2.2 V9-VOL
+For V9-VOL:
 
 ```text
 predicted_volatility_bps = kappa(f) * sqrt(predictive_variance_bps2)
 realized_volatility_bps  = abs(actual_return_bps)
 ```
 
-All required inputs must be finite. Predicted volatility must be strictly positive. A zero realized move is valid evidence.
+All required numeric inputs must be finite. Predicted volatility must be strictly positive. An exactly zero realized move is valid evidence.
+
+A finite prediction `<= 0` is excluded and counted in `n_nonpositive_prediction_excluded`, not in a null/non-finite bucket.
 
 ---
 
-## 3. Exact lineage identities and twelve-cell multiplicity budget
+## 5. V-1A merge identity and deterministic official evaluation population
 
-E-1 lineage boundaries are preserved exactly.
+The V-1B official population is not operator-selected.
 
-FAMILY identity is:
+### 5.1 Verified V-1A merge identity
 
-```text
-(quant_id, formula_version, symbol, horizon)
-```
+After this PR is Owner-merged, V-1B must determine the exact GitHub merge commit that introduced decision `ATOM-V1A-VOLATILITY-FIRST-FREEZE-1` into `main`.
 
-V9 identity is:
+Before any population derivation, V-1B must verify all of the following through repository history available to the execution revision:
 
-```text
-(v3_model_version, symbol, horizon, cohort_id, cohort_hash)
-```
+- `v1a_merge_sha` is a 40-character lowercase hexadecimal commit reachable from the exact authorized V-1B `main` revision;
+- that commit is the Owner-merged main commit for PR #319, not the PR head, a branch-only commit, or a caller-supplied arbitrary SHA;
+- that commit contains this contract path with this decision ID;
+- the merge commit's committer timestamp is read from that same verified commit object.
 
-Distinct identities may never be pooled.
+Failure to prove this identity before evidence reading is `BLOCKED`. If identity inconsistency is discovered only after evidence evaluation has begun, it is `INVALID` and uses the pre-cell-invalid receipt schema in §14.2 when complete cells cannot truthfully be constructed.
 
-### 3.1 FAMILY-VOL lineage
+### 5.2 Evaluation session and as-of
 
-For each horizon, FAMILY-VOL is fixed to:
+Let `T_merge` be the UTC committer timestamp of the verified V-1A merge commit.
 
-```text
-quant_id        = q3_volatility
-formula_version = realized-volatility-v1
-symbol          = COIN
-horizon         = the cell horizon
-```
+Convert `T_merge` to America/New_York. `evaluation_session` is the latest **fully completed regular XNYS session** whose regular close at 16:00 America/New_York is strictly before `T_merge`.
 
-### 3.2 Deterministic V9-VOL lineage selection
-
-For each horizon, consider every admissible `PRODUCTION` V9 forecast identity for `symbol = COIN` inside the frozen snapshot and as-of boundary. For each identity compute its maximum admissible forecast `cutoff_at` without examining outcomes or any volatility metric.
-
-Select the identity with the greatest such maximum cutoff. If multiple identities tie, sort the complete identity tuple `(v3_model_version, symbol, horizon, cohort_id, cohort_hash)` by UTF-8 code-point order and select the first.
-
-All rows from every non-selected identity are excluded and counted as `n_unselected_lineage_rows`. They are never pooled into the selected lineage.
-
-Therefore the inferential multiplicity budget remains exactly:
+If the merge occurs during a regular session, that in-progress session is excluded. Half-days and non-regular sessions are excluded.
 
 ```text
-6 FAMILY-VOL cells + 6 V9-VOL cells = 12 cells
+evaluation_as_of_at = regular close of evaluation_session = 16:00:00 America/New_York
 ```
+
+stored as UTC RFC3339 microseconds.
+
+No operator-selected later or earlier as-of is permitted.
+
+### 5.3 One snapshot
+
+The official scorecard uses one read-only `REPEATABLE READ` transaction/snapshot for all database evidence reads.
+
+A record/proof can enter the official population only when every required durable row and publication proof is present inside that snapshot and its relevant availability timestamp is `<= evaluation_as_of_at`.
+
+Evidence or proof published after `evaluation_as_of_at` is excluded even if its market cutoff refers to an earlier time.
+
+### 5.4 Session set
+
+For each selected cell lineage, candidate session dates are the sorted unique America/New_York dates represented by admissible target forecasts whose target intervals end no later than `evaluation_as_of_at`.
+
+Every qualifying regular XNYS date is included. No operator may manually add, remove, sample, shorten, retry, or choose dates based on outcomes or metrics.
+
+The entire target interval must remain inside 09:30–16:00 America/New_York.
 
 ---
 
-## 4. Deterministic official evaluation population
+## 6. Exact proof seams, non-overlap selection, and mutually exclusive accounting
 
-### 4.1 Merge-derived evaluation session and as-of boundary
+Reuse E-1 ordering and non-overlap mechanics, but use these **volatility-specific target-row proof seams**.
 
-The official V-1B run is one-shot.
+### 6.1 FAMILY-VOL proof seam
 
-Let `v1a_merge_committed_at` be the UTC commit timestamp of the Owner-merged V-1A merge commit on `main`.
+FAMILY-VOL target rows are `public.volatility_forecasts` joined to `public.volatility_forecast_outcomes` by the existing forecast identity.
 
-Convert that instant to `America/New_York`.
+Admissibility and durable availability use the existing legacy publication-proof reader for these exact proof kinds:
 
-- If it is at or after 16:00:00 local on a regular full XNYS session, `evaluation_session` is that session date.
-- Otherwise `evaluation_session` is the immediately preceding completed regular full XNYS session.
-- Half-days, weekends, holidays, and in-progress sessions are excluded.
-
-`evaluation_as_of_at` is exactly `16:00:00.000000 America/New_York` on `evaluation_session`, converted to UTC and serialized as `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
-
-No operator-selected later as-of, session subset, extension, early stop, or outcome-dependent session selection is permitted.
-
-### 4.2 Snapshot
-
-The official evidence read uses one read-only `REPEATABLE READ` transaction/snapshot for the complete run.
-
-Evidence is inside the official snapshot only when all required forecast, outcome, and publication-proof timestamps are at or before `evaluation_as_of_at` under their existing proof contracts.
-
-Evidence published after `evaluation_as_of_at` is excluded even when its market cutoff is earlier.
-
-### 4.3 Session-date population
-
-For each selected lineage, use every sorted unique regular XNYS date present among its admissible forecast rows through `evaluation_session`. No date may be manually added, removed, retried, or sampled.
-
----
-
-## 5. Exact canonical selected-lineage array and run identity
-
-Before outcome scoring, construct `selected_lineages` as a JSON array of exactly 12 objects in the exact cell order in §12.1.
-
-FAMILY object shape is exactly:
-
-```json
-{
-  "cell_order": 0,
-  "forecaster": "FAMILY-VOL",
-  "horizon": "30S",
-  "identity": {
-    "quant_id": "q3_volatility",
-    "formula_version": "realized-volatility-v1",
-    "symbol": "COIN",
-    "horizon": "30S"
-  }
-}
+```text
+VOLATILITY_FORECAST
+VOLATILITY_OUTCOME
 ```
 
-V9 object shape is exactly:
+A directional proof kind may not substitute.
 
-```json
-{
-  "cell_order": 6,
-  "forecaster": "V9-VOL",
-  "horizon": "30S",
-  "identity": {
-    "v3_model_version": "<string>",
-    "symbol": "COIN",
-    "horizon": "30S",
-    "cohort_id": "<string>",
-    "cohort_hash": "<string>"
-  }
-}
-```
+The forecast proof and outcome proof must both exist and satisfy the existing integrity/proof-method rules. For target-row eligibility at the official as-of, required commit-observation timestamps must be `<= evaluation_as_of_at`.
 
-Only the values and cell-order/horizon positions vary as frozen. No extra keys are permitted.
+### 6.2 V9-VOL target proof seam
 
-`run_identity_body` is exactly:
+V9-VOL target rows use `public.atom_v9_v4_forecasts` and `public.atom_v9_v4_outcomes` under the existing V4 forecast/outcome proof seam and exact E-1 V9 proof eligibility rules.
 
-```json
-{
-  "decision_id": "ATOM-V1A-VOLATILITY-FIRST-FREEZE-1",
-  "job_id": "ATOM-V1B-READ-ONLY-VOLATILITY-SCORECARD-1",
-  "v1a_merge_sha": "<40 lowercase hex>",
-  "evaluation_session": "YYYY-MM-DD",
-  "evaluation_as_of_at": "YYYY-MM-DDTHH:MM:SS.ffffffZ",
-  "selected_lineages": ["<the exact 12 objects above in §12.1 order>"]
-}
-```
+Decoded `evidence_origin` must be `PRODUCTION`. No simulator or reconstructed evidence may enter.
 
-The bracketed notation above denotes the JSON array itself, not a string serialization.
+### 6.3 Non-overlap
 
-`run_identity = sha256(canonical_json(run_identity_body))` under §13.3.
+Within each cell and session:
 
-Exactly one receipt may become `OFFICIAL` for a run identity. Reruns are reproducibility-only and must use the identical snapshot boundary, lineages, code revision, database identity, and mathematics. Any substantive disagreement makes the study `INVALID`; no favorable rerun may replace the first official result.
+- deterministic ordering = `(session_date, cutoff_at, immutable_record_identity)`;
+- apply the existing E-1 horizon-spaced non-overlap selector;
+- selection restarts each session;
+- six horizons and all selected lineages are independent;
+- no imputation.
 
----
+### 6.4 Ordered mutually exclusive row accounting
 
-## 6. Window selection and mutually exclusive row accounting
+`n_input` is the count of all source forecast rows for that forecaster/horizon/symbol inside the database snapshot and official as-of boundary **before lineage filtering**.
 
-Reuse E-1 deterministic ordering and horizon-spaced non-overlap selection. Selection restarts per session.
+Each input row enters exactly one first-applicable bucket in this order:
 
-For each forecaster/horizon candidate universe, `n_input` is every raw forecast row for `symbol = COIN` and that horizon visible in the frozen snapshot before lineage filtering.
+1. `n_unselected_lineage_rows` — row is not the selected exact lineage; for FAMILY-VOL this is always zero because its lineage is fixed.
+2. `n_inadmissible` — selected lineage but proof/admissibility/evidence-origin contract fails.
+3. `n_non_rth` — admissible but target interval is not wholly inside a regular XNYS RTH session in the official session set.
+4. `n_overlap_excluded` — otherwise eligible but excluded by frozen non-overlap selection.
+5. `n_null_or_nonfinite_excluded` — selected window has a required null or non-finite target/prediction input.
+6. `n_nonpositive_prediction_excluded` — required inputs are finite but the resulting predicted volatility is `<= 0`.
+7. `n_kappa_unavailable` — V9 only: otherwise valid target window but causal kappa is unavailable under §7; FAMILY value is zero.
+8. `n_windows` — selected valid volatility windows surviving every preceding bucket.
 
-Each input row is assigned to **exactly one** bucket using this precedence, stopping at the first matching condition:
+A row satisfying multiple defects is counted only in the earliest applicable bucket.
 
-1. `n_unselected_lineage_rows` — identity is not the selected lineage.
-2. `n_inadmissible` — selected lineage but publication/proof/admissibility fails.
-3. `n_non_rth` — selected/admissible but complete forecast interval is outside one regular 09:30–16:00 XNYS session.
-4. `n_overlap_excluded` — selected/admissible/RTH but excluded by frozen horizon-spacing selection.
-5. `n_null_or_nonfinite_excluded` — selected window has a required null or non-finite forecast/outcome/variance input.
-6. `n_nonpositive_prediction_excluded` — resulting predicted volatility is finite but `<= 0`.
-7. `n_kappa_unavailable` — V9-VOL only: all other inputs qualify but §7 does not produce an accepted causal MATURE kappa. FAMILY-VOL always records `0` here.
-8. `n_windows` — row survives all prior buckets and is a valid selected volatility window.
-
-Exactly:
+The first required reconciliation equation is:
 
 ```text
 n_input
@@ -219,27 +260,19 @@ n_input
 + n_windows
 ```
 
-A row satisfying multiple defects is counted only in the earliest applicable bucket.
-
-Persistence accounting is also exclusive:
-
-```text
-n_windows = n_persist20_unavailable + n_regression_windows
-```
-
-`n_sessions` is the number of distinct session dates represented by `n_windows`; `n_regression_sessions` is the number represented by `n_regression_windows`.
-
-The receipt must satisfy both equations exactly for every cell or the cell and overall run are `INVALID`.
+Failure of this equation is a protocol defect => `INVALID`.
 
 ---
 
 ## 7. Complete causal-kappa reconstruction
 
-V-1B must not read a latest/current V4C state merely to obtain kappa. It reconstructs causal kappa from existing V4 forecast/outcome evidence using the frozen V4C functions unchanged.
+V-1B must not read the latest/current V4C state to assign historical kappa and must not add a V4C-state privilege merely for kappa.
 
-### 7.1 Exact causal scope
+For each selected V9 target forecast `f`, reconstruct kappa in memory from causally prior V4 forecast/outcome evidence using the existing frozen V4C calibration mathematics unchanged.
 
-For target V9 forecast `f`, only V4 pairs matching all of:
+### 7.1 Exact identity and causal availability
+
+Only V4 pairs matching `f` exactly may contribute:
 
 ```text
 v3_model_version = f.v3_model_version
@@ -249,257 +282,91 @@ cohort_id         = f.cohort_id
 cohort_hash       = f.cohort_hash
 ```
 
-may contribute.
+Every contributing pair must satisfy all of:
 
-Every contributing pair must satisfy all existing V4 proof/admissibility requirements plus:
+- existing V4 proof/admissibility contract;
+- finite required inputs;
+- forecast `cutoff_at < f.cutoff_at`;
+- durable outcome `target_resolved_at < f.cutoff_at`;
+- durable outcome `created_at < f.cutoff_at`;
+- required forecast publication/proof-observation timestamp `< f.cutoff_at`;
+- required outcome publication/proof-observation timestamp `< f.cutoff_at`.
 
-```text
-forecast.cutoff_at        < f.cutoff_at
-outcome.target_resolved_at < f.cutoff_at
-outcome.created_at         < f.cutoff_at
-forecast publication proof observed_at < f.cutoff_at
-outcome publication proof observed_at  < f.cutoff_at
-```
+Equality to `f.cutoff_at` is not prior and is excluded.
 
-Equality is not prior and is excluded. Delayed recovery or delayed durable insertion may never back-enter a causal kappa state for an earlier target forecast.
+A delayed/recovered outcome inserted after `f.cutoff_at` cannot back-enter kappa merely because it carries an earlier target-resolution timestamp.
 
-### 7.2 Exact non-overlap and latest-250 split
+### 7.2 Governed selection, latest-250 withholding, and calibration end
 
 For the strictly prior governed pairs:
 
-1. apply the existing V4C governed-evidence filter unchanged;
-2. apply existing `select_non_overlapping(...)` unchanged;
-3. sort by `(forecast.cutoff_at, forecast_record_id)`;
+1. apply existing V4C governed-evidence filtering unchanged;
+2. apply existing V4C `select_non_overlapping(...)` unchanged;
+3. order selected pairs by `(forecast.cutoff_at, forecast_record_id)`;
 4. `split = max(0, len(selected) - 250)`;
 5. `calibration_pairs = selected[:split]`;
-6. `validation_pairs = selected[split:]`;
-7. the latest 250 selected pairs are withheld from fitting;
-8. construct existing `CalibrationObservation` values from calibration pairs only;
-9. call existing frozen `calibrate_scale(...)` unchanged.
+6. `validation_pairs = selected[split:]`; the latest 250 selected pairs are withheld and never enter kappa fitting;
+7. if `calibration_pairs` is non-empty, set `calibration_end = calibration_pairs[-1].forecast.cutoff_at`;
+8. if `calibration_pairs` is empty, set `calibration_end` to the strict causal boundary immediately before `f.cutoff_at`, represented by the greatest timestamp that is strictly less than `f.cutoff_at` at the implementation's timestamp precision;
+9. build existing `CalibrationObservation` values from `calibration_pairs` only;
+10. call exactly `calibrate_scale(observations, calibration_end=calibration_end)` using the existing implementation unchanged.
 
-### 7.3 Acceptance
+The calibration-end argument may not be replaced by `f.cutoff_at`, `evaluation_as_of_at`, outcome resolution time, or current time.
 
-`kappa(f)` is usable only when reconstructed `ScaleResult.status == "MATURE"` and kappa is finite and strictly positive.
+### 7.3 MATURE-only
 
-`PROVISIONAL`, `UNAVAILABLE`, null, non-finite, zero, or negative values are unavailable and counted in `n_kappa_unavailable`.
+`kappa(f)` is usable only when reconstructed `ScaleResult.status == "MATURE"` and `kappa` is finite and strictly positive.
 
-No fallback, cross-cohort, neighboring-horizon, interpolated, current-state, or forward-filled kappa is allowed.
+`PROVISIONAL`, `UNAVAILABLE`, null, non-finite, zero, or negative kappa is unavailable and the target window enters `n_kappa_unavailable`.
+
+No fallback kappa, current state, cross-cohort state, neighboring horizon, interpolation, or forward fill is allowed.
 
 ---
 
-## 8. Persistence benchmark and inferential minimum
+## 8. Persistence benchmark and regression population
 
-For each cell, valid selected windows are ordered by `(session_date, cutoff_at, immutable_record_identity)` across the frozen population.
+For each cell, `n_windows` selected valid windows are ordered by `(session_date, cutoff_at, immutable_record_identity)` across the official session population.
+
+For valid window `w`:
 
 ```text
-persist_20(w) = arithmetic mean realized_volatility_bps of the prior 20 valid selected windows
+persist_1(w)  = realized_volatility_bps of the immediately prior selected valid window
+persist_20(w) = arithmetic mean realized_volatility_bps of the prior 20 selected valid windows
 ```
 
-Every component must itself be durably outcome/proof available no later than `w.cutoff_at`.
+Every constituent realized value used in `persist_20(w)` must have its outcome and required proof durably available no later than `w.cutoff_at`.
 
-The first 20 valid windows and any later row without 20 causal prior realized magnitudes are `n_persist20_unavailable`.
+The first 20 selected valid windows, and any later valid window lacking 20 causal prior realized magnitudes, are excluded from benchmark-relative inference and counted as `n_persist20_unavailable`.
 
-Remaining rows are the regression population.
+Rows remaining are the **regression population**.
 
-Inferential eligibility applies only to:
+```text
+n_regression_windows  = number of regression-population rows
+n_regression_sessions = number of distinct regular XNYS dates represented by those rows
+```
+
+Second required reconciliation equation:
+
+```text
+n_windows = n_persist20_unavailable + n_regression_windows
+```
+
+The inferential minimum applies to the regression population only:
 
 ```text
 n_regression_windows  >= 100
 n_regression_sessions >= 10
 ```
 
-Pre-persistence `n_windows` / `n_sessions` are descriptive only.
+Pre-persistence `n_windows` and `n_sessions` are descriptive and cannot satisfy the inferential minimum.
 
 ---
 
 ## 9. Descriptive metrics
 
-For every cell report:
+For each cell report:
 
 ```text
-mae_bps      = mean(abs(predicted_volatility_bps - realized_volatility_bps))
-level_ratio  = median(predicted_volatility_bps) / median(realized_volatility_bps)
-coverage_90  = mean(realized_volatility_bps <= 1.6448536269514722 * predicted_volatility_bps)
-```
-
-If median realized volatility is zero, `level_ratio = null`.
-
-Mincer-Zarnowitz descriptive regression is:
-
-```text
-realized_volatility_bps = mz_a + mz_b * predicted_volatility_bps + error
-```
-
-### 9.1 Spearman
-
-For `rank_corr` and `persist_rank_corr`:
-
-- paired finite observations only;
-- ascending numeric order;
-- ties receive arithmetic mean of one-based rank positions;
-- Pearson correlation of rank vectors using binary64 arithmetic;
-- fewer than two pairs or zero variance in either rank vector => JSON `null`;
-- no jitter, random tie-breaking, epsilon, imputation, or alternate rank method.
-
----
-
-## 10. Sole inferential model and exact bootstrap
-
-The sole classification statistic is `enc_b` in:
-
-```text
-realized_volatility_bps
-  = intercept
-  + persistence_coefficient * persist_20
-  + enc_b * predicted_volatility_bps
-  + error
-```
-
-Fit ordinary least squares with intercept on the full regression population.
-
-### 10.1 Exact session-resampled OLS-refit algorithm
-
-`quant/volatility_scorecard.py` is explicitly authorized to run this pure in-memory loop.
-
-For each cell:
-
-1. construct `sessions = tuple(sorted(unique regression session YYYY-MM-DD dates))` in ascending ISO date order;
-2. instantiate exactly `rng = random.Random(0)` once for that cell;
-3. for every attempt execute exactly `drawn = rng.choices(sessions, k=len(sessions))`;
-4. for each identity in `drawn`, append all regression rows from that session in original deterministic row order; repeated session identities duplicate all their rows;
-5. refit the exact OLS model;
-6. valid draw requires full column rank and finite `enc_b`;
-7. rank-deficient/non-finite draws are discarded, counted, and still consume the RNG state created by the exact `choices` call.
-
-Require exactly `200000` valid draws. Stop after `1000000` attempted draws. If fewer than `200000` valid draws exist then, classification is `INVALID` and no partial interval is permitted.
-
-Percentile indices are exactly:
-
-```text
-lower = floor((1 - level) / 2 * (B - 1))
-upper = ceil((1 + level) / 2 * (B - 1))
-B = 200000
-levels = 0.999, 0.95
-```
-
-No alternate RNG call, bootstrap, robust covariance, t test, ridge, pseudoinverse, or model fallback is authorized.
-
----
-
-## 11. Classification and precedence
-
-1. Protocol/identity/causality/proof/accounting defect => `INVALID` regardless of sample size.
-2. Else regression population below 100 windows or 10 sessions => `INSUFFICIENT`; do not bootstrap.
-3. Else full-sample OLS invalid or bootstrap-valid-draw requirement fails => `INVALID`.
-4. Else lower endpoint of `enc_b_ci_0999` strictly greater than zero => `INFORMATIVE`.
-5. Else => `NOISE`.
-
-There are exactly 12 inferential cells; report-only expected false-`INFORMATIVE` count is `12 * 0.0005 = 0.006`.
-
-No V-1 result is tradeable, profitable, production-ready, or capital authority.
-
----
-
-## 12. Exact V-1B implementation boundary and cell ordering
-
-Owner merge of V-1A authorizes only job:
-
-```text
-ATOM-V1B-READ-ONLY-VOLATILITY-SCORECARD-1
-```
-
-Unconditional implementation files:
-
-```text
-quant/volatility_scorecard.py
-tests/test_volatility_scorecard.py
-```
-
-Conditional third file only when exact FAMILY-VOL reader access is absent:
-
-```text
-migrations/033_authorize_v1_volatility_scorecard_reader.sql
-```
-
-Every other repository path is blocked. Existing E-1/V4C functions may be imported but not edited. If another file or a different migration ordinal is required, stop `BLOCKED` for a documentation-first amendment.
-
-### 12.1 Canonical cell order
-
-```text
-0  FAMILY-VOL 30S
-1  FAMILY-VOL 1M
-2  FAMILY-VOL 5M
-3  FAMILY-VOL 15M
-4  FAMILY-VOL 30M
-5  FAMILY-VOL 1H
-6  V9-VOL     30S
-7  V9-VOL     1M
-8  V9-VOL     5M
-9  V9-VOL     15M
-10 V9-VOL     30M
-11 V9-VOL     1H
-```
-
----
-
-## 13. Exact evaluated receipt schema
-
-A run that passes authority verification far enough to evaluate cells emits exactly one `ATOM-V1B-RECEIPT-1` JSON object.
-
-Top-level keys/types are exactly:
-
-```text
-schema_version       string = "ATOM-V1B-RECEIPT-1"
-decision_id          string = "ATOM-V1A-VOLATILITY-FIRST-FREEZE-1"
-job_id               string = "ATOM-V1B-READ-ONLY-VOLATILITY-SCORECARD-1"
-contract_path        string = "docs/v-1a-volatility-first-freeze.md"
-code_version         string
-verified_main_sha    string, 40 lowercase hex
-v1a_merge_sha        string, 40 lowercase hex
-run_identity         string, 64 lowercase hex
-evaluation_session   string YYYY-MM-DD
-evaluation_as_of_at  string RFC3339 UTC microseconds
-generated_at_utc     string RFC3339 UTC microseconds
-reader_identity      string = "atom_e1_scorecard_reader"
-database_identity    object
-authority_proof      object
-bootstrap            object
-cells                array exactly 12
-overall_status       PASS | FAIL | INVALID
-overall_reason_codes array[string], sorted unique
-scouting_disclosure  array[string]
-read_only            boolean = true
-forecast_writes      integer = 0
-outcome_writes       integer = 0
-evidence_writes      integer = 0
-receipt_sha256       string, 64 lowercase hex
-```
-
-### 13.1 Cell object
-
-Each cell object has exactly:
-
-```text
-cell_order
-forecaster
-horizon
-lineage_identity
-session_dates
-evidence_min_cutoff_at
-evidence_max_cutoff_at
-n_input
-n_unselected_lineage_rows
-n_inadmissible
-n_non_rth
-n_overlap_excluded
-n_null_or_nonfinite_excluded
-n_nonpositive_prediction_excluded
-n_kappa_unavailable
-n_windows
-n_sessions
-n_persist20_unavailable
-n_regression_windows
-n_regression_sessions
 mae_bps
 rank_corr
 level_ratio
@@ -508,156 +375,310 @@ mz_a
 mz_b
 mz_r2
 persist_rank_corr
-enc_b
-enc_b_ci_0999
-enc_b_ci_095
-bootstrap_attempted_draws
-bootstrap_valid_draws
-bootstrap_invalid_draws
-classification
-reason_codes
 ```
 
-Counts are nonnegative integers. Metric values are finite JSON numbers or null where explicitly allowed. Reason codes are sorted unique strings.
-
-### 13.2 Authority proof object
-
-Exact keys:
+Definitions over `n_windows` selected valid windows unless stated otherwise:
 
 ```text
-current_user
-observed_database_name
-observed_supabase_project_ref
-project_identity_method
-schema_public_usage
-schema_public_create
-six_tables_select
-six_tables_insert
-six_tables_update
-six_tables_delete
-six_tables_truncate
-six_tables_rls_enabled
-six_tables_permissive_full_read_policy
-six_tables_restrictive_policy_absent
-read_only_transaction
-verification_status
+mae_bps     = mean(abs(predicted_volatility_bps - realized_volatility_bps))
+rank_corr   = Spearman(predicted_volatility_bps, realized_volatility_bps)
+level_ratio = median(predicted_volatility_bps) / median(realized_volatility_bps)
+coverage_90 = mean(realized_volatility_bps <= 1.6448536269514722 * predicted_volatility_bps)
 ```
 
-### 13.3 Canonical JSON and digest
+If median realized volatility is zero, `level_ratio = null`.
 
-Canonical JSON is UTF-8 with exactly:
+Mincer–Zarnowitz descriptive regression over selected valid windows:
 
 ```text
-sort_keys=true
-separators=(",", ":")
-ensure_ascii=false
-allow_nan=false
+realized_volatility_bps = mz_a + mz_b * predicted_volatility_bps + error
 ```
 
-To compute `receipt_sha256`, remove the digest key, canonicalize the complete remaining object, SHA-256 the UTF-8 bytes, lowercase-hex encode, then add the digest field. The digest never hashes itself.
-
-### 13.4 Evaluated receipt filename/publication
-
-Exact filename:
+`mz_r2` is the ordinary unadjusted coefficient of determination:
 
 ```text
-docs/v-1b-volatility-scorecard-receipt-<evaluation_session>-<run_identity>-<receipt_sha256>.json
+1 - SSE / SST
 ```
 
-Runtime generation is not publication. Publication is a separate documentation-only PR adding one immutable file. The first Owner-merged SHA-valid receipt for the run identity is uniquely official. A second distinct receipt for the same run identity is forbidden and causes fail-closed ambiguity until amendment.
+using the OLS fitted values, with JSON `null` when `SST == 0` or the regression is not descriptively fit-able. This descriptive null does not itself create `INVALID`.
+
+`persist_rank_corr` is exactly:
+
+```text
+Spearman(persist_20, realized_volatility_bps)
+```
+
+over **regression-population rows only**.
+
+### 9.1 Exact Spearman behavior
+
+For `rank_corr` and `persist_rank_corr`:
+
+1. use only the frozen paired finite observations for the stated population;
+2. sort values ascending;
+3. ties receive arithmetic mean of their one-based rank positions (midrank);
+4. calculate ordinary Pearson correlation of rank vectors using binary64 arithmetic;
+5. if fewer than two pairs exist or either rank vector has zero variance, return JSON `null`;
+6. no jitter, random tie break, epsilon, imputation, or alternate ranking method.
+
+Descriptive metrics never independently create `INFORMATIVE`.
 
 ---
 
-## 14. Exact BLOCKED receipt schema
+## 10. Sole inferential model and deterministic bootstrap
 
-A failure before the full evaluation population/cells/run identity can be constructed must not fabricate those values.
-
-Such a run emits a distinct JSON object with exactly:
+The only V-1 classification statistic is `enc_b` in the regression-population OLS:
 
 ```text
-schema_version              string = "ATOM-V1B-BLOCKED-RECEIPT-1"
-decision_id                 string = "ATOM-V1A-VOLATILITY-FIRST-FREEZE-1"
-job_id                      string = "ATOM-V1B-READ-ONLY-VOLATILITY-SCORECARD-1"
-contract_path               string = "docs/v-1a-volatility-first-freeze.md"
-code_version                string
-v1a_merge_sha               string, 40 lowercase hex
-generated_at_utc            string RFC3339 UTC microseconds
-failure_stage               string = ENVIRONMENT | REVISION | DATABASE_IDENTITY | READER_IDENTITY | AUTHORITY | MIGRATION_REQUIRED | BOUNDARY
-reason_codes                array[string], sorted unique
-declared_project_ref        string = "afyiydxbjgzaiswnbcyj"
-declared_database_name      string = "postgres"
-observed_project_ref        string | null
-observed_database_name      string | null
-observed_current_user       string | null
-execution_revision_sha      string | null
-expected_v1b_main_sha       string | null
-read_only                   boolean = true
-forecast_writes             integer = 0
-outcome_writes              integer = 0
-evidence_writes             integer = 0
-overall_status              string = "BLOCKED"
-receipt_sha256              string, 64 lowercase hex
+realized_volatility_bps
+    = intercept
+    + persistence_coefficient * persist_20
+    + enc_b * predicted_volatility_bps
+    + error
 ```
 
-Same canonical JSON/digest rule as §13.3.
+Full-sample OLS requires a full-column-rank design and finite coefficient values.
 
-A BLOCKED receipt has no `run_identity`, `cells`, metrics, classification, or official-scorecard authority. It is negative operational evidence only.
+### 10.1 Exact session-resampling operation
 
-Optional publication, if the Owner chooses to preserve it in-repo, uses exactly:
+For each eligible cell:
+
+- canonical `sessions = sorted(unique regression session dates as YYYY-MM-DD strings)` ascending;
+- instantiate one `rng = random.Random(0)` once per cell;
+- for every bootstrap attempt execute exactly:
+
+```python
+drawn_sessions = rng.choices(sessions, k=len(sessions))
+```
+
+- for each drawn session identity, duplicate all regression-population rows from that session once for each occurrence in `drawn_sessions`;
+- refit the exact OLS model;
+- a draw is valid only when the resampled design is full column rank and the fitted `enc_b` is finite.
+
+Invalid attempts consume the RNG state from that exact `choices(...)` call and are counted; they are not rewound.
+
+The implementation must obtain exactly:
 
 ```text
-docs/v-1b-volatility-scorecard-blocked-<YYYY-MM-DD>-<receipt_sha256>.json
+bootstrap_valid_draws = 200000
 ```
 
-It can never satisfy the V-1B official evaluated-receipt gate.
+with hard cap:
+
+```text
+bootstrap_attempted_draws = 1000000
+```
+
+If one million attempts are reached before 200,000 valid draws, the cell is `INVALID` and no partial interval is emitted.
+
+```text
+bootstrap_invalid_draws = bootstrap_attempted_draws - bootstrap_valid_draws
+```
+
+### 10.2 Exact percentile order statistics
+
+After exactly 200,000 valid `enc_b` values exist, sort those 200,000 values **ascending**.
+
+For interval level `L`, `B = 200000`:
+
+```text
+lower_index = floor((1 - L) / 2 * (B - 1))
+upper_index = ceil((1 + L) / 2 * (B - 1))
+```
+
+Use levels exactly `0.999` and `0.95`.
+
+The interval endpoints are direct zero-based selections of the sorted values at those integer indices. No interpolation, quantile library default, standard error, t-test, robust covariance, ridge, pseudoinverse fallback, or alternative bootstrap is permitted.
 
 ---
 
-## 15. Exact database/project and runtime authority proof
+## 11. Cell eligibility, classification, and precedence
 
-The only authorized evidence database is:
+Classification precedence is exactly:
 
-```text
-Supabase project ref: afyiydxbjgzaiswnbcyj
-Database:             postgres
-Reader:               atom_e1_scorecard_reader
-```
+1. protocol, identity, causality, proof, accounting-reconciliation, or frozen-contract defect => `INVALID` regardless of sample size;
+2. otherwise if `n_regression_windows < 100` or `n_regression_sessions < 10` => `INSUFFICIENT`, no bootstrap;
+3. otherwise if full-sample OLS is rank-deficient/non-finite or the valid-bootstrap requirement fails => `INVALID`;
+4. otherwise if lower endpoint of `enc_b_ci_0999` is strictly greater than zero => `INFORMATIVE`;
+5. otherwise => `NOISE`.
 
-### 15.1 Runtime project binding
-
-Before opening evidence queries, parse `ATOM_E1_SCORECARD_READONLY_DATABASE_URL` without logging its secret material.
-
-It must prove project ref `afyiydxbjgzaiswnbcyj` by one of these exact Supabase DSN forms:
-
-1. direct host: hostname exactly `db.afyiydxbjgzaiswnbcyj.supabase.co`; or
-2. Supavisor/pooler form: database username exactly ends with `.afyiydxbjgzaiswnbcyj` and the host ends with `.pooler.supabase.com`.
-
-The database path/name must be exactly `postgres`. Any DSN that does not cryptographically/structurally bind the connection target to that project ref under one of these forms is `BLOCKED`; do not infer identity from table names or receipt constants.
-
-After connecting, require `current_database() = 'postgres'` and `current_user = 'atom_e1_scorecard_reader'`.
-
-Record the observed project ref and the method (`DIRECT_HOST` or `POOLER_USERNAME`) in `authority_proof`.
-
-No restore, PITR, simulator, development, local, or other project may be used for the official run.
-
-### 15.2 Conditional migration
-
-Only if the two volatility tables lack exact reader access, migration `033_authorize_v1_volatility_scorecard_reader.sql` may be applied once to project `afyiydxbjgzaiswnbcyj`, database `postgres`, by an Owner-controlled session with `current_user = 'postgres'`.
-
-Application anywhere else is forbidden.
-
-The migration may grant only the minimum SELECT/RLS policy authority on:
+There are exactly 12 inferential cells. Report-only null expectation under the one-sided screen induced by a two-sided 0.999 interval is:
 
 ```text
-public.volatility_forecasts
-public.volatility_forecast_outcomes
+12 * 0.0005 = 0.006 expected false INFORMATIVE cells
 ```
 
-No new role, password, membership, writer, source, service, function, broad grant, or default privilege is authorized.
+No alternate multiplicity correction may be substituted after results are seen.
 
-### 15.3 Six-table full-read/no-write proof
+No V-1 result may be called tradeable, profitable, production-ready, an options edge, or sufficient to authorize capital.
 
-Before evidence reads and again before evaluated receipt construction, verify all six:
+---
+
+## 12. V-1B exact implementation boundary
+
+Owner merge of V-1A authorizes **V-1B only**.
+
+V-1B job identity:
+
+```text
+ATOM-V1B-READ-ONLY-VOLATILITY-SCORECARD-1
+```
+
+### 12.1 Exhaustive file list
+
+Only these unconditional repository files are authorized:
+
+```text
+quant/volatility_scorecard.py
+tests/test_volatility_scorecard.py
+```
+
+Only this conditional third path is authorized:
+
+```text
+migrations/033_authorize_v1_volatility_scorecard_reader.sql
+```
+
+and only when the pre-implementation privilege check proves the existing reader lacks the exact volatility-table access required in §15.
+
+No modification is authorized to `quant/evidence_scorecard.py`, `quant/v9_v4c_predictive.py`, `quant/evidence_outbox.py`, `quant/web.py`, `AGENTS.md`, `PHASES.md`, `FREEZE.md`, `SIMULATION_FREEZE.md`, or any other path.
+
+The new V-1B module is explicitly authorized to perform the pure in-memory session-resampled OLS-refit loop frozen in §10. It must import/reuse existing E-1/V4C primitives without editing their source files.
+
+If any unlisted path is required, stop `BLOCKED` for documentation-first amendment.
+
+If migration path `033` is no longer collision-free at V-1B implementation time, do not silently renumber; stop `BLOCKED` for an amendment naming the replacement path.
+
+### 12.2 Required tests
+
+At minimum tests must prove:
+
+- canonical six horizons and 12-cell order;
+- exact FAMILY and V9 lineage identities and no pooling;
+- deterministic V9 lineage selection is outcome-blind;
+- V-1A merge identity validation and evaluation-session/as-of derivation;
+- exact volatility-specific proof kinds and V4 target proof seam;
+- E-1 non-overlap parity;
+- mutually exclusive accounting order and both reconciliation equations;
+- zero realized magnitude valid;
+- null/non-finite and finite-nonpositive prediction buckets distinct;
+- strict causal kappa requires cutoff, target-resolved, outcome-created, and proof-observation times all prior;
+- latest-250 withholding;
+- exact `calibration_end` boundary and equivalence to existing V4C calibration behavior;
+- MATURE-only kappa acceptance;
+- exact causal `persist_20`;
+- actual regression-population minima;
+- exact MAE/rank/level/coverage/MZ/persistence metrics;
+- `mz_r2` definition and null behavior;
+- exact Spearman ties/null behavior;
+- bootstrap exact `random.Random(0).choices(...)` call and canonical session order;
+- invalid bootstrap draws consume RNG state and exactly 200,000 valid refits are required;
+- ascending order-statistic interval extraction;
+- pure persistence cannot become INFORMATIVE merely by descriptive metrics;
+- constructed incremental signal positive path;
+- full-sample rank defect => INVALID;
+- exact evaluated, BLOCKED, and pre-cell-INVALID schemas and canonical hashes;
+- effective DSN target verification including rejection of target-override parameters;
+- exact six-table read/RLS/no-write authority proof including restrictive policies;
+- execution revision and V-1A merge revision binding;
+- no writes, SIM, broker, order, production-math, V-1C, or V-2 behavior;
+- if migration is present, migration self-refusal and exact privilege proof.
+
+---
+
+## 13. Exact evaluated receipt schema
+
+A successfully evaluated V-1B run produces one top-level JSON object with **exactly** these keys:
+
+```text
+schema_version
+decision_id
+job_id
+contract_path
+code_version
+verified_main_sha
+v1a_merge_sha
+run_identity
+evaluation_session
+evaluation_as_of_at
+generated_at_utc
+reader_identity
+database_identity
+authority_proof
+bootstrap
+cells
+overall_status
+overall_reason_codes
+scouting_disclosure
+read_only
+forecast_writes
+outcome_writes
+evidence_writes
+receipt_sha256
+```
+
+### 13.1 Top-level types/domains
+
+```text
+schema_version      string = "ATOM-V1B-RECEIPT-1"
+decision_id         string = "ATOM-V1A-VOLATILITY-FIRST-FREEZE-1"
+job_id              string = "ATOM-V1B-READ-ONLY-VOLATILITY-SCORECARD-1"
+contract_path       string = "docs/v-1a-volatility-first-freeze.md"
+code_version        string = "ATOM-V1B-1"
+verified_main_sha   string, exactly 40 lowercase hex, bound by §16
+v1a_merge_sha       string, exactly 40 lowercase hex, verified by §5.1
+run_identity        string, exactly 64 lowercase hex
+evaluation_session  string YYYY-MM-DD
+evaluation_as_of_at string UTC RFC3339 microseconds `YYYY-MM-DDTHH:MM:SS.ffffffZ`
+generated_at_utc    string same timestamp format
+reader_identity     string = "atom_e1_scorecard_reader"
+overall_status      string = PASS | FAIL | INVALID
+overall_reason_codes array[string], sorted unique UTF-8 ascending
+scouting_disclosure array[string], exact §17 lines in listed order
+read_only           boolean = true
+forecast_writes     integer = 0
+outcome_writes      integer = 0
+evidence_writes     integer = 0
+receipt_sha256      string, exactly 64 lowercase hex
+```
+
+`BLOCKED` is not a valid status in this evaluated schema; pre-evaluation blocked failures use §14.1.
+
+### 13.2 `database_identity` exact object
+
+Exactly two keys:
+
+```text
+supabase_project_ref string = "afyiydxbjgzaiswnbcyj"
+database_name        string = "postgres"
+```
+
+No extra keys.
+
+### 13.3 `authority_proof` exact object
+
+Exactly these keys:
+
+```text
+current_user                    string = "atom_e1_scorecard_reader"
+current_database                string = "postgres"
+effective_host                  string
+project_binding_verified        boolean = true
+schema_public_usage             boolean = true
+schema_public_create            boolean = false
+six_tables_select               object[string table -> boolean true]
+six_tables_insert               object[string table -> boolean false]
+six_tables_update               object[string table -> boolean false]
+six_tables_delete               object[string table -> boolean false]
+six_tables_truncate             object[string table -> boolean false]
+six_tables_rls_enabled          object[string table -> boolean]
+six_tables_permissive_full_read object[string table -> boolean true]
+six_tables_restrictive_select   object[string table -> boolean false]
+read_only_transaction           boolean = true
+verification_status             string = "PASS"
+```
+
+Each six-table object contains exactly these six keys in semantic set terms (canonical JSON later sorts object keys):
 
 ```text
 public.forecasts
@@ -668,104 +689,458 @@ public.volatility_forecasts
 public.volatility_forecast_outcomes
 ```
 
-Require:
+No extra table keys.
 
-- exact reader identity;
-- schema `public` USAGE true and CREATE false;
-- SELECT true on every table;
-- INSERT/UPDATE/DELETE/TRUNCATE false on every table;
-- required RLS enabled;
-- at least one applicable **PERMISSIVE** SELECT policy whose effective predicate is full-read/true for the reader;
-- **zero applicable RESTRICTIVE SELECT policies**, including policies applying through `PUBLIC`, for the reader on every table;
+### 13.4 `bootstrap` exact object
+
+Exactly:
+
+```text
+resamples_required integer = 200000
+max_attempts       integer = 1000000
+seed               integer = 0
+interval_levels    array[number] = [0.999, 0.95]
+cluster            string = "XNYS_SESSION_DATE"
+sampling_operation string = "random.Random(0).choices(sessions,k=len(sessions))"
+```
+
+### 13.5 `cells` exact array/object schema
+
+`cells` is an array of exactly 12 objects in §3.3 order. Each cell contains exactly:
+
+```text
+cell_order                         integer 0..11
+forecaster                         string FAMILY-VOL | V9-VOL
+horizon                            string 30S | 1M | 5M | 15M | 30M | 1H
+lineage_identity                   object exact shape below
+session_dates                      array[string YYYY-MM-DD], ascending unique
+evidence_min_cutoff_at             string UTC RFC3339 microseconds | null
+evidence_max_cutoff_at             string UTC RFC3339 microseconds | null
+n_input                            integer >= 0
+n_unselected_lineage_rows          integer >= 0
+n_inadmissible                     integer >= 0
+n_non_rth                          integer >= 0
+n_overlap_excluded                 integer >= 0
+n_null_or_nonfinite_excluded       integer >= 0
+n_nonpositive_prediction_excluded  integer >= 0
+n_kappa_unavailable                integer >= 0
+n_windows                          integer >= 0
+n_sessions                         integer >= 0
+n_persist20_unavailable            integer >= 0
+n_regression_windows               integer >= 0
+n_regression_sessions              integer >= 0
+mae_bps                            finite number | null
+rank_corr                          finite number | null
+level_ratio                        finite number | null
+coverage_90                        finite number | null
+mz_a                               finite number | null
+mz_b                               finite number | null
+mz_r2                              finite number | null
+persist_rank_corr                  finite number | null
+enc_b                              finite number | null
+enc_b_ci_0999                      array[finite number, finite number] | null
+enc_b_ci_095                       array[finite number, finite number] | null
+bootstrap_attempted_draws          integer >= 0
+bootstrap_valid_draws              integer >= 0
+bootstrap_invalid_draws            integer >= 0
+classification                     string INFORMATIVE | NOISE | INSUFFICIENT | INVALID
+reason_codes                       array[string], sorted unique UTF-8 ascending
+```
+
+FAMILY lineage object has exactly:
+
+```text
+quant_id        string = "q3_volatility"
+formula_version string = "realized-volatility-v1"
+symbol          string = "COIN"
+horizon         string = cell horizon
+```
+
+V9 lineage object has exactly:
+
+```text
+v3_model_version string
+symbol           string = "COIN"
+horizon          string = cell horizon
+cohort_id        string
+cohort_hash      string
+```
+
+No extra lineage keys.
+
+For an `INSUFFICIENT` cell, inferential coefficients/intervals that were not validly computed are `null`, and bootstrap counts are zero. For an `INVALID` cell, fields already truthfully computed before the defect may be preserved; fields whose meaning is invalid or unavailable are `null`; reason codes identify the defect. No NaN/Infinity.
+
+### 13.6 Exact run identity body
+
+Before outcomes are scored, construct `selected_lineages` as a JSON array of exactly 12 objects in §3.3 order. Each object is exactly:
+
+FAMILY:
+
+```json
+{"cell_order":0,"forecaster":"FAMILY-VOL","horizon":"30S","lineage_identity":{"quant_id":"q3_volatility","formula_version":"realized-volatility-v1","symbol":"COIN","horizon":"30S"}}
+```
+
+with cell/horizon substituted appropriately.
+
+V9:
+
+```json
+{"cell_order":6,"forecaster":"V9-VOL","horizon":"30S","lineage_identity":{"v3_model_version":"<string>","symbol":"COIN","horizon":"30S","cohort_id":"<string>","cohort_hash":"<string>"}}
+```
+
+with cell/horizon/identity substituted appropriately.
+
+No extra keys are permitted.
+
+`run_identity_body` has exactly:
+
+```text
+decision_id       string = decision ID
+job_id            string = job ID
+v1a_merge_sha     verified 40-hex SHA
+evaluation_session YYYY-MM-DD
+evaluation_as_of_at UTC RFC3339 microseconds
+selected_lineages array = the exact 12-object array above
+```
+
+`run_identity = sha256(canonical_json(run_identity_body))`.
+
+### 13.7 Canonical JSON and receipt hash
+
+Canonical JSON:
+
+```text
+UTF-8
+sort_keys = true
+separators = (",", ":")
+ensure_ascii = false
+allow_nan = false
+```
+
+Array order is preserved.
+
+To compute `receipt_sha256`:
+
+1. construct complete receipt without `receipt_sha256`;
+2. canonicalize exactly;
+3. SHA-256 UTF-8 bytes;
+4. lowercase hex digest;
+5. add digest field. The digest field is excluded from its own hash boundary.
+
+### 13.8 Official filename
+
+Only:
+
+```text
+docs/v-1b-volatility-scorecard-receipt-<evaluation_session>-<run_identity>-<receipt_sha256>.json
+```
+
+---
+
+## 14. Pre-evaluation negative receipts
+
+Negative receipts preserve failures without fabricating evaluated cells.
+
+### 14.1 BLOCKED receipt
+
+Use only when repository/environment/database/credential/revision authority fails **before evidence evaluation begins**.
+
+Exact top-level keys:
+
+```text
+schema_version       string = "ATOM-V1B-BLOCKED-RECEIPT-1"
+decision_id          exact decision string
+job_id               exact job string
+contract_path        exact contract path
+generated_at_utc     UTC RFC3339 microseconds
+stage                string = "PRE_EVALUATION_AUTHORITY"
+reason_codes         array[string], sorted unique
+observed_main_sha    40-hex string | null
+expected_main_sha    40-hex string | null
+observed_v1a_merge_sha 40-hex string | null
+observed_user        string | null
+observed_database    string | null
+observed_effective_host string | null
+project_binding_verified boolean | null
+read_only            boolean | null
+receipt_sha256       64 lowercase hex
+```
+
+No `run_identity`, `cells`, metrics, or classifications exist in this schema. It cannot be published as the official evaluated receipt and cannot open V-1C.
+
+### 14.2 PRE-CELL INVALID receipt
+
+Use when evidence evaluation has begun but a protocol/identity/causality/proof/accounting defect prevents truthful construction of all 12 evaluated cell objects or a valid run identity.
+
+Exact top-level keys:
+
+```text
+schema_version       string = "ATOM-V1B-PRE-CELL-INVALID-RECEIPT-1"
+decision_id          exact decision string
+job_id               exact job string
+contract_path        exact contract path
+verified_main_sha    exact authorized V-1B SHA
+v1a_merge_sha        verified V-1A merge SHA | null if the invalid defect is that identity itself
+evaluation_session   YYYY-MM-DD | null
+evaluation_as_of_at  UTC RFC3339 microseconds | null
+generated_at_utc     UTC RFC3339 microseconds
+stage                string = "EVALUATION_STARTED"
+reason_codes         array[string], sorted unique
+reader_identity      string = "atom_e1_scorecard_reader"
+database_identity    exact §13.2 object when known | null
+authority_proof      exact §13.3 object when authority already passed | null
+read_only            boolean = true
+forecast_writes      integer = 0
+outcome_writes       integer = 0
+evidence_writes      integer = 0
+receipt_sha256       64 lowercase hex
+```
+
+No fabricated `cells` or `run_identity`. Overall semantic status is `INVALID` by schema identity. It cannot become the official evaluated receipt and cannot open V-1C.
+
+Both negative schemas use §13.7 canonicalization/hash rules.
+
+---
+
+## 15. Exact database, migration, effective target, and reader authority
+
+Only authorized database target:
+
+```text
+Supabase project ref: afyiydxbjgzaiswnbcyj
+Database:             postgres
+Reader role:          atom_e1_scorecard_reader
+Purpose:              ATOM production evidence database
+Credential env:       ATOM_E1_SCORECARD_READONLY_DATABASE_URL
+```
+
+No simulator, restore/PITR, development, local, or other project/database is authorized.
+
+### 15.1 Effective DSN target verification — before connect
+
+The implementation must parse the supplied libpq/psycopg connection string and determine the **effective connection target**, not merely the URI authority hostname.
+
+Fail `BLOCKED` before evidence reading unless all conditions hold:
+
+- database name is exactly `postgres`;
+- direct-host form is exactly `db.afyiydxbjgzaiswnbcyj.supabase.co`, **or** approved Supavisor pooler host is used with a username whose project suffix binds exactly `afyiydxbjgzaiswnbcyj` under Supabase's pooler convention;
+- no URI/query/conninfo option can override or redirect the verified target.
+
+Explicitly reject DSNs containing connection-target override parameters including:
+
+```text
+host
+hostaddr
+service
+servicefile
+```
+
+in query/options or duplicate conninfo forms that can replace the verified authority target. Also reject multi-host target lists.
+
+If the implementation cannot prove the effective target from the pinned parser/libpq semantics, stop `BLOCKED`; do not connect first and infer later.
+
+### 15.2 Conditional migration 033
+
+If and only if FAMILY volatility tables lack required reader access, V-1B may include:
+
+```text
+migrations/033_authorize_v1_volatility_scorecard_reader.sql
+```
+
+It may be applied only to project `afyiydxbjgzaiswnbcyj`, database `postgres`, through an Owner-controlled SQL/migration session.
+
+The migration file itself must fail closed **before any GRANT/POLICY mutation** unless SQL runtime proves:
+
+```text
+current_user = 'postgres'
+current_database() = 'postgres'
+```
+
+The migration must self-verify these assertions in an initial `DO` block or equivalent fail-before-mutation mechanism.
+
+It may grant only the exact minimum existing-reader authority needed for:
+
+```text
+public.volatility_forecasts
+public.volatility_forecast_outcomes
+```
+
+including schema `USAGE` only if required and exact SELECT policies only if required.
+
+No new role, password, membership, writer, function, service, source, broad table grant, default privilege, or application elsewhere.
+
+### 15.3 Six-table runtime full-read and zero-write proof
+
+Before evidence reads, and again immediately before evaluated receipt construction in the same read-only run, verify:
+
+- `current_user = atom_e1_scorecard_reader`;
+- `current_database() = postgres`;
+- effective host/project binding already passed §15.1;
+- schema `public` USAGE true;
+- schema `public` CREATE false;
+- SELECT true on all six tables;
+- INSERT/UPDATE/DELETE/TRUNCATE false on all six;
+- RLS enabled wherever repository law requires it;
+- at least one applicable PERMISSIVE SELECT policy gives full read (`USING (true)` semantically) for the reader on each RLS table;
+- **zero applicable RESTRICTIVE SELECT policies** for the reader, including policies applying through `PUBLIC` or any role membership;
 - transaction read-only true;
-- no fallback credential.
+- no fallback credential attempted.
 
-Any restrictive applicable policy fails full-read proof even if a permissive `USING (true)` policy also exists.
+Six tables:
 
-Failure => `BLOCKED` before inference and use §14 receipt shape.
+```text
+public.forecasts
+public.forecast_outcomes
+public.atom_v9_v4_forecasts
+public.atom_v9_v4_outcomes
+public.volatility_forecasts
+public.volatility_forecast_outcomes
+```
+
+Any pre-read authority failure => BLOCKED receipt. Any authority drift discovered after evaluation begins => PRE-CELL INVALID or evaluated INVALID depending on whether complete truthful cells can be constructed.
 
 ---
 
-## 16. Execution revision binding
+## 16. V-1B job environment, revision binding, rollback, and overall verdict
 
-The V-1B implementation PR must be independently reviewed, green, and Owner-merged before execution.
-
-Let `authorized_v1b_main_sha` be the exact `main` commit SHA produced by that Owner merge.
-
-Before the one-shot run, the Owner sets non-secret environment variable:
-
-```text
-ATOM_V1B_AUTHORIZED_MAIN_SHA=<authorized_v1b_main_sha>
-```
-
-At execution time the worker must require all of:
-
-```text
-ATOM_V1B_AUTHORIZED_MAIN_SHA == authorized_v1b_main_sha
-RENDER_GIT_COMMIT            == authorized_v1b_main_sha
-git rev-parse HEAD           == authorized_v1b_main_sha
-```
-
-Each must be exactly 40 lowercase hexadecimal characters. If repository checkout metadata is unavailable or any value differs, emit `BLOCKED` receipt with `failure_stage = REVISION` and do not read evidence.
-
-For an evaluated receipt:
-
-```text
-verified_main_sha = authorized_v1b_main_sha
-```
-
-No caller-supplied arbitrary SHA may populate `verified_main_sha`.
-
----
-
-## 17. Accountable environment, rollback, and overall result
+### 16.1 Accountability
 
 ```text
 Job ID:                   ATOM-V1B-READ-ONLY-VOLATILITY-SCORECARD-1
 Architecture/final audit: ChatGPT Pro
-Implementation owner:     Codex by default
+Implementation owner:     Codex-class implementation labor
 Merge/infra owner:        Owner
-Execution service:        atom-h2d3-benchmark
-Credential env:           ATOM_E1_SCORECARD_READONLY_DATABASE_URL
-Authorized revision env:  ATOM_V1B_AUTHORIZED_MAIN_SHA
 ```
 
-No new worker, service, credential, production web deploy, V9 runtime activation, or SIM activation is authorized.
+### 16.2 Authorized execution environment
 
-Repository rollback target is the exact Owner-merged V-1A `main` SHA immediately before V-1B implementation merge. Operational rollback stops the one-shot command and restores the benchmark worker’s pre-V-1B start-command/environment state. Evidence and receipts are preserved; ad hoc privilege rollback is forbidden.
+Existing Render benchmark worker only:
 
-Overall evaluated status:
+```text
+service:        atom-h2d3-benchmark
+credential env: ATOM_E1_SCORECARD_READONLY_DATABASE_URL
+reader:         atom_e1_scorecard_reader
+project:        afyiydxbjgzaiswnbcyj
+database:       postgres
+```
 
-- `INVALID` if any cell is `INVALID` or reproducibility/accounting/protocol integrity fails after evaluation begins.
-- `PASS` if at least one valid cell is `INFORMATIVE` and no cell is `INVALID`.
-- `FAIL` if no cell is `INFORMATIVE`, no cell is `INVALID`, and evaluation completed.
-- `BLOCKED` is represented only by §14 and means required authority/environment/boundary was unavailable before a valid evaluation.
+No new worker/service/credential/database identity or production web deploy.
 
-PASS authorizes no production promotion.
+### 16.3 Exact V-1B execution revision
+
+After the V-1B implementation PR itself is independently reviewed, all required checks are green, zero material findings remain, and Owner merges it, define that exact main merge commit as `V1B_AUTHORIZED_MAIN_SHA`.
+
+Before database evidence reads, the one-shot environment must provide:
+
+```text
+ATOM_V1B_AUTHORIZED_MAIN_SHA=<exact 40-hex Owner-merged V-1B main commit>
+```
+
+and verify:
+
+```text
+RENDER_GIT_COMMIT == ATOM_V1B_AUTHORIZED_MAIN_SHA
+git rev-parse HEAD == ATOM_V1B_AUTHORIZED_MAIN_SHA
+```
+
+The authorized SHA must be a main commit containing this V-1A decision and the reviewed V-1B implementation. Failure => BLOCKED.
+
+`verified_main_sha` in any evaluated receipt is exactly this observed authorized SHA, never a caller-supplied claim.
+
+The verified `v1a_merge_sha` under §5.1 must also be reachable from this authorized main revision and proven to be the PR #319 Owner-merge commit.
+
+### 16.4 Rollback
+
+Repository rollback target = exact Owner-merged V-1A `main` SHA immediately before V-1B implementation merge.
+
+Operational rollback:
+
+1. stop/suspend the one-shot V-1B command;
+2. restore benchmark worker to pre-V-1B command/environment state;
+3. preserve all generated receipts/evidence;
+4. no deletion/rewrite;
+5. no ad-hoc privilege rollback; privilege rollback requires reviewed migration/amendment.
+
+### 16.5 Overall evaluated status
+
+Evaluated receipt `overall_status`:
+
+- `INVALID` if any cell is INVALID or any run-level protocol/evidence/reproducibility defect exists;
+- otherwise `PASS` if at least one cell is INFORMATIVE;
+- otherwise `FAIL` when all evaluated cells are NOISE and/or INSUFFICIENT with no INVALID cell.
+
+A BLOCKED run uses the separate BLOCKED schema and has no evaluated overall status.
+
+PASS means only that at least one frozen existing ATOM volatility forecaster contains incremental realized-volatility information versus `persist_20`. It does **not** establish an options edge or economic profitability.
 
 ---
 
-## 18. Preregistration disclosure
+## 17. Preregistration disclosure
 
-The official receipt must disclose:
+The evaluated receipt includes these strings in exactly this order:
 
-1. pooled overlapping-window Q3 volatility correlations, level ratios, and slopes were inspected before adoption;
-2. Q3 appeared to carry rank information while absolute level was horizon-miscalibrated;
-3. an overlapping previous-window persistence calculation was inspected and recognized as overlap-contaminated;
-4. no exact E-1-selected, persistence-adjusted, session-bootstrap `enc_b` result under this contract was adopted before V-1A;
-5. no exact V9-VOL causal-kappa `enc_b` result under this contract was adopted before V-1A.
+1. `2026-09-03 pooled overlapping-window Q3 volatility correlations, level ratios, and slopes were inspected before V-1A adoption.`
+2. `Q3 appeared to carry rank information while its absolute level was horizon-miscalibrated.`
+3. `An overlapping previous-window persistence calculation was inspected and recognized as overlap-contaminated.`
+4. `No exact E-1-selected non-overlapping session-clustered V-1 enc_b statistic under this frozen population was adopted as controlling evidence before V-1A.`
+5. `No exact V9-VOL causal-kappa enc_b statistic under this frozen population was adopted as controlling evidence before V-1A.`
 
-If evidence proves an exact confirmatory statistic/population was inspected before adoption, the affected claim is `INVALID` for confirmatory use and preserved only as exploratory evidence.
+If independent review establishes that the exact inferential statistic for an exact confirmatory cell/population was already inspected before adoption, that affected cell is `INVALID` for confirmatory claims and preserved as exploratory evidence.
 
 ---
 
-## 19. Future dashboard contract — V-1C still blocked
+## 18. Receipt generation, publication, and review gate
 
-This freezes source semantics only; it does **not** authorize dashboard code.
+A local/runtime evaluated or negative receipt is not publication.
 
-A future V-1C may source `V9 VOLATILITY ACCURACY` only from the unique Owner-merged SHA-valid official V-1B evaluated receipt and only its V9-VOL cells.
+Only an **evaluated** `ATOM-V1B-RECEIPT-1` receipt can become the official V-1B evidence receipt.
 
-Rows remain exactly:
+Publication is a separate documentation-only PR adding exactly one immutable JSON file matching §13.8.
+
+Before Owner merge of that receipt PR, all of these are mandatory:
+
+1. independent review of the exact final receipt-PR head;
+2. every required check green on that exact head;
+3. zero unresolved P1/P2/material review threads;
+4. SHA/schema/run-identity recomputation confirms the file is exactly the generated evaluated receipt;
+5. no other repository path is changed.
+
+Only after those gates may the Owner merge the receipt PR. That Owner merge is the publication event.
+
+For a given run identity, the first Owner-merged SHA-valid evaluated receipt is the unique `OFFICIAL` receipt. A second different evaluated receipt for the same run identity is forbidden and causes fail-closed ambiguity until documentation-first amendment.
+
+A BLOCKED or PRE-CELL INVALID receipt may be preserved in an audit PR if desired, but it is never an official evaluated receipt and never opens V-1C.
+
+---
+
+## 19. Rerun policy
+
+Exactly one evaluated receipt may become OFFICIAL for the frozen `run_identity`.
+
+A local rerun is allowed only for reproducibility and must use the same:
+
+- verified V-1A merge SHA;
+- evaluation session/as-of;
+- selected lineages;
+- project/database/reader;
+- authorized V-1B main SHA;
+- frozen mathematics and implementation.
+
+If two otherwise valid reruns disagree on any substantive `cells`, `authority_proof`, evaluation identity, run identity, or receipt body field other than `generated_at_utc` and corresponding digest, the run is `INVALID`; no competing official receipt may be selected until documentation-first amendment.
+
+No operator may rerun with a new session population to seek a favorable result.
+
+---
+
+## 20. Frozen future dashboard source — V-1C remains blocked
+
+This section freezes only a possible future source contract. It grants no V-1C implementation authority.
+
+If ChatGPT Pro later explicitly opens V-1C after official receipt audit, `V9 VOLATILITY ACCURACY` must read only the six V9-VOL cells from the unique Owner-merged SHA-valid OFFICIAL receipt bundled in the deployed repository.
+
+The web process may not query live evidence tables or recompute V-1 statistics.
+
+Visible rows exactly:
 
 ```text
 MAE BPS
@@ -775,117 +1150,149 @@ LEVEL RATIO
 STATUS
 ```
 
-`INVALID` has precedence and may never be hidden by freshness.
-
-For non-INVALID valid positive-horizon receipts, freshness is based on `evaluation_session`, not `evidence_max_cutoff_at`: a receipt is `STALE` only when a later fully completed regular XNYS session exists after `evaluation_session`. On the evaluation session itself and before the next completed regular session, it is not automatically stale merely because the last eligible cutoff precedes 16:00 by the horizon length.
-
-No live evidence recomputation or directional percentage reuse is permitted.
-
-V-1C remains `BLOCKED` until V-1B implementation is Owner-merged, the official evaluated receipt is published by Owner merge, ChatGPT Pro audits that receipt, and ChatGPT Pro explicitly opens V-1C.
-
----
-
-## 20. V-2 remains separate
-
-No V-2 hypothesis, production volatility-primary synthesis, Q3 family insertion, reweighting, opportunity gating, sizing, options work, broker/order change, `final_bps` change, Gamma activation, or live-capital action is authorized.
-
-An `INFORMATIVE` V-1 result buys only the right for ChatGPT Pro and the Owner to decide whether to author a later V-2 freeze.
-
----
-
-## 21. Production / SIM / broker boundary
-
-V-1 does not authorize changes to:
-
-- `final_bps` or signed V9 synthesis;
-- existing family signs/weights or Q3 formula;
-- V4C production state;
-- production Gamma activation;
-- SIM entry, exit, resolution, or P&L mathematics;
-- broker/account/order endpoints;
-- live capital or options execution;
-- Level II mathematical use;
-- existing immutable directional evidence;
-- production deployment.
-
-Directional forecasting may continue unchanged.
-
----
-
-## 22. Phase-pointer relationship
-
-V-1A and V-1B are read-only documentation/research work and take **no active-phase pointer**.
-
-They may run alongside the current active program only while they do not mutate or delay it. This document does not edit `AGENTS.md` or move its active pointer.
-
-Owner merge of V-1A authorizes **V-1B only** under the exact boundary above.
-
-V-1C remains blocked. V-2 remains blocked.
-
----
-
-## 23. Required V-1B tests
-
-At minimum test:
-
-1. six canonical horizons and twelve exact cells;
-2. exact FAMILY and deterministic V9 lineage selection, no pooling;
-3. canonical `selected_lineages` JSON array/object shape and run-identity stability;
-4. merge-derived evaluation session/as-of and no operator session selection;
-5. mutually exclusive row bucket precedence and both reconciliation equations;
-6. zero prediction accounting and zero realized move validity;
-7. strict causal kappa including `outcome.created_at < f.cutoff_at` and both publication-proof timestamps;
-8. latest-250 withholding and MATURE-only kappa;
-9. 100-window/10-session minimum on regression population;
-10. deterministic Spearman midranks/null behavior;
-11. exact `random.Random(0).choices(sessions, k=len(sessions))` sampling and invalid-draw continuation;
-12. 200,000 valid-draw requirement / 1,000,000 attempt cap;
-13. rank-deficient full sample and bootstrap paths;
-14. direct-host and pooler project-ref verification plus rejection of wrong project/restore/local DSNs;
-15. exact reader identity, six-table SELECT, zero writes, permissive full-read policy, and zero applicable restrictive policies;
-16. evaluated receipt exact schema/canonical hash/filename;
-17. BLOCKED receipt exact schema without fabricated cells/run identity;
-18. exact execution revision equality across authorized env, `RENDER_GIT_COMMIT`, and `git rev-parse HEAD`;
-19. dashboard freshness rule and `INVALID` precedence as a pure contract test if represented in V-1B utilities;
-20. no imports/write paths that create production/SIM/broker authority.
-
----
-
-## 24. Sequencing and merge gate
-
-Order only:
+Columns exactly:
 
 ```text
-V-1A documentation PR
--> fresh independent exact-head review
+30S 1M 5M 15M 30M 1H
+```
+
+Directional wins/losses/accuracy may not populate the volatility card.
+
+### 20.1 Dashboard status precedence and freshness
+
+For a V9 horizon:
+
+1. if no unique Owner-merged SHA-valid OFFICIAL evaluated receipt exists => `NO DATA`;
+2. if the receipted cell classification is `INVALID` => `INVALID` regardless of freshness;
+3. otherwise determine freshness by `evaluation_session`, **not** by positive-horizon `evidence_max_cutoff_at`;
+4. `STALE` only when receipt `evaluation_session` is earlier than the most recent fully completed regular XNYS session before render time;
+5. otherwise show exact receipt classification `INFORMATIVE`, `NOISE`, or `INSUFFICIENT`.
+
+A valid positive-horizon receipt is therefore not automatically stale merely because its final admissible forecast cutoff precedes the session close.
+
+`NO DATA` metric cells blank. `STALE` retains receipted metrics. Never fabricate zeroes.
+
+---
+
+## 21. V-1C and V-2 gates
+
+### V-1C
+
+`BLOCKED` until, in order:
+
+1. V-1A Owner merge;
+2. V-1B implementation exact-head independent review, green checks, zero material findings, Owner merge;
+3. any authorized migration 033 applied and verified if required;
+4. one-shot scorecard run from exact authorized V-1B merged SHA;
+5. evaluated receipt generated;
+6. receipt publication PR exact-head independent review, all required checks green, zero material findings;
+7. Owner merge of unique evaluated receipt;
+8. ChatGPT Pro audits the published receipt and explicitly opens V-1C.
+
+No implementation agent may infer V-1C authority.
+
+### V-2
+
+The draft's prior 20-session V-2 hypothesis is **not adopted**.
+
+V-2 remains a separate future protected-boundary freeze. Even a V-1B PASS buys only the right to decide what to research next.
+
+No production volatility-primary synthesis, Q3 insertion, family reweighting, IV comparison, options monetization, gating, sizing, broker/order change, Gamma production activation, `final_bps` change, or live-capital action is authorized by V-1.
+
+---
+
+## 22. Active-phase pointer relationship
+
+V-1A and V-1B are read-only research work and **take no active-phase pointer**.
+
+This decision does not modify `AGENTS.md`, `PHASES.md`, or the current active-phase pointer. Existing SIM and other separately authorized work may continue only if it does not mutate V-1 definitions, evidence, or execution environment.
+
+No pointer change is implied by Owner merge of V-1A, V-1B implementation, or receipt publication.
+
+---
+
+## 23. Production, SIM, broker, and immutable-evidence boundaries
+
+V-1 authorizes no changes to:
+
+- `final_bps`;
+- current V9 signed synthesis;
+- family signs/weights;
+- Q3 production formula;
+- V4C production mathematics/state contract;
+- V4D production contract;
+- Gamma production activation;
+- SIM entry/exit/resolution/P&L mathematics;
+- SIM database/service boundaries;
+- broker/account/position/order/execution endpoints;
+- live capital;
+- options execution;
+- Level-II mathematical use;
+- immutable directional evidence;
+- directional accuracy lineage.
+
+All V-1 database reads are read-only. No evidence backfill, correction, rewrite, deletion, or conversion is authorized.
+
+---
+
+## 24. Stop conditions
+
+Stop `BLOCKED` before evaluation if implementation requires or discovers:
+
+- any unlisted repository path;
+- a new market-data source;
+- a new database/role/credential/service;
+- broader database authority than §15;
+- target DSN/project cannot be proven;
+- migration ordinal 033 collision;
+- authorized execution SHA cannot be proven;
+- V-1A merge identity cannot be proven before evaluation;
+- production V9/SIM/broker/order/capital changes;
+- dashboard implementation;
+- V-1C or V-2 work.
+
+After evaluation begins, any protocol/identity/causality/proof/accounting defect is `INVALID`, not BLOCKED. Use evaluated INVALID receipt when complete truthful cells can be constructed; otherwise PRE-CELL INVALID receipt.
+
+Any required widening needs documentation-first amendment and independent exact-head review before implementation.
+
+---
+
+## 25. Exact sequence
+
+```text
+V-1A documentation PR #319
+-> exact-head independent review
 -> all required checks green
 -> zero unresolved material findings
 -> Owner merge
--> V-1B implementation under exact file boundary
--> independent final-head review / green checks
+-> record verified V-1A merge SHA
+-> V-1B implementation PR only
+-> exact-head independent review
+-> tests / all required checks green
+-> zero unresolved material findings
 -> Owner merge
--> conditional migration 033 only if required, production project only
--> runtime project/revision/reader/full-read proof
--> one-shot official evaluation
--> evaluated or BLOCKED immutable receipt
--> separate documentation-only receipt publication PR if evaluated
--> Owner merge of official evaluated receipt
+-> record exact V1B_AUTHORIZED_MAIN_SHA
+-> conditional migration 033 only if privilege check requires it
+-> migration self-check + post-apply reader authority verification
+-> configure one-shot benchmark worker with exact authorized SHA
+-> run V-1B read-only scorecard
+-> evaluated receipt OR truthful negative receipt
+-> if evaluated receipt: documentation-only publication PR containing exactly one receipt file
+-> exact-head independent receipt review
+-> all required receipt-PR checks green
+-> zero unresolved material receipt findings
+-> Owner merge official evaluated receipt
 -> ChatGPT Pro receipt audit
--> only then possible V-1C decision
--> separate future V-2 decision if warranted
+-> separate V-1C decision
+-> later separate V-2 decision
 ```
 
-Do not merge V-1A while any required check is not green or any P1/P2/material review finding remains unresolved on the exact final head.
+V-1C and V-2 are not authorized early.
 
 ---
 
-## 25. Frozen conclusion
+## 26. Adoption statement
 
-Volatility becomes ATOM’s primary **research evaluation target** without relabeling directional evidence or altering production mathematics.
+Owner merge of this exact final-head document makes `ATOM-V1A-VOLATILITY-FIRST-FREEZE-1` controlling for V-1 subject matter and authorizes **V-1B implementation only** under the exhaustive boundaries above.
 
-V-1B is a deterministic, read-only, lineage-preserving, persistence-adjusted falsification scorecard.
-
-Owner merge of V-1A authorizes V-1B only.
-
-**V-1C: BLOCKED.**  
-**V-2: BLOCKED.**
+Until Owner merge, it remains proposed documentation.
