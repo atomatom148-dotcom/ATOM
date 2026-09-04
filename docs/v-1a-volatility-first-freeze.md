@@ -193,9 +193,20 @@ Failure to prove this identity before evidence reading is `BLOCKED`. If identity
 
 Let `T_merge` be the UTC committer timestamp of the verified V-1A merge commit.
 
-Convert `T_merge` to America/New_York. `evaluation_session` is the latest **fully completed regular XNYS session** whose regular close at 16:00 America/New_York is strictly before `T_merge`.
+The sole XNYS calendar authority throughout this contract is
+`exchange-calendars==4.13.2`, calendar name `XNYS`. Convert that calendar's
+UTC schedule instants to America/New_York. A **qualifying full-day XNYS
+session** is exactly a schedule row whose local open is 09:30:00 and whose
+local close is 16:00:00. An early-close/half-day schedule row, a non-session
+date, or a row with either different boundary is not qualifying. Every use of
+"regular XNYS session/date" elsewhere in this contract means this qualifying
+full-day definition unless a sentence explicitly says otherwise.
 
-If the merge occurs during a regular session, that in-progress session is excluded. Half-days and non-regular sessions are excluded.
+`evaluation_session` is the latest fully completed qualifying full-day XNYS
+session whose 16:00:00 America/New_York close is strictly before `T_merge`.
+If the merge occurs during a qualifying session, that in-progress session is
+excluded. If it occurs on a half-day or non-session date, that date is never a
+candidate.
 
 ```text
 evaluation_as_of_at = regular close of evaluation_session = 16:00:00 America/New_York
@@ -217,9 +228,14 @@ Evidence or proof published after `evaluation_as_of_at` is excluded even if its 
 
 For each selected cell lineage, candidate session dates are the sorted unique America/New_York dates represented by admissible target forecasts whose target intervals end no later than `evaluation_as_of_at`.
 
-Every qualifying regular XNYS date is included. No operator may manually add, remove, sample, shorten, retry, or choose dates based on outcomes or metrics.
+Every qualifying full-day XNYS date under the exact §5.2 calendar is
+included. Every half-day/early-close date is excluded as an entire candidate
+date, even when a forecast's target interval would end before that day's early
+close. No operator may manually add, remove, sample, shorten, retry, or choose
+dates based on outcomes or metrics.
 
-The entire target interval must remain inside 09:30–16:00 America/New_York.
+On an included full-day date, the entire target interval must remain inside
+09:30:00–16:00:00 America/New_York.
 
 ---
 
@@ -367,9 +383,21 @@ For each cell, `n_windows` selected valid windows are ordered by `(session_date,
 For valid window `w`:
 
 ```text
-persist_1(w)  = realized_volatility_bps of the immediately prior selected valid window
-persist_20(w) = arithmetic mean realized_volatility_bps of the prior 20 selected valid windows
+persist_1(w) = realized_volatility_bps of the immediately prior selected valid window
+persist_20(w)
+= math.fsum(
+    float(realized_volatility_bps) for the prior 20 selected valid windows
+    in their existing frozen order
+  ) / 20
 ```
+
+For `persist_20(w)`, convert each constituent once to IEEE-754 binary64
+Python `float`, preserve the displayed prior-window order, and execute the
+displayed `math.fsum` and division in that order. Built-in `sum`, SQL
+`AVG`, NumPy, decimal or extended precision, reassociation, and every other
+reduction are forbidden. An arithmetic exception or non-finite result makes
+`persist_20(w)` unavailable and the row is counted in
+`n_persist20_unavailable`.
 
 Every constituent realized value used in `persist_20(w)` must have its outcome and required proof durably available no later than `w.cutoff_at`.
 
@@ -957,9 +985,19 @@ Only these unconditional repository files are authorized:
 ```text
 quant/volatility_scorecard.py
 tests/test_volatility_scorecard.py
+requirements.txt
 ```
 
-Only this conditional third path is authorized:
+The authorized `requirements.txt` change is to append exactly
+`exchange-calendars==4.13.2` plus its complete transitive dependency closure,
+each as an exact `name==version` line matching the reviewed
+`EXPECTED_DEPENDENCY_VERSIONS` in §13.2.1. Every pre-existing line and its
+order must remain unchanged; the new lines are UTF-8 sorted by normalized
+distribution name after the `exchange-calendars` line. If an existing
+requirement conflicts with that closure, stop `BLOCKED` for a
+documentation-first amendment; do not resolve or upgrade it.
+
+Only this conditional fourth path is authorized:
 
 ```text
 migrations/033_authorize_v1_volatility_scorecard_reader.sql
@@ -987,6 +1025,9 @@ At minimum tests must prove:
 - the zero-admissible-V9-lineage sentinel, accounting, run identity, null fields,
   gate statuses, classification, and exact failed-minimum reason codes;
 - V-1A merge identity validation and evaluation-session/as-of derivation;
+- exact `exchange-calendars==4.13.2` `XNYS` schedule use, including
+  complete exclusion of half-day candidate dates and boundary tests for
+  09:30:00/16:00:00 full-day sessions;
 - exact volatility-specific proof kinds and V4 target proof seam;
 - E-1 non-overlap parity;
 - mutually exclusive accounting order and both reconciliation equations;
@@ -996,7 +1037,9 @@ At minimum tests must prove:
 - latest-250 withholding;
 - exact `calibration_end` boundary and equivalence to existing V4C calibration behavior;
 - MATURE-only kappa acceptance;
-- exact causal `persist_20`;
+- exact causal `persist_20`, including ordered binary64
+  `math.fsum(...)/20` fixtures that distinguish it from built-in, NumPy,
+  SQL, or reassociated reductions;
 - actual regression-population minima;
 - exact MAE/rank/level/coverage/MZ/persistence metrics;
 - exact binary64 MZ fit coefficients, rank/null rule, SSE, and `mz_r2`
@@ -1016,9 +1059,15 @@ At minimum tests must prove:
 - exact evaluated, BLOCKED, pre-cell-INVALID, and
   post-evaluation-authority-INVALID schemas and canonical hashes;
 - direct-host-only effective DSN target/login verification, including
-  rejection of every pooler, duplicate or ambient target/login parameter, and
-  startup `options` value;
+  certificate-verified TLS, an explicit nonempty URI password, and rejection
+  of every pooler, duplicate, ambient or file-based target/login/password/TLS
+  source and every startup `options` value;
 - exact six-table read/RLS/no-write authority proof including restrictive policies;
+- catalog-wide rejection of effective `CREATE` on any non-system schema,
+  including a synthetic seventh schema;
+- exact runtime-identity equality before database connection, exact
+  runtime-manifest/run-identity/receipt binding, and rejection of each changed
+  runtime field;
 - execution revision and V-1A merge revision binding;
 - rollback deployment target derivation from the V-1B merge's exact first
   parent, with intervening main commits preserved;
@@ -1074,6 +1123,8 @@ At minimum tests must prove:
 - catalog-wide pre-read and pre-receipt rejection of effective
   INSERT/UPDATE/DELETE/TRUNCATE privilege on any non-system relation,
   including a synthetic seventh production table;
+- catalog-wide pre-read and pre-receipt rejection of effective `CREATE` on
+  any non-system schema, including a synthetic seventh schema;
 - pre-read and pre-receipt verification of `atom_v9_internal` USAGE and
   EXECUTE on exactly both proof-reader functions;
 - deterministic routing of a failed final authority recheck to the exact
@@ -1102,6 +1153,7 @@ evaluation_as_of_at
 generated_at_utc
 reader_identity
 database_identity
+runtime_identity
 authority_proof
 bootstrap
 cells
@@ -1153,6 +1205,73 @@ database_name        string = "postgres"
 
 No extra keys.
 
+### 13.2.1 `runtime_identity` exact object
+
+Exactly these keys:
+
+```text
+render_service_id       string = "srv-daa7thgae00c73a2lmn0"
+render_runtime          string = "python"
+python_implementation   string = "CPython"
+python_version_source   string = "PYTHON_VERSION"
+python_version_env      string = "3.14.3"
+python_version          string = "3.14.3"
+python_cache_tag        string = "cpython-314"
+platform_system         string = "Linux"
+platform_machine        string = "x86_64"
+byteorder               string = "little"
+libc_name               string = "glibc"
+libc_version            string = "2.36"
+float_radix             integer = 2
+float_mant_dig          integer = 53
+float_max_exp           integer = 1024
+float_rounds            integer = 1
+libpq_version           integer, exact reviewed V-1B literal
+dependency_versions     object[string normalized distribution name -> exact version]
+numeric_probe_sha256     string, exact reviewed V-1B 64-lowercase-hex literal
+runtime_manifest_sha256 string, exactly 64 lowercase hex
+```
+
+`dependency_versions` has no optional entries. It is the exact
+UTF-8-key-sorted object of every third-party distribution imported directly
+or transitively by the scorecard, including `psycopg`,
+`exchange-calendars`, and their imported dependencies. The reviewed V-1B
+module must contain this complete object as a literal
+`EXPECTED_DEPENDENCY_VERSIONS`; no run-time package resolution or
+operator-supplied value may define it.
+
+Before database connection, compute `numeric_probe_body` with exactly these
+operations and preserve each resulting Python value without decimal
+re-rounding: (1) `random.Random(0).choices(list(range(17)), k=64)`; (2)
+`math.log(x).hex()` for `x` in the displayed order
+`[float.fromhex("0x0.0000000000001p-1022"), 0.5, 1.0, 2.0,
+float.fromhex("0x1.fffffffffffffp+1023")]`; (3) `math.exp(x).hex()` for
+`x` in `[-700.0, -1.0, 0.0, 1.0, 700.0]`; (4)
+`math.fsum(x).hex()` for each ordered sequence
+`[[1e100, 1.0, -1e100], [0.1] * 10, [1.0, 2**-53, 2**-53]]`; and (5) the
+exact UTF-8 bytes from §13.7 canonicalization of
+`{"floats":[-0.0,0.1,1e-300,1e300]}`. The body has exactly the UTF-8-sorted
+keys `exp_hex`, `fsum_hex`, `json_utf8_hex`, `log_hex`, and
+`random_choices`. `numeric_probe_sha256` is its §13.7 canonical-JSON
+SHA-256. The reviewed V-1B module contains the recomputed literal expected
+digest; mismatch is `BLOCKED`. This probe binds the `random.choices`,
+libm, `math.fsum`, and float-JSON behavior used by this contract even if a
+native image changes without changing its coarse version labels.
+
+Every field above except `runtime_manifest_sha256`, including the exact
+`PYTHON_VERSION` source/value, reviewed `libpq_version`, and literal
+dependency object and `numeric_probe_sha256`, forms
+`runtime_manifest_body` in displayed key-set terms.
+`runtime_manifest_sha256 = sha256(canonical_json(runtime_manifest_body))`
+under §13.7. The reviewed V-1B module must contain both the complete literal
+body and its recomputed literal digest. Before any database connection or
+evidence read, construct the observed object from the Render service
+identity, Python `sys`/`platform`, `sys.float_info`, loaded distribution
+metadata, and `psycopg.pq.version()`. Exact equality to the reviewed
+manifest and digest is required; mismatch is §14.1 `BLOCKED`. The evaluated
+receipt serializes that identical observed-and-expected object. No extra
+runtime key is permitted.
+
 ### 13.3 `authority_proof` exact object
 
 Exactly these keys:
@@ -1161,6 +1280,12 @@ Exactly these keys:
 current_user                         string = "atom_e1_scorecard_reader"
 session_user                         string = "atom_e1_scorecard_reader"
 dsn_login_user                       string = "atom_e1_scorecard_reader"
+dsn_password_present                 boolean = true
+dsn_password_fallbacks_absent        boolean = true
+dsn_sslmode                          string = "verify-full"
+dsn_sslrootcert                      string = "system"
+dsn_tls_fallbacks_absent             boolean = true
+tls_active                           boolean = true
 dsn_identity_overrides_absent        boolean = true
 current_database                     string = "postgres"
 database_owner                       string != "atom_e1_scorecard_reader"
@@ -1173,6 +1298,7 @@ effective_port                       integer = 5432
 project_binding_verified             boolean = true
 schema_public_usage                  boolean = true
 schema_public_create                 boolean = false
+non_system_schema_create_privilege_count integer = 0
 schema_atom_v9_internal_usage        boolean = true
 proof_functions_execute              object[string function signature -> boolean true]
 reader_role_attributes               object exact shape below
@@ -1235,8 +1361,17 @@ value is exactly `atom_e1_scorecard_reader` on the required direct host.
 No Supavisor or other pooler form is authorized.
 
 It is derived from the credential, never from the mutable PostgreSQL
-`current_user` or `session_user`. `dsn_identity_overrides_absent` is
-`true` only when every prohibition in §15.1 has passed.
+`current_user` or `session_user`. `dsn_password_present` is only the
+boolean proof that the named URI contained exactly one nonempty password
+after one percent-decoding pass; the password itself is never serialized,
+logged, hashed, or copied outside the one connection attempt.
+`dsn_password_fallbacks_absent` and `dsn_tls_fallbacks_absent` are true
+only when every credential, file, keyword-argument, and environment
+prohibition in §15.1 has passed. `dsn_sslmode` and `dsn_sslrootcert`
+are the exact normalized URI values. `tls_active` is the single boolean
+returned for the current backend by `pg_catalog.pg_stat_ssl`.
+`dsn_identity_overrides_absent` is `true` only when every identity
+prohibition in §15.1 has passed.
 
 `database_owner` is exactly the single value returned by
 `SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_catalog.pg_database WHERE
@@ -1272,6 +1407,14 @@ in exactly `{INSERT, UPDATE, DELETE, TRUNCATE}`, `relkind` in exactly
 `information_schema`, and every name beginning `pg_toast` or `pg_temp`.
 All other schemas are production/non-system for this proof. The only passing
 count is `0`.
+
+`non_system_schema_create_privilege_count` is the count of
+`pg_namespace.oid` values for which
+`has_schema_privilege(current_user, oid, 'CREATE')` is true, excluding
+exactly `pg_catalog`, `information_schema`, and every namespace name
+beginning `pg_toast` or `pg_temp`. No other namespace is excluded,
+including `public` and `atom_v9_internal`. The only passing count is
+`0`.
 
 ### 13.4 `bootstrap` exact object
 
@@ -1495,6 +1638,7 @@ job_id            string = job ID
 v1a_merge_sha     verified 40-hex SHA
 evaluation_session YYYY-MM-DD
 evaluation_as_of_at UTC RFC3339 microseconds
+runtime_manifest_sha256 exact §13.2.1 digest
 selected_lineages array = the exact 12-object array above
 ```
 
@@ -1660,30 +1804,45 @@ The implementation must parse the supplied libpq/psycopg connection string and d
 
 Fail `BLOCKED` before evidence reading unless all conditions hold:
 
+- the environment value is one PostgreSQL URI, not keyword/value conninfo;
 - database name is exactly `postgres`;
 - direct-host form is exactly `db.afyiydxbjgzaiswnbcyj.supabase.co:5432`;
 - the credential username is exactly `atom_e1_scorecard_reader`;
-- the credential itself supplies exactly one unambiguous `user`, `host`,
-  `port`, and `dbname` value; and
-- no URI/query/conninfo, separate connect keyword argument, service file, or
-  ambient libpq setting can add, replace, or redirect the verified target,
-  login identity, or startup authorization state.
+- the URI userinfo supplies exactly one password whose value is nonempty
+  after one percent-decoding pass;
+- the URI supplies exactly one unambiguous `user`, `password`, `host`,
+  `port`, `dbname`, `sslmode`, `sslrootcert`, and `gssencmode`
+  value;
+- the normalized TLS values are exactly `sslmode=verify-full`,
+  `sslrootcert=system`, and `gssencmode=disable`; and
+- no URI query, keyword conninfo, separate connect keyword argument, service
+  or password file, or ambient libpq/OpenSSL setting can add, replace, or
+  redirect the verified target, login, password, TLS trust, or startup
+  authorization state.
 
 Inspect the original credential and every alternate parameter source for
 duplicates before libpq normalization. Percent-decode each retained value once
 under the pinned parser, then normalize it. Explicitly reject:
 
 ```text
-duplicate user, host, hostaddr, port, dbname, database, service, or options keys
+duplicate user, password, passfile, host, hostaddr, port, dbname, database,
+  service, options, sslmode, sslrootcert, or gssencmode keys
 any hostaddr
-any service or servicefile
+any service, servicefile, passfile, or keyword/value conninfo
+any password outside the URI userinfo
 any options value
+any TLS mode/root/GSS value other than the three exact required values
 any Supavisor, PgBouncer, dedicated-pooler, or other pooler target
 any multi-host or multi-port list
-any separate connect keyword argument for user, host, hostaddr, port, dbname,
-  database, service, servicefile, or options
-any nonempty PGUSER, PGHOST, PGHOSTADDR, PGPORT, PGDATABASE, PGSERVICE,
-  PGSERVICEFILE, or PGOPTIONS process environment variable
+any separate connect keyword argument, including password, passfile, target,
+  login, service, options, SSL, TLS, GSS, or certificate arguments
+any nonempty PGUSER, PGPASSWORD, PGPASSFILE, PGHOST, PGHOSTADDR, PGPORT,
+  PGDATABASE, PGSERVICE, PGSERVICEFILE, PGOPTIONS, PGSSLMODE, PGSSLROOTCERT,
+  PGGSSENCMODE, PGSSLCERT, PGSSLKEY, PGSSLCRL, PGSSLCRLDIR,
+  PGSSLNEGOTIATION, PGREQUIRESSL, PGCHANNELBINDING,
+  PGSSL_MIN_PROTOCOL_VERSION, or PGSSL_MAX_PROTOCOL_VERSION environment value
+any nonempty SSL_CERT_FILE or SSL_CERT_DIR environment value
+any readable default ~/.pgpass password file
 ```
 
 The V-1B implementation must never issue `SET ROLE`, `RESET ROLE`, `SET
@@ -1692,13 +1851,27 @@ startup `options=-c role=...`, `options=-c session_authorization=...`, and
 Supabase temporary-access `options=-c jit=true` are all forbidden, regardless
 of encoding or spelling.
 
+The explicit URI password is held only in memory for this one connection and
+must be redacted from every exception, log, receipt, and test fixture.
+Absence/emptiness stops before libpq. Because every alternate password source
+and the default password file are rejected before connect, libpq may not
+discover or retry a fallback credential.
+
+The exact `verify-full` plus `system` root configuration validates both
+the CA chain and the requested hostname
+`db.afyiydxbjgzaiswnbcyj.supabase.co`; `gssencmode=disable` prevents a
+different encrypted transport from bypassing that TLS proof. After connect,
+the row in `pg_catalog.pg_stat_ssl` for `pg_backend_pid()` must exist and
+have `ssl = true`. Any weaker, missing, ambient, or unproved setting stops
+`BLOCKED`.
+
 The direct-host-only rule inherits the controlling E-1 requirement that one
 `REPEATABLE READ` snapshot hold for the whole run; V-1A does not supersede
 that connection rule. The parsed credential login is recorded as
 `dsn_login_user`; it is not inferred from post-connect role state. If the
-implementation cannot prove the effective target, port, and login from the
-pinned parser/libpq semantics, stop `BLOCKED`; do not connect first and infer
-later.
+implementation cannot prove the effective target, port, login, explicit
+password source, and certificate-verified TLS semantics, stop `BLOCKED`; do
+not connect first and infer later.
 
 ### 15.2 Conditional migration 033
 
@@ -1768,10 +1941,14 @@ Before evidence reads, and again immediately before evaluated receipt constructi
   membership may supply it;
 - `pg_catalog.pg_my_temp_schema() = 0`, both before evidence reads and at the
   final recheck;
-- direct target, port `5432`, parsed credential login, and absence of every
-  identity override already passed §15.1;
+- direct target, port `5432`, parsed credential login, explicit URI
+  password, exact TLS settings, and absence of every identity/password/TLS
+  fallback already passed §15.1;
+- the current-backend `pg_catalog.pg_stat_ssl` row exists with `ssl = true`;
 - schema `public` USAGE true;
 - schema `public` CREATE false;
+- the exact §13.3 catalog-wide
+  `non_system_schema_create_privilege_count = 0`;
 - schema `atom_v9_internal` USAGE true;
 - EXECUTE true on exactly the two required proof-reader signatures
   `atom_v9_internal.read_forecast_commit_proof(text)` and
@@ -1838,6 +2015,21 @@ database:       postgres
 ```
 
 No new worker/service/credential/database identity or production web deploy.
+The sole V-1B Render configuration change authorized is for the Owner to set
+`PYTHON_VERSION=3.14.3` on this exact suspended benchmark worker before its
+V-1B build. No other service setting or environment variable may change under
+this authority.
+
+The service runtime must remain Render native `python` on Linux
+`x86_64`/glibc `2.36`. The process must be CPython `3.14.3` with the
+exact §13.2.1 binary64 fields. The reviewed V-1B code freezes the complete
+dependency object and manifest digest. Before any database connection it must
+prove the observed §13.2.1 object exactly equals that reviewed manifest.
+Missing `PYTHON_VERSION`, a Render default, a different patch release,
+platform/library drift, or any dependency mismatch is §14.1 `BLOCKED`; it
+may not be recorded as a valid run. Operational rollback restores the
+benchmark worker's exact prior `PYTHON_VERSION` setting along with the prior
+command/environment under §16.4.
 
 ### 16.3 Exact V-1B execution revision
 
@@ -1963,6 +2155,7 @@ A local rerun is allowed only for reproducibility and must use the same:
 - evaluation session/as-of;
 - selected lineages;
 - project/database/reader;
+- exact §13.2.1 runtime identity and manifest digest;
 - authorized V-1B main SHA;
 - frozen mathematics and implementation.
 
