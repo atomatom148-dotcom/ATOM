@@ -851,11 +851,13 @@ class SimulationEntryStoreTests(unittest.TestCase):
                         )
                         self.assertEqual(cursor.fetchone(), (False, True))
                 cursor.execute(
-                    "SELECT CASE WHEN pg_input_is_valid(%s, 'double precision') "
-                    "THEN encode(float8send(CAST(%s AS double precision)), "
-                    "'hex') = encode(float8send(%s::double precision), 'hex') "
-                    "ELSE FALSE END",
-                    ("not-a-float", "not-a-float", 177.06),
+                    "SELECT CASE WHEN pg_input_is_valid(e.token, 'double precision') "
+                    "THEN encode(float8send(CAST(e.token AS double precision)), "
+                    "'hex') = encode(float8send(e.entry_price), 'hex') "
+                    "ELSE FALSE END "
+                    "FROM (VALUES (%s::text, %s::double precision)) "
+                    "AS e(token, entry_price)",
+                    ("not-a-float", 177.06),
                 )
                 self.assertEqual(cursor.fetchone(), (False,))
 
