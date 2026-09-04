@@ -57,6 +57,15 @@ The inferential budget is exactly **12 cells = 2 forecasters × 6 horizons**.
 
 No third forecaster, IV benchmark, HAR model, BTC model, Level-II model, event model, market-data source, or production family is silently added to V-1. Such ideas require a separate documentation-first research freeze.
 
+Benchmark strengthening is not the addition of a forecaster. Exactly two additional
+comparison benchmarks are authorized, and only these two: `unconditional` (§8.2) and
+`seasonal` (§8.3). Both are computed solely from the already-authorized
+realized-volatility series of the same cell. Neither is a forecaster, may be
+classified, may earn `INFORMATIVE`, may appear on any dashboard, nor introduces a new
+data source, instrument, table, credential, or model family. Every other prohibition
+in this section is unchanged; in particular no IV, HAR, BTC, Level-II, or event model
+enters V-1.
+
 ---
 
 ## 3. Exact lineage identities and deterministic cell selection
@@ -323,7 +332,9 @@ No fallback kappa, current state, cross-cohort state, neighboring horizon, inter
 
 ---
 
-## 8. Persistence benchmark and regression population
+## 8. Benchmarks and regression population
+
+### 8.1 Persistence
 
 For each cell, `n_windows` selected valid windows are ordered by `(session_date, cutoff_at, immutable_record_identity)` across the official session population.
 
@@ -360,6 +371,54 @@ n_regression_sessions >= 10
 
 Pre-persistence `n_windows` and `n_sessions` are descriptive and cannot satisfy the inferential minimum.
 
+### 8.2 Unconditional benchmark — the floor
+
+Over the regression population in the frozen order of §8.1, for window `w`:
+
+```text
+unconditional(w) = arithmetic mean realized_volatility_bps of ALL prior
+                   regression-population windows of that cell
+```
+
+Every constituent realized value must have its outcome and required proof durably
+available no later than `w.cutoff_at`.
+
+`unconditional(w)` is null for the first regression-population window of the cell.
+Such rows are excluded from unconditional-gate inference only and counted as
+`n_unconditional_unavailable`. This count is a subset of `n_regression_windows`, not a
+partition of `n_windows`, and therefore adds no reconciliation equation.
+
+This benchmark uses no conditioning information at all. It is the floor: a forecaster
+that does not beat it has demonstrated nothing about variation in volatility.
+
+### 8.3 Seasonal benchmark — the public-structure floor
+
+```text
+seasonal(w) = unconditional(w) * diurnal_factor(w)
+```
+
+`diurnal_factor(w)` is computed exactly as follows, using only strictly prior
+sessions:
+
+1. bucket every regression-population window by intraday bucket index
+   `floor(minutes since 09:30 America/New_York / 30)`, giving buckets `0..12`;
+2. for the session containing `w`, using ONLY regression-population windows from
+   strictly earlier sessions of that cell, compute
+   `mean(log(realized_volatility_bps))` per bucket and the overall mean across all
+   those windows;
+3. `diurnal_factor(w) = exp(bucket_mean(bucket(w)) - overall_mean)` when at least
+   three strictly-earlier sessions exist and `w`'s bucket has at least two
+   observations among them; otherwise `diurnal_factor(w) = 1.0`;
+4. windows whose `log(realized_volatility_bps)` is non-finite because the realized
+   magnitude is exactly zero are excluded from profile ESTIMATION only; they remain in
+   the evaluated population;
+5. no smoothing, interpolation, parametric shape, or later-session data.
+
+`seasonal(w)` is unavailable exactly when `unconditional(w)` is unavailable.
+
+This benchmark contains only the publicly known intraday volatility U-shape. Beating
+persistence but not this is not a finding.
+
 ---
 
 ## 9. Descriptive metrics
@@ -375,6 +434,8 @@ mz_a
 mz_b
 mz_r2
 persist_rank_corr
+unconditional_rank_corr
+seasonal_rank_corr
 ```
 
 Definitions over `n_windows` selected valid windows unless stated otherwise:
@@ -409,6 +470,19 @@ Spearman(persist_20, realized_volatility_bps)
 ```
 
 over **regression-population rows only**.
+
+`unconditional_rank_corr` and `seasonal_rank_corr` are exactly:
+
+```text
+Spearman(unconditional, realized_volatility_bps)
+Spearman(seasonal, realized_volatility_bps)
+```
+
+over regression-population rows where that benchmark is defined.
+
+Each benchmark's own rank correlation is reported alongside the candidate's so that a
+comparison against a benchmark carrying no information of its own is visible in the
+receipt rather than inferred.
 
 ### 9.1 Exact Spearman behavior
 
@@ -490,6 +564,42 @@ Use levels exactly `0.999` and `0.95`.
 
 The interval endpoints are direct zero-based selections of the sorted values at those integer indices. No interpolation, quantile library default, standard error, t-test, robust covariance, ridge, pseudoinverse fallback, or alternative bootstrap is permitted.
 
+### 10.3 Mandatory benchmark-loss gates
+
+For a strictly positive forecast `f` and realized magnitude `r >= 0`, the frozen loss
+is exactly:
+
+```text
+QLIKE(r, f) = log(f^2) + (r^2 / f^2)
+```
+
+evaluated with `f = predicted_volatility_bps` or the benchmark value, and
+`r = realized_volatility_bps`. This form is finite at `r = 0`, which §4 declares valid
+evidence, and ranks forecasts identically to the standard QLIKE, from which it differs
+only by a term independent of `f`. Lower is better. No alternative loss may be
+substituted.
+
+For each benchmark `b` in exactly `{unconditional, seasonal}`, compute per
+regression-population row where both `b(w)` and the prediction are defined:
+
+```text
+d_b(w) = QLIKE(realized, b(w)) - QLIKE(realized, predicted(w))
+```
+
+`d_b > 0` means the candidate loses less than the benchmark.
+
+Bootstrap `mean(d_b)` using EXACTLY the §10.1 session-resampling operation and the
+§10.2 order statistics: one `random.Random(0)` instantiated once per
+`(cell, benchmark)`, canonical ascending session order, per attempt exactly
+`rng.choices(sessions, k=len(sessions))`, 200,000 valid draws required, 1,000,000
+attempt cap. A draw is valid when the resampled `mean(d_b)` is finite; invalid attempts
+consume RNG state and are not rewound. Exhausting the cap without 200,000 valid draws
+makes the cell `INVALID`.
+
+Gate `b` is `PASS` only when the lower endpoint of the 0.999 interval of `mean(d_b)` is
+strictly greater than zero. Gate `b` is `UNAVAILABLE` when no regression-population row
+has `b(w)` defined; an `UNAVAILABLE` gate is not a `PASS`.
+
 ---
 
 ## 11. Cell eligibility, classification, and precedence
@@ -499,14 +609,21 @@ Classification precedence is exactly:
 1. protocol, identity, causality, proof, accounting-reconciliation, or frozen-contract defect => `INVALID` regardless of sample size;
 2. otherwise if `n_regression_windows < 100` or `n_regression_sessions < 10` => `INSUFFICIENT`, no bootstrap;
 3. otherwise if full-sample OLS is rank-deficient/non-finite or the valid-bootstrap requirement fails => `INVALID`;
-4. otherwise if lower endpoint of `enc_b_ci_0999` is strictly greater than zero => `INFORMATIVE`;
-5. otherwise => `NOISE`.
+4. otherwise if ALL THREE of the following hold => `INFORMATIVE`:
+   a. lower endpoint of `enc_b_ci_0999` is strictly greater than zero;
+   b. the unconditional gate is `PASS` under §10.3;
+   c. the seasonal gate is `PASS` under §10.3;
+5. otherwise => `NOISE`, with reason codes distinguishing `ENC_B_NOT_POSITIVE`,
+   `FAILED_UNCONDITIONAL_GATE`, and `FAILED_SEASONAL_GATE`.
 
 There are exactly 12 inferential cells. Report-only null expectation under the one-sided screen induced by a two-sided 0.999 interval is:
 
 ```text
 12 * 0.0005 = 0.006 expected false INFORMATIVE cells
 ```
+
+Adding conjunctive gates can only reduce the false-`INFORMATIVE` rate below this
+bound, never raise it, so the bound stands unchanged.
 
 No alternate multiplicity correction may be substituted after results are seen.
 
@@ -582,6 +699,21 @@ At minimum tests must prove:
 - exact six-table read/RLS/no-write authority proof including restrictive policies;
 - execution revision and V-1A merge revision binding;
 - no writes, SIM, broker, order, production-math, V-1C, or V-2 behavior;
+- unconditional benchmark uses only causally prior regression-population realized
+  values and is null for the first such window;
+- diurnal factor uses only strictly-earlier sessions, returns exactly `1.0` below the
+  three-session / two-observation minimum, and excludes zero-magnitude windows from
+  estimation only;
+- `QLIKE` is finite when the realized magnitude is exactly zero;
+- a constant forecast fitted on i.i.d. constant-volatility evidence beats `persist_1`
+  and `persist_20` but FAILS the unconditional gate, so the cell is `NOISE`, never
+  `INFORMATIVE`;
+- constructed heteroskedastic evidence carrying genuine incremental information
+  satisfies all three §11 conditions;
+- gate bootstraps use the exact §10.1 operation and §10.2 indices with one RNG per
+  `(cell, benchmark)`;
+- an `UNAVAILABLE` gate is not treated as `PASS`;
+- reason codes distinguish the three distinct `NOISE` causes;
 - if migration is present, migration self-refusal and exact privilege proof.
 
 ---
@@ -702,6 +834,8 @@ seed               integer = 0
 interval_levels    array[number] = [0.999, 0.95]
 cluster            string = "XNYS_SESSION_DATE"
 sampling_operation string = "random.Random(0).choices(sessions,k=len(sessions))"
+loss_function      string = "QLIKE(r,f)=log(f^2)+r^2/f^2"
+gates              array[string] = ["unconditional", "seasonal"]
 ```
 
 ### 13.5 `cells` exact array/object schema
@@ -743,6 +877,20 @@ enc_b_ci_095                       array[finite number, finite number] | null
 bootstrap_attempted_draws          integer >= 0
 bootstrap_valid_draws              integer >= 0
 bootstrap_invalid_draws            integer >= 0
+n_unconditional_unavailable        integer >= 0
+unconditional_rank_corr            finite number | null
+seasonal_rank_corr                 finite number | null
+qlike_candidate                    finite number | null
+qlike_unconditional                finite number | null
+qlike_seasonal                     finite number | null
+d_unconditional                    finite number | null
+d_unconditional_ci_0999            array[finite number, finite number] | null
+d_unconditional_ci_095             array[finite number, finite number] | null
+d_seasonal                         finite number | null
+d_seasonal_ci_0999                 array[finite number, finite number] | null
+d_seasonal_ci_095                  array[finite number, finite number] | null
+gate_unconditional                 string PASS | FAIL | UNAVAILABLE
+gate_seasonal                      string PASS | FAIL | UNAVAILABLE
 classification                     string INFORMATIVE | NOISE | INSUFFICIENT | INVALID
 reason_codes                       array[string], sorted unique UTF-8 ascending
 ```
@@ -1071,7 +1219,11 @@ Evaluated receipt `overall_status`:
 
 A BLOCKED run uses the separate BLOCKED schema and has no evaluated overall status.
 
-PASS means only that at least one frozen existing ATOM volatility forecaster contains incremental realized-volatility information versus `persist_20`. It does **not** establish an options edge or economic profitability.
+PASS means only that at least one frozen existing ATOM volatility forecaster carries
+incremental realized-volatility information beyond `persist_20`, beyond an
+unconditional level, and beyond the public intraday seasonal shape, on the frozen
+population. It does **not** establish an options edge, an advantage over implied
+volatility, or economic profitability.
 
 ---
 
