@@ -291,7 +291,7 @@ SELECT f.forecast_record_id, f.forecast_record_hash, f.record_json,
        o.outcome_record_hash, o.record_json
 FROM public.atom_v9_v4_forecasts AS f
 LEFT JOIN LATERAL (
- SELECT x.record_json FROM public.atom_v9_v4_outcomes AS x
+ SELECT x.outcome_record_hash, x.record_json FROM public.atom_v9_v4_outcomes AS x
  WHERE x.forecast_record_id = f.forecast_record_id
    AND x.record_json->>'target_timing_status' = 'VERIFIED'
  ORDER BY x.created_at, x.outcome_record_id LIMIT 1
