@@ -1059,15 +1059,19 @@ At minimum tests must prove:
 - exact evaluated, BLOCKED, pre-cell-INVALID, and
   post-evaluation-authority-INVALID schemas and canonical hashes;
 - direct-host-only effective DSN target/login verification, including
-  certificate-verified TLS, an explicit nonempty URI password, and rejection
-  of every pooler, duplicate, ambient or file-based target/login/password/TLS
-  source and every startup `options` value;
+  certificate-verified TLS, required SCRAM password authentication, an
+  explicit nonempty URI password, raw encoded/noncanonical query-name
+  rejection, independent libpq conninfo parity, and rejection of every
+  pooler, duplicate, ambient, default-file or argument-based
+  target/login/password/TLS/client-certificate source and every startup
+  `options` value;
 - exact six-table read/RLS/no-write authority proof including restrictive policies;
 - catalog-wide rejection of effective `CREATE` on any non-system schema,
   including a synthetic seventh schema;
-- exact runtime-identity equality before database connection, exact
-  runtime-manifest/run-identity/receipt binding, and rejection of each changed
-  runtime field;
+- exact runtime-identity equality before database connection, content hashes
+  for the CPython executable, stdlib, full dependency tree, and every loaded
+  native executable/library, exact manifest/run-identity/receipt binding, and
+  rejection after any covered artifact byte changes;
 - execution revision and V-1A merge revision binding;
 - rollback deployment target derivation from the V-1B merge's exact first
   parent, with intervening main commits preserved;
@@ -1125,6 +1129,8 @@ At minimum tests must prove:
   including a synthetic seventh production table;
 - catalog-wide pre-read and pre-receipt rejection of effective `CREATE` on
   any non-system schema, including a synthetic seventh schema;
+- pre-read and pre-receipt rejection of direct, inherited, or `PUBLIC`
+  EXECUTE on a synthetic additional non-system `SECURITY DEFINER` routine;
 - pre-read and pre-receipt verification of `atom_v9_internal` USAGE and
   EXECUTE on exactly both proof-reader functions;
 - deterministic routing of a failed final authority recheck to the exact
@@ -1228,7 +1234,8 @@ float_max_exp           integer = 1024
 float_rounds            integer = 1
 libpq_version           integer, exact reviewed V-1B literal
 dependency_versions     object[string normalized distribution name -> exact version]
-numeric_probe_sha256     string, exact reviewed V-1B 64-lowercase-hex literal
+runtime_artifact_components object, exact four-key shape below
+runtime_artifact_sha256 string, exact reviewed V-1B 64-lowercase-hex literal
 runtime_manifest_sha256 string, exactly 64 lowercase hex
 ```
 
@@ -1240,27 +1247,52 @@ module must contain this complete object as a literal
 `EXPECTED_DEPENDENCY_VERSIONS`; no run-time package resolution or
 operator-supplied value may define it.
 
-Before database connection, compute `numeric_probe_body` with exactly these
-operations and preserve each resulting Python value without decimal
-re-rounding: (1) `random.Random(0).choices(list(range(17)), k=64)`; (2)
-`math.log(x).hex()` for `x` in the displayed order
-`[float.fromhex("0x0.0000000000001p-1022"), 0.5, 1.0, 2.0,
-float.fromhex("0x1.fffffffffffffp+1023")]`; (3) `math.exp(x).hex()` for
-`x` in `[-700.0, -1.0, 0.0, 1.0, 700.0]`; (4)
-`math.fsum(x).hex()` for each ordered sequence
-`[[1e100, 1.0, -1e100], [0.1] * 10, [1.0, 2**-53, 2**-53]]`; and (5) the
-exact UTF-8 bytes from §13.7 canonicalization of
-`{"floats":[-0.0,0.1,1e-300,1e300]}`. The body has exactly the UTF-8-sorted
-keys `exp_hex`, `fsum_hex`, `json_utf8_hex`, `log_hex`, and
-`random_choices`. `numeric_probe_sha256` is its §13.7 canonical-JSON
-SHA-256. The reviewed V-1B module contains the recomputed literal expected
-digest; mismatch is `BLOCKED`. This probe binds the `random.choices`,
-libm, `math.fsum`, and float-JSON behavior used by this contract even if a
-native image changes without changing its coarse version labels.
+The exact `runtime_artifact_components` object is:
+
+```text
+python_executable_sha256     string, 64 lowercase hex
+stdlib_tree_sha256           string, 64 lowercase hex
+dependency_tree_sha256       string, 64 lowercase hex
+loaded_native_tree_sha256    string, 64 lowercase hex
+```
+
+Before database connection, import the complete module closure used anywhere
+in the scorecard; no later import or dynamic module load is permitted. Hash
+actual artifact bytes, never version labels or sampled numerical outputs.
+For each tree, construct an array of objects with exactly `path`, `size`,
+and `sha256`; use normalized UTF-8 POSIX logical paths, sort by `path`,
+reject duplicate logical paths, and hash its §13.7 canonical JSON.
+
+- `python_executable_sha256` is SHA-256 of the regular file reached by fully
+  resolving `/proc/self/exe`.
+- `stdlib_tree_sha256` covers the union of every non-cache regular source,
+  extension, and data file beneath the CPython `stdlib` and `platstdlib`
+  roots returned by `sysconfig`, excluding only directories that are the
+  separately covered `purelib`/`platlib` roots. `__pycache__`, `.pyc`, and `.pyo`
+  artifacts are excluded; the run must execute their corresponding covered
+  source under the exact CPython executable, never sourceless bytecode.
+- `dependency_tree_sha256` covers every non-cache installed regular file
+  listed by `importlib.metadata.files()` for every distribution in
+  `EXPECTED_DEPENDENCY_VERSIONS`, keyed by normalized distribution name
+  plus distribution-relative path. Missing, unlisted, duplicate, or
+  sourceless-bytecode files are `BLOCKED`.
+- `loaded_native_tree_sha256` covers every distinct existing regular file
+  with an executable mapping in `/proc/self/maps` after the complete import
+  closure is loaded, keyed by resolved absolute path. It must include the
+  dynamic loader, CPython/libpython, libc, libm, `math`, `_random`,
+  `_json`, libpq, libssl, and libcrypto artifacts; absence is `BLOCKED`.
+
+`runtime_artifact_sha256 =
+sha256(canonical_json(runtime_artifact_components))`. The reviewed V-1B
+module contains the exact four component digests and combined digest as
+literals. Before any connection, recompute all five from the actual files and
+require exact equality. A changed libm or other relevant executable/library
+therefore fails even when Python, glibc, and package version strings remain
+unchanged.
 
 Every field above except `runtime_manifest_sha256`, including the exact
-`PYTHON_VERSION` source/value, reviewed `libpq_version`, and literal
-dependency object and `numeric_probe_sha256`, forms
+`PYTHON_VERSION` source/value, reviewed `libpq_version`, literal
+dependency object, artifact components, and `runtime_artifact_sha256`, forms
 `runtime_manifest_body` in displayed key-set terms.
 `runtime_manifest_sha256 = sha256(canonical_json(runtime_manifest_body))`
 under §13.7. The reviewed V-1B module must contain both the complete literal
@@ -1284,6 +1316,8 @@ dsn_password_present                 boolean = true
 dsn_password_fallbacks_absent        boolean = true
 dsn_sslmode                          string = "verify-full"
 dsn_sslrootcert                      string = "system"
+dsn_sslcertmode                      string = "disable"
+dsn_require_auth                     string = "scram-sha-256"
 dsn_tls_fallbacks_absent             boolean = true
 tls_active                           boolean = true
 dsn_identity_overrides_absent        boolean = true
@@ -1301,6 +1335,7 @@ schema_public_create                 boolean = false
 non_system_schema_create_privilege_count integer = 0
 schema_atom_v9_internal_usage        boolean = true
 proof_functions_execute              object[string function signature -> boolean true]
+non_system_security_definer_execute_privilege_count integer = 0
 reader_role_attributes               object exact shape below
 reader_role_memberships               array[string] = []
 six_tables_select                    object[string table -> boolean true]
@@ -1367,9 +1402,10 @@ after one percent-decoding pass; the password itself is never serialized,
 logged, hashed, or copied outside the one connection attempt.
 `dsn_password_fallbacks_absent` and `dsn_tls_fallbacks_absent` are true
 only when every credential, file, keyword-argument, and environment
-prohibition in §15.1 has passed. `dsn_sslmode` and `dsn_sslrootcert`
-are the exact normalized URI values. `tls_active` is the single boolean
-returned for the current backend by `pg_catalog.pg_stat_ssl`.
+prohibition in §15.1 has passed. `dsn_sslmode`, `dsn_sslrootcert`,
+`dsn_sslcertmode`, and `dsn_require_auth` are the exact normalized URI
+values. `tls_active` is the single boolean returned for the current backend
+by `pg_catalog.pg_stat_ssl`.
 `dsn_identity_overrides_absent` is `true` only when every identity
 prohibition in §15.1 has passed.
 
@@ -1415,6 +1451,16 @@ exactly `pg_catalog`, `information_schema`, and every namespace name
 beginning `pg_toast` or `pg_temp`. No other namespace is excluded,
 including `public` and `atom_v9_internal`. The only passing count is
 `0`.
+
+Resolve the two §13.3 `proof_functions_execute` signatures to two distinct
+non-null `pg_proc.oid` values. Then
+`non_system_security_definer_execute_privilege_count` is the count of every
+other `pg_proc.oid` for which `prosecdef = true` and
+`has_function_privilege(current_user, oid, 'EXECUTE')` is true, with the
+same exact non-system namespace exclusions as the schema count. The two
+resolved proof-reader OIDs are the only exclusions; direct, inherited, or
+`PUBLIC` EXECUTE on any additional non-system `SECURITY DEFINER`
+function/procedure is counted. The only passing value is `0`.
 
 ### 13.4 `bootstrap` exact object
 
@@ -1811,38 +1857,61 @@ Fail `BLOCKED` before evidence reading unless all conditions hold:
 - the URI userinfo supplies exactly one password whose value is nonempty
   after one percent-decoding pass;
 - the URI supplies exactly one unambiguous `user`, `password`, `host`,
-  `port`, `dbname`, `sslmode`, `sslrootcert`, and `gssencmode`
-  value;
-- the normalized TLS values are exactly `sslmode=verify-full`,
-  `sslrootcert=system`, and `gssencmode=disable`; and
+  `port`, `dbname`, `sslmode`, `sslrootcert`, `sslcertmode`,
+  `require_auth`, and `gssencmode` value;
+- the normalized security values are exactly `sslmode=verify-full`,
+  `sslrootcert=system`, `sslcertmode=disable`,
+  `require_auth=scram-sha-256`, and `gssencmode=disable`; and
 - no URI query, keyword conninfo, separate connect keyword argument, service
   or password file, or ambient libpq/OpenSSL setting can add, replace, or
   redirect the verified target, login, password, TLS trust, or startup
   authorization state.
 
+Before decoding any value, scan the raw URI query pairs. Their key set must be
+exactly `{gssencmode, require_auth, sslcertmode, sslmode, sslrootcert}`,
+each once. Every raw key must already be its lowercase ASCII canonical spelling:
+a percent escape, plus sign, non-ASCII byte, case variant, empty key, or any
+other key is `BLOCKED`. Percent-decode every key exactly once anyway, require
+byte-for-byte equality with its raw spelling, then perform allowlist and
+duplicate validation on the decoded names. Only after that, percent-decode
+each retained value exactly once and normalize it.
+
+Independently parse the untouched original URI in memory with the pinned
+`psycopg.conninfo.conninfo_to_dict`/libpq parser. Redact the password before
+any error rendering. Its non-secret key set and every effective target, login,
+TLS, GSS, and authentication value must equal the raw-parser result and this
+section's exact required values; any extra key or mismatch is `BLOCKED`.
+After connection, the corresponding non-secret
+`Connection.info.get_parameters()` values must agree again.
+
 Inspect the original credential and every alternate parameter source for
-duplicates before libpq normalization. Percent-decode each retained value once
-under the pinned parser, then normalize it. Explicitly reject:
+duplicates before libpq normalization. Explicitly reject:
 
 ```text
 duplicate user, password, passfile, host, hostaddr, port, dbname, database,
-  service, options, sslmode, sslrootcert, or gssencmode keys
+  service, options, sslmode, sslrootcert, sslcertmode, require_auth, or
+  gssencmode keys, including duplicates created by name decoding
+any encoded, noncanonical, or non-allowlisted URI query parameter name
 any hostaddr
 any service, servicefile, passfile, or keyword/value conninfo
 any password outside the URI userinfo
-any options value
-any TLS mode/root/GSS value other than the three exact required values
+any options, sslcert, sslkey, sslpassword, or sslkeylogfile value
+any TLS/root/client-certificate/authentication/GSS value other than the five
+  exact required values
 any Supavisor, PgBouncer, dedicated-pooler, or other pooler target
 any multi-host or multi-port list
 any separate connect keyword argument, including password, passfile, target,
   login, service, options, SSL, TLS, GSS, or certificate arguments
 any nonempty PGUSER, PGPASSWORD, PGPASSFILE, PGHOST, PGHOSTADDR, PGPORT,
   PGDATABASE, PGSERVICE, PGSERVICEFILE, PGOPTIONS, PGSSLMODE, PGSSLROOTCERT,
-  PGGSSENCMODE, PGSSLCERT, PGSSLKEY, PGSSLCRL, PGSSLCRLDIR,
-  PGSSLNEGOTIATION, PGREQUIRESSL, PGCHANNELBINDING,
-  PGSSL_MIN_PROTOCOL_VERSION, or PGSSL_MAX_PROTOCOL_VERSION environment value
+  PGSSLCERTMODE, PGREQUIREAUTH, PGGSSENCMODE, PGSSLCERT, PGSSLKEY,
+  PGSSLKEYLOGFILE, PGSSLCRL, PGSSLCRLDIR, PGSSLNEGOTIATION, PGREQUIRESSL,
+  PGCHANNELBINDING, PGSSL_MIN_PROTOCOL_VERSION, or
+  PGSSL_MAX_PROTOCOL_VERSION environment value
 any nonempty SSL_CERT_FILE or SSL_CERT_DIR environment value
 any readable default ~/.pgpass password file
+any existing default ~/.postgresql/postgresql.crt or
+  ~/.postgresql/postgresql.key client-certificate file
 ```
 
 The V-1B implementation must never issue `SET ROLE`, `RESET ROLE`, `SET
@@ -1854,13 +1923,17 @@ of encoding or spelling.
 The explicit URI password is held only in memory for this one connection and
 must be redacted from every exception, log, receipt, and test fixture.
 Absence/emptiness stops before libpq. Because every alternate password source
-and the default password file are rejected before connect, libpq may not
-discover or retry a fallback credential.
+and the default password file are rejected before connect, and
+`require_auth=scram-sha-256` requires the server's SCRAM password challenge,
+libpq may not authenticate through a fallback credential or a no-password
+method.
 
 The exact `verify-full` plus `system` root configuration validates both
 the CA chain and the requested hostname
-`db.afyiydxbjgzaiswnbcyj.supabase.co`; `gssencmode=disable` prevents a
-different encrypted transport from bypassing that TLS proof. After connect,
+`db.afyiydxbjgzaiswnbcyj.supabase.co`; `sslcertmode=disable` forbids
+sending any client certificate even if a default file exists, and the default
+certificate/key files are independently forbidden. `gssencmode=disable`
+prevents a different encrypted transport from bypassing that TLS proof. After connect,
 the row in `pg_catalog.pg_stat_ssl` for `pg_backend_pid()` must exist and
 have `ssl = true`. Any weaker, missing, ambient, or unproved setting stops
 `BLOCKED`.
@@ -1953,6 +2026,8 @@ Before evidence reads, and again immediately before evaluated receipt constructi
 - EXECUTE true on exactly the two required proof-reader signatures
   `atom_v9_internal.read_forecast_commit_proof(text)` and
   `atom_v9_internal.read_legacy_evidence_publications_for_records(text,timestamptz,bigint[])`;
+- the exact §13.3 catalog-wide
+  `non_system_security_definer_execute_privilege_count = 0`;
 - SELECT true on all six tables;
 - INSERT/UPDATE/DELETE/TRUNCATE false on all six;
 - the exact §13.3 catalog-wide
@@ -2023,10 +2098,12 @@ this authority.
 The service runtime must remain Render native `python` on Linux
 `x86_64`/glibc `2.36`. The process must be CPython `3.14.3` with the
 exact §13.2.1 binary64 fields. The reviewed V-1B code freezes the complete
-dependency object and manifest digest. Before any database connection it must
+dependency object, byte-level runtime-artifact component digests, combined
+artifact digest, and manifest digest. Before any database connection it must
 prove the observed §13.2.1 object exactly equals that reviewed manifest.
 Missing `PYTHON_VERSION`, a Render default, a different patch release,
-platform/library drift, or any dependency mismatch is §14.1 `BLOCKED`; it
+platform/library or artifact drift, or any dependency mismatch is §14.1
+`BLOCKED`; it
 may not be recorded as a valid run. Operational rollback restores the
 benchmark worker's exact prior `PYTHON_VERSION` setting along with the prior
 command/environment under §16.4.
