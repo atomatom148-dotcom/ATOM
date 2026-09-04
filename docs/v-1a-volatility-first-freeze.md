@@ -1061,17 +1061,19 @@ At minimum tests must prove:
 - direct-host-only effective DSN target/login verification, including
   certificate-verified TLS, required SCRAM password authentication, an
   explicit nonempty URI password, raw encoded/noncanonical query-name
-  rejection, independent libpq conninfo parity, and rejection of every
-  pooler, duplicate, ambient, default-file or argument-based
-  target/login/password/TLS/client-certificate source and every startup
-  `options` value;
+  rejection, independent pre-connect libpq parsing, post-connect
+  `PQconninfo` verification including values equal to compiled defaults,
+  and rejection of every pooler, duplicate, ambient, default-file or
+  argument-based target/login/password/TLS/client-certificate source and
+  every startup `options` value;
 - exact six-table read/RLS/no-write authority proof including restrictive policies;
 - catalog-wide rejection of effective `CREATE` on any non-system schema,
   including a synthetic seventh schema;
 - exact runtime-identity equality before database connection, content hashes
   for the CPython executable, stdlib, full dependency tree, and every loaded
-  native executable/library, exact manifest/run-identity/receipt binding, and
-  rejection after any covered artifact byte changes;
+  native executable/library, exact non-ASLR `log`/`exp` libm dispatch
+  binding, exact manifest/run-identity/receipt binding, and rejection after
+  any covered artifact byte or selected implementation changes;
 - execution revision and V-1A merge revision binding;
 - rollback deployment target derivation from the V-1B merge's exact first
   parent, with intervening main commits preserved;
@@ -1131,6 +1133,10 @@ At minimum tests must prove:
   any non-system schema, including a synthetic seventh schema;
 - pre-read and pre-receipt rejection of direct, inherited, or `PUBLIC`
   EXECUTE on a synthetic additional non-system `SECURITY DEFINER` routine;
+- pre-read and pre-receipt exact OID, owner, language, security, volatility,
+  parallelism, configuration, row-estimate, and definition-hash binding for
+  both permitted proof-reader functions, with one-at-a-time negative fixtures
+  for every bound field and each function body;
 - pre-read and pre-receipt verification of `atom_v9_internal` USAGE and
   EXECUTE on exactly both proof-reader functions;
 - deterministic routing of a failed final authority recheck to the exact
@@ -1236,6 +1242,8 @@ libpq_version           integer, exact reviewed V-1B literal
 dependency_versions     object[string normalized distribution name -> exact version]
 runtime_artifact_components object, exact four-key shape below
 runtime_artifact_sha256 string, exact reviewed V-1B 64-lowercase-hex literal
+libm_dispatch          object, exact two-key shape below
+libm_dispatch_sha256   string, exact reviewed V-1B 64-lowercase-hex literal
 runtime_manifest_sha256 string, exactly 64 lowercase hex
 ```
 
@@ -1290,17 +1298,46 @@ require exact equality. A changed libm or other relevant executable/library
 therefore fails even when Python, glibc, and package version strings remain
 unchanged.
 
+`libm_dispatch` contains exactly the object keys `exp` and `log`. Each
+value contains exactly:
+
+```text
+loaded_native_path string, normalized resolved absolute path
+file_offset        integer >= 0
+```
+
+After the complete import closure is loaded and before database connection,
+resolve each symbol with the process's `dlsym(RTLD_DEFAULT,...)`. For its
+returned address, find the unique executable `/proc/self/maps` mapping that
+contains it and set:
+
+```text
+file_offset = resolved_address - mapping_start + mapping_file_offset
+```
+
+ASLR addresses are never serialized. `loaded_native_path` must equal the
+resolved path of the exact libm entry already covered by
+`loaded_native_tree_sha256`; resolution outside that artifact, no mapping,
+or multiple mappings is `BLOCKED`. The reviewed V-1B module contains the
+exact expected two-key object and
+`libm_dispatch_sha256 = sha256(canonical_json(libm_dispatch))` as literals.
+Recompute both before connection and require exact equality. This binds the
+actual glibc IFUNC-selected `log` and `exp` implementations, so a different
+CPU feature dispatch fails even when the libm bytes are identical.
+
 Every field above except `runtime_manifest_sha256`, including the exact
 `PYTHON_VERSION` source/value, reviewed `libpq_version`, literal
-dependency object, artifact components, and `runtime_artifact_sha256`, forms
+dependency object, artifact components, `runtime_artifact_sha256`,
+`libm_dispatch`, and `libm_dispatch_sha256`, forms
 `runtime_manifest_body` in displayed key-set terms.
 `runtime_manifest_sha256 = sha256(canonical_json(runtime_manifest_body))`
 under §13.7. The reviewed V-1B module must contain both the complete literal
 body and its recomputed literal digest. Before any database connection or
 evidence read, construct the observed object from the Render service
 identity, Python `sys`/`platform`, `sys.float_info`, loaded distribution
-metadata, and `psycopg.pq.version()`. Exact equality to the reviewed
-manifest and digest is required; mismatch is §14.1 `BLOCKED`. The evaluated
+metadata, `psycopg.pq.version()`, and the exact dispatch-resolution
+procedure above. Exact equality to the reviewed manifest and digest is
+required; mismatch is §14.1 `BLOCKED`. The evaluated
 receipt serializes that identical observed-and-expected object. No extra
 runtime key is permitted.
 
@@ -1335,6 +1372,7 @@ schema_public_create                 boolean = false
 non_system_schema_create_privilege_count integer = 0
 schema_atom_v9_internal_usage        boolean = true
 proof_functions_execute              object[string function signature -> boolean true]
+proof_function_definitions            object, exact two-key shape below
 non_system_security_definer_execute_privilege_count integer = 0
 reader_role_attributes               object exact shape below
 reader_role_memberships               array[string] = []
@@ -1375,6 +1413,62 @@ atom_v9_internal.read_legacy_evidence_publications_for_records(text,timestamptz,
 No extra function keys. These two object keys are the frozen literal strings
 above; the implementation must not derive their receipt spelling from
 `regprocedure::text` or any catalog-rendered alias.
+
+`proof_function_definitions` contains those same two frozen literal keys.
+Each value has exactly these keys, populated directly from the resolved
+`pg_proc`/`pg_language` row and the unmodified function-definition text:
+
+```text
+oid                 integer
+owner               string
+language            string
+prokind             string
+prosecdef           boolean
+proleakproof        boolean
+proisstrict         boolean
+provolatile         string
+proparallel         string
+prorows             integer
+proconfig           array[string]
+definition_sha256   string, 64 lowercase hex
+```
+
+The only passing values are:
+
+```text
+atom_v9_internal.read_forecast_commit_proof(text)
+  oid               = 42475
+  owner             = "atom_v9_proof_owner"
+  language          = "sql"
+  prokind           = "f"
+  prosecdef         = true
+  proleakproof      = false
+  proisstrict       = false
+  provolatile       = "s"
+  proparallel       = "u"
+  prorows           = 1000
+  proconfig         = ["search_path=pg_catalog"]
+  definition_sha256 = "dd5c1d60982ab8c943482c807e1f9f9782986564fdc7430d43eef13d0e0ed877"
+
+atom_v9_internal.read_legacy_evidence_publications_for_records(text,timestamptz,bigint[])
+  oid               = 49997
+  owner             = "atom_v9_proof_owner"
+  language          = "sql"
+  prokind           = "f"
+  prosecdef         = true
+  proleakproof      = false
+  proisstrict       = false
+  provolatile       = "s"
+  proparallel       = "u"
+  prorows           = 65536
+  proconfig         = ["search_path=pg_catalog"]
+  definition_sha256 = "076891760da2d132feccff61a2557175eff6926d7f2ecf54a5ba15f7298a7bfb"
+```
+
+`definition_sha256` is SHA-256 of the exact UTF-8 bytes returned by
+`pg_catalog.pg_get_functiondef(oid)`, including its final newline, with no
+normalization. A read-only production catalog query on 2026-09-04 verified
+these exact values. No database state changed.
 
 `reader_role_attributes` contains exactly:
 
@@ -1453,13 +1547,19 @@ including `public` and `atom_v9_internal`. The only passing count is
 `0`.
 
 Resolve the two §13.3 `proof_functions_execute` signatures to two distinct
-non-null `pg_proc.oid` values. Then
+non-null `pg_proc.oid` values and construct
+`proof_function_definitions`. Exact equality to every frozen value above is
+required before either OID may be treated as permitted. A same-signature or
+same-OID routine with a changed owner, attribute, configuration, or definition
+is a failed authority proof.
+
+Only after that equality passes,
 `non_system_security_definer_execute_privilege_count` is the count of every
 other `pg_proc.oid` for which `prosecdef = true` and
 `has_function_privilege(current_user, oid, 'EXECUTE')` is true, with the
 same exact non-system namespace exclusions as the schema count. The two
-resolved proof-reader OIDs are the only exclusions; direct, inherited, or
-`PUBLIC` EXECUTE on any additional non-system `SECURITY DEFINER`
+fully verified proof-reader OIDs are the only exclusions; direct, inherited,
+or `PUBLIC` EXECUTE on any additional non-system `SECURITY DEFINER`
 function/procedure is counted. The only passing value is `0`.
 
 ### 13.4 `bootstrap` exact object
@@ -1881,8 +1981,26 @@ Independently parse the untouched original URI in memory with the pinned
 any error rendering. Its non-secret key set and every effective target, login,
 TLS, GSS, and authentication value must equal the raw-parser result and this
 section's exact required values; any extra key or mismatch is `BLOCKED`.
-After connection, the corresponding non-secret
-`Connection.info.get_parameters()` values must agree again.
+
+After connection, inspect `Connection.pgconn.info`, psycopg's direct wrapper
+of `PQconninfo(PGconn *)`. Index its `ConninfoOption` entries by decoded
+ASCII `keyword`; a duplicate keyword, missing required entry, null required
+`val`, or undecodable required value is `BLOCKED`. The `val` for each of
+`host`, `port`, `dbname`, `user`, `sslmode`, `sslrootcert`,
+`sslcertmode`, `require_auth`, and `gssencmode` must equal the
+corresponding pre-connect value and this section's exact required value.
+`Connection.info.host`, `port`, `dbname`, and `user` must agree too.
+The password entry is neither compared as text nor rendered; its source and
+nonemptiness were already proved before connect.
+
+Do not use `Connection.info.get_parameters()` or
+`Connection.info.dsn` for this gate: psycopg intentionally omits parameters
+whose values equal libpq's compiled defaults. In particular, explicit
+`port=5432` and `gssencmode=disable` must still be present and verified
+through `PQconninfo`. Other `PQconninfo` entries that merely expose
+artifact-bound libpq defaults are not caller-supplied extra keys; the raw URI,
+environment, file, and argument checks above remain the authority for input
+source rejection.
 
 Inspect the original credential and every alternate parameter source for
 duplicates before libpq normalization. Explicitly reject:
@@ -2026,6 +2144,8 @@ Before evidence reads, and again immediately before evaluated receipt constructi
 - EXECUTE true on exactly the two required proof-reader signatures
   `atom_v9_internal.read_forecast_commit_proof(text)` and
   `atom_v9_internal.read_legacy_evidence_publications_for_records(text,timestamptz,bigint[])`;
+- exact equality of both routines' complete §13.3
+  `proof_function_definitions` objects, including OIDs and definition hashes;
 - the exact §13.3 catalog-wide
   `non_system_security_definer_execute_privilege_count = 0`;
 - SELECT true on all six tables;
@@ -2099,10 +2219,11 @@ The service runtime must remain Render native `python` on Linux
 `x86_64`/glibc `2.36`. The process must be CPython `3.14.3` with the
 exact §13.2.1 binary64 fields. The reviewed V-1B code freezes the complete
 dependency object, byte-level runtime-artifact component digests, combined
-artifact digest, and manifest digest. Before any database connection it must
-prove the observed §13.2.1 object exactly equals that reviewed manifest.
-Missing `PYTHON_VERSION`, a Render default, a different patch release,
-platform/library or artifact drift, or any dependency mismatch is §14.1
+artifact digest, exact `log`/`exp` libm dispatch object/digest, and manifest
+digest. Before any database connection it must prove the observed §13.2.1
+object exactly equals that reviewed manifest. Missing `PYTHON_VERSION`, a
+Render default, a different patch release, platform/library, artifact, or
+selected numerical implementation drift, or any dependency mismatch is §14.1
 `BLOCKED`; it
 may not be recorded as a valid run. Operational rollback restores the
 benchmark worker's exact prior `PYTHON_VERSION` setting along with the prior
