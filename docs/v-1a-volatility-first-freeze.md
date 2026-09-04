@@ -1015,7 +1015,8 @@ At minimum tests must prove:
   including exact empty behavior;
 - runtime rejection of every transaction isolation level other than
   `repeatable read`;
-- pre-read and pre-receipt rejection when any frozen reader role attribute
+- pre-read and pre-receipt rejection when `session_user` differs from the
+  reader, any reader membership exists, or any frozen reader role attribute
   differs, including `rolsuper` or `rolbypassrls`;
 - pre-read and pre-receipt verification of `atom_v9_internal` USAGE and
   EXECUTE on exactly both proof-reader functions;
@@ -1098,6 +1099,7 @@ Exactly these keys:
 
 ```text
 current_user                         string = "atom_e1_scorecard_reader"
+session_user                         string = "atom_e1_scorecard_reader"
 current_database                     string = "postgres"
 effective_host                       string
 project_binding_verified             boolean = true
@@ -1106,6 +1108,7 @@ schema_public_create                 boolean = false
 schema_atom_v9_internal_usage        boolean = true
 proof_functions_execute              object[string function signature -> boolean true]
 reader_role_attributes               object exact shape below
+reader_role_memberships               array[string] = []
 six_tables_select                    object[string table -> boolean true]
 six_tables_insert                    object[string table -> boolean false]
 six_tables_update                    object[string table -> boolean false]
@@ -1156,6 +1159,12 @@ rolbypassrls    boolean = false
 ```
 
 No extra role-attribute keys.
+
+`reader_role_memberships` is exactly the ascending UTF-8 list of role names
+from every `pg_catalog.pg_auth_members` row whose `member` is the OID of
+`atom_e1_scorecard_reader`. The only passing value is `[]`; any direct
+membership is a pre-read authority failure, regardless of `inherit_option`,
+`set_option`, or `admin_option`.
 
 ### 13.4 `bootstrap` exact object
 
@@ -1552,7 +1561,9 @@ No new role, password, membership, writer, function, service, source, broad tabl
 
 Before evidence reads, and again immediately before evaluated receipt construction in the same read-only run, verify:
 
-- `current_user = atom_e1_scorecard_reader`;
+- `session_user = current_user = atom_e1_scorecard_reader`;
+- zero `pg_catalog.pg_auth_members` rows have the reader's role OID as
+  `member`;
 - the `pg_catalog.pg_roles` row for that user is exactly `LOGIN NOINHERIT
   NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, matching
   every boolean in §13.3;
