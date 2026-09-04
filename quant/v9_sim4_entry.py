@@ -44,6 +44,7 @@ SIM_INSTALLATION_ID = "ATOM_TRUE_V9_SIM_INSTALLATION_1"
 SIM_RECONCILIATION_CHECKPOINT_KEY = "ATOM_TRUE_V9_SIM4_RECONCILIATION_1"
 SIM_PUBLISHER_RUNTIME_ROLE = "atom_v9_sim_runtime"
 SIM_ENTRY_RUNTIME_ROLE = "atom_v9_sim_entry_runtime"
+SIM_WEB_READER_ROLE = "atom_v9_sim_web_reader"
 SIM_RUNTIME_ROLE = SIM_ENTRY_RUNTIME_ROLE
 SIM4_QUOTE_SOURCE_SPEC = "ATOM_TRUE_V9_SIM4_ALPACA_SIP_QUOTE_1"
 QUOTE_ID_PREFIX = "v9simquote:"
@@ -650,7 +651,8 @@ def validate_simulator_database_url(database_url: str, *, project_ref: str,
     """Validate one direct or session-mode isolated Supabase runtime DSN."""
     if not isinstance(project_ref, str) or _PROJECT_REF_RE.fullmatch(project_ref) is None:
         raise SimulationDatabaseConfigurationError("simulator project ref is malformed")
-    if required_role not in (SIM_PUBLISHER_RUNTIME_ROLE, SIM_ENTRY_RUNTIME_ROLE):
+    if required_role not in (SIM_PUBLISHER_RUNTIME_ROLE, SIM_ENTRY_RUNTIME_ROLE,
+                             SIM_WEB_READER_ROLE):
         raise SimulationDatabaseConfigurationError("simulator database role is not authorized")
     parsed, hostname, port = _split_database_url(database_url)
     if parsed.fragment or parsed.path != "/postgres" or port != 5432:
