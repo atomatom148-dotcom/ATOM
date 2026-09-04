@@ -99,13 +99,25 @@ A V9 lineage identity is exactly:
 
 with `symbol = COIN` and decoded `evidence_origin = PRODUCTION`.
 
-For each horizon, determine the eligible V9 lineage set inside the frozen official snapshot before scoring outcomes. Select exactly one lineage using this outcome-blind rule:
+For each horizon, determine the eligible V9 lineage set inside the frozen official snapshot before scoring outcomes. If that set is nonempty, select exactly one lineage using this outcome-blind rule:
 
 1. maximize the latest admissible forecast `cutoff_at` not later than `evaluation_as_of_at`;
 2. tie-break by lexicographically greatest UTF-8 tuple `(v3_model_version, cohort_id, cohort_hash)`;
 3. once selected, retain only that exact identity for the cell.
 
 All rows belonging to other V9 lineages are excluded as `n_unselected_lineage_rows`; their outcomes and metric values may not affect selection.
+
+If the eligible set is empty, the V9 cell is still constructed. Its exact reserved lineage identity is:
+
+```text
+v3_model_version = "__NO_ADMISSIBLE_V9_LINEAGE__"
+symbol           = "COIN"
+horizon          = cell horizon
+cohort_id        = "__NO_ADMISSIBLE_V9_LINEAGE__"
+cohort_hash      = "0000000000000000000000000000000000000000000000000000000000000000"
+```
+
+That tuple is a receipt-only sentinel and can never identify a durable V9 row. A durable row using either reserved string together with the reserved hash is a frozen-contract defect. For the sentinel cell, `n_input` is still the §6.4 source-row count; `n_unselected_lineage_rows = 0`; every input row is assigned to `n_inadmissible`; every later §6.4 bucket, `n_sessions`, and every §8/§10.3 population count (including `n_unconditional_unavailable`) are zero. The three evidence-span fields follow the empty behavior in §13.5, all descriptive, coefficient, interval, and loss-summary values are `null`, all three bootstrap counter triplets are zero, and both gates are `UNAVAILABLE`. The cell is `INSUFFICIENT`, not `INVALID`, and emits every failed-minimum reason code required by §11. No outcome is scored for this sentinel cell.
 
 This rule preserves exactly six V9 cells and therefore exactly 12 inferential cells total.
 
@@ -244,8 +256,8 @@ Within each cell and session:
 
 Each input row enters exactly one first-applicable bucket in this order:
 
-1. `n_unselected_lineage_rows` — row is not the selected exact lineage; for FAMILY-VOL this is always zero because its lineage is fixed.
-2. `n_inadmissible` — selected lineage but proof/admissibility/evidence-origin contract fails.
+1. `n_unselected_lineage_rows` — for a real selected V9 lineage, row is not that exact lineage; for FAMILY-VOL and the §3.2 sentinel cell this is always zero.
+2. `n_inadmissible` — selected lineage but proof/admissibility/evidence-origin contract fails; in the §3.2 sentinel cell, every input row is assigned here because no admissible lineage exists.
 3. `n_non_rth` — admissible but target interval is not wholly inside a regular XNYS RTH session in the official session set.
 4. `n_overlap_excluded` — otherwise eligible but excluded by frozen non-overlap selection.
 5. `n_null_or_nonfinite_excluded` — selected window has a required null or non-finite target/prediction input.
@@ -532,7 +544,39 @@ realized_volatility_bps
     + error
 ```
 
-Full-sample OLS requires a full-column-rank design and finite coefficient values.
+Every full-sample and bootstrap fit of this §10 encompassing OLS model uses the following sole binary64 algorithm. Let `p_i = persist_20`, `f_i = predicted_volatility_bps`, and `y_i = realized_volatility_bps`. Full-sample row instances are in §6.3 deterministic order. A resample orders row instances by the drawn-session sequence and then by §6.3 order within each occurrence of that session. Convert every scalar to an IEEE-754 binary64 Python `float`; evaluate the displayed operations in the displayed order; and use `math.fsum` for every displayed sum:
+
+```text
+n     = number of row instances
+p_bar = math.fsum(p_i) / n
+f_bar = math.fsum(f_i) / n
+y_bar = math.fsum(y_i) / n
+
+S_pp = math.fsum((p_i - p_bar) * (p_i - p_bar))
+S_ff = math.fsum((f_i - f_bar) * (f_i - f_bar))
+S_pf = math.fsum((p_i - p_bar) * (f_i - f_bar))
+S_py = math.fsum((p_i - p_bar) * (y_i - y_bar))
+S_fy = math.fsum((f_i - f_bar) * (y_i - y_bar))
+
+Q = S_pp * S_ff
+D = Q - (S_pf * S_pf)
+```
+
+The three-column design `[intercept, p, f]` is numerically full rank if and only if every source and intermediate value above is finite, `S_pp > 0`, `S_ff > 0`, `Q > 0`, and:
+
+```text
+D > (2.0 ** -40) * Q
+```
+
+Equality fails the criterion. For a full-rank design, compute exactly:
+
+```text
+persistence_coefficient = ((S_py * S_ff) - (S_fy * S_pf)) / D
+enc_b                   = ((S_fy * S_pp) - (S_py * S_pf)) / D
+intercept               = y_bar - (persistence_coefficient * p_bar) - (enc_b * f_bar)
+```
+
+All three coefficients must be finite. A non-finite source, intermediate, coefficient, or arithmetic exception is a non-finite fit. If every value is finite but any rank inequality fails, the fit is rank-deficient. No library rank default, least-squares driver, QR/SVD tolerance, standardization, ridge, pseudoinverse, fallback fit, or algebraic reassociation may replace this algorithm. The same rules determine full-sample validity and whether each bootstrap draw is valid.
 
 ### 10.1 Exact session-resampling operation
 
@@ -653,13 +697,23 @@ d_seasonal          = mean(d_seasonal(w))
 All five summaries are `null` when the common gate population is empty. No sum,
 median, differently filtered population, or alternate aggregate is permitted.
 
-When §11 permits gate inference, bootstrap `mean(d_b)` using EXACTLY the §10.1
-session-resampling operation and the §10.2 order statistics: one
-`random.Random(0)` instantiated once per `(cell, benchmark)`, canonical
-ascending session order, and per attempt exactly
-`rng.choices(sessions, k=len(sessions))`. Exactly 200,000 valid draws are
-required with a 1,000,000-attempt cap. A draw is valid only when its resampled
-`mean(d_b)` is finite. Invalid attempts consume RNG state and are not rewound.
+When §11 permits gate inference, bootstrap `mean(d_b)` from that gate's
+population only. For each benchmark `b`, define:
+
+```text
+sessions_b = sorted(unique session dates in G_b as YYYY-MM-DD strings)
+rng = random.Random(0)
+drawn_sessions_b = rng.choices(sessions_b, k=len(sessions_b))
+```
+
+Instantiate the RNG once per `(cell, benchmark)`. On every attempt, execute
+that exact `choices(...)` call, then duplicate only the `d_b` rows in
+`G_b` for each occurrence of their session in `drawn_sessions_b`, in draw
+order and §6.3 order within each session occurrence. No regression-population
+row outside `G_b` enters a gate draw. Apply the §10.2 order statistics to the
+resulting gate-draw means. Exactly 200,000 valid draws are required with a
+1,000,000-attempt cap. A draw is valid only when its resampled `mean(d_b)` is
+finite. Invalid attempts consume RNG state and are not rewound.
 
 Each benchmark reports its own exact counters:
 
@@ -722,17 +776,46 @@ other gate without a completed valid interval is `NOT_RUN`. Counters preserve
 the attempts actually made before invalidation, and all later-not-run counters
 are zero.
 
-For a `NOISE` cell, `reason_codes` contains every and only applicable code:
+The evaluated-cell `reason_codes` namespace is closed. The array is sorted
+unique in ascending UTF-8 order, contains no free text or implementation-specific
+strings, and is derived solely from the final classification as follows:
 
-- include `ENC_B_NOT_POSITIVE` iff the lower endpoint of `enc_b_ci_0999` is
-  less than or equal to zero;
-- include `FAILED_UNCONDITIONAL_GATE` iff `gate_unconditional == FAIL`;
-- include `FAILED_SEASONAL_GATE` iff `gate_seasonal == FAIL`.
+- `INFORMATIVE`: exactly `[]`.
+- `NOISE`: include every and only applicable code:
+  - `ENC_B_NOT_POSITIVE` iff the lower endpoint of `enc_b_ci_0999` is less
+    than or equal to zero;
+  - `FAILED_UNCONDITIONAL_GATE` iff `gate_unconditional == FAIL`;
+  - `FAILED_SEASONAL_GATE` iff `gate_seasonal == FAIL`.
+- `INSUFFICIENT`: include each code whose stated inequality is true:
+  - `INSUFFICIENT_REGRESSION_WINDOWS` iff `n_regression_windows < 100`;
+  - `INSUFFICIENT_REGRESSION_SESSIONS` iff `n_regression_sessions < 10`;
+  - `INSUFFICIENT_UNCONDITIONAL_GATE_WINDOWS` iff
+    `n_unconditional_gate_windows < 100`;
+  - `INSUFFICIENT_UNCONDITIONAL_GATE_SESSIONS` iff
+    `n_unconditional_gate_sessions < 10`;
+  - `INSUFFICIENT_SEASONAL_GATE_WINDOWS` iff
+    `n_seasonal_gate_windows < 100`;
+  - `INSUFFICIENT_SEASONAL_GATE_SESSIONS` iff
+    `n_seasonal_gate_sessions < 10`.
+- `INVALID`: include every and only applicable code from this list:
+  - `CELL_PROTOCOL_DEFECT` iff §11 rule 1 applies, except for the specific
+    §17 preinspection condition below;
+  - `FULL_SAMPLE_OLS_RANK_DEFICIENT` iff rule 3 has only finite values but
+    fails at least one of the positive/rank inequalities in §10;
+  - `FULL_SAMPLE_OLS_NONFINITE` iff rule 3 encounters a non-finite source,
+    intermediate, coefficient, or arithmetic exception under §10;
+  - `ENC_B_BOOTSTRAP_EXHAUSTED` iff the `enc_b` bootstrap reaches its cap
+    before 200,000 valid draws;
+  - `UNCONDITIONAL_GATE_BOOTSTRAP_EXHAUSTED` iff that gate reaches its cap
+    before 200,000 valid draws;
+  - `SEASONAL_GATE_BOOTSTRAP_EXHAUSTED` iff that gate reaches its cap before
+    200,000 valid draws;
+  - `PREINSPECTED_CONFIRMATORY_STATISTIC` iff §17 invalidates the cell.
 
-The array is then sorted unique in ascending UTF-8 order. Multiple failed
-conditions therefore produce multiple codes; no first-failure precedence is
-used. An unavailable or not-run gate is classified earlier and never maps to a
-`NOISE` reason code.
+A condition not reached because an earlier precedence rule stopped evaluation
+does not emit a code. Multiple established conditions emit multiple codes; no
+first-failure reason-code precedence is used. An unavailable or not-run gate is
+classified earlier and never maps to a `NOISE` reason code.
 
 There are exactly 12 inferential cells. Under the nominal one-sided screen
 induced by a two-sided 0.999 interval, the report-only nominal expectation is:
@@ -796,6 +879,8 @@ At minimum tests must prove:
 - canonical six horizons and 12-cell order;
 - exact FAMILY and V9 lineage identities and no pooling;
 - deterministic V9 lineage selection is outcome-blind;
+- the zero-admissible-V9-lineage sentinel, accounting, run identity, null fields,
+  gate statuses, classification, and exact failed-minimum reason codes;
 - V-1A merge identity validation and evaluation-session/as-of derivation;
 - exact volatility-specific proof kinds and V4 target proof seam;
 - E-1 non-overlap parity;
@@ -816,6 +901,11 @@ At minimum tests must prove:
 - ascending order-statistic interval extraction;
 - pure persistence cannot become INFORMATIVE merely by descriptive metrics;
 - constructed incremental signal positive path;
+- the exact §10 binary64 OLS coefficients and finite/rank decisions, including
+  fixtures strictly below, exactly equal to, and strictly above the frozen
+  determinant threshold;
+- constant `predicted_volatility_bps` and constant `persist_20` each fail the
+  frozen rank criterion and classify `INVALID`;
 - full-sample rank defect => INVALID;
 - exact evaluated, BLOCKED, and pre-cell-INVALID schemas and canonical hashes;
 - effective DSN target verification including rejection of target-override parameters;
@@ -828,13 +918,16 @@ At minimum tests must prove:
   three-session / two-observation minimum, and excludes zero-magnitude windows from
   estimation only;
 - `QLIKE` is finite when the realized magnitude is exactly zero;
-- a constant forecast fitted on i.i.d. constant-volatility evidence beats `persist_1`
-  and `persist_20` but FAILS the unconditional gate, so the cell is `NOISE`, never
+- a constructed full-column-rank fixture with varying `persist_20` and a
+  nonconstant candidate has lower point QLIKE than `persist_1` and
+  `persist_20` but does not beat `unconditional`; its completed
+  unconditional gate is `FAIL`, so the cell is `NOISE`, never
   `INFORMATIVE`;
 - constructed heteroskedastic evidence carrying genuine incremental information
   satisfies all three §11 conditions;
-- gate bootstraps use the exact §10.1 operation and §10.2 indices with one RNG per
-  `(cell, benchmark)`;
+- each gate bootstrap derives its session list from that gate's `G_b`, samples
+  and duplicates only that gate's rows, uses the §10.2 indices, and has one RNG
+  per `(cell, benchmark)`;
 - causal benchmark sets exclude rows whose outcomes or proofs were not durable by
   the evaluated window's `cutoff_at`, including delayed earlier-session rows;
 - later unconditional unavailability, all-zero causal history, and exact
@@ -847,8 +940,15 @@ At minimum tests must prove:
   `d_*` summary;
 - `UNAVAILABLE` and `NOT_RUN` status behavior for skipped or incomplete gate
   inference;
-- every failed `NOISE` condition emits its own reason code with no
-  first-failure precedence;
+- exact closed cell and overall evaluated reason-code derivation for every
+  `INFORMATIVE`, `NOISE`, `INSUFFICIENT`, `INVALID`, `PASS`, and
+  `FAIL` status, including multiple simultaneously applicable codes;
+- `session_dates` and evidence cutoff extrema derive only from `n_windows`,
+  including exact empty behavior;
+- runtime rejection of every transaction isolation level other than
+  `repeatable read`;
+- pre-read and pre-receipt verification of `atom_v9_internal` USAGE and
+  EXECUTE on exactly both proof-reader functions;
 - if migration is present, migration self-refusal and exact privilege proof.
 
 ---
@@ -927,22 +1027,25 @@ No extra keys.
 Exactly these keys:
 
 ```text
-current_user                    string = "atom_e1_scorecard_reader"
-current_database                string = "postgres"
-effective_host                  string
-project_binding_verified        boolean = true
-schema_public_usage             boolean = true
-schema_public_create            boolean = false
-six_tables_select               object[string table -> boolean true]
-six_tables_insert               object[string table -> boolean false]
-six_tables_update               object[string table -> boolean false]
-six_tables_delete               object[string table -> boolean false]
-six_tables_truncate             object[string table -> boolean false]
-six_tables_rls_enabled          object[string table -> boolean]
-six_tables_permissive_full_read object[string table -> boolean true]
-six_tables_restrictive_select   object[string table -> boolean false]
-read_only_transaction           boolean = true
-verification_status             string = "PASS"
+current_user                         string = "atom_e1_scorecard_reader"
+current_database                     string = "postgres"
+effective_host                       string
+project_binding_verified             boolean = true
+schema_public_usage                  boolean = true
+schema_public_create                 boolean = false
+schema_atom_v9_internal_usage        boolean = true
+proof_functions_execute              object[string function signature -> boolean true]
+six_tables_select                    object[string table -> boolean true]
+six_tables_insert                    object[string table -> boolean false]
+six_tables_update                    object[string table -> boolean false]
+six_tables_delete                    object[string table -> boolean false]
+six_tables_truncate                  object[string table -> boolean false]
+six_tables_rls_enabled               object[string table -> boolean]
+six_tables_permissive_full_read      object[string table -> boolean true]
+six_tables_restrictive_select        object[string table -> boolean false]
+transaction_isolation                string = "repeatable read"
+read_only_transaction                boolean = true
+verification_status                  string = "PASS"
 ```
 
 Each six-table object contains exactly these six keys in semantic set terms (canonical JSON later sorts object keys):
@@ -958,6 +1061,15 @@ public.volatility_forecast_outcomes
 
 No extra table keys.
 
+`proof_functions_execute` contains exactly these two keys, both `true`:
+
+```text
+atom_v9_internal.read_forecast_commit_proof(text)
+atom_v9_internal.read_legacy_evidence_publications_for_records(text,timestamptz,bigint[])
+```
+
+No extra function keys.
+
 ### 13.4 `bootstrap` exact object
 
 Exactly:
@@ -972,6 +1084,11 @@ sampling_operation string = "random.Random(0).choices(sessions,k=len(sessions))"
 loss_function      string = "QLIKE(r,f)=log(f^2)+r^2/f^2"
 gates              array[string] = ["unconditional", "seasonal"]
 ```
+
+The `sampling_operation` value uses `sessions` as the canonical population
+variable: it means §10.1 regression sessions for `enc_b`, and the
+benchmark-specific §10.3 `sessions_b` for gate `b`. It never authorizes a
+gate draw from the full regression population.
 
 ### 13.5 `cells` exact array/object schema
 
@@ -1040,6 +1157,23 @@ classification                     string INFORMATIVE | NOISE | INSUFFICIENT | I
 reason_codes                       array[string], sorted unique UTF-8 ascending
 ```
 
+The evidence-span metadata is derived from exactly the selected valid-window
+population counted by `n_windows`, before persistence or benchmark
+availability can reduce a later population:
+
+- `session_dates` is the ascending unique set of XNYS session-date strings
+  among exactly those `n_windows` rows, and `n_sessions =
+  len(session_dates)`;
+- `evidence_min_cutoff_at` and `evidence_max_cutoff_at` are respectively
+  the minimum and maximum forecast `cutoff_at` instants among exactly those
+  rows, rendered in the required UTC format;
+- when `n_windows == 0`, `session_dates = []` and both cutoff fields are
+  `null`.
+
+Membership in a later regression or gate population is irrelevant: every row
+counted in `n_windows` contributes even if persistence or a benchmark is later
+unavailable, and no row outside `n_windows` contributes.
+
 FAMILY lineage object has exactly:
 
 ```text
@@ -1059,7 +1193,10 @@ cohort_id        string
 cohort_hash      string
 ```
 
-No extra lineage keys.
+No extra lineage keys. A V9 cell with a real selected lineage records that
+identity verbatim. A zero-eligible-lineage V9 cell records exactly the §3.2
+sentinel values; no other placeholder, omitted cell, `null` lineage member,
+or negative receipt is permitted for that condition.
 
 For an `INSUFFICIENT` cell, inferential coefficients/intervals and loss summaries that were not validly computed are `null`, all three bootstrap counter triplets are zero, and gate statuses follow §11. For an `INVALID` cell, fields already truthfully computed before the defect may be preserved; fields whose meaning is invalid or unavailable are `null`; gate statuses and counters follow §11; reason codes identify the defect. No NaN/Infinity.
 
@@ -1081,7 +1218,9 @@ V9:
 {"cell_order":6,"forecaster":"V9-VOL","horizon":"30S","lineage_identity":{"v3_model_version":"<string>","symbol":"COIN","horizon":"30S","cohort_id":"<string>","cohort_hash":"<string>"}}
 ```
 
-with cell/horizon/identity substituted appropriately.
+with cell/horizon/identity substituted appropriately. For the §3.2 empty-set
+case, the three identity placeholders are substituted with the exact reserved
+sentinel strings and hash.
 
 No extra keys are permitted.
 
@@ -1271,11 +1410,17 @@ Before evidence reads, and again immediately before evaluated receipt constructi
 - effective host/project binding already passed §15.1;
 - schema `public` USAGE true;
 - schema `public` CREATE false;
+- schema `atom_v9_internal` USAGE true;
+- EXECUTE true on exactly the two required proof-reader signatures
+  `atom_v9_internal.read_forecast_commit_proof(text)` and
+  `atom_v9_internal.read_legacy_evidence_publications_for_records(text,timestamptz,bigint[])`;
 - SELECT true on all six tables;
 - INSERT/UPDATE/DELETE/TRUNCATE false on all six;
 - RLS enabled wherever repository law requires it;
 - at least one applicable PERMISSIVE SELECT policy gives full read (`USING (true)` semantically) for the reader on each RLS table;
 - **zero applicable RESTRICTIVE SELECT policies** for the reader, including policies applying through `PUBLIC` or any role membership;
+- `SHOW transaction_isolation`, normalized to lowercase, equals exactly
+  `repeatable read`;
 - transaction read-only true;
 - no fallback credential attempted.
 
@@ -1361,6 +1506,15 @@ Evaluated receipt `overall_status`:
 - `INVALID` if any cell is INVALID or any run-level protocol/evidence/reproducibility defect exists;
 - otherwise `PASS` if at least one cell is INFORMATIVE;
 - otherwise `FAIL` when all evaluated cells are NOISE and/or INSUFFICIENT with no INVALID cell.
+
+The evaluated `overall_reason_codes` derivation is exact:
+
+- `PASS` => exactly `[]`;
+- `FAIL` => exactly `["NO_INFORMATIVE_CELL"]`;
+- `INVALID` => include `INVALID_CELL_PRESENT` iff at least one cell is
+  `INVALID`, and include `RUN_PROTOCOL_DEFECT` iff a run-level
+  protocol/evidence/reproducibility defect exists. Include every applicable
+  code, sort unique in ascending UTF-8 order, and include no other code.
 
 A BLOCKED run uses the separate BLOCKED schema and has no evaluated overall status.
 
