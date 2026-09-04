@@ -841,9 +841,6 @@ class SimulationEntryStoreTests(unittest.TestCase):
                     float.fromhex("0x1.fffffffffffffp+1023"),
                 ):
                     with self.subTest(entry_price=entry_price):
-                        record_json = json.dumps({
-                            "entry_price": {"$float64": entry_price.hex()},
-                        })
                         cursor.execute(
                             "SELECT "
                             "e.token = "
@@ -852,7 +849,7 @@ class SimulationEntryStoreTests(unittest.TestCase):
                             + sim4_entry_module._ENTRY_PRICE_CANONICAL_TOKEN_SQL
                             + " FROM (VALUES (%s::text, %s::double precision)) "
                             "AS e(token, entry_price)",
-                            (record_json["entry_price"]["$float64"], entry_price),
+                            (entry_price.hex(), entry_price),
                         )
                         self.assertEqual(cursor.fetchone(), (False, True))
                 for invalid_token in ("not-a-float", "177.06"):
