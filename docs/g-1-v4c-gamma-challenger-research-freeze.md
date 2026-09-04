@@ -11,7 +11,7 @@
 
 Authorize one preregistered, out-of-sample test of the already-coded but production-inactive V4C Gamma Challenger. The challenger may be evaluated only as a variance/calibration mechanism. A PASS is not directional-edge proof and does not authorize shipping or wiring.
 
-The detailed code-state audit in `docs/drafts/g-1-v4c-gamma-challenger-research-contract-DRAFT.md` is retained as supporting research material. Where that draft says its contents have zero authority, this freeze supersedes that status only for the exact decisions and contract fixed below. Unresolved alternatives in the draft are not law.
+The detailed pre-adoption research and code-state audit is preserved in PR #312 history at head `97053f2e6b00c0faf8637549c36a653c22b0c4c1`; the current draft path is only a supersession marker so no discarded alternative can be mistaken for law. This freeze is the sole controlling G-1 research contract.
 
 ## 2. Frozen hypothesis
 
