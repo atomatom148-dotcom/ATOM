@@ -10,7 +10,7 @@ import os
 import signal
 from html import escape
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Event, Lock, Thread
 from typing import Callable, Iterable, Mapping
 from wsgiref.simple_server import make_server
@@ -45,6 +45,23 @@ _SIMULATOR_WORKER_CREDENTIAL_ENVS = frozenset({
     "ATOM_V9_SIM4_ALPACA_PAPER_API_SECRET_KEY",
     "ATOM_V9_SIM4_ALPACA_PROVISIONING_ATTESTATION_ID",
     "ATOM_V9_SIM4_ALPACA_PROVISIONING_ATTESTATION_SHA256",
+})
+# SIM-5W read-only simulation web card (docs/sim-5w-read-only-sim-web-card-freeze.md).
+SIM_WEB_READONLY_DATABASE_URL_ENV = "ATOM_V9_SIM_WEB_READONLY_DATABASE_URL"
+_SIMULATOR_WEB_READER_ROLE = "atom_v9_sim_web_reader"
+SIM5W_LIVE_WINDOW = timedelta(minutes=90)
+SIM5W_ROWS = ("CLOSED", "RESOLVED", "UNRESOLVED")
+_SIM5W_STATEMENT_TIMEOUT_SQL = "SET LOCAL statement_timeout = '2000ms'"
+_SIM5W_COUNT_SQL = (
+    "SELECT horizon, resolution_status, count(*) AS n "
+    "FROM public.atom_v9_sim_resolutions "
+    "GROUP BY horizon, resolution_status"
+)
+_SIM5W_LATEST_SQL = "SELECT max(created_at) FROM public.atom_v9_sim_resolutions"
+_SIM5W_RESOLVED_STATUSES = frozenset({"RESOLVED"})
+_SIM5W_UNRESOLVED_STATUSES = frozenset({
+    "UNRESOLVED_WINDOW_EXPIRED",
+    "UNRESOLVED_OBSERVATION_GAP",
 })
 FAMILY_NAMES = (
     "Momentum",
@@ -454,9 +471,21 @@ def _table(
     return f"<div class=scroll><table><thead><tr><th></th>{heading}</tr></thead><tbody>{body}</tbody></table></div>"
 
 
-def dashboard_page(data: dict[str, object]) -> bytes:
+def _sim_paper_only_no_data() -> dict[str, object]:
+    """The SIM-5W card's fail-closed presentation: NO DATA and a blank grid."""
+
+    return {
+        "status": "NO DATA",
+        "counts": {row: [None] * len(PHASE_E_HORIZONS) for row in SIM5W_ROWS},
+    }
+
+
+def dashboard_page(data: dict[str, object], *,
+                   sim_paper_only: dict[str, object] | None = None) -> bytes:
     """Render the numerical dashboard; null JSON values become blank cells."""
 
+    sim_paper_only = sim_paper_only if sim_paper_only is not None else _sim_paper_only_no_data()
+    sim_rows = tuple((row, sim_paper_only["counts"][row]) for row in SIM5W_ROWS)
     market = data["market"]
     horizons = data["horizons"]
     final_numbers = data["final_numbers"]
@@ -542,6 +571,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
 <div><div class=label>DATA AGE</div><div class=value data-dashboard-field="market.data_age">{_decimal_cell(market['data_age'], 's')}</div></div><div><div class=label>LAST CYCLE</div><div class=value data-dashboard-field="market.last_cycle">{_cycle_cell(market['last_cycle'])}</div></div></div>
 <h2>FINAL NUMBERS</h2>{_table(horizons, final_numbers.items(), section='final_numbers', decimal=True)}
 <h2>V9 DIRECTIONAL ACCURACY</h2>{_table(PHASE_E_HORIZONS, accuracy_rows, section='v9_accuracy')}
+<h2>SIM — PAPER ONLY</h2><div>STATUS: <span data-dashboard-field="sim_paper_only.status">{_cell(sim_paper_only['status'])}</span></div>{_table(PHASE_E_HORIZONS, sim_rows, section='sim_paper_only')}
 <h2>12 QUANT FAMILIES</h2>{_table(horizons, ((item['name'], item['values']) for item in families), section='quant_families', decimal=True)}
 <h2>OPTIONS DATA</h2><div>STATUS: <span data-dashboard-field="options_data.status">{_cell(options['status'])}</span></div><div>AS OF: <span data-dashboard-field="options_data.as_of_epoch">{_cycle_cell(options['as_of_epoch'])}</span></div><div>EXPIRATION: <span data-dashboard-field="options_data.expiration">{_cell(options['expiration'])}</span></div>{option_table('calls')}{option_table('puts')}
 <h2>EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in evidence.items()), section='evidence')}{phase_e_table}
@@ -706,6 +736,7 @@ def create_app(
     metrics: OperationalMetrics | None = None,
     monotonic_clock: Callable[[], float] = time.perf_counter,
     readiness_check: Callable[[], bool] | None = None,
+    sim_web_reader_connection_factory: Callable[[], object] | None = None,
 ) -> Callable:
     """Create the WSGI application, rendering current state on every request."""
 
@@ -898,7 +929,10 @@ def create_app(
         )
         apply_btc_source_truth(data)
         if path == "/":
-            status, content_type, body = "200 OK", "text/html; charset=utf-8", dashboard_page(data)
+            sim_paper_only = _read_sim_paper_only_counts(
+                sim_web_reader_connection_factory, now_epoch=as_of_epoch)
+            status, content_type, body = "200 OK", "text/html; charset=utf-8", dashboard_page(
+                data, sim_paper_only=sim_paper_only)
         elif path == "/api/dashboard":
             status, content_type, body = "200 OK", "application/json", json.dumps(data, separators=(",", ":"), allow_nan=False).encode()
         start_response(status, [("Content-Type", content_type), ("Content-Length", str(len(body)))])
@@ -1016,6 +1050,113 @@ def _isolated_simulator_connection_factory(
     return simulator_connect
 
 
+def _sim_web_reader_connection_factory(
+    environ: Mapping[str, str],
+    connect: Callable[[str], object],
+) -> Callable[[], object] | None:
+    """Fail closed unless the dedicated SIM-5W reader DSN is fully proved.
+
+    The DSN must bind exactly ``atom_v9_sim_web_reader`` on the isolated
+    simulator project, and the production project must be proved distinct.
+    Nothing here performs I/O; every rejection disables the card only.
+    """
+    database_url = environ.get(SIM_WEB_READONLY_DATABASE_URL_ENV)
+    project_ref = environ.get(SIMULATOR_PROJECT_REF_ENV)
+    production_database_url = environ.get("DATABASE_URL")
+    if (not database_url or not project_ref or not production_database_url or
+            any(name in environ for name in _SIMULATOR_WORKER_CREDENTIAL_ENVS)):
+        return None
+    try:
+        from .v9_sim4_entry import (
+            discover_supabase_project_ref,
+            validate_simulator_database_url,
+        )
+        identity = validate_simulator_database_url(
+            database_url,
+            project_ref=project_ref,
+            required_role=_SIMULATOR_WEB_READER_ROLE,
+        )
+        production_project_ref = discover_supabase_project_ref(
+            production_database_url)
+    except Exception:
+        return None
+    if (production_project_ref is None or
+            production_project_ref == identity.project_ref):
+        return None
+    return lambda: connect(database_url)
+
+
+def _read_sim_paper_only_counts(
+    connection_factory: Callable[[], object] | None,
+    *,
+    now_epoch: float,
+) -> dict[str, object]:
+    """Run the one frozen read-only SIM-5W transaction; any failure is NO DATA.
+
+    Exactly the statements frozen in section 6 run, the transaction is never
+    committed, and the connection is closed on every path.
+    """
+    no_data = _sim_paper_only_no_data()
+    if connection_factory is None:
+        return no_data
+    connection = None
+    try:
+        connection = connection_factory()
+        connection.read_only = True
+        cursor = connection.cursor()
+        try:
+            cursor.execute(_SIM5W_STATEMENT_TIMEOUT_SQL)
+            cursor.execute(_SIM5W_COUNT_SQL)
+            grouped = list(cursor.fetchall())
+            cursor.execute(_SIM5W_LATEST_SQL)
+            latest_row = cursor.fetchone()
+        finally:
+            cursor.close()
+        connection.rollback()
+    except Exception:
+        return no_data
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    counts = {row: [0] * len(PHASE_E_HORIZONS) for row in SIM5W_ROWS}
+    total = 0
+    for record in grouped:
+        try:
+            horizon, resolution_status, n = record
+        except (TypeError, ValueError):
+            return no_data
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            return no_data
+        if horizon not in PHASE_E_HORIZONS:
+            continue
+        index = PHASE_E_HORIZONS.index(horizon)
+        if resolution_status in _SIM5W_RESOLVED_STATUSES:
+            counts["RESOLVED"][index] += n
+        elif resolution_status in _SIM5W_UNRESOLVED_STATUSES:
+            counts["UNRESOLVED"][index] += n
+        else:
+            return no_data
+        counts["CLOSED"][index] += n
+        total += n
+    if total == 0:
+        return no_data
+    latest = latest_row[0] if latest_row else None
+    if not isinstance(latest, datetime) or latest.tzinfo is None:
+        return no_data
+    try:
+        age_seconds = float(now_epoch) - latest.timestamp()
+    except (OverflowError, ValueError):
+        return no_data
+    if not math.isfinite(age_seconds):
+        return no_data
+    status = "LIVE" if age_seconds <= SIM5W_LIVE_WINDOW.total_seconds() else "STALE"
+    return {"status": status, "counts": counts}
+
+
 def _install_shutdown_handlers(shutdown_requested: Event) -> dict[int, object]:
     """Translate Render/terminal signals into the coordinated drain path."""
 
@@ -1106,6 +1247,8 @@ def main(*, simulator_connection_factory: Callable | None = None,
                 os.environ, runtime_connect)
             simulator_connection_factory = _isolated_simulator_connection_factory(
                 os.environ, simulator_connection_factory)
+        sim_web_reader_connection_factory = _sim_web_reader_connection_factory(
+            os.environ, runtime_connect)
         outbox = EvidenceOutbox(metrics=metrics)
         ledger_connection = runtime_connect(database_url)
         external_state_builder = (
@@ -1191,6 +1334,7 @@ def main(*, simulator_connection_factory: Callable | None = None,
         app = create_app(
             state=state, evidence_cache=evidence_cache, metrics=metrics,
             readiness_check=readiness_check,
+            sim_web_reader_connection_factory=sim_web_reader_connection_factory,
         )
         with make_server(args.host, args.port, app) as server:
             Thread(
