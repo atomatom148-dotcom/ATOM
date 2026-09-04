@@ -89,6 +89,14 @@ A FAMILY-VOL cell identity is exactly:
 (quant_id, formula_version, symbol, horizon)
 ```
 
+For §6.4 `n_input`, the FAMILY-VOL source population is every
+`public.volatility_forecasts` row inside the snapshot/as-of boundary with
+`quant_id = q3_volatility`, the cell symbol, and the cell horizon, regardless
+of `formula_version`. Only `formula_version = realized-volatility-v1` is the
+selected lineage. Every source row with another formula version is
+`n_unselected_lineage_rows` and cannot affect admissibility, outcomes, or
+metrics.
+
 ### 3.2 V9-VOL identity
 
 A V9 lineage identity is exactly:
@@ -252,11 +260,17 @@ Within each cell and session:
 
 ### 6.4 Ordered mutually exclusive row accounting
 
-`n_input` is the count of all source forecast rows for that forecaster/horizon/symbol inside the database snapshot and official as-of boundary **before lineage filtering**.
+`n_input` is counted before lineage filtering. For FAMILY-VOL it is exactly
+the §3.1 source population. For V9-VOL it is every
+`public.atom_v9_v4_forecasts` row inside the snapshot/as-of boundary with the
+cell symbol and horizon, before model/cohort filtering.
 
 Each input row enters exactly one first-applicable bucket in this order:
 
-1. `n_unselected_lineage_rows` — for a real selected V9 lineage, row is not that exact lineage; for FAMILY-VOL and the §3.2 sentinel cell this is always zero.
+1. `n_unselected_lineage_rows` — for FAMILY-VOL, a source row does not have
+   the exact §3.1 selected identity; for a real selected V9 lineage, a source
+   row does not have that exact §3.2 identity; for the §3.2 sentinel cell only,
+   this bucket is zero.
 2. `n_inadmissible` — selected lineage but proof/admissibility/evidence-origin contract fails; in the §3.2 sentinel cell, every input row is assigned here because no admissible lineage exists.
 3. `n_non_rth` — admissible but target interval is not wholly inside a regular XNYS RTH session in the official session set.
 4. `n_overlap_excluded` — otherwise eligible but excluded by frozen non-overlap selection.
@@ -488,13 +502,45 @@ Mincer–Zarnowitz descriptive regression over selected valid windows:
 realized_volatility_bps = mz_a + mz_b * predicted_volatility_bps + error
 ```
 
-`mz_r2` is the ordinary unadjusted coefficient of determination:
+Use exactly the `n_windows` row order from §6.3. Let `n` be the
+number of selected valid windows. If `n < 2`, set all three MZ fields to
+`null` and do not evaluate a division. Otherwise convert `f_i =
+predicted_volatility_bps` and `y_i = realized_volatility_bps` to IEEE-754
+binary64 Python `float` values, evaluate in the displayed order, and use
+`math.fsum` for every displayed sum:
 
 ```text
-1 - SSE / SST
+f_bar = math.fsum(f_i) / n
+y_bar = math.fsum(y_i) / n
+S_ff  = math.fsum((f_i - f_bar) * (f_i - f_bar))
+S_fy  = math.fsum((f_i - f_bar) * (y_i - y_bar))
+S_yy  = math.fsum((y_i - y_bar) * (y_i - y_bar))
 ```
 
-using the OLS fitted values, with JSON `null` when `SST == 0` or the regression is not descriptively fit-able. This descriptive null does not itself create `INVALID`.
+The two-column design `[intercept, f]` is descriptively fit-able if and only
+if `n >= 2`, every source/intermediate above is finite, and `S_ff > 0`.
+Equality fails. When fit-able, compute exactly:
+
+```text
+mz_b = S_fy / S_ff
+mz_a = y_bar - (mz_b * f_bar)
+SSE  = math.fsum((y_i - (mz_a + (mz_b * f_i))) * (y_i - (mz_a + (mz_b * f_i))))
+SST  = S_yy
+```
+
+Both coefficients must be finite. If the fit criterion, coefficient finiteness,
+or any pre-coefficient arithmetic operation fails, `mz_a = null`, `mz_b =
+null`, and `mz_r2 = null`. Otherwise retain the finite coefficients and
+compute the ordinary unadjusted coefficient of determination exactly as:
+
+```text
+mz_r2 = 1.0 - (SSE / SST)
+```
+
+when `SST > 0`, `SSE` is finite, and the result is finite; otherwise only
+`mz_r2 = null`. No library least-squares/rank default, alternate tolerance,
+or fallback fit is permitted. Any MZ null remains descriptive and does not
+itself create `INVALID`.
 
 `persist_rank_corr` is exactly:
 
@@ -694,8 +740,19 @@ d_unconditional     = mean(d_unconditional(w))
 d_seasonal          = mean(d_seasonal(w))
 ```
 
-All five summaries are `null` when the common gate population is empty. No sum,
-median, differently filtered population, or alternate aggregate is permitted.
+For every nonempty gate population and every nonempty resampled gate draw,
+`mean(values)` in this section means exactly:
+
+```text
+math.fsum(values in the frozen §6.3/drawn-instance order) / len(values)
+```
+
+All values and the division use IEEE-754 binary64 Python `float` arithmetic.
+This rule governs all five displayed receipt summaries and every bootstrap
+`mean(d_b)`; built-in `sum`, `statistics.fmean`, NumPy reductions, and
+every other aggregation are forbidden. All five summaries are `null` when
+the common gate population is empty. No sum, median, differently filtered
+population, or alternate aggregate is permitted.
 
 When §11 permits gate inference, bootstrap `mean(d_b)` from that gate's
 population only. For each benchmark `b`, define:
@@ -741,14 +798,20 @@ Each gate status is exactly one of `PASS`, `FAIL`, `UNAVAILABLE`, or
 - `FAIL` when a completed 0.999 interval has lower endpoint less than or equal
   to zero;
 - `UNAVAILABLE` only when its gate population has zero rows; and
-- `NOT_RUN` when its population is nonempty but §11 skips inference or a valid
-  interval is not completed.
+- `NOT_RUN` when its population is nonempty but §11 skips inference, a valid
+  interval is not completed, or §13.5 suppresses an INVALID cell's analytic
+  result.
 
 `UNAVAILABLE` and `NOT_RUN` are not `PASS`.
 
 ---
 
 ## 11. Cell eligibility, classification, and precedence
+
+Before applying the precedence below, a conforming implementation completes
+all cell-level rule-1 validation and the §17 preinspection check. Those checks
+are a mandatory pre-inference checkpoint; no descriptive metric, full-sample
+fit, or bootstrap begins first.
 
 Classification and inference precedence is exactly:
 
@@ -770,11 +833,9 @@ Classification and inference precedence is exactly:
 
 For `INSUFFICIENT`, all three bootstrap counter triplets are zero. A gate with
 zero population is `UNAVAILABLE`; a gate with a nonzero population is
-`NOT_RUN`. For an `INVALID` cell, a gate with a completed valid interval
-retains `PASS` or `FAIL`; a zero-population gate is `UNAVAILABLE`; every
-other gate without a completed valid interval is `NOT_RUN`. Counters preserve
-the attempts actually made before invalidation, and all later-not-run counters
-are zero.
+`NOT_RUN`. Every `INVALID` cell serializes analytic values, gate statuses,
+and bootstrap counters by the sole §13.5 matrix; no provisional `PASS`,
+`FAIL`, coefficient, interval, or metric is optionally retained.
 
 The evaluated-cell `reason_codes` namespace is closed. The array is sorted
 unique in ascending UTF-8 order, contains no free text or implementation-specific
@@ -878,6 +939,8 @@ At minimum tests must prove:
 
 - canonical six horizons and 12-cell order;
 - exact FAMILY and V9 lineage identities and no pooling;
+- nonselected FAMILY formula versions enter
+  `n_unselected_lineage_rows` and reconcile without affecting the cell;
 - deterministic V9 lineage selection is outcome-blind;
 - the zero-admissible-V9-lineage sentinel, accounting, run identity, null fields,
   gate statuses, classification, and exact failed-minimum reason codes;
@@ -894,7 +957,8 @@ At minimum tests must prove:
 - exact causal `persist_20`;
 - actual regression-population minima;
 - exact MAE/rank/level/coverage/MZ/persistence metrics;
-- `mz_r2` definition and null behavior;
+- exact binary64 MZ fit coefficients, rank/null rule, SSE, and `mz_r2`
+  behavior;
 - exact Spearman ties/null behavior;
 - bootstrap exact `random.Random(0).choices(...)` call and canonical session order;
 - invalid bootstrap draws consume RNG state and exactly 200,000 valid refits are required;
@@ -911,6 +975,8 @@ At minimum tests must prove:
 - effective DSN target verification including rejection of target-override parameters;
 - exact six-table read/RLS/no-write authority proof including restrictive policies;
 - execution revision and V-1A merge revision binding;
+- rollback deployment target derivation from the V-1B merge's exact first
+  parent, with intervening main commits preserved;
 - no writes, SIM, broker, order, production-math, V-1C, or V-2 behavior;
 - unconditional benchmark uses only causally prior regression-population realized
   values and is null for the first such window;
@@ -936,17 +1002,21 @@ At minimum tests must prove:
 - all four rank correlations use the exact §9.1 Spearman behavior;
 - gate-specific 100-window/10-session minima and separate attempted/valid/invalid
   draw counters;
-- exact arithmetic-mean definitions and populations for every `qlike_*` and
-  `d_*` summary;
+- exact `math.fsum(...)/len(...)` aggregation and populations for every
+  `qlike_*`, `d_*`, and resampled gate-draw mean;
 - `UNAVAILABLE` and `NOT_RUN` status behavior for skipped or incomplete gate
   inference;
 - exact closed cell and overall evaluated reason-code derivation for every
   `INFORMATIVE`, `NOISE`, `INSUFFICIENT`, `INVALID`, `PASS`, and
   `FAIL` status, including multiple simultaneously applicable codes;
+- the complete §13.5 INVALID serialization matrix for every INVALID cause,
+  including null fields, gate states, and each bootstrap-exhaustion frontier;
 - `session_dates` and evidence cutoff extrema derive only from `n_windows`,
   including exact empty behavior;
 - runtime rejection of every transaction isolation level other than
   `repeatable read`;
+- pre-read and pre-receipt rejection when any frozen reader role attribute
+  differs, including `rolsuper` or `rolbypassrls`;
 - pre-read and pre-receipt verification of `atom_v9_internal` USAGE and
   EXECUTE on exactly both proof-reader functions;
 - if migration is present, migration self-refusal and exact privilege proof.
@@ -1035,6 +1105,7 @@ schema_public_usage                  boolean = true
 schema_public_create                 boolean = false
 schema_atom_v9_internal_usage        boolean = true
 proof_functions_execute              object[string function signature -> boolean true]
+reader_role_attributes               object exact shape below
 six_tables_select                    object[string table -> boolean true]
 six_tables_insert                    object[string table -> boolean false]
 six_tables_update                    object[string table -> boolean false]
@@ -1068,7 +1139,23 @@ atom_v9_internal.read_forecast_commit_proof(text)
 atom_v9_internal.read_legacy_evidence_publications_for_records(text,timestamptz,bigint[])
 ```
 
-No extra function keys.
+No extra function keys. These two object keys are the frozen literal strings
+above; the implementation must not derive their receipt spelling from
+`regprocedure::text` or any catalog-rendered alias.
+
+`reader_role_attributes` contains exactly:
+
+```text
+rolcanlogin     boolean = true
+rolinherit      boolean = false
+rolsuper        boolean = false
+rolcreatedb     boolean = false
+rolcreaterole   boolean = false
+rolreplication  boolean = false
+rolbypassrls    boolean = false
+```
+
+No extra role-attribute keys.
 
 ### 13.4 `bootstrap` exact object
 
@@ -1198,7 +1285,67 @@ identity verbatim. A zero-eligible-lineage V9 cell records exactly the §3.2
 sentinel values; no other placeholder, omitted cell, `null` lineage member,
 or negative receipt is permitted for that condition.
 
-For an `INSUFFICIENT` cell, inferential coefficients/intervals and loss summaries that were not validly computed are `null`, all three bootstrap counter triplets are zero, and gate statuses follow §11. For an `INVALID` cell, fields already truthfully computed before the defect may be preserved; fields whose meaning is invalid or unavailable are `null`; gate statuses and counters follow §11; reason codes identify the defect. No NaN/Infinity.
+For an `INSUFFICIENT` cell, inferential coefficients/intervals and loss
+summaries that were not validly computed are `null`, all three bootstrap
+counter triplets are zero, and gate statuses follow §11.
+
+An evaluated `INVALID` cell is permitted only when its identity,
+evidence-span metadata, and every population/accounting `n_*` field can be
+truthfully constructed; otherwise use §14.2. It serializes deterministically:
+
+1. retain the structural fields through `evidence_max_cutoff_at` and every
+   `n_*` field at its exact computed value;
+2. set every field in this exact list to `null`:
+
+```text
+mae_bps
+rank_corr
+level_ratio
+coverage_90
+mz_a
+mz_b
+mz_r2
+persist_rank_corr
+enc_b
+enc_b_ci_0999
+enc_b_ci_095
+unconditional_rank_corr
+seasonal_rank_corr
+qlike_candidate
+qlike_unconditional
+qlike_seasonal
+d_unconditional
+d_unconditional_ci_0999
+d_unconditional_ci_095
+d_seasonal
+d_seasonal_ci_0999
+d_seasonal_ci_095
+```
+
+3. serialize each gate as `UNAVAILABLE` iff its `n_*_gate_windows == 0`;
+   otherwise serialize it as `NOT_RUN`, even if a provisional interval was
+   completed before a later bootstrap exhausted its cap;
+4. serialize bootstrap counter triplets by the first and only possible
+   exhaustion point under §11:
+   - no `*_BOOTSTRAP_EXHAUSTED` reason code: all three triplets are zero;
+   - `ENC_B_BOOTSTRAP_EXHAUSTED`: its attempted count is `1000000`, its
+     valid count is the exact attained value below `200000`, its invalid
+     count is the difference, and both gate triplets are zero;
+   - `UNCONDITIONAL_GATE_BOOTSTRAP_EXHAUSTED`: retain the completed `enc_b`
+     triplet; its own attempted count is `1000000`, valid count is the exact
+     attained value below `200000`, and invalid count is the difference; the
+     seasonal triplet is zero;
+   - `SEASONAL_GATE_BOOTSTRAP_EXHAUSTED`: retain the completed `enc_b` and
+     unconditional triplets; its attempted count is `1000000`, valid count
+     is the exact attained value below `200000`, and invalid count is the
+     difference;
+5. set `classification = INVALID` and derive `reason_codes` only by §11.
+
+A completed retained triplet has `valid_draws = 200000` and its exact
+deterministic attempted/invalid counts. §11 stops at the first exhausted
+bootstrap, so an INVALID cell can contain at most one exhaustion code. No other
+field may vary with discovery or evaluation order. No NaN/Infinity is ever
+serialized.
 
 ### 13.6 Exact run identity body
 
@@ -1406,6 +1553,9 @@ No new role, password, membership, writer, function, service, source, broad tabl
 Before evidence reads, and again immediately before evaluated receipt construction in the same read-only run, verify:
 
 - `current_user = atom_e1_scorecard_reader`;
+- the `pg_catalog.pg_roles` row for that user is exactly `LOGIN NOINHERIT
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, matching
+  every boolean in §13.3;
 - `current_database() = postgres`;
 - effective host/project binding already passed §15.1;
 - schema `public` USAGE true;
@@ -1489,15 +1639,26 @@ The verified `v1a_merge_sha` under §5.1 must also be reachable from this author
 
 ### 16.4 Rollback
 
-Repository rollback target = exact Owner-merged V-1A `main` SHA immediately before V-1B implementation merge.
+Let `V1B_PREMERGE_MAIN_SHA` be the exact first parent of
+`V1B_AUTHORIZED_MAIN_SHA`. Verify the direct parent relationship from the
+repository commit object. That first parent—not the V-1A merge SHA—is the sole
+deployment rollback target, so every main commit that landed between V-1A and
+V-1B is preserved.
+
+Repository history is never reset to either SHA. If repository reversal is
+needed, use a separately reviewed revert commit that reverses exactly the V-1B
+merge diff on top of then-current `main`; do not discard intervening or later
+work.
 
 Operational rollback:
 
 1. stop/suspend the one-shot V-1B command;
-2. restore benchmark worker to pre-V-1B command/environment state;
+2. restore the benchmark worker to the command/environment at
+   `V1B_PREMERGE_MAIN_SHA` or the exact reviewed V-1B revert;
 3. preserve all generated receipts/evidence;
 4. no deletion/rewrite;
-5. no ad-hoc privilege rollback; privilege rollback requires reviewed migration/amendment.
+5. no ad-hoc privilege rollback; privilege rollback requires reviewed
+   migration/amendment.
 
 ### 16.5 Overall evaluated status
 
