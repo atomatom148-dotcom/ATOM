@@ -243,10 +243,17 @@ Update this section only by Owner-approved documentation change.
   mature and does not take or block the SIM-5 pointer.
 - Owner-approved L-2 state-cache read-reduction work remains separately
   authorized alongside SIM-5 and does not take or block the SIM-5 pointer.
+- Owner-approved SIM-5W read-only web-card work is separately authorized
+  alongside SIM-5 under `docs/sim-5w-read-only-sim-web-card-freeze.md` and does
+  not take or block the SIM-5 pointer. Its only new authority is the exact
+  resolution-only role `atom_v9_sim_web_reader`, the exact web-only credential
+  `ATOM_V9_SIM_WEB_READONLY_DATABASE_URL`, migration 032, and the exact file and
+  deployment surface frozen there.
 - Not authorized: E-2, E-3, E-4, SIM-6 or later simulator phases, Level-II
   mathematical use, V9/family changes except the exact L-2 implementation
-  surface, new services/roles/credentials/sources,
-  broker/account/order authority, or live-capital trading.
+  surface, new services/roles/credentials/sources except the exact SIM-5W
+  reader role and web-only credential above, broker/account/order authority,
+  or live-capital trading.
 
 ## What each document is for
 
