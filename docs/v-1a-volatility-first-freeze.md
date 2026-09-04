@@ -971,8 +971,10 @@ At minimum tests must prove:
 - constant `predicted_volatility_bps` and constant `persist_20` each fail the
   frozen rank criterion and classify `INVALID`;
 - full-sample rank defect => INVALID;
-- exact evaluated, BLOCKED, and pre-cell-INVALID schemas and canonical hashes;
-- effective DSN target verification including rejection of target-override parameters;
+- exact evaluated, BLOCKED, pre-cell-INVALID, and
+  post-evaluation-authority-INVALID schemas and canonical hashes;
+- effective DSN target/login verification, including rejection of duplicate or
+  ambient target/login parameters and every startup `options` value;
 - exact six-table read/RLS/no-write authority proof including restrictive policies;
 - execution revision and V-1A merge revision binding;
 - rollback deployment target derivation from the V-1B merge's exact first
@@ -1018,8 +1020,13 @@ At minimum tests must prove:
 - pre-read and pre-receipt rejection when `session_user` differs from the
   reader, any reader membership exists, or any frozen reader role attribute
   differs, including `rolsuper` or `rolbypassrls`;
+- pre-read and pre-receipt rejection when the reader owns the database or has
+  effective database `CREATE` or `TEMPORARY` privilege, including through
+  `PUBLIC` or implicit `pg_database_owner` authority;
 - pre-read and pre-receipt verification of `atom_v9_internal` USAGE and
   EXECUTE on exactly both proof-reader functions;
+- deterministic routing of a failed final authority recheck to the exact
+  post-evaluation authority-invalid receipt, never the passing evaluated schema;
 - if migration is present, migration self-refusal and exact privilege proof.
 
 ---
@@ -1100,7 +1107,12 @@ Exactly these keys:
 ```text
 current_user                         string = "atom_e1_scorecard_reader"
 session_user                         string = "atom_e1_scorecard_reader"
+dsn_login_user                       string, exact conditional value below
+dsn_identity_overrides_absent        boolean = true
 current_database                     string = "postgres"
+database_owner                       string != "atom_e1_scorecard_reader"
+database_create                      boolean = false
+database_temporary                   boolean = false
 effective_host                       string
 project_binding_verified             boolean = true
 schema_public_usage                  boolean = true
@@ -1159,6 +1171,28 @@ rolbypassrls    boolean = false
 ```
 
 No extra role-attribute keys.
+
+`dsn_login_user` is the normalized, percent-decoded username from the
+credential itself, before any connection is attempted. Its only permitted
+values are:
+
+- direct host: exactly `atom_e1_scorecard_reader`;
+- approved Supavisor host: exactly
+  `atom_e1_scorecard_reader.afyiydxbjgzaiswnbcyj`, following Supavisor's
+  `[DB-USER].[PROJECT-REF]` convention.
+
+It is derived from the credential, never from the mutable PostgreSQL
+`current_user` or `session_user`. `dsn_identity_overrides_absent` is
+`true` only when every prohibition in §15.1 has passed.
+
+`database_owner` is exactly the single value returned by
+`SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_catalog.pg_database WHERE
+datname = current_database()`. It must not equal the reader.
+`database_create` and
+`database_temporary` are the effective
+`pg_catalog.has_database_privilege(current_user,current_database(),...)`
+results, including privileges inherited from `PUBLIC` and implicit
+`pg_database_owner`; both must be `false`.
 
 `reader_role_memberships` is exactly the ascending UTF-8 list of role names
 from every `pg_catalog.pg_auth_members` row whose `member` is the OID of
@@ -1425,7 +1459,7 @@ docs/v-1b-volatility-scorecard-receipt-<evaluation_session>-<run_identity>-<rece
 
 ---
 
-## 14. Pre-evaluation negative receipts
+## 14. Negative receipts
 
 Negative receipts preserve failures without fabricating evaluated cells.
 
@@ -1486,7 +1520,44 @@ receipt_sha256       64 lowercase hex
 
 No fabricated `cells` or `run_identity`. Overall semantic status is `INVALID` by schema identity. It cannot become the official evaluated receipt and cannot open V-1C.
 
-Both negative schemas use §13.7 canonicalization/hash rules.
+### 14.3 POST-EVALUATION AUTHORITY INVALID receipt
+
+Use only when all 12 truthful cell objects and a valid `run_identity` have
+been constructed, but the mandatory final §15.3 authority recheck fails. The
+passing §13 evaluated schema is forbidden for this condition.
+
+Exact top-level keys:
+
+```text
+schema_version          string = "ATOM-V1B-POST-EVALUATION-AUTHORITY-INVALID-RECEIPT-1"
+decision_id             exact decision string
+job_id                  exact job string
+contract_path           exact contract path
+verified_main_sha       exact authorized V-1B SHA
+v1a_merge_sha           verified V-1A merge SHA
+run_identity            string, exactly 64 lowercase hex
+evaluation_session      YYYY-MM-DD
+evaluation_as_of_at     UTC RFC3339 microseconds
+generated_at_utc        UTC RFC3339 microseconds
+stage                   string = "POST_EVALUATION_AUTHORITY_RECHECK"
+reason_codes            array[string] = ["FINAL_AUTHORITY_RECHECK_FAILED"]
+reader_identity         string = "atom_e1_scorecard_reader"
+database_identity       exact §13.2 object
+initial_authority_proof exact passing §13.3 object from the pre-read check
+read_only               boolean = true
+forecast_writes         integer = 0
+outcome_writes          integer = 0
+evidence_writes         integer = 0
+receipt_sha256          64 lowercase hex
+```
+
+No `cells`, metrics, classifications, evaluated `overall_status`, or final
+passing `authority_proof` is serialized. The single exact reason code is used
+regardless of which or how many final checks fail, so check/discovery order
+cannot change the receipt body. Overall semantic status is `INVALID` by
+schema identity. This receipt cannot become official and cannot open V-1C.
+
+All three negative schemas use §13.7 canonicalization/hash rules.
 
 ---
 
@@ -1511,21 +1582,41 @@ The implementation must parse the supplied libpq/psycopg connection string and d
 Fail `BLOCKED` before evidence reading unless all conditions hold:
 
 - database name is exactly `postgres`;
-- direct-host form is exactly `db.afyiydxbjgzaiswnbcyj.supabase.co`, **or** approved Supavisor pooler host is used with a username whose project suffix binds exactly `afyiydxbjgzaiswnbcyj` under Supabase's pooler convention;
-- no URI/query/conninfo option can override or redirect the verified target.
+- direct-host form is exactly `db.afyiydxbjgzaiswnbcyj.supabase.co` and
+  the credential username is exactly `atom_e1_scorecard_reader`, **or** an
+  approved Supavisor pooler host is used and the credential username is
+  exactly
+  `atom_e1_scorecard_reader.afyiydxbjgzaiswnbcyj`;
+- the credential itself supplies exactly one unambiguous `user`, `host`,
+  and `dbname` value; and
+- no URI/query/conninfo, separate connect keyword argument, service file, or
+  ambient libpq setting can add, replace, or redirect the verified target,
+  login identity, or startup authorization state.
 
-Explicitly reject DSNs containing connection-target override parameters including:
+After percent-decoding and libpq normalization, explicitly reject:
 
 ```text
-host
-hostaddr
-service
-servicefile
+duplicate user, host, hostaddr, port, dbname, database, service, or options keys
+any hostaddr
+any service or servicefile
+any options value
+any multi-host or multi-port list
+any separate connect keyword argument for user, host, hostaddr, port, dbname,
+  database, service, servicefile, or options
+any nonempty PGUSER, PGHOST, PGHOSTADDR, PGPORT, PGDATABASE, PGSERVICE,
+  PGSERVICEFILE, or PGOPTIONS process environment variable
 ```
 
-in query/options or duplicate conninfo forms that can replace the verified authority target. Also reject multi-host target lists.
+The V-1B implementation must never issue `SET ROLE`, `RESET ROLE`, `SET
+SESSION AUTHORIZATION`, or `RESET SESSION AUTHORIZATION`. In particular,
+startup `options=-c role=...`, `options=-c session_authorization=...`, and
+Supabase temporary-access `options=-c jit=true` are all forbidden, regardless
+of encoding or spelling.
 
-If the implementation cannot prove the effective target from the pinned parser/libpq semantics, stop `BLOCKED`; do not connect first and infer later.
+The parsed credential login is recorded as `dsn_login_user`; it is not
+inferred from post-connect role state. If the implementation cannot prove the
+effective target and login from the pinned parser/libpq semantics, stop
+`BLOCKED`; do not connect first and infer later.
 
 ### 15.2 Conditional migration 033
 
@@ -1555,7 +1646,7 @@ public.volatility_forecast_outcomes
 
 including schema `USAGE` only if required and exact SELECT policies only if required.
 
-No new role, password, membership, writer, function, service, source, broad table grant, default privilege, or application elsewhere.
+No new role, password, membership, writer, function, service, source, broad table grant, default privilege, or application elsewhere. Migration 033 may not alter database ownership or any database-level privilege; failure of the database-owner/`CREATE`/`TEMPORARY` checks requires a documentation-first amendment.
 
 ### 15.3 Six-table runtime full-read and zero-write proof
 
@@ -1568,7 +1659,15 @@ Before evidence reads, and again immediately before evaluated receipt constructi
   NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, matching
   every boolean in §13.3;
 - `current_database() = postgres`;
-- effective host/project binding already passed §15.1;
+- the `pg_catalog.pg_database` owner of `current_database()`, resolved with
+  `pg_catalog.pg_get_userbyid(datdba)`, is not
+  `atom_e1_scorecard_reader`;
+- `pg_catalog.has_database_privilege(current_user,current_database(),'CREATE')`
+  is exactly `false`;
+- `pg_catalog.has_database_privilege(current_user,current_database(),'TEMPORARY')`
+  is exactly `false`;
+- effective target, parsed credential login, and absence of every identity
+  override already passed §15.1;
 - schema `public` USAGE true;
 - schema `public` CREATE false;
 - schema `atom_v9_internal` USAGE true;
@@ -1596,7 +1695,18 @@ public.volatility_forecasts
 public.volatility_forecast_outcomes
 ```
 
-Any pre-read authority failure => BLOCKED receipt. Any authority drift discovered after evaluation begins => PRE-CELL INVALID or evaluated INVALID depending on whether complete truthful cells can be constructed.
+The routing is exact:
+
+- any failure of the first, pre-read check => §14.1 BLOCKED;
+- any authority failure after evaluation begins but before all 12 truthful
+  cells and a valid `run_identity` exist => §14.2 PRE-CELL INVALID;
+- when all 12 truthful cells and a valid `run_identity` exist, any failure of
+  the final check => §14.3 POST-EVALUATION AUTHORITY INVALID.
+
+A final authority failure may never be represented by the passing §13
+evaluated schema, even as evaluated `overall_status = INVALID`. Only when
+both complete §15.3 checks pass may their identical passing values populate
+the evaluated `authority_proof`.
 
 ---
 
@@ -1688,7 +1798,8 @@ The evaluated `overall_reason_codes` derivation is exact:
   protocol/evidence/reproducibility defect exists. Include every applicable
   code, sort unique in ascending UTF-8 order, and include no other code.
 
-A BLOCKED run uses the separate BLOCKED schema and has no evaluated overall status.
+A BLOCKED, PRE-CELL INVALID, or POST-EVALUATION AUTHORITY INVALID run uses its
+separate §14 schema and has no evaluated overall status.
 
 PASS means only that at least one frozen existing ATOM volatility forecaster carries
 incremental realized-volatility information beyond `persist_20`, beyond an
@@ -1732,7 +1843,9 @@ Only after those gates may the Owner merge the receipt PR. That Owner merge is t
 
 For a given run identity, the first Owner-merged SHA-valid evaluated receipt is the unique `OFFICIAL` receipt. A second different evaluated receipt for the same run identity is forbidden and causes fail-closed ambiguity until documentation-first amendment.
 
-A BLOCKED or PRE-CELL INVALID receipt may be preserved in an audit PR if desired, but it is never an official evaluated receipt and never opens V-1C.
+A BLOCKED, PRE-CELL INVALID, or POST-EVALUATION AUTHORITY INVALID receipt may
+be preserved in an audit PR if desired, but it is never an official evaluated
+receipt and never opens V-1C.
 
 ---
 
