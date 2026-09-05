@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
+import os
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -208,3 +209,56 @@ def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
     assert "GRANT TRUNCATE" not in sql
     assert sql.count("FORCE ROW LEVEL SECURITY") == 3
     assert "HIST8_EFFECTIVE_PRIVILEGE_BOUNDARY_UNSATISFIED" in sql
+
+
+def test_schema_enforces_importer_boundary_in_postgres() -> None:
+    dsn = os.environ.get("H2C_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("CI PostgreSQL is not available")
+    import psycopg
+
+    sql = Path("research/hist8/schema.sql").read_text(encoding="utf-8")
+    with psycopg.connect(dsn, autocommit=False) as connection:
+        try:
+            with connection.cursor() as cursor:
+                for role in ("anon", "authenticated", "service_role"):
+                    cursor.execute(
+                        f"create role {role} nologin nosuperuser nocreatedb "
+                        "nocreaterole noreplication nobypassrls"
+                    )
+                cursor.execute(sql)
+                cursor.execute(
+                    """select rolcanlogin, rolinherit, rolsuper, rolcreatedb,
+                              rolcreaterole, rolreplication, rolbypassrls
+                       from pg_roles where rolname='atom_hist8_importer'"""
+                )
+                assert cursor.fetchone() == (
+                    True, False, False, False, False, False, False,
+                )
+                cursor.execute("set role atom_hist8_importer")
+                artifact_id = "sha256:" + "e" * 64
+                cursor.execute(
+                    """insert into atom_research_history.raw_responses
+                       (artifact_id, body, byte_length) values (%s,%s,%s)""",
+                    (artifact_id, b"{}", 2),
+                )
+                cursor.execute(
+                    "select body from atom_research_history.raw_responses "
+                    "where artifact_id=%s", (artifact_id,),
+                )
+                assert bytes(cursor.fetchone()[0]) == b"{}"
+                cursor.execute("savepoint mutation_probe")
+                with pytest.raises(psycopg.Error):
+                    cursor.execute(
+                        "update atom_research_history.raw_responses "
+                        "set body=body where artifact_id=%s", (artifact_id,),
+                    )
+                cursor.execute("rollback to savepoint mutation_probe")
+                cursor.execute("reset role")
+                cursor.execute(
+                    """select count(*) from information_schema.tables
+                       where table_schema='atom_research_history'"""
+                )
+                assert cursor.fetchone()[0] == 3
+        finally:
+            connection.rollback()
