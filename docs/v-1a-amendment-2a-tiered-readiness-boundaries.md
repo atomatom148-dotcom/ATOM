@@ -379,10 +379,14 @@ slowest of 12 heterogeneous populations even when a fixed subset has met every
 prospective minimum. The constituent rules are not mathematically impossible
 without another deadline or cap. They compose into stronger hidden floors:
 
-- at 1H, at most six RTH target windows per full session plus the 20-window
-  persistence warmup and 100-regression-window minimum require at least 120
-  selected target windows, hence at least 20 full sessions even though the
-  stated session minimum is 10; and
+- at 1H, at most six wholly-contained RTH target windows exist per full
+  session. After the 20-window persistence warmup, the first regression window
+  lacks a causal unconditional benchmark under unchanged V-1A §8.2. Therefore
+  100 unconditional gate windows require at least 101 regression windows, or
+  at least 121 selected target windows and `ceil(121 / 6) = 21` full sessions.
+  This is a necessary lower bound, not sufficient readiness or a date
+  guarantee: the separate seasonal gate, all six exact minima, causal
+  availability, lineage, and selector rules remain unchanged; and
 - for V9 kappa, latest-250 withholding plus the 250-raw-score MATURE minimum
   requires at least 500 governed selected calibration pairs before effective-N
   and finite-positive-kappa conditions can be decisive; Correction 2's 5M
@@ -1060,9 +1064,14 @@ result_scope
 ```
 
 Fixed string fields equal §8.1. `result_scope = "MANIFEST_ONLY"`.
-`manifest_cells` is the exact §8.2 array. In BLOCKED, either merge SHA is null
-only when failure of that exact merge-identity proof is the blocking cause;
-otherwise it is verified. Both are non-null in either INVALID schema.
+`manifest_cells` is the exact §8.2 array. In each of the three negative
+schemas, each of `amendment_merge_sha` and `tls_amendment_merge_sha` is its
+exact verified lowercase 40-hex merge SHA, or `null` only when inability to
+establish that exact identity is the defect causing the corresponding
+BLOCKED/INVALID route. Every independently verified unaffected merge identity
+remains non-null. A guessed, substitute, ambiguous, or unverified SHA is never
+serialized as verified. This is a narrow negative-schema exception to §8.1;
+evaluated receipts still require both verified non-null merge identities.
 Before sealing, `readiness`, `sealed_run_identity`, and `seal_record_sha256`
 are all `null`. After sealing, `readiness` is the complete sealed §8.2 object,
 `sealed_run_identity` is the exact §8.4 `run_identity`, and
@@ -1075,7 +1084,12 @@ seal record. Its inherited `verified_main_sha`, `v1a_merge_sha`,
 the sealed `readiness_identity_body`; `evaluation_session` equals
 `readiness.boundary_session`; and `evaluation_as_of_at` equals
 `readiness.boundary_as_of_at`. Its amendment, TLS, evidence, manifest, and
-readiness fields also equal the sealed values after canonicalization.
+readiness fields also equal the sealed values after canonicalization, except
+that only an affected top-level `amendment_merge_sha` or
+`tls_amendment_merge_sha` scalar may be null when its identity-verification
+defect caused the route. Every non-null merge SHA equals the sealed value, and
+every other sealed cross-binding remains exact. Null current verification is
+not propagated into, and does not rehash, a previously accepted seal.
 
 For a consuming PRE-CELL INVALID receipt, the inherited `authority_proof` is
 non-null and equals the seal record's `initial_authority_proof`. For a
@@ -1105,7 +1119,9 @@ database, TLS, sealed-identity, or sealed-input failure
 or inability to verify found before protected calculation—including before
 evidence reading—routes instead to consuming PRE-CELL INVALID with the sealed
 `readiness`, `sealed_run_identity`, and `seal_record_sha256`. Recovery can
-never return BLOCKED, clear those fields, or authorize a replacement identity.
+never return BLOCKED, clear those fields, alter the original complete sealed
+readiness, `sealed_run_identity`, `seal_record_sha256`, or immutable seal
+identity bodies, authorize a replacement identity, or create a new look.
 
 After sealing, a calculation exception, receipt-construction or serialization
 failure, final lineage/count mismatch, or late duplicate discovery routes to
@@ -1342,6 +1358,9 @@ In addition to every unchanged applicable V-1A test, tests must prove:
   identity;
 - deferred scans use the same anchor regardless of actual invocation time;
 - all six minima use unchanged population and exact selector results;
+- at 1H, 120 selected windows cannot meet the 100-window unconditional gate;
+  121 is only the arithmetic lower bound and must still pass every existing
+  readiness predicate;
 - inter-arrival, persisted-rate, capacity, effective-N proxy, and calendar
   estimates cannot satisfy readiness;
 - the calibration split makes `calibration_pairs` first nonempty at 251
@@ -1367,6 +1386,14 @@ In addition to every unchanged applicable V-1A test, tests must prove:
   computation, and routes to null-seal PRE-CELL INVALID;
 - exact evaluated and amended negative schemas, hashes, and retained-seal
   cross-bindings, including both consuming-negative authority fields;
+- unavailable, duplicate, or otherwise unverifiable amendment or TLS merge
+  identities after evidence reading serialize null only for the affected
+  top-level merge-SHA scalar, preserve every independently verified unaffected
+  SHA, and reject every guessed, substitute, ambiguous, or unverified non-null
+  value;
+- a retained-seal recovery identity-verification failure consumes the original
+  sealed identity without changing or rehashing its readiness, run identity,
+  seal digest, or identity bodies and without permitting BLOCKED or a new look;
 - boundary, lineage, count, amendment, TLS, evidence, revision, runtime,
   database, authority, and manifest bindings;
 - later evidence cannot move the sealed boundary;
@@ -1385,7 +1412,15 @@ In addition to every unchanged applicable V-1A test, tests must prove:
 - manifest-only status derivation and `result_scope` wording;
 - global 12-cell multiplicity remains unchanged;
 - manifest partitioning leaves each cell's exact row order, RNG streams,
-  draws, statistics, and classification invariant; and
+  draws, statistics, and classification invariant;
+- every execution revision and its regular, non-symlink worktree files match
+  the reviewed implementation merge's exact path state, Git modes, blobs, and
+  raw bytes across the exhaustive implementation surface, conditional
+  migration, TLS CA, and closed reviewed set of reused source primitives;
+- ancestry-valid heads that change scorecard source, `requirements.txt`, a
+  reused source primitive, the CA, or conditional migration state are rejected,
+  while receipt-only descendants with an identical bound implementation
+  surface are accepted and recovery remains bound to the sealed revision; and
 - `v1b_implementation_merge_sha` identifies the isolated implementation diff,
   and rollback of that diff preserves every amendment, evidence file, seal,
   and receipt.
@@ -1420,7 +1455,44 @@ Authenticated repository metadata also fixes
 `v1b_implementation_merge_sha` as the `merge_commit_sha` of the exact
 Owner-merged implementation PR in §11 step 3. Its first-parent diff is limited
 to the exhaustive §10.1 implementation surface, and every authorized execution
-revision must descend from it.
+revision must descend from it. Ancestry is necessary but insufficient.
+
+For every execution revision, exact path presence or absence, Git mode, Git
+blob identity, and raw-byte SHA-256 must equal the authenticated immutable
+implementation merge for the exhaustive §10.1 implementation surface,
+including the conditionally absent or present migration, and for the single CA
+artifact expressly added by merged TLS Amendment 1 §4. The binding also
+includes every unchanged repository-source primitive actually imported or
+reused by the reviewed scorecard; independent implementation review fixes that
+closed path set. Binding those primitives authorizes no edit to them. Expected
+bytes and identities come only from the authenticated implementation merge,
+never from a later execution head or caller-supplied replacement, and no source
+file embeds its own digest in its own bytes.
+
+Verification covers both the execution-revision Git objects and the actual
+regular, non-symlink worktree bytes, while retaining every existing runtime,
+dependency, and native-library check. It runs on every new-seal invocation,
+every later or deferred main revision, and exact recovery before evidence reads
+or protected computation, and runs again at final verification. Later receipt
+or documentation commits are permitted only while this entire bound
+implementation surface remains exactly equal. An ancestry-valid intervening
+implementation change, changed imported primitive, missing or unreadable file,
+mode or symlink change, added conditional migration, or unverifiable equality
+fails closed through the existing §8.6 timing rules, including a consuming
+INVALID after sealing. Recovery remains bound to the sealed revision.
+
+This binding uses the existing verified revision, run, and receipt identities
+plus authenticated implementation-merge verification. The runtime-artifact
+manifest is not a substitute for repository-source equality. It adds no
+receipt, seal, or run/readiness schema key, implementation path, manifest,
+environment variable, scanner, alternative implementation baseline, runtime
+repair, or new-look allowance. A changed implementation requires the existing
+documentation-first repair process and cannot silently become an accepted
+later execution head. Tests must reject ancestry-valid heads that change the
+scorecard source, `requirements.txt`, a reused source primitive, the CA, or the
+conditional migration state; accept receipt-only descendants whose entire
+bound implementation surface is identical; and prove recovery stays bound to
+the sealed revision.
 
 Rollback reverts only that implementation first-parent diff, using a
 separately reviewed revert applied to then-current `main`. The per-invocation
