@@ -74,7 +74,11 @@ Count incomplete windows and residual session tails without emitting bars for th
 
 Use only one Owner-designated isolated research Supabase project, distinct from production and SIM. This authorization permits use of that isolated project for the HIST8 corpus only; it does not authorize creating an additional project, service, or billing commitment. Bind its exact project/database identity in the reviewed implementation manifest; absent or mismatched identity blocks all database writes.
 
-The new database surface is limited to private schema `atom_research_history`, append-only tables `bars` and `manifests`, and their necessary constraints, indexes, mutation-rejection protections, and project-local least-privilege grants. Manifests may bind immutable external source artifacts; references must remain retrievable and hash-verifiable.
+The new database surface is limited to private schema `atom_research_history`, append-only tables `bars` and `manifests`, the project-local importer role `atom_hist8_importer` defined below, and their necessary constraints, indexes, mutation-rejection protections, and project-local least-privilege grants. Manifests may bind immutable external source artifacts; references must remain retrievable and hash-verifiable.
+
+The only HIST8 importer role is `atom_hist8_importer`, with attributes `LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`. Authorize its creation only through `research/hist8/schema.sql` on the bound isolated project, without embedding a password in repository SQL. If that name already exists, accept it only as a verified repeat of this same HIST8 installation with the exact project binding, attributes, and effective privileges; otherwise stop `BLOCKED` without adopting or changing it. The importer owns no database, schema, or table and is a member of no other role. Its application-data privileges are limited to `SELECT` and `INSERT` on `atom_research_history.bars` and `atom_research_history.manifests`, with only the required database `CONNECT` and schema `USAGE`. No schema `CREATE`, mutation authority, privilege elevation, or access to other application data is authorized. Do not reuse a production, SIM, score-reader, owner, or service role as the importer.
+
+The sole HIST8 importer database credential is `ATOM_HIST8_IMPORT_DATABASE_URL`, a secret connection URL authenticating as `atom_hist8_importer` to the exact bound isolated project/database. The Owner securely provisions its password/URL only after the separately gated implementation merge and only to the bounded offline importer. Missing or mismatched role/project identity blocks ingestion; no owner/admin/service-role URL or generic `DATABASE_URL` fallback is permitted. Never commit, log, include in source artifacts/manifests/receipts, or distribute the secret value to production, V1B, SIM, V9, web services, or live workers. Existing market-data credentials are unchanged.
 
 Each bar must store or immutably bind corpus/instrument identity, timeframe, UTC start, session date/calendar, OHLCV and units/null semantics, source/feed/product, originating retrieval/import identity, derivation version, source-row lineage, and content hash. Canonical lineage identifies the preserved provider artifact and exact source record; derived lineage identifies its ordered canonical inputs.
 
@@ -124,9 +128,34 @@ A missing proof, unresolved same-key conflict, wrong source/project, mutable acc
 
 ## 9. Documentation gate and exact Codex handoff
 
-The documentation PR may add only this authorization. It must contain no implementation, migration, data import, active-phase-pointer change, or runtime/configuration change. Require independent final-head review, all mandatory checks green, zero unresolved material findings, and Owner approval/merge. That Owner-approved documentation-only merge is the sole effectivity event for `ATOM-HIST8-CORPUS-AMENDMENT-1`; no parent decision, parent approval, or parent merge is required.
+The documentation PR allowlist is exactly:
 
-Only after that gate, hand Codex this implementation job: create the isolated schema/tables/protections; implement the three authorized historical source adapters and validated reuse/backfill; derive the four timeframes from canonical minutes; implement frozen validation/snapshot/partition rules; add focused tests; and produce the receipt above. Nothing else.
+- `docs/isolated-historical-corpus-eight-instrument-amendment.md` - this complete authorization.
+- `AGENTS.md` - add only the single parallel-authorization entry reproduced below.
+
+The same documentation gate authorizes both changes. Insert the following as one entry in `AGENTS.md` under `## Active phase pointer`, immediately before the existing `Not authorized` entry. Preserve every existing `AGENTS.md` line unchanged; do not edit, remove, move, or reformat another entry. The active phase remains SIM-5. This addition is a parallel authorization, not a change to the active-phase selection, and HIST8 neither blocks SIM-5 nor becomes its prerequisite.
+
+```text
+- Owner-approved HIST8 corpus work is separately authorized alongside SIM-5
+  under `docs/isolated-historical-corpus-eight-instrument-amendment.md`
+  (`ATOM-HIST8-CORPUS-AMENDMENT-1`) and does not change, take, or block the
+  SIM-5 active-phase pointer. Its only added authority is private schema
+  `atom_research_history`, importer role `atom_hist8_importer`, offline-only
+  credential `ATOM_HIST8_IMPORT_DATABASE_URL`, and the exact implementation
+  allowlist: `research/hist8/schema.sql`, `research/hist8/corpus.py`,
+  `research/hist8/calendar_manifest.json`, `tests/test_hist8_corpus.py`, and
+  append-only artifacts under `docs/receipts/hist8/`, using only the frozen
+  Alpaca SIP, Coinbase Exchange, and Massive `I:COMP` historical sources.
+  This entry expressly excepts only that HIST8 scope from the following
+  prohibition on new roles/credentials/sources; every other prohibition
+  remains unchanged. All HIST8 gates apply. No new service or project and
+  no production, V1B, SIM, V9, broker, execution, or model-research authority
+  is granted.
+```
+
+The documentation PR must contain no implementation, migration, data import, active-phase selection change, or runtime/configuration change. Require independent final-head review of both allowed changes, all mandatory checks green, zero unresolved material findings, and Owner approval/merge. That Owner-approved documentation-only merge is the sole effectivity event for `ATOM-HIST8-CORPUS-AMENDMENT-1` and its single `AGENTS.md` parallel entry; no parent decision, parent approval, or parent merge is required.
+
+Only after that gate, hand Codex this implementation job: create the isolated schema/tables/protections and the exact importer role/access in section 5; implement the three authorized historical source adapters and validated reuse/backfill; derive the four timeframes from canonical minutes; implement frozen validation/snapshot/partition rules; add focused tests; and produce the receipt above. Nothing else.
 
 The implementation file allowlist is only `research/hist8/schema.sql` (isolated-only migration, never registered with production migrations), `research/hist8/corpus.py` (offline command and corpus logic), `research/hist8/calendar_manifest.json` (dated schedules and source identities), `tests/test_hist8_corpus.py`, and append-only artifacts under `docs/receipts/hist8/`. Do not overwrite an occupied path without verifying it belongs to this job. Codex must bind the verified isolated destination and exact changed/artifact paths in one implementation PR. Existing production, V1B, SIM, V9, mathematics, evidence, dependencies, workflows, services, credentials, and configuration remain unchanged except the expressly authorized isolated importer access. No surrounding refactor or additional platform is authorized. Required access or scope beyond this contract returns to the Owner/ChatGPT Pro, not an implementation workaround.
 
