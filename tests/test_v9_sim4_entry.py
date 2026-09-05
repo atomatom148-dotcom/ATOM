@@ -705,6 +705,21 @@ class SimulationEntryStoreTests(unittest.TestCase):
             "jsonb_typeof(r.record_json) = 'object'",
             sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
         )
+        # The canonical 24-field cardinality guard must use the same
+        # expression migration 031 uses.  jsonb_object_length() does not
+        # exist in PostgreSQL, so any such spelling raises UndefinedFunction
+        # (42883) on the mandatory SIM-4 activation path the moment
+        # migration 031 lands, disabling SIM-4 while SIM-5 is still gated
+        # off.  Freeze section 9 requires the disabled SIM-5 path to leave
+        # SIM-4 behavior intact.
+        self.assertIn(
+            "jsonb_array_length(jsonb_path_query_array(r.record_json, '$.*')) = 24",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
+        self.assertNotIn(
+            "jsonb_object_length",
+            sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
+        )
         self.assertIn(
             "jsonb_array_length(jsonb_path_query_array(r.record_json, '$.*')) = 24",
             sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE,
