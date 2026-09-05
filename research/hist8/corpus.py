@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 import uuid
 import zlib
@@ -147,8 +147,11 @@ def _canonical(value: object) -> object:
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise ValueError("nonfinite decimal")
-        normalized = value.normalize()
-        text = format(normalized, "f")
+        # Avoid Decimal.normalize(): it applies the active precision context and
+        # can collapse distinct high-precision provider values before hashing.
+        text = format(value, "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
         return "0" if text in ("-0", "") else text
     if isinstance(value, datetime):
         if value.tzinfo is None:
@@ -236,6 +239,14 @@ def _decimal(value: object, *, nullable: bool = False) -> Decimal | None:
     if not number.is_finite():
         raise Hist8Error("nonfinite decimal value")
     return number
+
+
+def _integer(value: object, *, name: str) -> int:
+    number = _decimal(value)
+    assert isinstance(number, Decimal)
+    if number != number.to_integral_value():
+        raise Hist8Error(f"{name} is not an integer")
+    return int(number)
 
 
 def _http_get(
@@ -335,8 +346,12 @@ def coinbase_pages(
 
 def _strip_secret_query(url: str) -> tuple[str, dict[str, str]]:
     parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname != "api.massive.com":
-        raise Hist8Error("Massive pagination origin mismatch")
+    expected = urlparse(MASSIVE_URL)
+    if (parsed.scheme != "https" or parsed.hostname != "api.massive.com"
+            or parsed.port is not None or parsed.username is not None
+            or parsed.password is not None or parsed.fragment
+            or unquote(parsed.path) != unquote(expected.path)):
+        raise Hist8Error("Massive pagination resource mismatch")
     safe = [(k, v) for k, v in parse_qsl(parsed.query) if k.lower() != "apikey"]
     endpoint = urlunparse(parsed._replace(query=""))
     return endpoint, dict(safe)
@@ -364,6 +379,8 @@ def massive_pages(
         payload = page.payload()
         if not isinstance(payload, dict) or not isinstance(payload.get("results", []), list):
             raise Hist8Error("malformed Massive page")
+        if payload.get("ticker") != "I:COMP":
+            raise Hist8Error("Massive ticker identity mismatch")
         next_url = payload.get("next_url")
         if next_url is None:
             return
@@ -382,6 +399,22 @@ def _manifest_id(payload: Mapping[str, object]) -> str:
     return "sha256:" + sha256(payload)
 
 
+def _membership_sequence(row: Bar) -> int:
+    delta = row.bar_start_utc - START
+    total_seconds = delta.days * 86400 + delta.seconds
+    minute_offset, remainder = divmod(total_seconds, 60)
+    if (delta.microseconds or remainder or minute_offset < 0
+            or row.bar_start_utc >= END):
+        raise Hist8Error("snapshot member timestamp outside frozen minute grid")
+    # Each timeframe receives two million slots (the window has 1,051,200
+    # minutes); each instrument receives ten million slots.
+    return (
+        INSTRUMENTS.index(row.instrument) * 10_000_000
+        + TIMEFRAMES.index(row.timeframe) * 2_000_000
+        + minute_offset
+    )
+
+
 class Hist8Store:
     def __init__(self, connection_factory: Callable[[], object]) -> None:
         self._connection_factory = connection_factory
@@ -390,14 +423,18 @@ class Hist8Store:
     def from_environment(cls) -> "Hist8Store":
         dsn = os.environ.get(IMPORT_DATABASE_ENV, "")
         parsed = urlparse(dsn)
-        query = parse_qs(parsed.query)
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        required_query = [
+            ("sslmode", "verify-full"), ("sslrootcert", "system"),
+        ]
         if (parsed.scheme not in ("postgres", "postgresql")
                 or parsed.hostname != DATABASE_HOST
                 or parsed.port not in (None, 5432)
                 or parsed.username != IMPORTER_ROLE
+                or not parsed.password
                 or parsed.path != f"/{DATABASE_NAME}"
-                or query.get("sslmode") != ["verify-full"]
-                or query.get("sslrootcert") != ["system"]):
+                or parsed.fragment
+                or sorted(query_pairs) != sorted(required_query)):
             raise Hist8Error("HIST8 importer credential/project mismatch")
         try:
             import psycopg
@@ -533,9 +570,9 @@ class Hist8Store:
                          bar_end_utc,session_date,calendar_id,calendar_sha256,open,high,
                          low,close,volume,trade_count,vwap,volume_unit,source,feed,product,
                          adjustment,currency,import_id,derivation_version,
-                         source_artifact_id,source_record_locator,lineage_json,research_eligible)
+                         source_artifact_id,source_record_locator,lineage_json)
                         values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         on conflict do nothing""", [_bar_values(row) for row in pending],
                     )
                     inserted = len(pending)
@@ -548,6 +585,50 @@ class Hist8Store:
                 for row in rows:
                     if verified.get((row.timeframe, row.bar_start_utc)) != row.content_hash:
                         raise Hist8ConflictError("bar readback mismatch")
+
+                members = []
+                expected_members = {}
+                for row in rows:
+                    sequence = _membership_sequence(row)
+                    payload = {
+                        "corpus_id": CORPUS_ID, "import_id": row.import_id,
+                        "kind": "SNAPSHOT_MEMBER", "sequence_no": sequence,
+                        "instrument": row.instrument, "timeframe": row.timeframe,
+                        "bar_start_utc": row.bar_start_utc, "bar_id": row.bar_id,
+                        "content_hash": row.content_hash,
+                        "research_eligible": row.research_eligible,
+                    }
+                    expected_members[sequence] = (
+                        row.bar_id, row.content_hash, row.research_eligible,
+                    )
+                    members.append((
+                        _manifest_id(payload), CORPUS_ID, row.import_id, sequence,
+                        row.instrument, row.bar_id, row.content_hash, row.timeframe,
+                        row.bar_start_utc, row.research_eligible,
+                    ))
+                cursor.executemany(
+                    """insert into atom_research_history.manifests
+                    (manifest_id,corpus_id,manifest_kind,import_id,sequence_no,
+                     instrument,member_bar_id,member_content_hash,member_timeframe,
+                     member_bar_start_utc,member_research_eligible,metadata_json)
+                    values (%s,%s,'SNAPSHOT_MEMBER',%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
+                    on conflict (manifest_id) do nothing""", members,
+                )
+                cursor.execute(
+                    """select sequence_no,member_bar_id,member_content_hash,
+                              member_research_eligible
+                       from atom_research_history.manifests
+                       where corpus_id=%s and import_id=%s
+                         and manifest_kind='SNAPSHOT_MEMBER'
+                         and sequence_no = any(%s)""",
+                    (CORPUS_ID, rows[0].import_id, list(expected_members)),
+                )
+                actual_members = {
+                    record[0]: (record[1], record[2], record[3])
+                    for record in cursor.fetchall()
+                }
+                if actual_members != expected_members:
+                    raise Hist8ConflictError("snapshot membership readback mismatch")
         return inserted, len(rows) - inserted
 
     def seal_snapshot(self, import_id: str, metadata: Mapping[str, object]) -> str:
@@ -556,11 +637,22 @@ class Hist8Store:
         connection = self._connection_factory()
         self._verify(connection)
         try:
+            with connection.cursor() as lock_cursor:
+                lock_cursor.execute(
+                    "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (import_id,),
+                )
             with connection.cursor(name="hist8_snapshot") as cursor:
                 cursor.execute(
-                    """select instrument,timeframe,bar_id,content_hash,research_eligible
-                    from atom_research_history.bars where corpus_id=%s
-                    order by instrument,timeframe,bar_start_utc""", (CORPUS_ID,),
+                    """select m.instrument,m.member_timeframe,m.member_bar_id,
+                              m.member_content_hash,m.member_research_eligible
+                       from atom_research_history.manifests m
+                       join atom_research_history.bars b
+                         on b.bar_id=m.member_bar_id
+                        and b.content_hash=m.member_content_hash
+                       where m.corpus_id=%s and m.import_id=%s
+                         and m.manifest_kind='SNAPSHOT_MEMBER'
+                       order by m.sequence_no""", (CORPUS_ID, import_id),
                 )
                 for instrument, timeframe, bar_id, content_hash, eligible in cursor:
                     digest.update(canonical_bytes((instrument, timeframe, bar_id,
@@ -600,7 +692,6 @@ def _bar_values(row: Bar) -> tuple[object, ...]:
         values["adjustment"], values["currency"], values["import_id"],
         values["derivation_version"], values["source_artifact_id"],
         values["source_record_locator"], json.dumps(list(row.lineage)),
-        values["research_eligible"],
     )
 
 
@@ -646,7 +737,10 @@ def parse_source_page(
             rows.append(SourceBar(
                 instrument, _iso_utc(item["t"]), _decimal(item["o"]),
                 _decimal(item["h"]), _decimal(item["l"]), _decimal(item["c"]),
-                _decimal(item["v"]), None if item.get("n") is None else int(item["n"]),
+                _decimal(item["v"]),
+                None if item.get("n") is None else _integer(
+                    item["n"], name="Alpaca trade count"
+                ),
                 _decimal(item.get("vw"), nullable=True), artifact,
                 f"$.bars.{instrument}[{index}]", "ALPACA", "SIP",
                 f"{instrument}:1Min", "raw", "SHARES",
@@ -655,7 +749,8 @@ def parse_source_page(
         for index, item in enumerate(payload):
             if not isinstance(item, list) or len(item) < 6:
                 raise Hist8Error("malformed Coinbase candle")
-            start = datetime.fromtimestamp(int(item[0]), timezone.utc)
+            timestamp = _integer(item[0], name="Coinbase timestamp")
+            start = datetime.fromtimestamp(timestamp, timezone.utc)
             rows.append(SourceBar(
                 instrument, start, _decimal(item[3]), _decimal(item[2]),
                 _decimal(item[1]), _decimal(item[4]), _decimal(item[5]), None,
@@ -663,8 +758,10 @@ def parse_source_page(
                 "BTC-USD:60", "none", "BTC",
             ))
     elif page.source == "MASSIVE":
+        if payload.get("ticker") != "I:COMP":
+            raise Hist8Error("Massive ticker identity mismatch")
         for index, item in enumerate(payload.get("results", [])):
-            milliseconds = int(item["t"])
+            milliseconds = _integer(item["t"], name="Massive timestamp")
             if milliseconds % 1000:
                 raise Hist8Error("Massive timestamp is not second aligned")
             start = datetime.fromtimestamp(milliseconds // 1000, timezone.utc)
@@ -714,7 +811,9 @@ def _session_for(row: SourceBar, definitions: Mapping[str, tuple[datetime, datet
 
 def _content_payload(row: Bar) -> dict[str, object]:
     payload = asdict(row)
-    for key in ("bar_id", "content_hash", "import_id"):
+    # Eligibility is snapshot state, not canonical bar identity. This permits a
+    # later append-only backfill to mark an existing minute eligible.
+    for key in ("bar_id", "content_hash", "import_id", "research_eligible"):
         payload.pop(key)
     payload["lineage"] = list(row.lineage)
     return payload

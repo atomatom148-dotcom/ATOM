@@ -1,8 +1,10 @@
 -- ATOM-HIST8-CORPUS-AMENDMENT-1
 -- Isolated installation only: pjbjpgnmniwcajqkuhge / postgres.
 
-SET lock_timeout = '5s';
-SET statement_timeout = '60s';
+BEGIN;
+
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '60s';
 
 DO $hist8$
 BEGIN
@@ -19,18 +21,15 @@ BEGIN
       'HIST8_PROJECT_MISMATCH: not legacy V8 project pjbjpgnmniwcajqkuhge';
   END IF;
 
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'atom_hist8_importer') THEN
-    CREATE ROLE atom_hist8_importer
-      LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE
-      NOREPLICATION NOBYPASSRLS;
-  ELSIF EXISTS (
-    SELECT 1 FROM pg_roles
-    WHERE rolname = 'atom_hist8_importer'
-      AND (rolsuper OR rolinherit OR rolcreaterole OR rolcreatedb
-           OR rolreplication OR rolbypassrls OR NOT rolcanlogin)
-  ) THEN
-    RAISE EXCEPTION 'HIST8_ROLE_MISMATCH';
+  -- Never adopt a coincidentally named principal. This installer is deliberately
+  -- one-shot; a repeat deployment must first be proved from the execution receipt.
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'atom_hist8_importer') THEN
+    RAISE EXCEPTION 'HIST8_IMPORTER_ROLE_ALREADY_EXISTS';
   END IF;
+
+  CREATE ROLE atom_hist8_importer
+    LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE
+    NOREPLICATION NOBYPASSRLS;
 
   IF EXISTS (
     SELECT 1 FROM pg_auth_members m
@@ -60,7 +59,10 @@ CREATE TABLE atom_research_history.manifests (
     CHECK (manifest_id ~ '^sha256:[0-9a-f]{64}$'),
   corpus_id text NOT NULL CHECK (corpus_id = 'HIST8_20240901_20260901_V1'),
   manifest_kind text NOT NULL
-    CHECK (manifest_kind IN ('RETRIEVAL', 'IMPORT_ATTEMPT', 'REPLAY_ATTEMPT', 'SNAPSHOT')),
+    CHECK (manifest_kind IN (
+      'RETRIEVAL', 'IMPORT_ATTEMPT', 'REPLAY_ATTEMPT',
+      'SNAPSHOT_MEMBER', 'SNAPSHOT'
+    )),
   import_id text NOT NULL CHECK (length(import_id) BETWEEN 1 AND 128),
   sequence_no bigint NOT NULL CHECK (sequence_no >= 0),
   source text,
@@ -77,6 +79,15 @@ CREATE TABLE atom_research_history.manifests (
   artifact_id text REFERENCES atom_research_history.raw_responses(artifact_id)
     ON DELETE RESTRICT,
   artifact_byte_length bigint CHECK (artifact_byte_length >= 0),
+  member_bar_id text,
+  member_content_hash text CHECK (
+    member_content_hash IS NULL OR member_content_hash ~ '^[0-9a-f]{64}$'
+  ),
+  member_timeframe text CHECK (
+    member_timeframe IS NULL OR member_timeframe IN ('1m','5m','15m','30m','1H')
+  ),
+  member_bar_start_utc timestamptz,
+  member_research_eligible boolean,
   metadata_json jsonb NOT NULL CHECK (jsonb_typeof(metadata_json) = 'object'),
   created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT hist8_retrieval_artifact_required CHECK (
@@ -85,6 +96,17 @@ CREATE TABLE atom_research_history.manifests (
         AND endpoint IS NOT NULL AND retrieved_at IS NOT NULL
         AND http_status IS NOT NULL AND artifact_id IS NOT NULL
         AND artifact_byte_length IS NOT NULL)
+  ),
+  CONSTRAINT hist8_snapshot_member_required CHECK (
+    (manifest_kind = 'SNAPSHOT_MEMBER'
+      AND instrument IS NOT NULL AND member_bar_id IS NOT NULL
+      AND member_content_hash IS NOT NULL AND member_timeframe IS NOT NULL
+      AND member_bar_start_utc IS NOT NULL
+      AND member_research_eligible IS NOT NULL)
+    OR (manifest_kind <> 'SNAPSHOT_MEMBER'
+      AND member_bar_id IS NULL AND member_content_hash IS NULL
+      AND member_timeframe IS NULL AND member_bar_start_utc IS NULL
+      AND member_research_eligible IS NULL)
   ),
   UNIQUE (import_id, sequence_no, manifest_kind)
 );
@@ -120,7 +142,6 @@ CREATE TABLE atom_research_history.bars (
     ON DELETE RESTRICT,
   source_record_locator text,
   lineage_json jsonb NOT NULL CHECK (jsonb_typeof(lineage_json) = 'array'),
-  research_eligible boolean NOT NULL,
   created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT hist8_bar_interval CHECK (bar_end_utc > bar_start_utc),
   CONSTRAINT hist8_bar_duration CHECK (
@@ -150,6 +171,14 @@ CREATE TABLE atom_research_history.bars (
   UNIQUE (corpus_id, instrument, timeframe, bar_start_utc)
 );
 
+ALTER TABLE atom_research_history.bars
+  ADD CONSTRAINT hist8_bar_identity_pair UNIQUE (bar_id, content_hash);
+ALTER TABLE atom_research_history.manifests
+  ADD CONSTRAINT hist8_snapshot_member_bar_fk
+  FOREIGN KEY (member_bar_id, member_content_hash)
+  REFERENCES atom_research_history.bars (bar_id, content_hash)
+  ON DELETE RESTRICT;
+
 CREATE INDEX hist8_bars_snapshot_scan_idx
   ON atom_research_history.bars (corpus_id, instrument, timeframe, bar_start_utc);
 CREATE INDEX hist8_manifests_import_idx
@@ -168,6 +197,31 @@ $function$;
 
 REVOKE ALL ON FUNCTION atom_research_history.reject_mutation() FROM PUBLIC, anon, authenticated, service_role, atom_hist8_importer;
 
+CREATE OR REPLACE FUNCTION atom_research_history.guard_snapshot_membership()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(NEW.import_id, 0)
+  );
+  IF NEW.manifest_kind = 'SNAPSHOT_MEMBER' AND EXISTS (
+    SELECT 1
+    FROM atom_research_history.manifests
+    WHERE corpus_id = NEW.corpus_id
+      AND import_id = NEW.import_id
+      AND manifest_kind = 'SNAPSHOT'
+  ) THEN
+    RAISE EXCEPTION 'HIST8 snapshot membership is sealed';
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+REVOKE ALL ON FUNCTION atom_research_history.guard_snapshot_membership() FROM PUBLIC, anon, authenticated, service_role, atom_hist8_importer;
+
 CREATE TRIGGER hist8_raw_reject_update_delete
   BEFORE UPDATE OR DELETE ON atom_research_history.raw_responses
   FOR EACH ROW EXECUTE FUNCTION atom_research_history.reject_mutation();
@@ -180,6 +234,9 @@ CREATE TRIGGER hist8_manifests_reject_update_delete
 CREATE TRIGGER hist8_manifests_reject_truncate
   BEFORE TRUNCATE ON atom_research_history.manifests
   FOR EACH STATEMENT EXECUTE FUNCTION atom_research_history.reject_mutation();
+CREATE TRIGGER hist8_snapshot_membership_guard
+  BEFORE INSERT ON atom_research_history.manifests
+  FOR EACH ROW EXECUTE FUNCTION atom_research_history.guard_snapshot_membership();
 CREATE TRIGGER hist8_bars_reject_update_delete
   BEFORE UPDATE OR DELETE ON atom_research_history.bars
   FOR EACH ROW EXECUTE FUNCTION atom_research_history.reject_mutation();
@@ -259,17 +316,6 @@ BEGIN
 
   IF EXISTS (
     SELECT 1
-    FROM (VALUES ('raw_responses'), ('manifests'), ('bars')) expected(table_name)
-    CROSS JOIN (VALUES
-      ('anon'), ('authenticated'), ('service_role')
-    ) excluded(role_name)
-    WHERE has_table_privilege(
-      excluded.role_name,
-      'atom_research_history.' || expected.table_name,
-      'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
-    )
-  ) OR EXISTS (
-    SELECT 1
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     CROSS JOIN LATERAL aclexplode(
@@ -277,9 +323,12 @@ BEGIN
     ) acl
     WHERE n.nspname = 'atom_research_history'
       AND c.relname IN ('raw_responses', 'manifests', 'bars')
-      -- PUBLIC is represented by ACL grantee OID 0, not by a pg_roles row.
-      AND acl.grantee = 0
-      AND acl.privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+      -- OID 0 is PUBLIC. Every other non-owner/non-importer grantee is also
+      -- forbidden, including custom roles inherited from default privileges.
+      AND acl.grantee NOT IN (
+        c.relowner,
+        (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer')
+      )
   ) THEN
     RAISE EXCEPTION 'HIST8_FOREIGN_ROLE_ACCESS_BOUNDARY_UNSATISFIED';
   END IF;
@@ -311,3 +360,5 @@ BEGIN
   END IF;
 END
 $hist8_verify$;
+
+COMMIT;
