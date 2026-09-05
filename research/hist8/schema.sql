@@ -7,7 +7,16 @@ SET statement_timeout = '60s';
 DO $hist8$
 BEGIN
   IF current_database() <> 'postgres' THEN
-    RAISE EXCEPTION 'HIST8_PROJECT_MISMATCH: database %', current_database();
+    RAISE EXCEPTION 'HIST8_DATABASE_MISMATCH: database %', current_database();
+  END IF;
+
+  -- Positive project fingerprint: both legacy V8 objects are present only in the
+  -- Owner-designated pjbjpgnmniwcajqkuhge project at the reviewed baseline.
+  IF to_regclass('public.coin_v8_market_bars') IS NULL
+    OR to_regclass('public.coin_v8_ai_decision_logs') IS NULL
+  THEN
+    RAISE EXCEPTION
+      'HIST8_PROJECT_MISMATCH: not legacy V8 project pjbjpgnmniwcajqkuhge';
   END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'atom_hist8_importer') THEN
@@ -114,6 +123,15 @@ CREATE TABLE atom_research_history.bars (
   research_eligible boolean NOT NULL,
   created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT hist8_bar_interval CHECK (bar_end_utc > bar_start_utc),
+  CONSTRAINT hist8_bar_duration CHECK (
+    bar_end_utc - bar_start_utc = CASE timeframe
+      WHEN '1m' THEN interval '60 seconds'
+      WHEN '5m' THEN interval '300 seconds'
+      WHEN '15m' THEN interval '900 seconds'
+      WHEN '30m' THEN interval '1800 seconds'
+      ELSE interval '3600 seconds'
+    END
+  ),
   CONSTRAINT hist8_bar_ohlc CHECK (
     low <= LEAST(open, close) AND GREATEST(open, close) <= high
   ),
@@ -237,6 +255,21 @@ BEGIN
       )
   ) THEN
     RAISE EXCEPTION 'HIST8_TABLE_PRIVILEGE_MISMATCH';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM (VALUES ('raw_responses'), ('manifests'), ('bars')) expected(table_name)
+    CROSS JOIN (VALUES
+      ('PUBLIC'), ('anon'), ('authenticated'), ('service_role')
+    ) excluded(role_name)
+    WHERE has_table_privilege(
+      excluded.role_name,
+      'atom_research_history.' || expected.table_name,
+      'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+    )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_FOREIGN_ROLE_ACCESS_BOUNDARY_UNSATISFIED';
   END IF;
 
   IF EXISTS (

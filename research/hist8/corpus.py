@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
 from urllib.error import HTTPError
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 import uuid
 import zlib
@@ -390,10 +390,14 @@ class Hist8Store:
     def from_environment(cls) -> "Hist8Store":
         dsn = os.environ.get(IMPORT_DATABASE_ENV, "")
         parsed = urlparse(dsn)
+        query = parse_qs(parsed.query)
         if (parsed.scheme not in ("postgres", "postgresql")
                 or parsed.hostname != DATABASE_HOST
+                or parsed.port not in (None, 5432)
                 or parsed.username != IMPORTER_ROLE
-                or parsed.path != f"/{DATABASE_NAME}"):
+                or parsed.path != f"/{DATABASE_NAME}"
+                or query.get("sslmode") != ["verify-full"]
+                or query.get("sslrootcert") != ["system"]):
             raise Hist8Error("HIST8 importer credential/project mismatch")
         try:
             import psycopg
@@ -660,7 +664,10 @@ def parse_source_page(
             ))
     elif page.source == "MASSIVE":
         for index, item in enumerate(payload.get("results", [])):
-            start = datetime.fromtimestamp(int(item["t"]) / 1000, timezone.utc)
+            milliseconds = int(item["t"])
+            if milliseconds % 1000:
+                raise Hist8Error("Massive timestamp is not second aligned")
+            start = datetime.fromtimestamp(milliseconds // 1000, timezone.utc)
             rows.append(SourceBar(
                 instrument, start, _decimal(item["o"]), _decimal(item["h"]),
                 _decimal(item["l"]), _decimal(item["c"]), None, None, None,
@@ -700,12 +707,7 @@ def _session_definitions(calendar: Mapping[str, object], instrument: str) -> dic
 
 
 def _session_for(row: SourceBar, definitions: Mapping[str, tuple[datetime, datetime, int]]) -> str | None:
-    if row.instrument == "BTC-USD":
-        key = row.start.date().isoformat()
-    else:
-        candidates = (row.start.date(), (row.start - timedelta(hours=5)).date())
-        key = next((item.isoformat() for item in candidates
-                    if item.isoformat() in definitions), "")
+    key = row.start.date().isoformat()
     bounds = definitions.get(key)
     return key if bounds and bounds[0] <= row.start < bounds[1] else None
 
@@ -739,11 +741,15 @@ def canonical_bar(
     return _finish_bar(bar)
 
 
-def derive_session(minutes: Sequence[Bar], timeframe: str, import_id: str) -> tuple[Bar, ...]:
+def derive_session(
+    minutes: Sequence[Bar], timeframe: str, import_id: str, *, session_open: datetime,
+) -> tuple[Bar, ...]:
     width = TIMEFRAME_MINUTES[timeframe]
     if not minutes or any(row.timeframe != "1m" or not row.research_eligible
                           for row in minutes):
         return ()
+    if minutes[0].bar_start_utc != session_open:
+        raise Hist8Error("derivation must anchor at session open")
     output: list[Bar] = []
     for offset in range(0, len(minutes) - width + 1, width):
         window = minutes[offset:offset + width]
@@ -812,7 +818,9 @@ def materialize_instrument(
         all_rows: list[Bar] = list(canonical)
         if complete:
             for timeframe in TIMEFRAMES[1:]:
-                all_rows.extend(derive_session(canonical, timeframe, write_attempt_id))
+                all_rows.extend(derive_session(
+                    canonical, timeframe, write_attempt_id, session_open=opened,
+                ))
         added, same = store.insert_bars(all_rows)
         inserted += added
         idempotent += same

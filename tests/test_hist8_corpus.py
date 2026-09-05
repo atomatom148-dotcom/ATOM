@@ -106,8 +106,12 @@ def test_complete_session_is_eligible_and_derives_deterministically() -> None:
         session_date="2025-01-02", calendar_hash="b" * 64,
         import_id="attempt-1", eligible=True,
     ) for index in range(5))
-    first = corpus.derive_session(minute_bars, "5m", "attempt-1")[0]
-    second = corpus.derive_session(minute_bars, "5m", "attempt-2")[0]
+    first = corpus.derive_session(
+        minute_bars, "5m", "attempt-1", session_open=start,
+    )[0]
+    second = corpus.derive_session(
+        minute_bars, "5m", "attempt-2", session_open=start,
+    )[0]
     assert first.open == Decimal("100")
     assert first.high == Decimal("103")
     assert first.low == Decimal("99")
@@ -192,11 +196,18 @@ def test_database_url_must_bind_exact_project_database_and_role(monkeypatch) -> 
         "", "postgresql://atom_hist8_importer:x@example.com/postgres",
         f"postgresql://postgres:x@{corpus.DATABASE_HOST}/postgres",
         f"postgresql://atom_hist8_importer:x@{corpus.DATABASE_HOST}/other",
+        f"postgresql://atom_hist8_importer:x@{corpus.DATABASE_HOST}/postgres",
     )
     for value in bad_urls:
         monkeypatch.setenv(corpus.IMPORT_DATABASE_ENV, value)
         with pytest.raises(corpus.Hist8Error, match="credential/project mismatch"):
             corpus.Hist8Store.from_environment()
+    monkeypatch.setenv(
+        corpus.IMPORT_DATABASE_ENV,
+        f"postgresql://atom_hist8_importer:x@{corpus.DATABASE_HOST}:5432/postgres"
+        "?sslmode=verify-full&sslrootcert=system",
+    )
+    assert isinstance(corpus.Hist8Store.from_environment(), corpus.Hist8Store)
 
 
 def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
@@ -226,6 +237,8 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                         f"create role {role} nologin nosuperuser nocreatedb "
                         "nocreaterole noreplication nobypassrls"
                     )
+                cursor.execute("create table public.coin_v8_market_bars (id bigint)")
+                cursor.execute("create table public.coin_v8_ai_decision_logs (id bigint)")
                 cursor.execute(sql)
                 cursor.execute(
                     """select rolcanlogin, rolinherit, rolsuper, rolcreatedb,
