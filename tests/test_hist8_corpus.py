@@ -220,6 +220,8 @@ def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
     assert "GRANT TRUNCATE" not in sql
     assert sql.count("FORCE ROW LEVEL SECURITY") == 3
     assert "HIST8_EFFECTIVE_PRIVILEGE_BOUNDARY_UNSATISFIED" in sql
+    assert "acl.grantee = 0" in sql
+    assert "('PUBLIC'), ('anon')" not in sql
 
 
 def test_schema_enforces_importer_boundary_in_postgres() -> None:

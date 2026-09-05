@@ -261,13 +261,25 @@ BEGIN
     SELECT 1
     FROM (VALUES ('raw_responses'), ('manifests'), ('bars')) expected(table_name)
     CROSS JOIN (VALUES
-      ('PUBLIC'), ('anon'), ('authenticated'), ('service_role')
+      ('anon'), ('authenticated'), ('service_role')
     ) excluded(role_name)
     WHERE has_table_privilege(
       excluded.role_name,
       'atom_research_history.' || expected.table_name,
       'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
     )
+  ) OR EXISTS (
+    SELECT 1
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    CROSS JOIN LATERAL aclexplode(
+      COALESCE(c.relacl, acldefault('r', c.relowner))
+    ) acl
+    WHERE n.nspname = 'atom_research_history'
+      AND c.relname IN ('raw_responses', 'manifests', 'bars')
+      -- PUBLIC is represented by ACL grantee OID 0, not by a pg_roles row.
+      AND acl.grantee = 0
+      AND acl.privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
   ) THEN
     RAISE EXCEPTION 'HIST8_FOREIGN_ROLE_ACCESS_BOUNDARY_UNSATISFIED';
   END IF;
