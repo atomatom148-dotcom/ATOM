@@ -1,0 +1,54 @@
+Follow-up to the cadence and readiness measurements I sent earlier. Correction 1
+is attached. It supersedes one section of that document.
+
+WITHDRAWN: the section "Hard arithmetic floor on V9 1H" — the 6-calibration-
+pairs-per-session cap and the ~15-week floor. Both wrong. Your retraction of the
+84-session claim was correct and Correction 1 confirms it from merged code:
+
+  - CellSelector (quant/evidence_scorecard.py:175) has the RTH filter and resets
+    self._last at every session boundary. It governs V-1A regression windows and
+    the G-1 gamma study.
+  - select_non_overlapping (quant/v9_v4a_evidence.py:385) has no RTH predicate
+    and no session reset. It is what §7.2 V4C calls
+    (quant/evidence_outbox.py:503). Your read of the pool was right; mine was
+    the wrong selector.
+
+CONFIRMED, independently: the 1H pool advances exactly +15 selected pairs per
+full trading day, cumulative, and stood at 95 at the 2026-09-04 close (six
+consecutive full days at +15; day-by-day table in Correction 1 §2). Your 91 is
+the same quantity under a slightly different eligibility cut.
+
+CONFIRMED: your upward correction of MATURE. quant/v9_v4c_predictive.py:371 —
+status = "MATURE" if len(scores)>=250 and neff>=200 and k is not None. Both
+conditions. With calibration_pairs = selected[:len(selected)-250], the floor is
+500 selected pairs. 450 was wrong.
+
+THREE ITEMS FOR THE AMENDMENT, not previously on the table:
+
+1. The 27-trading-day estimate assumes N_eff ~ raw n. effective_n
+   (quant/v9_v2b_calibration.py:167) is Geyer initial-positive-sequence:
+   N_eff = n/tau. N_eff >= 200 from n = 250 requires tau <= 1.25. The current 1H
+   effective-n ratio is 0.373 (tau ~ 2.7) against 0.93-1.00 at 15M and 30M. That
+   is a small-sample proxy on the directional series, not a result — but if tau
+   sits near 2.7 the date moves from ~2026-10-14 to mid-November. Measure
+   effective_n on the 1H V4C calibration score series at the frozen boundary and
+   report tau before the amendment fixes a date. I did not compute it; it is a
+   gate input.
+
+2. calibrate_range (quant/v9_v4c_predictive.py:425) requires len(valid) >= 250,
+   and validation_pairs = selected[split:] is exactly 250 by construction. So
+   every one of the trailing 250 must be valid. One inadmissible row pins
+   range_status at PROVISIONAL indefinitely, with no slack. Intentional and
+   undocumented, or a defect — needs a ruling.
+
+3. The pool is cumulative but not durable. The 1H cohort_hash rotated once on
+   2026-08-24 at 19:05Z and non_overlapping_n reset to zero and rebuilt. Any
+   freeze merged before the first receipt that touches an input feeding the
+   cohort hash restarts every calibration pool — 34 trading days from zero at
+   +15/day, with no visible failure. The amendment should either pin those
+   inputs for the readiness window or state that cohort rotation resets
+   readiness and require the rotation to be recorded. This is the strongest
+   argument for the tiered boundary: tiers bank the early-maturing cells against
+   a later rotation; an all-cells rule loses everything.
+
+Everything else in the earlier document stands as issued.
