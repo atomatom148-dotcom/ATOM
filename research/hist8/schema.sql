@@ -196,12 +196,58 @@ GRANT SELECT, INSERT ON atom_research_history.raw_responses,
 
 DO $hist8_verify$
 BEGIN
+  IF NOT has_database_privilege('atom_hist8_importer', current_database(), 'CONNECT')
+    OR NOT has_schema_privilege(
+      'atom_hist8_importer', 'atom_research_history', 'USAGE'
+    )
+    OR has_schema_privilege(
+      'atom_hist8_importer', 'atom_research_history', 'CREATE'
+    )
+    OR EXISTS (
+      SELECT 1 FROM pg_database
+      WHERE datname = current_database()
+        AND datdba = (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer')
+    )
+    OR EXISTS (
+      SELECT 1 FROM pg_namespace
+      WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer')
+    )
+    OR EXISTS (
+      SELECT 1 FROM pg_class
+      WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer')
+    )
+  THEN
+    RAISE EXCEPTION 'HIST8_ROLE_OWNERSHIP_OR_BASE_PRIVILEGE_MISMATCH';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM (VALUES ('raw_responses'), ('manifests'), ('bars')) expected(table_name)
+    WHERE NOT has_table_privilege(
+        'atom_hist8_importer', 'atom_research_history.' || expected.table_name,
+        'SELECT'
+      )
+      OR NOT has_table_privilege(
+        'atom_hist8_importer', 'atom_research_history.' || expected.table_name,
+        'INSERT'
+      )
+      OR has_table_privilege(
+        'atom_hist8_importer', 'atom_research_history.' || expected.table_name,
+        'UPDATE,DELETE,TRUNCATE'
+      )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_TABLE_PRIVILEGE_MISMATCH';
+  END IF;
+
   IF EXISTS (
     SELECT 1
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind IN ('r','p','v','m','f')
-      AND n.nspname NOT IN ('pg_catalog','information_schema','atom_research_history')
+      -- Supabase's platform-managed extension statistics are not application data.
+      AND n.nspname NOT IN (
+        'pg_catalog','information_schema','extensions','atom_research_history'
+      )
       AND (has_table_privilege('atom_hist8_importer', c.oid, 'SELECT')
         OR has_table_privilege('atom_hist8_importer', c.oid, 'INSERT')
         OR has_table_privilege('atom_hist8_importer', c.oid, 'UPDATE')
@@ -209,6 +255,14 @@ BEGIN
         OR has_table_privilege('atom_hist8_importer', c.oid, 'TRUNCATE'))
   ) THEN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_PRIVILEGE_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM pg_namespace n
+    WHERE n.nspname NOT LIKE 'pg_temp_%'
+      AND has_schema_privilege('atom_hist8_importer', n.oid, 'CREATE')
+  ) THEN
+    RAISE EXCEPTION 'HIST8_EFFECTIVE_SCHEMA_CREATE_BOUNDARY_UNSATISFIED';
   END IF;
 END
 $hist8_verify$;

@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
-import re
-import time
 from typing import Callable, Iterator, Mapping, Sequence
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -49,7 +47,6 @@ MASSIVE_URL = (
     "https://api.massive.com/v2/aggs/ticker/I%3ACOMP/range/1/minute/"
     "2024-09-01/2026-09-01"
 )
-_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class Hist8Error(RuntimeError):
