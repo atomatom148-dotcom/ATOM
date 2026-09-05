@@ -249,6 +249,29 @@ Update this section only by Owner-approved documentation change.
   resolution-only role `atom_v9_sim_web_reader`, the exact web-only credential
   `ATOM_V9_SIM_WEB_READONLY_DATABASE_URL`, migration 032, and the exact file and
   deployment surface frozen there.
+- Owner-approved HIST8 corpus work is separately authorized alongside SIM-5
+  under `docs/isolated-historical-corpus-eight-instrument-amendment.md`
+  (`ATOM-HIST8-CORPUS-AMENDMENT-1`) and does not change, take, or block the
+  SIM-5 active-phase pointer. Its only added authority is private schema
+  `atom_research_history` in existing legacy project `pjbjpgnmniwcajqkuhge`,
+  database `postgres`, with append-only `bars`, `manifests`, and
+  `raw_responses`; importer role `atom_hist8_importer`; offline-only
+  credential `ATOM_HIST8_IMPORT_DATABASE_URL`; and the exact implementation
+  allowlist: `research/hist8/schema.sql`, `research/hist8/corpus.py`,
+  `research/hist8/calendar_manifest.json`, `tests/test_hist8_corpus.py`, and
+  append-only artifacts under `docs/receipts/hist8/`, using only the frozen
+  Alpaca SIP, Coinbase Exchange, and Massive `I:COMP` historical sources.
+  Isolation is schema/role-level within the shared legacy project, not a
+  separate research-only project. The named raw table is the sole durable
+  response-byte store. After implementation merge and isolated execution,
+  one documentation-only receipt PR under `docs/receipts/hist8/` requires
+  independent final-head review, green mandatory checks, Owner merge, and
+  then ChatGPT Pro final audit. This entry expressly excepts only that
+  HIST8 scope from the following prohibition on new roles/credentials/
+  sources; every other prohibition remains unchanged. All HIST8 gates
+  apply. No new service or project and no change to existing production,
+  V1B, SIM, or V9 behavior, and no broker, trading/execution, or
+  model-research authority is granted.
 - Not authorized: E-2, E-3, E-4, SIM-6 or later simulator phases, Level-II
   mathematical use, V9/family changes except the exact L-2 implementation
   surface, new services/roles/credentials/sources except the exact SIM-5W
