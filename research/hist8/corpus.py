@@ -64,6 +64,12 @@ MASSIVE_FROZEN_PARAMS = {
 }
 REPLAY_PAGE_BATCH_SIZE = 8
 SNAPSHOT_SCAN_BATCH_SIZE = 10_000
+IMPORTER_CONNECT_TIMEOUT_SECONDS = 15
+IMPORTER_SESSION_OPTIONS = (
+    "-c statement_timeout=60000 "
+    "-c lock_timeout=5000 "
+    "-c idle_in_transaction_session_timeout=60000"
+)
 
 _ISO_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
@@ -318,10 +324,18 @@ def _http_get(
             final_url = response.geturl() if hasattr(response, "geturl") else url
             if final_url != url:
                 raise Hist8Error("provider redirect is forbidden")
-            return int(response.status), dict(response.headers.items()), response.read()
+            headers = {
+                str(name).lower(): str(value)
+                for name, value in response.headers.items()
+            }
+            return int(response.status), headers, response.read()
     except HTTPError as exc:
         with exc:
-            return int(exc.code), dict(exc.headers.items()), exc.read()
+            headers = {
+                str(name).lower(): str(value)
+                for name, value in exc.headers.items()
+            }
+            return int(exc.code), headers, exc.read()
 
 
 def _build_page(
@@ -334,8 +348,8 @@ def _build_page(
     status, response_headers, body = _http_get(url, headers=headers, opener=opener)
     return RawPage(
         source, feed, product, tuple(instruments), endpoint, dict(params), clock(),
-        status, response_headers.get("Content-Type"),
-        response_headers.get("Content-Encoding"), body,
+        status, response_headers.get("content-type"),
+        response_headers.get("content-encoding"), body,
     )
 
 
@@ -609,7 +623,11 @@ class Hist8Store:
             import psycopg
         except ImportError as exc:
             raise Hist8Error("psycopg is required") from exc
-        return cls(lambda: psycopg.connect(dsn, connect_timeout=15))
+        return cls(lambda: psycopg.connect(
+            dsn,
+            connect_timeout=IMPORTER_CONNECT_TIMEOUT_SECONDS,
+            options=IMPORTER_SESSION_OPTIONS,
+        ))
 
     @staticmethod
     def _verify(connection: object) -> None:
@@ -1310,6 +1328,7 @@ def materialize_instrument(
     rejected = duplicates = 0
     inserted = idempotent = eligible_sessions = incomplete_sessions = 0
     observed_minutes = missing_minutes = 0
+    verified_retrieval_associations = 0
     excluded_windows = {timeframe: 0 for timeframe in TIMEFRAMES[1:]}
     residual_tails = {timeframe: 0 for timeframe in TIMEFRAMES[1:]}
     seen_sessions: set[str] = set()
@@ -1350,6 +1369,7 @@ def materialize_instrument(
     current_session: str | None = None
     current_rows: dict[datetime, SourceBar] = {}
     for page in store.retrieval_pages(source_import_id, instrument):
+        verified_retrieval_associations += 1
         if page.http_status != 200:
             raise Hist8Error(f"stored provider failure {page.http_status}")
         invalid = [0]
@@ -1392,6 +1412,7 @@ def materialize_instrument(
         "observed_minutes": observed_minutes, "missing_minutes": missing_minutes,
         "eligible_sessions": eligible_sessions,
         "incomplete_sessions": incomplete_sessions,
+        "verified_retrieval_associations": verified_retrieval_associations,
     }
     for timeframe in TIMEFRAMES[1:]:
         result[f"excluded_{timeframe}_windows"] = excluded_windows[timeframe]
@@ -1554,13 +1575,23 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
     results: dict[str, dict[str, object]] = {}
     for instrument in INSTRUMENTS:
         source_status = source_statuses[instrument]
-        metrics = (
-            materialize_instrument(
+        if source_status["availability"] == "AVAILABLE":
+            metrics: dict[str, object] = materialize_instrument(
                 store, chosen, instrument, calendar, attempt_id=attempt_id,
             )
-            if source_status["availability"] == "AVAILABLE"
-            else _unavailable_instrument_result(calendar, instrument)
-        )
+        else:
+            verified = sum(
+                1 for _page in store.retrieval_pages(chosen, instrument)
+            )
+            metrics = {
+                **_unavailable_instrument_result(calendar, instrument),
+                "verified_retrieval_associations": verified,
+            }
+        if (metrics.get("verified_retrieval_associations")
+                != source_status["retrieval_associations"]):
+            raise Hist8ConflictError(
+                "retrieval association count differs from sealed source status"
+            )
         results[instrument] = {**source_status, **metrics}
     membership = store.seal_snapshot(attempt_id, {
         "attempt_kind": kind, "retrieval_associations": retrieval_associations,

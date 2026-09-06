@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import gzip
 import json
 import os
 from pathlib import Path
@@ -188,6 +189,25 @@ def test_provider_redirect_is_rejected_before_response_acceptance() -> None:
         )
     assert any(isinstance(handler, corpus._RejectRedirects)
                for handler in corpus._NO_REDIRECT_OPENER.handlers)
+
+
+def test_provider_response_headers_are_case_insensitive() -> None:
+    payload = {"bars": {"SPY": []}}
+    response = _Response(payload)
+    response._body = gzip.compress(response._body)
+    response.headers = {
+        "content-type": "application/json",
+        "CoNtEnT-EnCoDiNg": "gzip",
+    }
+    page = corpus._build_page(
+        source="ALPACA", feed="SIP", product="1Min",
+        instruments=("SPY",), endpoint=corpus.ALPACA_URL, params={},
+        headers={}, opener=lambda *_args, **_kwargs: response,
+        clock=lambda: datetime(2026, 9, 2, tzinfo=UTC),
+    )
+    assert page.content_type == "application/json"
+    assert page.content_encoding == "gzip"
+    assert page.payload() == payload
 
 
 def test_acquisition_continues_after_provider_unavailability(monkeypatch) -> None:
@@ -506,6 +526,8 @@ def test_identical_insert_race_uses_actual_affected_row_count() -> None:
 
 
 def test_database_url_must_bind_exact_project_database_and_role(monkeypatch) -> None:
+    import psycopg
+
     bad_urls = (
         "", "postgresql://atom_hist8_importer:x@example.com/postgres",
         f"postgresql://postgres:x@{corpus.DATABASE_HOST}/postgres",
@@ -523,7 +545,25 @@ def test_database_url_must_bind_exact_project_database_and_role(monkeypatch) -> 
         f"postgresql://atom_hist8_importer:x@{corpus.DATABASE_HOST}:5432/postgres"
         "?sslmode=verify-full&sslrootcert=system",
     )
-    assert isinstance(corpus.Hist8Store.from_environment(), corpus.Hist8Store)
+    connections = []
+
+    def connect(dsn, **options):
+        connections.append((dsn, options))
+        return object()
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+    store = corpus.Hist8Store.from_environment()
+    assert isinstance(store, corpus.Hist8Store)
+    assert store._connection_factory() is not None
+    assert connections[0][1] == {
+        "connect_timeout": corpus.IMPORTER_CONNECT_TIMEOUT_SECONDS,
+        "options": corpus.IMPORTER_SESSION_OPTIONS,
+    }
+    assert "statement_timeout=60000" in corpus.IMPORTER_SESSION_OPTIONS
+    assert "lock_timeout=5000" in corpus.IMPORTER_SESSION_OPTIONS
+    assert "idle_in_transaction_session_timeout=60000" in (
+        corpus.IMPORTER_SESSION_OPTIONS
+    )
 
 
 def test_schema_installer_verifies_direct_tls_endpoint_before_sql() -> None:
@@ -601,6 +641,7 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
         for instrument in corpus.INSTRUMENTS
     }
     materialized = []
+    unavailable_replays = []
 
     class Store:
         attempts = []
@@ -616,6 +657,10 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
         def add_attempt(self, import_id, kind, metadata):
             self.attempts.append((import_id, kind, metadata))
 
+        def retrieval_pages(self, import_id, instrument):
+            unavailable_replays.append((import_id, instrument))
+            return iter(())
+
         def seal_snapshot(self, import_id, metadata):
             return "b" * 64
 
@@ -629,7 +674,9 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(
         corpus, "materialize_instrument",
         lambda _store, _source, instrument, _calendar, **_kwargs: (
-            materialized.append(instrument) or {"inserted": 0}
+            materialized.append(instrument) or {
+                "inserted": 0, "verified_retrieval_associations": 0,
+            }
         ),
     )
     monkeypatch.setattr(
@@ -644,6 +691,7 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
         "sha256:" + "d" * 64
     )
     assert materialized == list(corpus.INSTRUMENTS[:-1])
+    assert unavailable_replays == [("source-attempt", "NASDAQ")]
 
 
 def test_execute_seals_partial_availability_without_substitution(monkeypatch) -> None:
@@ -667,6 +715,13 @@ def test_execute_seals_partial_availability_without_substitution(monkeypatch) ->
         def add_attempt(self, import_id, kind, metadata):
             self.attempts.append((import_id, kind, metadata))
 
+        def retrieval_pages(self, import_id, instrument):
+            assert (import_id, instrument) == ("partial-source", "NASDAQ")
+            yield _raw_page(
+                {"partial": "massive"}, source="MASSIVE",
+                instruments=("NASDAQ",),
+            )
+
         def seal_snapshot(self, import_id, metadata):
             self.snapshots.append((import_id, metadata))
             return "e" * 64
@@ -685,7 +740,9 @@ def test_execute_seals_partial_availability_without_substitution(monkeypatch) ->
     monkeypatch.setattr(
         corpus, "materialize_instrument",
         lambda _store, _source, instrument, _calendar, **_kwargs: (
-            materialized.append(instrument) or {"inserted": 3}
+            materialized.append(instrument) or {
+                "inserted": 3, "verified_retrieval_associations": 1,
+            }
         ),
     )
     monkeypatch.setattr(
@@ -702,6 +759,63 @@ def test_execute_seals_partial_availability_without_substitution(monkeypatch) ->
     snapshot_metadata = store.snapshots[0][1]
     assert snapshot_metadata["retrieval_associations"] == 8
     assert snapshot_metadata["source_statuses"] == statuses
+
+
+def test_unavailable_replay_still_verifies_retained_artifacts(monkeypatch) -> None:
+    statuses = {
+        instrument: {
+            "source": corpus.INSTRUMENT_SOURCE[instrument],
+            "availability": (
+                "UNAVAILABLE" if instrument == "NASDAQ" else "AVAILABLE"
+            ),
+            "retrieval_associations": 1 if instrument == "NASDAQ" else 0,
+            **({"failure_type": "Hist8Error", "reason": "Massive HTTP 503"}
+               if instrument == "NASDAQ" else {}),
+        }
+        for instrument in corpus.INSTRUMENTS
+    }
+
+    class Store:
+        def sealed_snapshot_state(self, _import_id):
+            return {
+                "manifest_id": "sha256:" + "f" * 64,
+                "membership_sha256": "a" * 64,
+                "metadata": {"source_statuses": statuses},
+            }
+
+        def add_attempt(self, *_args, **_kwargs):
+            return None
+
+        def retrieval_pages(self, _import_id, instrument):
+            assert instrument == "NASDAQ"
+            raise corpus.Hist8ConflictError(
+                "retained raw artifact replay mismatch"
+            )
+            yield  # pragma: no cover
+
+        def seal_snapshot(self, *_args, **_kwargs):
+            raise AssertionError("corrupt retained bytes must block sealing")
+
+    monkeypatch.setattr(
+        corpus.Hist8Store, "from_environment", classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(corpus, "load_calendar", lambda: {
+        "schedule_sha256": "c" * 64,
+    })
+    monkeypatch.setattr(
+        corpus, "materialize_instrument",
+        lambda *_args, **_kwargs: {
+            "inserted": 0, "verified_retrieval_associations": 0,
+        },
+    )
+    monkeypatch.setattr(
+        corpus, "_unavailable_instrument_result",
+        lambda *_args, **_kwargs: {"inserted": 0},
+    )
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="artifact replay mismatch"
+    ):
+        corpus.execute("partial-source", acquire_sources=False)
 
 
 def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
