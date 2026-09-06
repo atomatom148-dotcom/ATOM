@@ -538,17 +538,17 @@ BEGIN
       AND (
         EXISTS (
           SELECT 1
-          FROM aclexplode(COALESCE(
+          FROM unnest(COALESCE(
             global_defaults.defaclacl,
             acldefault('f', creator.oid)
-          )) acl
+          )) entry(aclitem)
+          CROSS JOIN LATERAL aclexplode(ARRAY[entry.aclitem]) acl
           WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
         )
         OR EXISTS (
           SELECT 1
-          FROM aclexplode(COALESCE(
-            schema_defaults.defaclacl, '{}'::aclitem[]
-          )) acl
+          FROM unnest(schema_defaults.defaclacl) entry(aclitem)
+          CROSS JOIN LATERAL aclexplode(ARRAY[entry.aclitem]) acl
           WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
         )
       )
