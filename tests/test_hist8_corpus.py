@@ -1385,6 +1385,10 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                     "create function extensions.hist8_extension_callable() "
                     "returns integer language sql immutable as 'select 1'"
                 )
+                cursor.execute(
+                    "grant execute on function "
+                    "extensions.hist8_extension_callable() to public"
+                )
                 with pytest.raises(
                     psycopg.Error, match="ROUTINE_BOUNDARY_UNSATISFIED"
                 ):
@@ -1412,6 +1416,9 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 cursor.execute(
                     "create function public.hist8_callable() returns integer "
                     "language sql immutable as 'select 1'"
+                )
+                cursor.execute(
+                    "grant execute on function public.hist8_callable() to public"
                 )
                 with pytest.raises(
                     psycopg.Error, match="ROUTINE_BOUNDARY_UNSATISFIED"
