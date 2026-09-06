@@ -76,6 +76,9 @@ REPLAY_PAGE_BATCH_SIZE = 8
 SNAPSHOT_SCAN_BATCH_SIZE = 10_000
 SNAPSHOT_SESSION_BATCH_SIZE = 32
 POSTGRES_BIGINT_MAX = (1 << 63) - 1
+# PostgreSQL's documented implementation limits for unconstrained numeric.
+POSTGRES_NUMERIC_MAX_INTEGER_DIGITS = 131_072
+POSTGRES_NUMERIC_MAX_FRACTIONAL_DIGITS = 16_383
 IMPORTER_CONNECT_TIMEOUT_SECONDS = 15
 IMPORTER_SESSION_OPTIONS = (
     "-c statement_timeout=60000 "
@@ -209,6 +212,8 @@ def _canonical(value: object) -> object:
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise ValueError("nonfinite decimal")
+        if value.is_zero():
+            return "0"
         # Avoid Decimal.normalize(): it applies the active precision context and
         # can collapse distinct high-precision provider values before hashing.
         text = format(value, "f")
@@ -424,6 +429,21 @@ def _integer(value: object, *, name: str) -> int:
     return int(number)
 
 
+def _postgres_numeric_fits(value: object) -> bool:
+    """Return whether an exact Decimal fits unconstrained PostgreSQL numeric."""
+    if not isinstance(value, Decimal) or not value.is_finite():
+        return False
+    _sign, digits, exponent = value.as_tuple()
+    if not isinstance(exponent, int):
+        return False
+    integer_digits = max(len(digits) + exponent, 0)
+    fractional_digits = max(-exponent, 0)
+    return (
+        integer_digits <= POSTGRES_NUMERIC_MAX_INTEGER_DIGITS
+        and fractional_digits <= POSTGRES_NUMERIC_MAX_FRACTIONAL_DIGITS
+    )
+
+
 def _http_get(
     url: str, *, headers: Mapping[str, str], timeout: int = 30,
     opener: Callable[..., object] = _no_redirect_urlopen,
@@ -466,7 +486,10 @@ def _build_page(
     endpoint: str, params: Mapping[str, str], headers: Mapping[str, str],
     opener: Callable[..., object], clock: Callable[[], datetime],
 ) -> RawPage:
-    query = urlencode(params)
+    try:
+        query = urlencode(params)
+    except (TypeError, ValueError) as exc:
+        raise Hist8Error("provider request parameter encoding failure") from exc
     url = endpoint + ("?" if "?" not in endpoint else "&") + query
     status, response_headers, body = _http_get(url, headers=headers, opener=opener)
     return RawPage(
@@ -626,6 +649,10 @@ def _strip_secret_query(url: str) -> tuple[str, dict[str, str]]:
     cursor = supplied.get("cursor")
     if not cursor:
         raise Hist8Error("Massive pagination parameter mismatch")
+    try:
+        cursor.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise Hist8Error("Massive pagination parameter mismatch") from exc
     # Provider next_url examples contain only a cursor. Rebuild every request
     # from the frozen semantic parameters and canonical path encoding, and
     # never retain a URL API key or provider-controlled encoding variant.
@@ -2130,22 +2157,20 @@ def _validate_bar_identity(row: Bar) -> None:
     if (row.calendar_id != expected_calendar_id
             or row.calendar_sha256 != CALENDAR_SCHEDULE_SHA256):
         raise Hist8ConflictError("bar calendar identity mismatch")
-    if any(not isinstance(value, Decimal) or not value.is_finite() or value <= 0
+    if any(not _postgres_numeric_fits(value) or value <= 0
            for value in (row.open, row.high, row.low, row.close)):
         raise Hist8ConflictError("bar semantic identity mismatch")
     if (row.low > min(row.open, row.close)
             or max(row.open, row.close) > row.high
             or row.volume is not None and (
-                not isinstance(row.volume, Decimal)
-                or not row.volume.is_finite() or row.volume < 0
+                not _postgres_numeric_fits(row.volume) or row.volume < 0
             )
             or row.trade_count is not None and (
                 type(row.trade_count) is not int
                 or not 0 <= row.trade_count <= POSTGRES_BIGINT_MAX
             )
             or row.vwap is not None and (
-                not isinstance(row.vwap, Decimal)
-                or not row.vwap.is_finite() or row.vwap <= 0
+                not _postgres_numeric_fits(row.vwap) or row.vwap <= 0
             )):
         raise Hist8ConflictError("bar semantic identity mismatch")
     if row.instrument in EQUITIES:
@@ -2282,6 +2307,9 @@ def _verify_materialized_session(
                     item.volume for item in inputs if item.volume is not None
                 ))
             )
+            if (expected_volume is not None
+                    and not _postgres_numeric_fits(expected_volume)):
+                raise Hist8ConflictError("derived aggregation mismatch")
             expected_trade_count = None
             if not any(item.trade_count is None for item in inputs):
                 expected_trade_count = sum(
@@ -2315,21 +2343,25 @@ def _source_bar_from_canonical(row: Bar) -> SourceBar:
 
 
 def _validate_source_bar(row: SourceBar) -> None:
-    if (row.start.tzinfo is None or row.start.utcoffset() != timedelta(0)
+    if (not isinstance(row, SourceBar)
+            or not isinstance(row.start, datetime)
+            or row.start.tzinfo is None or row.start.utcoffset() != timedelta(0)
             or row.start.second or row.start.microsecond):
         raise Hist8Error("bar timestamp is not UTC-minute aligned")
-    if any(value is None or not value.is_finite() or value <= 0 for value in
+    if any(not _postgres_numeric_fits(value) or value <= 0 for value in
            (row.open, row.high, row.low, row.close)):
         raise Hist8Error("invalid OHLC")
     if row.low > min(row.open, row.close) or max(row.open, row.close) > row.high:
         raise Hist8Error("invalid OHLC ordering")
-    if row.volume is not None and (not row.volume.is_finite() or row.volume < 0):
+    if (row.volume is not None
+            and (not _postgres_numeric_fits(row.volume) or row.volume < 0)):
         raise Hist8Error("invalid volume")
     if (row.trade_count is not None
             and (type(row.trade_count) is not int
                  or not 0 <= row.trade_count <= POSTGRES_BIGINT_MAX)):
         raise Hist8Error("invalid trade count")
-    if row.vwap is not None and (not row.vwap.is_finite() or row.vwap <= 0):
+    if (row.vwap is not None
+            and (not _postgres_numeric_fits(row.vwap) or row.vwap <= 0)):
         raise Hist8Error("invalid vwap")
     if row.instrument == "NASDAQ" and row.volume is not None:
         raise Hist8Error("NASDAQ volume must be null")
@@ -2519,6 +2551,7 @@ def canonical_bar(
     row: SourceBar, *, session_date: str, calendar_hash: str,
     import_id: str, eligible: bool, calendar_id: str | None = None,
 ) -> Bar:
+    _validate_source_bar(row)
     bar = Bar(
         "", "", CORPUS_ID, row.instrument, "1m", row.start,
         row.start + timedelta(minutes=1), session_date,
@@ -2544,6 +2577,8 @@ def derive_session(
     if not minutes or any(row.timeframe != "1m" or not row.research_eligible
                           for row in minutes):
         return ()
+    for row in minutes:
+        _validate_bar_identity(row)
     if minutes[0].bar_start_utc != session_open:
         raise Hist8Error("derivation must anchor at session open")
     output: list[Bar] = []
@@ -2558,6 +2593,10 @@ def derive_session(
         volume = None if first.instrument == "NASDAQ" else _exact_decimal_sum(tuple(
             item.volume for item in window if item.volume is not None
         ))
+        if volume is not None and not _postgres_numeric_fits(volume):
+            raise Hist8Error(
+                "derived volume exceeds PostgreSQL numeric capacity"
+            )
         trade_count = None
         if not any(item.trade_count is None for item in window):
             trade_count = sum(item.trade_count or 0 for item in window)

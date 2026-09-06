@@ -247,6 +247,49 @@ def test_alpaca_trade_count_is_bounded_to_postgresql_bigint() -> None:
     assert rejected == [1]
 
 
+def test_provider_decimals_are_bounded_to_postgresql_numeric() -> None:
+    assert corpus._postgres_numeric_fits(Decimal("1e131071"))
+    assert corpus._postgres_numeric_fits(Decimal("1e-16383"))
+    assert corpus._postgres_numeric_fits(Decimal(0))
+    assert not corpus._postgres_numeric_fits(Decimal("1e131072"))
+    assert not corpus._postgres_numeric_fits(Decimal("1e-16384"))
+    assert not corpus._postgres_numeric_fits(Decimal("0e-1000000"))
+
+    start = "2025-01-02T14:30:00Z"
+    valid = {
+        "t": start, "o": "100", "h": "101", "l": "99",
+        "c": "100", "v": "5", "vw": "100",
+    }
+    page = _raw_page({"bars": {"SPY": [
+        valid,
+        {**valid, "o": "1e1000000", "h": "1e1000000",
+         "l": "1e1000000", "c": "1e1000000"},
+        {**valid, "v": "1e1000000"},
+        {**valid, "vw": "1e-1000000"},
+    ]}})
+    rejected = [0]
+
+    parsed = corpus.parse_source_page(
+        page, "SPY", rejection_counter=rejected,
+    )
+
+    assert len(parsed) == 1
+    assert rejected == [3]
+    assert corpus.canonical_bytes(Decimal("0e-1000000")) == b'"0"'
+    oversized = Decimal("1e1000000")
+    with pytest.raises(corpus.Hist8Error, match="invalid OHLC"):
+        corpus.canonical_bar(
+            replace(
+                _source_bar(datetime(2025, 1, 2, 14, 30, tzinfo=UTC)),
+                open=oversized, high=oversized,
+                low=oversized, close=oversized,
+            ),
+            session_date="2025-01-02",
+            calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
+            import_id="attempt", eligible=False,
+        )
+
+
 def test_canonical_decimal_hashing_preserves_precision_without_context_rounding() -> None:
     left = Decimal("12345678901234567890123456780")
     right = Decimal("12345678901234567890123456781")
@@ -301,6 +344,10 @@ def test_massive_identity_pagination_and_fractional_timestamp_fail_closed() -> N
     assert normalized_params == {
         "sort": "asc", "limit": "50000", "cursor": "opaque",
     }
+    with pytest.raises(corpus.Hist8Error, match="parameter mismatch"):
+        corpus._strip_secret_query(
+            corpus.MASSIVE_URL + "?cursor=\ud800"
+        )
     for query in (
         "cursor=next&adjusted=true",
         "cursor=next&sort=desc",
@@ -662,14 +709,21 @@ def test_massive_pagination_integer_limit_is_contained_to_one_provider(
     assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
 
 
-@pytest.mark.parametrize("malformed_next_url", (
-    "https://api.massive.com:notaport/v2/aggs/ticker/I%3ACOMP/range/1/"
-    "minute/2024-09-01/2026-09-01?cursor=next",
-    "https://[api.massive.com/v2/aggs/ticker/I%3ACOMP/range/1/minute/"
-    "2024-09-01/2026-09-01?cursor=next",
+@pytest.mark.parametrize(("malformed_next_url", "mismatch_kind"), (
+    (
+        "https://api.massive.com:notaport/v2/aggs/ticker/I%3ACOMP/range/1/"
+        "minute/2024-09-01/2026-09-01?cursor=next",
+        "resource",
+    ),
+    (
+        "https://[api.massive.com/v2/aggs/ticker/I%3ACOMP/range/1/minute/"
+        "2024-09-01/2026-09-01?cursor=next",
+        "resource",
+    ),
+    (corpus.MASSIVE_URL + "?cursor=\ud800", "parameter"),
 ))
 def test_massive_malformed_pagination_url_is_contained_to_one_provider(
-    monkeypatch, malformed_next_url,
+    monkeypatch, malformed_next_url, mismatch_kind,
 ) -> None:
     stored = []
     real_massive_pages = corpus.massive_pages
@@ -709,10 +763,26 @@ def test_massive_malformed_pagination_url_is_contained_to_one_provider(
     assert result["source_statuses"]["NASDAQ"] == {
         "source": "MASSIVE", "availability": "UNAVAILABLE",
         "retrieval_associations": 1, "failure_type": "Hist8Error",
-        "reason": "Massive pagination resource mismatch",
+        "reason": f"Massive pagination {mismatch_kind} mismatch",
     }
     assert result["source_statuses"]["SPY"]["availability"] == "AVAILABLE"
     assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
+
+
+def test_provider_request_parameter_encoding_failure_is_controlled() -> None:
+    with pytest.raises(
+        corpus.Hist8Error, match="request parameter encoding failure",
+    ):
+        corpus._build_page(
+            source="ALPACA", feed="SIP", product="1Min trade OHLCV",
+            instruments=corpus.EQUITIES, endpoint=corpus.ALPACA_URL,
+            params={**corpus.ALPACA_FROZEN_PARAMS, "page_token": "\ud800"},
+            headers={},
+            opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("unencodable request reached opener")
+            ),
+            clock=lambda: datetime.now(UTC),
+        )
 
 
 def test_malformed_alpaca_page_shape_is_contained_to_one_provider(
@@ -886,6 +956,25 @@ def test_derived_volume_sum_preserves_every_decimal_digit() -> None:
         minutes, "5m", "attempt", session_open=start,
     )[0]
     assert derived.volume == Decimal("10000000000000000000000000004")
+
+
+def test_derived_volume_cannot_overflow_postgresql_numeric() -> None:
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
+    volumes = [
+        Decimal("9e131071"), Decimal("9e131071"),
+        Decimal(0), Decimal(0), Decimal(0),
+    ]
+    minutes = tuple(corpus.canonical_bar(
+        replace(_source_bar(start + timedelta(minutes=index)), volume=volume),
+        session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
+        import_id="attempt", eligible=True,
+    ) for index, volume in enumerate(volumes))
+
+    with pytest.raises(corpus.Hist8Error, match="derived volume"):
+        corpus.derive_session(
+            minutes, "5m", "attempt", session_open=start,
+        )
 
 
 def test_derived_trade_count_cannot_overflow_postgresql_bigint() -> None:
