@@ -79,7 +79,8 @@ IMPORTER_CONNECT_TIMEOUT_SECONDS = 15
 IMPORTER_SESSION_OPTIONS = (
     "-c statement_timeout=60000 "
     "-c lock_timeout=5000 "
-    "-c idle_in_transaction_session_timeout=60000"
+    "-c idle_in_transaction_session_timeout=60000 "
+    "-c timezone=UTC"
 )
 EXECUTION_CODE_PATHS = (
     "research/hist8/corpus.py",
@@ -574,14 +575,18 @@ def _strip_secret_query(url: str) -> tuple[str, dict[str, str]]:
     if len(segments) != 9 or segments[:7] != expected_prefix:
         raise Hist8Error("Massive pagination resource mismatch")
     start_token, end_token = segments[7:]
-    if start_token == "2024-09-01":
-        page_start_ms = int(START.timestamp() * 1000)
-    elif start_token.isascii() and start_token.isdigit():
-        page_start_ms = int(start_token)
-    else:
-        raise Hist8Error("Massive pagination resource mismatch")
     frozen_start_ms = int(START.timestamp() * 1000)
     frozen_end_ms = int(END.timestamp() * 1000)
+    if start_token == "2024-09-01":
+        page_start_ms = frozen_start_ms
+    elif (start_token.isascii() and start_token.isdigit()
+          and len(start_token) <= len(str(frozen_end_ms))):
+        try:
+            page_start_ms = int(start_token)
+        except ValueError as exc:
+            raise Hist8Error("Massive pagination resource mismatch") from exc
+    else:
+        raise Hist8Error("Massive pagination resource mismatch")
     if (not frozen_start_ms <= page_start_ms < frozen_end_ms
             or end_token not in {"2026-09-01", str(frozen_end_ms)}):
         raise Hist8Error("Massive pagination resource mismatch")
@@ -1031,14 +1036,17 @@ class Hist8Store:
             cursor.execute(
                 "select current_user, current_database(), "
                 "current_setting('session_replication_role'), "
-                "current_setting('lo_compat_privileges')"
+                "current_setting('lo_compat_privileges'), "
+                "current_setting('TimeZone')"
             )
-            user, database, replication_role, lo_compat_privileges = (
+            (user, database, replication_role, lo_compat_privileges,
+             session_timezone) = (
                 cursor.fetchone()
             )
         if (user != IMPORTER_ROLE or database != DATABASE_NAME
                 or replication_role != "origin"
-                or lo_compat_privileges != "off"):
+                or lo_compat_privileges != "off"
+                or session_timezone != "UTC"):
             raise Hist8Error("HIST8 database identity mismatch")
 
     def _verify_canonical_provenance(
@@ -1370,37 +1378,17 @@ class Hist8Store:
     def sealed_snapshot_digest(self, import_id: str) -> str:
         return str(self.sealed_snapshot_state(import_id)["membership_sha256"])
 
-    def _record_bar_conflict(
-        self, row: Bar, existing_bar_id: str, existing_content_hash: str,
-        existing_import_id: str,
+    def _write_bar_conflict(
+        self, *, import_id: str, sequence: int, instrument: str,
+        metadata: Mapping[str, object],
     ) -> None:
-        sequence = _membership_sequence(row)
-        metadata = _canonical({
-            "conflict_kind": "SAME_CANONICAL_KEY",
-            "canonical_key": {
-                "corpus_id": row.corpus_id,
-                "instrument": row.instrument,
-                "timeframe": row.timeframe,
-                "bar_start_utc": row.bar_start_utc,
-            },
-            "existing": {
-                "bar_id": existing_bar_id,
-                "content_hash": existing_content_hash,
-                "originating_import_id": existing_import_id,
-            },
-            "candidate": {
-                "bar_id": row.bar_id,
-                "content_hash": row.content_hash,
-                "attempt_import_id": row.import_id,
-                "source_artifact_id": row.source_artifact_id,
-                "source_record_locator": row.source_record_locator,
-                "semantic_payload": _content_payload(row),
-            },
-        })
+        canonical_metadata = _canonical(dict(metadata))
+        if not isinstance(canonical_metadata, dict):
+            raise Hist8ConflictError("bar conflict evidence mismatch")
         payload = {
-            "corpus_id": CORPUS_ID, "import_id": row.import_id,
+            "corpus_id": CORPUS_ID, "import_id": import_id,
             "kind": "BAR_CONFLICT", "sequence_no": sequence,
-            "instrument": row.instrument, "metadata": metadata,
+            "instrument": instrument, "metadata": canonical_metadata,
         }
         manifest_id = _manifest_id(payload)
         with self._connection_factory() as connection:
@@ -1412,8 +1400,8 @@ class Hist8Store:
                         instrument,metadata_json)
                        values (%s,%s,'BAR_CONFLICT',%s,%s,%s,%s)
                        on conflict do nothing""",
-                    (manifest_id, CORPUS_ID, row.import_id, sequence,
-                     row.instrument, json.dumps(metadata)),
+                    (manifest_id, CORPUS_ID, import_id, sequence,
+                     instrument, json.dumps(canonical_metadata)),
                 )
             connection.commit()
             self._verify(connection)
@@ -1423,12 +1411,93 @@ class Hist8Store:
                        from atom_research_history.manifests
                        where corpus_id=%s and import_id=%s
                          and manifest_kind='BAR_CONFLICT' and sequence_no=%s""",
-                    (CORPUS_ID, row.import_id, sequence),
+                    (CORPUS_ID, import_id, sequence),
                 )
                 recorded = cursor.fetchone()
         if (recorded is None or recorded[0] != manifest_id
-                or _canonical(recorded[1]) != metadata):
+                or _canonical(recorded[1]) != canonical_metadata):
             raise Hist8ConflictError("bar conflict evidence mismatch")
+
+    def _record_bar_conflict(self, row: Bar, existing: Bar) -> None:
+        metadata = {
+            "conflict_kind": "SAME_CANONICAL_KEY",
+            "conflict_stage": "DATABASE_INSERT",
+            "canonical_key": {
+                "corpus_id": row.corpus_id,
+                "instrument": row.instrument,
+                "timeframe": row.timeframe,
+                "bar_start_utc": row.bar_start_utc,
+            },
+            "existing": {
+                "bar_id": existing.bar_id,
+                "content_hash": existing.content_hash,
+                "originating_import_id": existing.import_id,
+            },
+            "candidate": {
+                "bar_id": row.bar_id,
+                "content_hash": row.content_hash,
+                "attempt_import_id": row.import_id,
+                "source_artifact_id": row.source_artifact_id,
+                "source_record_locator": row.source_record_locator,
+                "semantic_payload": _content_payload(row),
+            },
+        }
+        self._write_bar_conflict(
+            import_id=row.import_id, sequence=_membership_sequence(row),
+            instrument=row.instrument, metadata=metadata,
+        )
+
+    def record_source_bar_conflict(
+        self, *, import_id: str, session_date: str, calendar_id: str,
+        calendar_sha256: str, existing: SourceBar, candidate: SourceBar,
+    ) -> None:
+        if (_source_bar_payload(existing) == _source_bar_payload(candidate)
+                or existing.instrument != candidate.instrument
+                or existing.start != candidate.start):
+            raise Hist8ConflictError("invalid provider bar conflict evidence")
+        existing_bar = canonical_bar(
+            existing, session_date=session_date,
+            calendar_hash=calendar_sha256, calendar_id=calendar_id,
+            import_id=import_id, eligible=False,
+        )
+        candidate_bar = canonical_bar(
+            candidate, session_date=session_date,
+            calendar_hash=calendar_sha256, calendar_id=calendar_id,
+            import_id=import_id, eligible=False,
+        )
+        if existing_bar.content_hash == candidate_bar.content_hash:
+            raise Hist8ConflictError("invalid provider bar conflict evidence")
+        metadata = {
+            "conflict_kind": "SAME_CANONICAL_KEY",
+            "conflict_stage": "RETAINED_PROVIDER_ROWS",
+            "canonical_key": {
+                "corpus_id": CORPUS_ID,
+                "instrument": candidate.instrument,
+                "timeframe": "1m",
+                "bar_start_utc": candidate.start,
+            },
+            "existing": {
+                "bar_id": existing_bar.bar_id,
+                "content_hash": existing_bar.content_hash,
+                "attempt_import_id": import_id,
+                "source_artifact_id": existing.artifact_id,
+                "source_record_locator": existing.locator,
+                "semantic_payload": _content_payload(existing_bar),
+            },
+            "candidate": {
+                "bar_id": candidate_bar.bar_id,
+                "content_hash": candidate_bar.content_hash,
+                "attempt_import_id": import_id,
+                "source_artifact_id": candidate.artifact_id,
+                "source_record_locator": candidate.locator,
+                "semantic_payload": _content_payload(candidate_bar),
+            },
+        }
+        self._write_bar_conflict(
+            import_id=import_id,
+            sequence=_membership_sequence(candidate_bar),
+            instrument=candidate.instrument, metadata=metadata,
+        )
 
     def insert_bars(
         self, rows: Sequence[Bar], *, session_open: datetime,
@@ -1453,7 +1522,7 @@ class Hist8Store:
         if len(keys) != len(set(keys)):
             raise Hist8ConflictError("duplicate generated bar identity")
         inserted = 0
-        conflict: tuple[Bar, str, str, str] | None = None
+        conflict: tuple[Bar, Bar] | None = None
         try:
             with self._connection_factory() as connection:
                 self._verify(connection)
@@ -1485,10 +1554,7 @@ class Hist8Store:
                         if key in existing:
                             stored = existing[key]
                             if stored.content_hash != row.content_hash:
-                                conflict = (
-                                    row, stored.bar_id, stored.content_hash,
-                                    stored.import_id,
-                                )
+                                conflict = (row, stored)
                                 raise Hist8ConflictError("same-key bar conflict")
                             continue
                         pending.append(row)
@@ -1543,10 +1609,7 @@ class Hist8Store:
                         if actual is None:
                             raise Hist8ConflictError("bar readback missing")
                         if actual.content_hash != row.content_hash:
-                            conflict = (
-                                row, actual.bar_id, actual.content_hash,
-                                actual.import_id,
-                            )
+                            conflict = (row, actual)
                             raise Hist8ConflictError("same-key bar conflict")
                         verified_attempt_rows.append(replace(
                             actual, research_eligible=row.research_eligible,
@@ -2536,6 +2599,12 @@ def materialize_instrument(
                     instrument, session, row.start,
                 )
                 if _source_bar_payload(stored) != _source_bar_payload(row):
+                    store.record_source_bar_conflict(
+                        import_id=write_attempt_id, session_date=session,
+                        calendar_id=calendar_id,
+                        calendar_sha256=calendar_hash,
+                        existing=stored, candidate=row,
+                    )
                     raise Hist8ConflictError(
                         "conflicting duplicate provider bar after session flush"
                     )
@@ -2548,6 +2617,12 @@ def materialize_instrument(
             prior = current_rows.get(row.start)
             if prior is not None:
                 if _source_bar_payload(prior) != _source_bar_payload(row):
+                    store.record_source_bar_conflict(
+                        import_id=write_attempt_id, session_date=session,
+                        calendar_id=calendar_id,
+                        calendar_sha256=calendar_hash,
+                        existing=prior, candidate=row,
+                    )
                     raise Hist8ConflictError("conflicting duplicate provider bar")
                 duplicates += 1
                 continue
