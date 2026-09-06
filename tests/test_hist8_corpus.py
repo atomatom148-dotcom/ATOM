@@ -397,6 +397,62 @@ def test_malformed_http_status_line_is_contained_to_one_provider(monkeypatch) ->
     assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
 
 
+def test_malformed_alpaca_page_shape_is_contained_to_one_provider(
+    monkeypatch,
+) -> None:
+    stored = []
+    real_alpaca_pages = corpus.alpaca_pages
+
+    def alpaca(*_args, **_kwargs):
+        yield from real_alpaca_pages(
+            "key", "secret",
+            opener=lambda *_args, **_kwargs: _Response({
+                "bars": None, "next_page_token": None,
+            }),
+        )
+
+    def coinbase(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "coinbase"}, source="COINBASE",
+            instruments=("BTC-USD",),
+        )
+
+    def massive(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "massive"}, source="MASSIVE",
+            instruments=("NASDAQ",),
+        )
+
+    class Store:
+        def store_page(self, import_id, sequence, page):
+            assert import_id == "alpaca-shape-attempt"
+            stored.append(page.source)
+            return sequence + len(page.instruments)
+
+    monkeypatch.setattr(corpus, "alpaca_pages", alpaca)
+    monkeypatch.setattr(corpus, "coinbase_pages", coinbase)
+    monkeypatch.setattr(corpus, "massive_pages", massive)
+    result = corpus.acquire(Store(), "alpaca-shape-attempt")
+
+    assert stored == ["ALPACA", "COINBASE", "MASSIVE"]
+    assert result["retrieval_associations"] == 8
+    assert result["source_statuses"]["SPY"] == {
+        "source": "ALPACA", "availability": "UNAVAILABLE",
+        "retrieval_associations": 1, "failure_type": "Hist8Error",
+        "reason": "malformed Alpaca page",
+    }
+    assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
+    assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
+
+    with pytest.raises(corpus.Hist8Error, match="malformed Alpaca page"):
+        list(real_alpaca_pages(
+            "key", "secret",
+            opener=lambda *_args, **_kwargs: _Response({
+                "bars": {"SPY": {}}, "next_page_token": None,
+            }),
+        ))
+
+
 def test_acquisition_continues_after_provider_unavailability(monkeypatch) -> None:
     calls = []
     stored = []
@@ -1335,6 +1391,10 @@ def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
     assert "member_provenance_hash text" in sql
     assert "HIST8_EXISTING_INSTALLATION_ROLE_MISMATCH" in sql
     assert "pg_get_functiondef(routine.oid)" in sql
+    assert "column_object.attnotnull" in sql
+    assert "pg_get_indexdef(index_object.oid)" in sql
+    assert "pg_get_triggerdef(trigger_object.oid, true)" in sql
+    assert "table_object.relhasrules" in sql
     assert "manifests_import_id_sequence_no_manifest_kind_key" in sql
 
 
@@ -1787,6 +1847,132 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                     "$function$;"
                 )
                 cursor.execute(sql[guard_start:guard_end])
+                cursor.execute(sql)
+
+                cursor.execute(
+                    "alter table atom_research_history.raw_responses "
+                    "alter column body drop not null"
+                )
+                with pytest.raises(
+                    psycopg.Error,
+                    match="EXISTING_INSTALLATION_PROTECTION_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "select attnotnull from pg_attribute where attrelid="
+                    "'atom_research_history.raw_responses'::regclass "
+                    "and attname='body'"
+                )
+                assert cursor.fetchone()[0] is False
+                cursor.execute(
+                    "alter table atom_research_history.raw_responses "
+                    "alter column body set not null"
+                )
+                cursor.execute(sql)
+
+                cursor.execute(
+                    "alter table atom_research_history.raw_responses "
+                    "alter column created_at set default "
+                    "'2000-01-01 00:00:00+00'::timestamptz"
+                )
+                with pytest.raises(
+                    psycopg.Error,
+                    match="EXISTING_INSTALLATION_PROTECTION_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "alter table atom_research_history.raw_responses "
+                    "alter column created_at set default current_timestamp"
+                )
+                cursor.execute(sql)
+
+                cursor.execute(
+                    "drop index "
+                    "atom_research_history.hist8_manifests_import_idx"
+                )
+                cursor.execute(
+                    "create index hist8_manifests_import_idx on "
+                    "atom_research_history.manifests (created_at)"
+                )
+                with pytest.raises(
+                    psycopg.Error,
+                    match="EXISTING_INSTALLATION_PROTECTION_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "select pg_get_indexdef("
+                    "'atom_research_history.hist8_manifests_import_idx'"
+                    "::regclass)"
+                )
+                assert cursor.fetchone()[0].endswith("(created_at)")
+                cursor.execute(
+                    "drop index "
+                    "atom_research_history.hist8_manifests_import_idx"
+                )
+                cursor.execute(
+                    "create index hist8_manifests_import_idx on "
+                    "atom_research_history.manifests "
+                    "(corpus_id, import_id, manifest_kind, sequence_no)"
+                )
+                cursor.execute(sql)
+
+                cursor.execute(
+                    "drop trigger hist8_snapshot_membership_guard on "
+                    "atom_research_history.manifests"
+                )
+                cursor.execute(
+                    "create trigger hist8_snapshot_membership_guard "
+                    "before insert on atom_research_history.manifests "
+                    "for each row when (false) execute function "
+                    "atom_research_history.guard_snapshot_membership()"
+                )
+                with pytest.raises(
+                    psycopg.Error,
+                    match="EXISTING_INSTALLATION_PROTECTION_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "select tgqual is not null from pg_trigger where "
+                    "tgrelid='atom_research_history.manifests'::regclass "
+                    "and tgname='hist8_snapshot_membership_guard'"
+                )
+                assert cursor.fetchone()[0] is True
+                cursor.execute(
+                    "drop trigger hist8_snapshot_membership_guard on "
+                    "atom_research_history.manifests"
+                )
+                cursor.execute(
+                    "create trigger hist8_snapshot_membership_guard "
+                    "before insert on atom_research_history.manifests "
+                    "for each row execute function "
+                    "atom_research_history.guard_snapshot_membership()"
+                )
+                cursor.execute(sql)
+
+                cursor.execute(
+                    "create rule hist8_forbidden_rewrite as on insert to "
+                    "atom_research_history.raw_responses do also nothing"
+                )
+                with pytest.raises(
+                    psycopg.Error,
+                    match="EXISTING_INSTALLATION_TABLE_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "select exists (select 1 from pg_rewrite where "
+                    "ev_class='atom_research_history.raw_responses'::regclass "
+                    "and rulename='hist8_forbidden_rewrite')"
+                )
+                assert cursor.fetchone()[0] is True
+                cursor.execute(
+                    "drop rule hist8_forbidden_rewrite on "
+                    "atom_research_history.raw_responses"
+                )
                 cursor.execute(sql)
                 cursor.execute("alter role atom_hist8_importer inherit")
                 with pytest.raises(

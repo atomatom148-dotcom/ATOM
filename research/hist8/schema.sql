@@ -12,6 +12,9 @@ DECLARE
   importer_role_exists boolean;
   protection_signature text;
   routine_signature text;
+  column_signature text;
+  index_signature text;
+  trigger_signature text;
 BEGIN
   -- The reviewed installer sets this marker only after establishing a
   -- verify-full TLS session to the frozen direct project endpoint. Refuse
@@ -349,10 +352,98 @@ GRANT SELECT, INSERT ON atom_research_history.raw_responses,
   IF routine_signature IS NULL THEN
     RAISE EXCEPTION 'HIST8_INSTALLATION_ROUTINE_SIGNATURE_MISSING';
   END IF;
+
+  -- Bind all durable column attributes, including nullability and defaults,
+  -- plus the stable logical table properties. Physical/statistics fields are
+  -- deliberately excluded because VACUUM and rewrites may change them.
+  SELECT md5(jsonb_agg(jsonb_build_array(
+           schema.nspname, table_object.relname,
+           table_object.relkind::text, table_object.relpersistence::text,
+           table_object.relowner, table_object.relam,
+           table_object.reltablespace, table_object.reloptions,
+           table_object.relrowsecurity, table_object.relforcerowsecurity,
+           table_object.relreplident::text,
+           column_object.attnum, column_object.attname,
+           format_type(column_object.atttypid, column_object.atttypmod),
+           column_object.attnotnull, column_object.atthasdef,
+           column_object.atthasmissing, column_object.attidentity::text,
+           column_object.attgenerated::text, column_object.attcollation,
+           column_object.attstorage::text, column_object.attcompression::text,
+           column_object.attstattarget, column_object.attislocal,
+           column_object.attinhcount, column_object.attacl,
+           column_object.attoptions, column_object.attfdwoptions,
+           pg_get_expr(default_object.adbin, default_object.adrelid, true)
+         ) ORDER BY table_object.relname, column_object.attnum)::text)
+    INTO column_signature
+  FROM pg_class table_object
+  JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
+  JOIN pg_attribute column_object
+    ON column_object.attrelid = table_object.oid
+  LEFT JOIN pg_attrdef default_object
+    ON default_object.adrelid = table_object.oid
+   AND default_object.adnum = column_object.attnum
+  WHERE schema.nspname = 'atom_research_history'
+    AND table_object.relname IN ('raw_responses','manifests','bars')
+    AND table_object.relkind = 'r'
+    AND column_object.attnum > 0
+    AND NOT column_object.attisdropped;
+
+  SELECT md5(jsonb_agg(jsonb_build_array(
+           schema.nspname, index_object.relname, table_object.relname,
+           index_object.relowner, index_object.relpersistence::text,
+           index_object.relam, index_object.reltablespace,
+           index_object.reloptions, index_metadata.indnatts,
+           index_metadata.indnkeyatts, index_metadata.indisunique,
+           index_metadata.indisprimary, index_metadata.indisexclusion,
+           index_metadata.indimmediate, index_metadata.indisclustered,
+           index_metadata.indisvalid, index_metadata.indcheckxmin,
+           index_metadata.indisready, index_metadata.indislive,
+           index_metadata.indisreplident, index_metadata.indkey::text,
+           index_metadata.indcollation::text,
+           index_metadata.indclass::text, index_metadata.indoption::text,
+           pg_get_expr(index_metadata.indexprs,
+                       index_metadata.indrelid, true),
+           pg_get_expr(index_metadata.indpred,
+                       index_metadata.indrelid, true),
+           pg_get_indexdef(index_object.oid)
+         ) ORDER BY index_object.relname)::text)
+    INTO index_signature
+  FROM pg_class index_object
+  JOIN pg_namespace schema ON schema.oid = index_object.relnamespace
+  JOIN pg_index index_metadata
+    ON index_metadata.indexrelid = index_object.oid
+  JOIN pg_class table_object ON table_object.oid = index_metadata.indrelid
+  WHERE schema.nspname = 'atom_research_history';
+
+  SELECT md5(jsonb_agg(jsonb_build_array(
+           schema.nspname, table_object.relname, trigger_object.tgname,
+           trigger_object.tgfoid, trigger_object.tgtype,
+           trigger_object.tgenabled::text, trigger_object.tgconstraint,
+           trigger_object.tgconstrrelid, trigger_object.tgdeferrable,
+           trigger_object.tginitdeferred, trigger_object.tgnargs,
+           encode(trigger_object.tgargs, 'hex'),
+           trigger_object.tgattr::text, trigger_object.tgoldtable,
+           trigger_object.tgnewtable,
+           pg_get_triggerdef(trigger_object.oid, true)
+         ) ORDER BY table_object.relname, trigger_object.tgname)::text)
+    INTO trigger_signature
+  FROM pg_trigger trigger_object
+  JOIN pg_class table_object ON table_object.oid = trigger_object.tgrelid
+  JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
+  WHERE schema.nspname = 'atom_research_history'
+    AND NOT trigger_object.tgisinternal;
+
+  IF column_signature IS NULL OR index_signature IS NULL
+    OR trigger_signature IS NULL
+  THEN
+    RAISE EXCEPTION 'HIST8_INSTALLATION_SURFACE_SIGNATURE_MISSING';
+  END IF;
   EXECUTE format(
     'COMMENT ON SCHEMA atom_research_history IS %L',
     'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1:'
       || protection_signature || ':' || routine_signature
+      || ':' || column_signature || ':' || index_signature
+      || ':' || trigger_signature
   );
 
   END IF;
@@ -363,6 +454,9 @@ DO $hist8_verify$
 DECLARE
   protection_signature text;
   routine_signature text;
+  column_signature text;
+  index_signature text;
+  trigger_signature text;
 BEGIN
   -- This block is also the retry path after an ambiguous client disconnect.
   -- It is deliberately read-only: an existing pair is accepted only when the
@@ -424,6 +518,83 @@ BEGIN
   FROM pg_proc routine
   JOIN pg_namespace schema ON schema.oid = routine.pronamespace
   WHERE schema.nspname = 'atom_research_history';
+
+  SELECT md5(jsonb_agg(jsonb_build_array(
+           schema.nspname, table_object.relname,
+           table_object.relkind::text, table_object.relpersistence::text,
+           table_object.relowner, table_object.relam,
+           table_object.reltablespace, table_object.reloptions,
+           table_object.relrowsecurity, table_object.relforcerowsecurity,
+           table_object.relreplident::text,
+           column_object.attnum, column_object.attname,
+           format_type(column_object.atttypid, column_object.atttypmod),
+           column_object.attnotnull, column_object.atthasdef,
+           column_object.atthasmissing, column_object.attidentity::text,
+           column_object.attgenerated::text, column_object.attcollation,
+           column_object.attstorage::text, column_object.attcompression::text,
+           column_object.attstattarget, column_object.attislocal,
+           column_object.attinhcount, column_object.attacl,
+           column_object.attoptions, column_object.attfdwoptions,
+           pg_get_expr(default_object.adbin, default_object.adrelid, true)
+         ) ORDER BY table_object.relname, column_object.attnum)::text)
+    INTO column_signature
+  FROM pg_class table_object
+  JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
+  JOIN pg_attribute column_object
+    ON column_object.attrelid = table_object.oid
+  LEFT JOIN pg_attrdef default_object
+    ON default_object.adrelid = table_object.oid
+   AND default_object.adnum = column_object.attnum
+  WHERE schema.nspname = 'atom_research_history'
+    AND table_object.relname IN ('raw_responses','manifests','bars')
+    AND table_object.relkind = 'r'
+    AND column_object.attnum > 0
+    AND NOT column_object.attisdropped;
+
+  SELECT md5(jsonb_agg(jsonb_build_array(
+           schema.nspname, index_object.relname, table_object.relname,
+           index_object.relowner, index_object.relpersistence::text,
+           index_object.relam, index_object.reltablespace,
+           index_object.reloptions, index_metadata.indnatts,
+           index_metadata.indnkeyatts, index_metadata.indisunique,
+           index_metadata.indisprimary, index_metadata.indisexclusion,
+           index_metadata.indimmediate, index_metadata.indisclustered,
+           index_metadata.indisvalid, index_metadata.indcheckxmin,
+           index_metadata.indisready, index_metadata.indislive,
+           index_metadata.indisreplident, index_metadata.indkey::text,
+           index_metadata.indcollation::text,
+           index_metadata.indclass::text, index_metadata.indoption::text,
+           pg_get_expr(index_metadata.indexprs,
+                       index_metadata.indrelid, true),
+           pg_get_expr(index_metadata.indpred,
+                       index_metadata.indrelid, true),
+           pg_get_indexdef(index_object.oid)
+         ) ORDER BY index_object.relname)::text)
+    INTO index_signature
+  FROM pg_class index_object
+  JOIN pg_namespace schema ON schema.oid = index_object.relnamespace
+  JOIN pg_index index_metadata
+    ON index_metadata.indexrelid = index_object.oid
+  JOIN pg_class table_object ON table_object.oid = index_metadata.indrelid
+  WHERE schema.nspname = 'atom_research_history';
+
+  SELECT md5(jsonb_agg(jsonb_build_array(
+           schema.nspname, table_object.relname, trigger_object.tgname,
+           trigger_object.tgfoid, trigger_object.tgtype,
+           trigger_object.tgenabled::text, trigger_object.tgconstraint,
+           trigger_object.tgconstrrelid, trigger_object.tgdeferrable,
+           trigger_object.tginitdeferred, trigger_object.tgnargs,
+           encode(trigger_object.tgargs, 'hex'),
+           trigger_object.tgattr::text, trigger_object.tgoldtable,
+           trigger_object.tgnewtable,
+           pg_get_triggerdef(trigger_object.oid, true)
+         ) ORDER BY table_object.relname, trigger_object.tgname)::text)
+    INTO trigger_signature
+  FROM pg_trigger trigger_object
+  JOIN pg_class table_object ON table_object.oid = trigger_object.tgrelid
+  JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
+  WHERE schema.nspname = 'atom_research_history'
+    AND NOT trigger_object.tgisinternal;
 
   IF NOT EXISTS (
     SELECT 1
@@ -517,6 +688,7 @@ BEGIN
         OR table_object.relowner <> 'postgres'::regrole
         OR NOT table_object.relrowsecurity
         OR NOT table_object.relforcerowsecurity
+        OR table_object.relhasrules
         OR (SELECT count(*) FROM pg_attribute column_object
             WHERE column_object.attrelid = table_object.oid
               AND column_object.attnum > 0
@@ -535,6 +707,40 @@ BEGIN
             WHERE column_object.attrelid = table_object.oid
               AND column_object.attnum > 0
               AND NOT column_object.attisdropped) <> expected.column_types
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM pg_attribute column_object
+      JOIN pg_class table_object
+        ON table_object.oid = column_object.attrelid
+      JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
+      WHERE schema.nspname = 'atom_research_history'
+        AND table_object.relname IN ('raw_responses','manifests','bars')
+        AND column_object.attnum > 0
+        AND column_object.attisdropped
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM pg_rewrite rewrite_object
+      JOIN pg_class table_object
+        ON table_object.oid = rewrite_object.ev_class
+      JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
+      WHERE schema.nspname = 'atom_research_history'
+        AND table_object.relname IN ('raw_responses','manifests','bars')
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM pg_inherits inheritance
+      WHERE inheritance.inhrelid IN (
+              to_regclass('atom_research_history.raw_responses'),
+              to_regclass('atom_research_history.manifests'),
+              to_regclass('atom_research_history.bars')
+            )
+         OR inheritance.inhparent IN (
+              to_regclass('atom_research_history.raw_responses'),
+              to_regclass('atom_research_history.manifests'),
+              to_regclass('atom_research_history.bars')
+            )
     )
   THEN
     RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_TABLE_MISMATCH';
@@ -641,12 +847,17 @@ BEGIN
 
   IF protection_signature IS NULL
     OR routine_signature IS NULL
+    OR column_signature IS NULL
+    OR index_signature IS NULL
+    OR trigger_signature IS NULL
     OR (SELECT obj_description(schema.oid, 'pg_namespace')
         FROM pg_namespace schema
         WHERE schema.nspname = 'atom_research_history')
        IS DISTINCT FROM
          'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1:'
            || protection_signature || ':' || routine_signature
+           || ':' || column_signature || ':' || index_signature
+           || ':' || trigger_signature
     OR EXISTS (
     SELECT 1
     FROM (VALUES

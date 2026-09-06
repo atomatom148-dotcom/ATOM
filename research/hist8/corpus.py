@@ -473,7 +473,12 @@ def alpaca_pages(
         if page.http_status != 200:
             raise Hist8Error(f"Alpaca HTTP {page.http_status}")
         payload = page.payload()
-        if not isinstance(payload, dict) or "bars" not in payload:
+        if not isinstance(payload, dict):
+            raise Hist8Error("malformed Alpaca page")
+        bars = payload.get("bars")
+        if (not isinstance(bars, dict)
+                or not set(bars).issubset(EQUITIES)
+                or any(not isinstance(rows, list) for rows in bars.values())):
             raise Hist8Error("malformed Alpaca page")
         next_token = payload.get("next_page_token")
         if next_token is None:
