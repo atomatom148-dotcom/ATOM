@@ -313,6 +313,16 @@ BEGIN
     RAISE EXCEPTION 'HIST8_ROLE_OWNERSHIP_OR_BASE_PRIVILEGE_MISMATCH';
   END IF;
 
+  IF has_database_privilege(
+       'atom_hist8_importer', current_database(), 'CREATE'
+     )
+    OR has_database_privilege(
+       'atom_hist8_importer', current_database(), 'TEMPORARY'
+     )
+  THEN
+    RAISE EXCEPTION 'HIST8_DATABASE_PRIVILEGE_BOUNDARY_UNSATISFIED';
+  END IF;
+
   IF EXISTS (
     SELECT 1
     FROM pg_database d
@@ -338,7 +348,7 @@ BEGIN
       )
       OR has_table_privilege(
         'atom_hist8_importer', 'atom_research_history.' || expected.table_name,
-        'UPDATE,DELETE,TRUNCATE'
+        'UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
       )
   ) THEN
     RAISE EXCEPTION 'HIST8_TABLE_PRIVILEGE_MISMATCH';
@@ -391,7 +401,9 @@ BEGIN
         OR has_table_privilege('atom_hist8_importer', c.oid, 'INSERT')
         OR has_table_privilege('atom_hist8_importer', c.oid, 'UPDATE')
         OR has_table_privilege('atom_hist8_importer', c.oid, 'DELETE')
-        OR has_table_privilege('atom_hist8_importer', c.oid, 'TRUNCATE'))
+        OR has_table_privilege('atom_hist8_importer', c.oid, 'TRUNCATE')
+        OR has_table_privilege('atom_hist8_importer', c.oid, 'REFERENCES')
+        OR has_table_privilege('atom_hist8_importer', c.oid, 'TRIGGER'))
   ) THEN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_PRIVILEGE_BOUNDARY_UNSATISFIED';
   END IF;

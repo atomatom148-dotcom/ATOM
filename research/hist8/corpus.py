@@ -31,7 +31,6 @@ DATABASE_HOST = "db.pjbjpgnmniwcajqkuhge.supabase.co"
 IMPORTER_ROLE = "atom_hist8_importer"
 IMPORT_DATABASE_ENV = "ATOM_HIST8_IMPORT_DATABASE_URL"
 INSTALLER_ROLE = "postgres"
-INSTALL_DATABASE_ENV = "ATOM_HIST8_INSTALL_DATABASE_URL"
 EQUITIES = ("COIN", "QQQ", "SPY", "NVDA", "XLE", "GLD")
 INSTRUMENTS = (*EQUITIES, "BTC-USD", "NASDAQ")
 TIMEFRAMES = ("1m", "5m", "15m", "30m", "1H")
@@ -53,6 +52,8 @@ MASSIVE_URL = (
 MASSIVE_FROZEN_PARAMS = {
     "adjusted": "false", "sort": "asc", "limit": "50000",
 }
+REPLAY_PAGE_BATCH_SIZE = 8
+SNAPSHOT_SCAN_BATCH_SIZE = 10_000
 
 _ISO_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
@@ -234,9 +235,10 @@ def load_calendar(path: Path | None = None) -> dict[str, object]:
     expected_calendars.update({"NASDAQ": "NASDAQ_CASH_RTH", "BTC-USD": "BTC_UTC_DAY"})
     if data.get("instrument_calendars") != expected_calendars:
         raise Hist8Error("instrument calendar binding mismatch")
+    # Bind the complete reviewed calendar artifact: schedule rows, exception
+    # annotations, source references, and calendar/timezone versions.
     payload = {
-        "btc_utc_dates": data.get("btc_utc_dates"),
-        "us_cash_sessions": data.get("us_cash_sessions"),
+        key: data[key] for key in data if key != "schedule_sha256"
     }
     if sha256(payload) != data.get("schedule_sha256"):
         raise Hist8Error("calendar schedule hash mismatch")
@@ -521,55 +523,53 @@ def _validate_database_url(
 
 
 def install_schema(
-    dsn: str | None = None, *, connector: Callable[..., object] | None = None,
-    schema_path: Path | None = None,
+    connection: object, *, schema_path: Path | None = None,
 ) -> dict[str, object]:
-    """Install only through the frozen direct endpoint with verified TLS."""
-    chosen_dsn = _validate_database_url(
-        dsn if dsn is not None else os.environ.get(INSTALL_DATABASE_ENV, ""),
-        expected_user=INSTALLER_ROLE,
-        purpose="installer",
-    )
-    if connector is None:
-        try:
-            import psycopg
-        except ImportError as exc:
-            raise Hist8Error("psycopg is required") from exc
-        connector = psycopg.connect
+    """Install over an already-authorized, verify-full privileged connection."""
+    info = getattr(connection, "info", None)
+    parameters = (
+        getattr(info, "dsn_parameters", {}) if info is not None else {}
+    ) or {}
+    if (getattr(connection, "autocommit", None) is not True
+            or getattr(info, "host", None) != DATABASE_HOST
+            or str(getattr(info, "port", "")) != "5432"
+            or getattr(info, "dbname", None) != DATABASE_NAME
+            or getattr(info, "user", None) != INSTALLER_ROLE
+            or parameters.get("sslmode") != "verify-full"
+            or parameters.get("sslrootcert") != "system"
+            or parameters.get("hostaddr") not in (None, "")):
+        raise Hist8Error("HIST8 installer endpoint identity mismatch")
     target = schema_path or Path(__file__).with_name("schema.sql")
     sql = target.read_text(encoding="utf-8")
     if (not sql.lstrip().startswith("-- ATOM-HIST8-CORPUS-AMENDMENT-1")
             or not sql.rstrip().endswith("COMMIT;")):
         raise Hist8Error("HIST8 schema artifact mismatch")
-    with connector(
-        chosen_dsn, autocommit=True, connect_timeout=15,
-    ) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """select current_user,current_database(),coalesce(
-                       (select ssl from pg_stat_ssl where pid=pg_backend_pid()),
-                       false
-                   )"""
-            )
-            user, database, tls_active = cursor.fetchone()
-            if (user != INSTALLER_ROLE or database != DATABASE_NAME
-                    or tls_active is not True):
-                raise Hist8Error("HIST8 installer endpoint identity mismatch")
-            cursor.execute(
-                "select set_config('atom.hist8_verified_project_ref', %s, false)",
-                (PROJECT_REF,),
-            )
-            cursor.execute(sql)
-            cursor.execute(
-                """select to_regnamespace('atom_research_history') is not null,
-                          exists (
-                            select 1 from pg_roles
-                            where rolname='atom_hist8_importer'
-                          ),
-                          (select count(*) from information_schema.tables
-                           where table_schema='atom_research_history')"""
-            )
-            schema_exists, role_exists, table_count = cursor.fetchone()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """select current_user,current_database(),coalesce(
+                   (select ssl from pg_stat_ssl where pid=pg_backend_pid()),
+                   false
+               )"""
+        )
+        user, database, tls_active = cursor.fetchone()
+        if (user != INSTALLER_ROLE or database != DATABASE_NAME
+                or tls_active is not True):
+            raise Hist8Error("HIST8 installer endpoint identity mismatch")
+        cursor.execute(
+            "select set_config('atom.hist8_verified_project_ref', %s, false)",
+            (PROJECT_REF,),
+        )
+        cursor.execute(sql)
+        cursor.execute(
+            """select to_regnamespace('atom_research_history') is not null,
+                      exists (
+                        select 1 from pg_roles
+                        where rolname='atom_hist8_importer'
+                      ),
+                      (select count(*) from information_schema.tables
+                       where table_schema='atom_research_history')"""
+        )
+        schema_exists, role_exists, table_count = cursor.fetchone()
     if schema_exists is not True or role_exists is not True or table_count != 3:
         raise Hist8Error("HIST8 schema installation readback mismatch")
     return {
@@ -704,27 +704,62 @@ class Hist8Store:
         return sequence + len(page.instruments)
 
     def retrieval_pages(self, import_id: str, instrument: str) -> Iterator[RawPage]:
-        connection = self._connection_factory()
-        self._verify(connection)
-        try:
-            with connection.cursor(name="hist8_raw_replay") as cursor:
+        with self._connection_factory() as connection:
+            self._verify(connection)
+            with connection.cursor() as cursor:
                 cursor.execute(
-                    """select m.source,m.feed,m.product,m.instrument,m.endpoint,
-                    m.request_params,m.retrieved_at,m.http_status,m.content_type,
-                    m.content_encoding,r.body
-                    from atom_research_history.manifests m
-                    join atom_research_history.raw_responses r using (artifact_id)
-                    where m.corpus_id=%s and m.import_id=%s
-                      and m.manifest_kind='RETRIEVAL' and m.instrument=%s
-                    order by m.sequence_no""", (CORPUS_ID, import_id, instrument),
+                    """select max(sequence_no)
+                       from atom_research_history.manifests
+                       where corpus_id=%s and import_id=%s
+                         and manifest_kind='RETRIEVAL' and instrument=%s""",
+                    (CORPUS_ID, import_id, instrument),
                 )
-                for row in cursor:
-                    yield RawPage(
-                        row[0], row[1], row[2], (row[3],), row[4], row[5], row[6],
-                        row[7], row[8], row[9], bytes(row[10]),
+                upper_sequence = cursor.fetchone()[0]
+        if upper_sequence is None:
+            return
+        last_sequence = -1
+        while last_sequence < upper_sequence:
+            batch: list[tuple[int, RawPage]] = []
+            with self._connection_factory() as connection:
+                self._verify(connection)
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """select m.sequence_no,m.source,m.feed,m.product,
+                                  m.instrument,m.endpoint,m.request_params,
+                                  m.retrieved_at,m.http_status,m.content_type,
+                                  m.content_encoding,m.artifact_id,
+                                  m.artifact_byte_length,r.byte_length,r.body
+                           from atom_research_history.manifests m
+                           left join atom_research_history.raw_responses r
+                             on r.artifact_id=m.artifact_id
+                           where m.corpus_id=%s and m.import_id=%s
+                             and m.manifest_kind='RETRIEVAL'
+                             and m.instrument=%s and m.sequence_no>%s
+                             and m.sequence_no<=%s
+                           order by m.sequence_no
+                           limit %s""",
+                        (CORPUS_ID, import_id, instrument, last_sequence,
+                         upper_sequence, REPLAY_PAGE_BATCH_SIZE),
                     )
-        finally:
-            connection.close()
+                    records = cursor.fetchall()
+                    for record in records:
+                        body = None if record[14] is None else bytes(record[14])
+                        if (body is None or record[11] != _artifact_id(body)
+                                or record[12] != len(body)
+                                or record[13] != len(body)):
+                            raise Hist8ConflictError(
+                                "retained raw artifact replay mismatch"
+                            )
+                        batch.append((record[0], RawPage(
+                            record[1], record[2], record[3], (record[4],),
+                            record[5], record[6], record[7], record[8],
+                            record[9], record[10], body,
+                        )))
+            if not batch:
+                raise Hist8ConflictError("retrieval replay sequence gap")
+            last_sequence = batch[-1][0]
+            for _, page in batch:
+                yield page
 
     def sealed_snapshot_digest(self, import_id: str) -> str:
         with self._connection_factory() as connection:
@@ -855,7 +890,11 @@ class Hist8Store:
                             on conflict do nothing""",
                             [_bar_values(row) for row in pending],
                         )
-                        inserted = len(pending)
+                        inserted = cursor.rowcount
+                        if not 0 <= inserted <= len(pending):
+                            raise Hist8ConflictError(
+                                "bar insert affected-row count mismatch"
+                            )
                     cursor.execute(
                         """select timeframe,bar_start_utc,bar_id,content_hash,import_id
                            from atom_research_history.bars
@@ -928,31 +967,69 @@ class Hist8Store:
     def seal_snapshot(self, import_id: str, metadata: Mapping[str, object]) -> str:
         digest = hashlib.sha256()
         counts: dict[str, int] = {}
-        connection = self._connection_factory()
-        self._verify(connection)
+        lock_connection = self._connection_factory()
+        lock_acquired = False
         try:
-            with connection.cursor() as lock_cursor:
+            self._verify(lock_connection)
+            # A session lock conflicts with the membership trigger's transaction
+            # lock but survives commits. This freezes membership without holding
+            # an MVCC snapshot while the evidence is scanned in short batches.
+            with lock_connection.cursor() as lock_cursor:
                 lock_cursor.execute(
-                    "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    "select pg_advisory_lock(hashtextextended(%s, 0))",
                     (import_id,),
                 )
-            with connection.cursor(name="hist8_snapshot") as cursor:
-                cursor.execute(
-                    """select m.instrument,m.member_timeframe,m.member_bar_id,
-                              m.member_content_hash,m.member_research_eligible
-                       from atom_research_history.manifests m
-                       join atom_research_history.bars b
-                         on b.bar_id=m.member_bar_id
-                        and b.content_hash=m.member_content_hash
-                       where m.corpus_id=%s and m.import_id=%s
-                         and m.manifest_kind='SNAPSHOT_MEMBER'
-                       order by m.sequence_no""", (CORPUS_ID, import_id),
-                )
-                for instrument, timeframe, bar_id, content_hash, eligible in cursor:
-                    digest.update(canonical_bytes((instrument, timeframe, bar_id,
-                                                   content_hash, eligible)))
+            lock_connection.commit()
+            lock_acquired = True
+            with self._connection_factory() as read_connection:
+                self._verify(read_connection)
+                with read_connection.cursor() as cursor:
+                    cursor.execute(
+                        """select max(sequence_no)
+                           from atom_research_history.manifests
+                           where corpus_id=%s and import_id=%s
+                             and manifest_kind='SNAPSHOT_MEMBER'""",
+                        (CORPUS_ID, import_id),
+                    )
+                    upper_sequence = cursor.fetchone()[0]
+            last_sequence = -1
+            while (upper_sequence is not None
+                   and last_sequence < upper_sequence):
+                with self._connection_factory() as read_connection:
+                    self._verify(read_connection)
+                    with read_connection.cursor() as cursor:
+                        cursor.execute(
+                            """select m.sequence_no,m.instrument,
+                                      m.member_timeframe,m.member_bar_id,
+                                      m.member_content_hash,
+                                      m.member_research_eligible,b.bar_id
+                               from atom_research_history.manifests m
+                               left join atom_research_history.bars b
+                                 on b.bar_id=m.member_bar_id
+                                and b.content_hash=m.member_content_hash
+                               where m.corpus_id=%s and m.import_id=%s
+                                 and m.manifest_kind='SNAPSHOT_MEMBER'
+                                 and m.sequence_no>%s and m.sequence_no<=%s
+                               order by m.sequence_no
+                               limit %s""",
+                            (CORPUS_ID, import_id, last_sequence,
+                             upper_sequence, SNAPSHOT_SCAN_BATCH_SIZE),
+                        )
+                        members = cursor.fetchall()
+                if not members:
+                    raise Hist8ConflictError("snapshot member scan gap")
+                for (sequence, instrument, timeframe, bar_id, content_hash,
+                     eligible, referenced_bar_id) in members:
+                    if referenced_bar_id != bar_id:
+                        raise Hist8ConflictError(
+                            "snapshot member bar identity mismatch"
+                        )
+                    digest.update(canonical_bytes((
+                        instrument, timeframe, bar_id, content_hash, eligible,
+                    )))
                     key = f"{instrument}/{timeframe}"
                     counts[key] = counts.get(key, 0) + 1
+                    last_sequence = sequence
             snapshot = {
                 **dict(metadata), "membership_sha256": digest.hexdigest(),
                 "row_counts": {key: counts.get(key, 0) for key in
@@ -960,18 +1037,41 @@ class Hist8Store:
             }
             payload = {"corpus_id": CORPUS_ID, "import_id": import_id,
                        "kind": "SNAPSHOT", "sequence_no": 0, "metadata": snapshot}
-            with connection.cursor() as cursor:
+            manifest_id = _manifest_id(payload)
+            with lock_connection.cursor() as cursor:
                 cursor.execute(
                     """insert into atom_research_history.manifests
                     (manifest_id,corpus_id,manifest_kind,import_id,sequence_no,metadata_json)
                     values (%s,%s,'SNAPSHOT',%s,0,%s) on conflict (manifest_id) do nothing""",
-                    (_manifest_id(payload), CORPUS_ID, import_id,
+                    (manifest_id, CORPUS_ID, import_id,
                      json.dumps(_canonical(snapshot))),
                 )
-            connection.commit()
+            lock_connection.commit()
+            self._verify(lock_connection)
+            with lock_connection.cursor() as cursor:
+                cursor.execute(
+                    """select metadata_json
+                       from atom_research_history.manifests
+                       where manifest_id=%s""", (manifest_id,),
+                )
+                recorded = cursor.fetchone()
+            if (recorded is None
+                    or _canonical(recorded[0]) != _canonical(snapshot)):
+                raise Hist8ConflictError("snapshot manifest readback mismatch")
             return digest.hexdigest()
         finally:
-            connection.close()
+            lock_connection.rollback()
+            if lock_acquired:
+                with lock_connection.cursor() as lock_cursor:
+                    lock_cursor.execute(
+                        "select pg_advisory_unlock(hashtextextended(%s, 0))",
+                        (import_id,),
+                    )
+                    released = lock_cursor.fetchone()[0]
+                lock_connection.commit()
+                if released is not True:
+                    raise Hist8ConflictError("snapshot advisory unlock mismatch")
+            lock_connection.close()
 
 
 def _bar_values(row: Bar) -> tuple[object, ...]:
@@ -1328,17 +1428,12 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("install", "run", "replay"))
+    parser.add_argument("command", choices=("run", "replay"))
     parser.add_argument("--import-id")
     args = parser.parse_args(argv)
     if args.command == "replay" and not args.import_id:
         parser.error("replay requires --import-id")
-    if args.command == "install":
-        if args.import_id:
-            parser.error("install does not accept --import-id")
-        result = install_schema()
-    else:
-        result = execute(args.import_id, acquire_sources=args.command == "run")
+    result = execute(args.import_id, acquire_sources=args.command == "run")
     print(json.dumps(_canonical(result), sort_keys=True, separators=(",", ":")))
     return 0
 
@@ -1350,8 +1445,8 @@ if __name__ == "__main__":
 __all__ = [
     "ALPACA_URL", "CALENDAR_VERSION", "CORPUS_ID", "DATABASE_HOST",
     "DATABASE_NAME", "DERIVATION_VERSION", "END", "EQUITIES", "Hist8Error",
-    "Hist8ConflictError", "Hist8Store", "IMPORTER_ROLE", "INSTALL_DATABASE_ENV",
-    "INSTRUMENTS", "MASSIVE_URL", "PARTITIONS", "PROJECT_REF", "RawPage",
+    "Hist8ConflictError", "Hist8Store", "IMPORTER_ROLE", "INSTRUMENTS",
+    "MASSIVE_URL", "PARTITIONS", "PROJECT_REF", "RawPage",
     "START", "SourceBar", "TIMEFRAMES",
     "alpaca_pages", "canonical_bar", "canonical_bytes", "coinbase_pages",
     "derive_session", "execute", "install_schema", "load_calendar", "massive_pages",
