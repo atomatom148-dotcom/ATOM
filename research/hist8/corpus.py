@@ -585,7 +585,7 @@ def _verified_retrieval_record(
 def _snapshot_member_manifest_payload(
     import_id: str, sequence_no: int, instrument: str, timeframe: str,
     bar_start_utc: datetime, bar_id: str, content_hash: str,
-    research_eligible: bool,
+    provenance_hash: str, research_eligible: bool,
 ) -> dict[str, object]:
     return {
         "corpus_id": CORPUS_ID,
@@ -597,6 +597,7 @@ def _snapshot_member_manifest_payload(
         "bar_start_utc": bar_start_utc,
         "bar_id": bar_id,
         "content_hash": content_hash,
+        "provenance_hash": provenance_hash,
         "research_eligible": research_eligible,
     }
 
@@ -604,11 +605,11 @@ def _snapshot_member_manifest_payload(
 def _verified_snapshot_member_record(
     record: Sequence[object], *, import_id: str,
 ) -> tuple[int, tuple[object, ...]]:
-    if len(record) != 11:
+    if len(record) != 12:
         raise Hist8ConflictError("snapshot member record shape mismatch")
     (manifest_id, stored_corpus_id, stored_import_id, manifest_kind,
      sequence_no, instrument, timeframe, bar_start_utc, bar_id,
-     content_hash, research_eligible) = record
+     content_hash, provenance_hash, research_eligible) = record
     if (stored_corpus_id != CORPUS_ID or stored_import_id != import_id
             or manifest_kind != "SNAPSHOT_MEMBER"
             or not isinstance(sequence_no, int)
@@ -617,17 +618,19 @@ def _verified_snapshot_member_record(
             or not isinstance(bar_start_utc, datetime)
             or not isinstance(bar_id, str)
             or not isinstance(content_hash, str)
+            or not isinstance(provenance_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", provenance_hash)
             or not isinstance(research_eligible, bool)):
         raise Hist8ConflictError("snapshot member manifest identity mismatch")
     expected_manifest_id = _manifest_id(_snapshot_member_manifest_payload(
         import_id, sequence_no, instrument, timeframe, bar_start_utc,
-        bar_id, content_hash, research_eligible,
+        bar_id, content_hash, provenance_hash, research_eligible,
     ))
     if manifest_id != expected_manifest_id:
         raise Hist8ConflictError("snapshot member manifest identity mismatch")
     return sequence_no, (
         instrument, timeframe, bar_start_utc, bar_id, content_hash,
-        research_eligible,
+        provenance_hash, research_eligible,
     )
 
 
@@ -735,6 +738,12 @@ def install_schema(
 class Hist8Store:
     def __init__(self, connection_factory: Callable[[], object]) -> None:
         self._connection_factory = connection_factory
+        # Parsing retained provider pages is expensive (especially a large
+        # Massive page). Keep only a small rolling cache while independently
+        # re-reading and re-hashing every retrieval manifest from PostgreSQL.
+        self._provenance_cache: dict[
+            tuple[str, str, str], dict[str, tuple[object, ...]]
+        ] = {}
 
     @classmethod
     def from_environment(cls) -> "Hist8Store":
@@ -760,6 +769,123 @@ class Hist8Store:
             user, database = cursor.fetchone()
         if user != IMPORTER_ROLE or database != DATABASE_NAME:
             raise Hist8Error("HIST8 database identity mismatch")
+
+    def _verify_canonical_provenance(
+        self, cursor: object, rows: Sequence[Bar],
+    ) -> None:
+        canonical = [row for row in rows if row.timeframe == "1m"]
+        if not canonical:
+            return
+        expected: dict[tuple[str, str, str, str], tuple[object, ...]] = {}
+        for row in canonical:
+            source_row = _source_bar_from_canonical(row)
+            key = (
+                row.import_id, row.instrument, source_row.artifact_id,
+                source_row.locator,
+            )
+            payload = _source_bar_payload(source_row)
+            prior = expected.get(key)
+            if prior is not None and prior != payload:
+                raise Hist8ConflictError("canonical provenance identity conflict")
+            expected[key] = payload
+        import_ids = sorted({key[0] for key in expected})
+        instruments = sorted({key[1] for key in expected})
+        artifact_ids = sorted({key[2] for key in expected})
+        cursor.execute(
+            """select m.manifest_id,m.corpus_id,m.import_id,
+                      m.manifest_kind,m.sequence_no,m.source,m.feed,
+                      m.product,m.instrument,m.endpoint,m.request_params,
+                      m.retrieved_at,m.http_status,m.content_type,
+                      m.content_encoding,m.artifact_id,
+                      m.artifact_byte_length,r.byte_length,r.body
+               from atom_research_history.manifests m
+               left join atom_research_history.raw_responses r
+                 on r.artifact_id=m.artifact_id
+               where m.corpus_id=%s and m.manifest_kind='RETRIEVAL'
+                 and m.import_id = any(%s) and m.instrument = any(%s)
+                 and m.artifact_id = any(%s)""",
+            (CORPUS_ID, import_ids, instruments, artifact_ids),
+        )
+        resolved: dict[tuple[str, str, str, str], tuple[object, ...]] = {}
+        for record in cursor.fetchall():
+            stored_import_id = record[2]
+            stored_instrument = record[8]
+            stored_artifact_id = record[15]
+            if (not isinstance(stored_import_id, str)
+                    or not isinstance(stored_instrument, str)
+                    or not isinstance(stored_artifact_id, str)):
+                raise Hist8ConflictError(
+                    "canonical provenance retrieval identity mismatch"
+                )
+            _, page = _verified_retrieval_record(
+                record, import_id=stored_import_id,
+                instrument=stored_instrument,
+            )
+            page_key = (
+                stored_import_id, stored_instrument, stored_artifact_id,
+            )
+            parsed = self._provenance_cache.get(page_key)
+            if parsed is None:
+                parsed = {}
+                rejected = [0]
+                for source_row in parse_source_page(
+                    page, stored_instrument, rejection_counter=rejected,
+                ):
+                    payload = _source_bar_payload(source_row)
+                    prior = parsed.get(source_row.locator)
+                    if prior is not None and prior != payload:
+                        raise Hist8ConflictError(
+                            "canonical provenance locator conflict"
+                        )
+                    parsed[source_row.locator] = payload
+                self._provenance_cache[page_key] = parsed
+                while len(self._provenance_cache) > 8:
+                    del self._provenance_cache[next(iter(self._provenance_cache))]
+            for key in expected:
+                if key[:3] != page_key:
+                    continue
+                payload = parsed.get(key[3])
+                if payload is None:
+                    continue
+                prior = resolved.get(key)
+                if prior is not None and prior != payload:
+                    raise Hist8ConflictError(
+                        "canonical provenance locator conflict"
+                    )
+                resolved[key] = payload
+        for key, payload in expected.items():
+            if resolved.get(key) != payload:
+                raise Hist8ConflictError(
+                    "canonical provenance does not resolve to retained source"
+                )
+
+    def stored_canonical_source_bar(
+        self, instrument: str, session_date: str, start: datetime,
+    ) -> SourceBar:
+        with self._connection_factory() as connection:
+            self._verify(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """select bar_id,content_hash,corpus_id,instrument,
+                              timeframe,bar_start_utc,bar_end_utc,session_date,
+                              calendar_id,calendar_sha256,open,high,low,close,
+                              volume,trade_count,vwap,volume_unit,source,feed,
+                              product,adjustment,currency,import_id,
+                              derivation_version,source_artifact_id,
+                              source_record_locator,lineage_json
+                       from atom_research_history.bars
+                       where corpus_id=%s and instrument=%s and timeframe='1m'
+                         and session_date=%s and bar_start_utc=%s""",
+                    (CORPUS_ID, instrument, session_date, start),
+                )
+                records = cursor.fetchall()
+                if len(records) != 1:
+                    raise Hist8ConflictError(
+                        "flushed overlap canonical row missing or duplicated"
+                    )
+                stored = _verified_stored_bar(records[0])
+                self._verify_canonical_provenance(cursor, (stored,))
+        return _source_bar_from_canonical(stored)
 
     def add_attempt(self, import_id: str, kind: str, metadata: Mapping[str, object]) -> None:
         payload = {"corpus_id": CORPUS_ID, "import_id": import_id,
@@ -1030,6 +1156,8 @@ class Hist8Store:
     def insert_bars(self, rows: Sequence[Bar]) -> tuple[int, int]:
         if not rows:
             return 0, 0
+        if len({row.import_id for row in rows}) != 1:
+            raise Hist8ConflictError("mixed snapshot attempt identity")
         keys = [(row.corpus_id, row.instrument, row.timeframe, row.bar_start_utc)
                 for row in rows]
         if len(keys) != len(set(keys)):
@@ -1052,7 +1180,7 @@ class Hist8Store:
                            where corpus_id=%s and instrument=%s and session_date=%s""",
                         (CORPUS_ID, rows[0].instrument, rows[0].session_date),
                     )
-                    existing = {}
+                    existing: dict[tuple[str, datetime], Bar] = {}
                     for record in cursor.fetchall():
                         stored = _verified_stored_bar(record)
                         key = (stored.timeframe, stored.bar_start_utc)
@@ -1060,24 +1188,23 @@ class Hist8Store:
                             raise Hist8ConflictError(
                                 "duplicate stored bar identity"
                             )
-                        existing[key] = (
-                            stored.bar_id, stored.content_hash, stored.import_id,
-                        )
+                        existing[key] = stored
                     pending = []
                     for row in rows:
                         key = (row.timeframe, row.bar_start_utc)
                         if key in existing:
-                            existing_bar_id, existing_hash, existing_import_id = (
-                                existing[key]
-                            )
-                            if existing_hash != row.content_hash:
+                            stored = existing[key]
+                            if stored.content_hash != row.content_hash:
                                 conflict = (
-                                    row, existing_bar_id, existing_hash,
-                                    existing_import_id,
+                                    row, stored.bar_id, stored.content_hash,
+                                    stored.import_id,
                                 )
                                 raise Hist8ConflictError("same-key bar conflict")
                             continue
                         pending.append(row)
+                    self._verify_canonical_provenance(
+                        cursor, (*existing.values(), *pending),
+                    )
                     if pending:
                         cursor.executemany(
                             """insert into atom_research_history.bars
@@ -1108,7 +1235,7 @@ class Hist8Store:
                            where corpus_id=%s and instrument=%s and session_date=%s""",
                         (CORPUS_ID, rows[0].instrument, rows[0].session_date),
                     )
-                    verified = {}
+                    verified: dict[tuple[str, datetime], Bar] = {}
                     for record in cursor.fetchall():
                         stored = _verified_stored_bar(record)
                         key = (stored.timeframe, stored.bar_start_utc)
@@ -1116,49 +1243,59 @@ class Hist8Store:
                             raise Hist8ConflictError(
                                 "duplicate stored bar identity"
                             )
-                        verified[key] = (
-                            stored.bar_id, stored.content_hash, stored.import_id,
-                        )
+                        verified[key] = stored
+                    self._verify_canonical_provenance(
+                        cursor, tuple(verified.values()),
+                    )
                     for row in rows:
                         actual = verified.get((row.timeframe, row.bar_start_utc))
                         if actual is None:
                             raise Hist8ConflictError("bar readback missing")
-                        if actual[1] != row.content_hash:
-                            conflict = (row, actual[0], actual[1], actual[2])
+                        if actual.content_hash != row.content_hash:
+                            conflict = (
+                                row, actual.bar_id, actual.content_hash,
+                                actual.import_id,
+                            )
                             raise Hist8ConflictError("same-key bar conflict")
 
                     members = []
                     expected_members = {}
                     for row in rows:
                         sequence = _membership_sequence(row)
+                        actual = verified[(row.timeframe, row.bar_start_utc)]
+                        provenance_hash = _bar_provenance_hash(actual)
                         payload = _snapshot_member_manifest_payload(
                             row.import_id, sequence, row.instrument,
                             row.timeframe, row.bar_start_utc, row.bar_id,
-                            row.content_hash, row.research_eligible,
+                            row.content_hash, provenance_hash,
+                            row.research_eligible,
                         )
                         expected_members[sequence] = (
                             row.instrument, row.timeframe, row.bar_start_utc,
-                            row.bar_id, row.content_hash,
+                            row.bar_id, row.content_hash, provenance_hash,
                             row.research_eligible,
                         )
                         members.append((
                             _manifest_id(payload), CORPUS_ID, row.import_id, sequence,
-                            row.instrument, row.bar_id, row.content_hash, row.timeframe,
-                            row.bar_start_utc, row.research_eligible,
+                            row.instrument, row.bar_id, row.content_hash,
+                            provenance_hash, row.timeframe, row.bar_start_utc,
+                            row.research_eligible,
                         ))
                     cursor.executemany(
                         """insert into atom_research_history.manifests
                         (manifest_id,corpus_id,manifest_kind,import_id,sequence_no,
-                         instrument,member_bar_id,member_content_hash,member_timeframe,
-                         member_bar_start_utc,member_research_eligible,metadata_json)
-                        values (%s,%s,'SNAPSHOT_MEMBER',%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
+                         instrument,member_bar_id,member_content_hash,
+                         member_provenance_hash,member_timeframe,member_bar_start_utc,
+                         member_research_eligible,metadata_json)
+                        values (%s,%s,'SNAPSHOT_MEMBER',%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
                         on conflict (manifest_id) do nothing""", members,
                     )
                     cursor.execute(
                         """select manifest_id,corpus_id,import_id,manifest_kind,
                                   sequence_no,instrument,member_timeframe,
                                   member_bar_start_utc,member_bar_id,
-                                  member_content_hash,member_research_eligible
+                                  member_content_hash,member_provenance_hash,
+                                  member_research_eligible
                            from atom_research_history.manifests
                            where corpus_id=%s and import_id=%s
                              and manifest_kind='SNAPSHOT_MEMBER'
@@ -1224,6 +1361,7 @@ class Hist8Store:
                                       m.manifest_kind,m.sequence_no,m.instrument,
                                       m.member_timeframe,m.member_bar_start_utc,
                                       m.member_bar_id,m.member_content_hash,
+                                      m.member_provenance_hash,
                                       m.member_research_eligible,
                                       b.bar_id,b.content_hash,b.corpus_id,
                                       b.instrument,b.timeframe,b.bar_start_utc,
@@ -1249,24 +1387,41 @@ class Hist8Store:
                         members = cursor.fetchall()
                 if not members:
                     raise Hist8ConflictError("snapshot member scan gap")
+                batch_items = []
                 for record in members:
                     sequence, member = _verified_snapshot_member_record(
-                        record[:11], import_id=import_id,
+                        record[:12], import_id=import_id,
                     )
                     (instrument, timeframe, bar_start_utc, bar_id,
-                     content_hash, eligible) = member
-                    referenced_bar = _verified_stored_bar(record[11:])
+                     content_hash, provenance_hash, eligible) = member
+                    referenced_bar = _verified_stored_bar(record[12:])
                     if (referenced_bar.bar_id != bar_id
                             or referenced_bar.content_hash != content_hash
                             or referenced_bar.instrument != instrument
                             or referenced_bar.timeframe != timeframe
                             or referenced_bar.bar_start_utc != bar_start_utc
+                            or _bar_provenance_hash(referenced_bar)
+                            != provenance_hash
                             or _membership_sequence(referenced_bar) != sequence):
                         raise Hist8ConflictError(
                             "snapshot member bar identity mismatch"
                         )
+                    batch_items.append((
+                        sequence, instrument, timeframe, bar_id, content_hash,
+                        provenance_hash, eligible, referenced_bar,
+                    ))
+                with self._connection_factory() as provenance_connection:
+                    self._verify(provenance_connection)
+                    with provenance_connection.cursor() as provenance_cursor:
+                        self._verify_canonical_provenance(
+                            provenance_cursor,
+                            tuple(item[7] for item in batch_items),
+                        )
+                for (sequence, instrument, timeframe, bar_id, content_hash,
+                     provenance_hash, eligible, _referenced_bar) in batch_items:
                     digest.update(canonical_bytes((
-                        instrument, timeframe, bar_id, content_hash, eligible,
+                        instrument, timeframe, bar_id, content_hash,
+                        provenance_hash, eligible,
                     )))
                     key = f"{instrument}/{timeframe}"
                     counts[key] = counts.get(key, 0) + 1
@@ -1342,6 +1497,46 @@ def _verified_stored_bar(record: Sequence[object]) -> Bar:
             or stored.bar_id != "hist8bar:" + expected_hash):
         raise Hist8ConflictError("stored bar identity mismatch")
     return stored
+
+
+def _bar_provenance_hash(row: Bar) -> str:
+    if row.timeframe == "1m":
+        if (not isinstance(row.source_artifact_id, str)
+                or not isinstance(row.source_record_locator, str)
+                or row.lineage):
+            raise Hist8ConflictError("canonical provenance shape mismatch")
+    elif (row.source_artifact_id is not None
+          or row.source_record_locator is not None or not row.lineage):
+        raise Hist8ConflictError("derived provenance shape mismatch")
+    try:
+        return sha256({
+            "corpus_id": row.corpus_id,
+            "instrument": row.instrument,
+            "timeframe": row.timeframe,
+            "bar_start_utc": row.bar_start_utc,
+            "bar_id": row.bar_id,
+            "content_hash": row.content_hash,
+            "originating_import_id": row.import_id,
+            "source_artifact_id": row.source_artifact_id,
+            "source_record_locator": row.source_record_locator,
+            "lineage": list(row.lineage),
+        })
+    except (TypeError, ValueError) as exc:
+        raise Hist8ConflictError("bar provenance identity mismatch") from exc
+
+
+def _source_bar_from_canonical(row: Bar) -> SourceBar:
+    if (row.timeframe != "1m" or row.bar_end_utc - row.bar_start_utc
+            != timedelta(minutes=1)
+            or not isinstance(row.source_artifact_id, str)
+            or not isinstance(row.source_record_locator, str)):
+        raise Hist8ConflictError("canonical provenance shape mismatch")
+    return SourceBar(
+        row.instrument, row.bar_start_utc, row.open, row.high, row.low,
+        row.close, row.volume, row.trade_count, row.vwap,
+        row.source_artifact_id, row.source_record_locator, row.source,
+        row.feed, row.product, row.adjustment, row.volume_unit,
+    )
 
 
 def _validate_source_bar(row: SourceBar) -> None:
@@ -1637,7 +1832,15 @@ def materialize_instrument(
                 rejected += 1
                 continue
             if current_session is not None and session < current_session:
-                raise Hist8ConflictError("provider bars are not session ordered")
+                stored = store.stored_canonical_source_bar(
+                    instrument, session, row.start,
+                )
+                if _source_bar_payload(stored) != _source_bar_payload(row):
+                    raise Hist8ConflictError(
+                        "conflicting duplicate provider bar after session flush"
+                    )
+                duplicates += 1
+                continue
             if current_session is not None and session != current_session:
                 flush_session(current_session, current_rows)
                 current_rows = {}

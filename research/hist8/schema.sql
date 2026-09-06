@@ -6,7 +6,10 @@ BEGIN;
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '60s';
 
-DO $hist8$
+DO $hist8_install$
+DECLARE
+  research_schema_exists boolean;
+  importer_role_exists boolean;
 BEGIN
   -- The reviewed installer sets this marker only after establishing a
   -- verify-full TLS session to the frozen direct project endpoint. Refuse
@@ -30,31 +33,40 @@ BEGIN
       'HIST8_PROJECT_MISMATCH: not legacy V8 project pjbjpgnmniwcajqkuhge';
   END IF;
 
-  IF to_regnamespace('atom_research_history') IS NOT NULL THEN
+  research_schema_exists :=
+    to_regnamespace('atom_research_history') IS NOT NULL;
+  importer_role_exists := EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname = 'atom_hist8_importer'
+  );
+
+  -- A partial name collision is never adopted or changed. When both names
+  -- exist, make no DDL/grant changes here; the read-only verifier below must
+  -- prove the exact prior HIST8 installation before the transaction commits.
+  IF research_schema_exists AND NOT importer_role_exists THEN
     RAISE EXCEPTION 'HIST8_RESEARCH_SCHEMA_ALREADY_EXISTS';
   END IF;
-
-  -- Never adopt a coincidentally named principal. This installer is deliberately
-  -- one-shot; a repeat deployment must first be proved from the execution receipt.
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'atom_hist8_importer') THEN
+  IF importer_role_exists AND NOT research_schema_exists THEN
     RAISE EXCEPTION 'HIST8_IMPORTER_ROLE_ALREADY_EXISTS';
   END IF;
 
-  CREATE ROLE atom_hist8_importer
-    LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE
-    NOREPLICATION NOBYPASSRLS;
+  IF NOT research_schema_exists THEN
+    CREATE ROLE atom_hist8_importer
+      LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE
+      NOREPLICATION NOBYPASSRLS;
 
-  IF EXISTS (
-    SELECT 1 FROM pg_auth_members m
-    JOIN pg_roles member_role ON member_role.oid = m.member
-    WHERE member_role.rolname = 'atom_hist8_importer'
-  ) THEN
-    RAISE EXCEPTION 'HIST8_ROLE_MEMBERSHIP_MISMATCH';
-  END IF;
-END
-$hist8$;
+    IF EXISTS (
+      SELECT 1 FROM pg_auth_members m
+      JOIN pg_roles member_role ON member_role.oid = m.member
+      WHERE member_role.rolname = 'atom_hist8_importer'
+    ) THEN
+      RAISE EXCEPTION 'HIST8_ROLE_MEMBERSHIP_MISMATCH';
+    END IF;
 
 CREATE SCHEMA atom_research_history AUTHORIZATION postgres;
+COMMENT ON ROLE atom_hist8_importer IS
+  'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1';
+COMMENT ON SCHEMA atom_research_history IS
+  'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1';
 ALTER ROLE atom_hist8_importer
   SET search_path = atom_research_history, pg_catalog;
 REVOKE ALL ON SCHEMA atom_research_history FROM PUBLIC, anon, authenticated, service_role;
@@ -98,6 +110,10 @@ CREATE TABLE atom_research_history.manifests (
   member_content_hash text CHECK (
     member_content_hash IS NULL OR member_content_hash ~ '^[0-9a-f]{64}$'
   ),
+  member_provenance_hash text CHECK (
+    member_provenance_hash IS NULL
+    OR member_provenance_hash ~ '^[0-9a-f]{64}$'
+  ),
   member_timeframe text CHECK (
     member_timeframe IS NULL OR member_timeframe IN ('1m','5m','15m','30m','1H')
   ),
@@ -116,10 +132,12 @@ CREATE TABLE atom_research_history.manifests (
     (manifest_kind = 'SNAPSHOT_MEMBER'
       AND instrument IS NOT NULL AND member_bar_id IS NOT NULL
       AND member_content_hash IS NOT NULL AND member_timeframe IS NOT NULL
+      AND member_provenance_hash IS NOT NULL
       AND member_bar_start_utc IS NOT NULL
       AND member_research_eligible IS NOT NULL)
     OR (manifest_kind <> 'SNAPSHOT_MEMBER'
       AND member_bar_id IS NULL AND member_content_hash IS NULL
+      AND member_provenance_hash IS NULL
       AND member_timeframe IS NULL AND member_bar_start_utc IS NULL
       AND member_research_eligible IS NULL)
   ),
@@ -289,8 +307,274 @@ GRANT SELECT, INSERT ON atom_research_history.raw_responses,
   atom_research_history.manifests, atom_research_history.bars
   TO atom_hist8_importer;
 
+  END IF;
+END
+$hist8_install$;
+
 DO $hist8_verify$
 BEGIN
+  -- This block is also the retry path after an ambiguous client disconnect.
+  -- It is deliberately read-only: an existing pair is accepted only when the
+  -- installation marker and independently inspected catalog structure match.
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_roles role
+    WHERE role.rolname = 'atom_hist8_importer'
+      AND role.rolcanlogin AND NOT role.rolinherit
+      AND NOT role.rolsuper AND NOT role.rolcreatedb
+      AND NOT role.rolcreaterole AND NOT role.rolreplication
+      AND NOT role.rolbypassrls AND role.rolconnlimit = -1
+      AND shobj_description(role.oid, 'pg_authid') =
+        'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1'
+  ) OR EXISTS (
+    SELECT 1
+    FROM pg_auth_members membership
+    JOIN pg_roles role ON role.oid = membership.member
+    WHERE role.rolname = 'atom_hist8_importer'
+  ) OR (SELECT count(*)
+        FROM pg_db_role_setting setting
+        WHERE setting.setrole = 'atom_hist8_importer'::regrole) <> 1
+    OR NOT EXISTS (
+      SELECT 1
+      FROM pg_db_role_setting setting
+      WHERE setting.setrole = 'atom_hist8_importer'::regrole
+        AND setting.setdatabase = 0
+        AND setting.setconfig =
+          ARRAY['search_path=atom_research_history, pg_catalog']
+  ) THEN
+    RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_ROLE_MISMATCH';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_namespace schema
+    WHERE schema.nspname = 'atom_research_history'
+      AND schema.nspowner = 'postgres'::regrole
+      AND obj_description(schema.oid, 'pg_namespace') =
+        'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1'
+  ) THEN
+    RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_SCHEMA_MISMATCH';
+  END IF;
+
+  IF (SELECT count(*)
+      FROM pg_class object
+      JOIN pg_namespace schema ON schema.oid = object.relnamespace
+      WHERE schema.nspname = 'atom_research_history'
+        AND object.relkind = 'r') <> 3
+    OR EXISTS (
+      SELECT 1
+      FROM (VALUES
+        ('raw_responses', 4, ARRAY[
+          'artifact_id','body','byte_length','created_at'
+        ]::text[], ARRAY[
+          'text','bytea','bigint','timestamp with time zone'
+        ]::text[]),
+        ('manifests', 25, ARRAY[
+          'manifest_id','corpus_id','manifest_kind','import_id','sequence_no',
+          'source','feed','product','instrument','endpoint','request_params',
+          'retrieved_at','http_status','content_type','content_encoding',
+          'artifact_id','artifact_byte_length','member_bar_id',
+          'member_content_hash','member_provenance_hash','member_timeframe',
+          'member_bar_start_utc','member_research_eligible','metadata_json',
+          'created_at'
+        ]::text[], ARRAY[
+          'text','text','text','text','bigint','text','text','text','text',
+          'text','jsonb','timestamp with time zone','integer','text','text',
+          'text','bigint','text','text','text','text',
+          'timestamp with time zone','boolean','jsonb',
+          'timestamp with time zone'
+        ]::text[]),
+        ('bars', 29, ARRAY[
+          'bar_id','content_hash','corpus_id','instrument','timeframe',
+          'bar_start_utc','bar_end_utc','session_date','calendar_id',
+          'calendar_sha256','open','high','low','close','volume','trade_count',
+          'vwap','volume_unit','source','feed','product','adjustment','currency',
+          'import_id','derivation_version','source_artifact_id',
+          'source_record_locator','lineage_json','created_at'
+        ]::text[], ARRAY[
+          'text','text','text','text','text','timestamp with time zone',
+          'timestamp with time zone','text','text','text','numeric','numeric',
+          'numeric','numeric','numeric','bigint','numeric','text','text','text',
+          'text','text','text','text','text','text','text','jsonb',
+          'timestamp with time zone'
+        ]::text[])
+      ) expected(table_name, column_count, column_names, column_types)
+      LEFT JOIN pg_class table_object
+        ON table_object.oid = to_regclass(
+          'atom_research_history.' || expected.table_name
+        )
+      WHERE table_object.oid IS NULL
+        OR table_object.relkind <> 'r'
+        OR table_object.relpersistence <> 'p'
+        OR table_object.relowner <> 'postgres'::regrole
+        OR NOT table_object.relrowsecurity
+        OR NOT table_object.relforcerowsecurity
+        OR (SELECT count(*) FROM pg_attribute column_object
+            WHERE column_object.attrelid = table_object.oid
+              AND column_object.attnum > 0
+              AND NOT column_object.attisdropped) <> expected.column_count
+        OR (SELECT array_agg(column_object.attname::text
+                            ORDER BY column_object.attnum)
+            FROM pg_attribute column_object
+            WHERE column_object.attrelid = table_object.oid
+              AND column_object.attnum > 0
+              AND NOT column_object.attisdropped) <> expected.column_names
+        OR (SELECT array_agg(
+                     format_type(column_object.atttypid,
+                                 column_object.atttypmod)
+                     ORDER BY column_object.attnum)
+            FROM pg_attribute column_object
+            WHERE column_object.attrelid = table_object.oid
+              AND column_object.attnum > 0
+              AND NOT column_object.attisdropped) <> expected.column_types
+    )
+  THEN
+    RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_TABLE_MISMATCH';
+  END IF;
+
+  IF (SELECT count(*)
+      FROM pg_proc routine
+      JOIN pg_namespace schema ON schema.oid = routine.pronamespace
+      WHERE schema.nspname = 'atom_research_history') <> 2
+    OR EXISTS (
+      SELECT 1
+      FROM (VALUES
+        ('reject_mutation', 'HIST8 evidence is append-only'),
+        ('guard_snapshot_membership', 'HIST8 import evidence is sealed')
+      ) expected(routine_name, required_source)
+      LEFT JOIN pg_proc routine
+        ON routine.oid = to_regprocedure(
+          'atom_research_history.' || expected.routine_name || '()'
+        )
+      WHERE routine.oid IS NULL
+        OR routine.proowner <> 'postgres'::regrole
+        OR routine.pronargs <> 0
+        OR routine.prorettype <> 'pg_catalog.trigger'::regtype
+        OR routine.prosecdef
+        OR routine.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']
+        OR position(expected.required_source in routine.prosrc) = 0
+    )
+  THEN
+    RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_ROUTINE_MISMATCH';
+  END IF;
+
+  IF (SELECT count(*)
+      FROM pg_trigger trigger_object
+      JOIN pg_class table_object ON table_object.oid = trigger_object.tgrelid
+      JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
+      WHERE schema.nspname = 'atom_research_history'
+        AND NOT trigger_object.tgisinternal) <> 7
+    OR EXISTS (
+      SELECT 1
+      FROM (VALUES
+        ('hist8_raw_reject_update_delete','raw_responses','reject_mutation',27),
+        ('hist8_raw_reject_truncate','raw_responses','reject_mutation',34),
+        ('hist8_manifests_reject_update_delete','manifests','reject_mutation',27),
+        ('hist8_manifests_reject_truncate','manifests','reject_mutation',34),
+        ('hist8_snapshot_membership_guard','manifests','guard_snapshot_membership',7),
+        ('hist8_bars_reject_update_delete','bars','reject_mutation',27),
+        ('hist8_bars_reject_truncate','bars','reject_mutation',34)
+      ) expected(trigger_name, table_name, routine_name, trigger_type)
+      LEFT JOIN pg_trigger trigger_object
+        ON trigger_object.tgname = expected.trigger_name
+       AND trigger_object.tgrelid = to_regclass(
+         'atom_research_history.' || expected.table_name
+       )
+      WHERE trigger_object.oid IS NULL
+        OR trigger_object.tgfoid <> to_regprocedure(
+          'atom_research_history.' || expected.routine_name || '()'
+        )
+        OR trigger_object.tgtype <> expected.trigger_type
+        OR trigger_object.tgenabled <> 'O'
+    )
+  THEN
+    RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_TRIGGER_MISMATCH';
+  END IF;
+
+  IF (SELECT count(*)
+      FROM pg_policy policy
+      JOIN pg_class table_object ON table_object.oid = policy.polrelid
+      JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
+      WHERE schema.nspname = 'atom_research_history') <> 6
+    OR EXISTS (
+      SELECT 1
+      FROM (VALUES
+        ('hist8_raw_importer_select','raw_responses','r'),
+        ('hist8_raw_importer_insert','raw_responses','a'),
+        ('hist8_manifests_importer_select','manifests','r'),
+        ('hist8_manifests_importer_insert','manifests','a'),
+        ('hist8_bars_importer_select','bars','r'),
+        ('hist8_bars_importer_insert','bars','a')
+      ) expected(policy_name, table_name, policy_command)
+      LEFT JOIN pg_policy policy
+        ON policy.polname = expected.policy_name
+       AND policy.polrelid = to_regclass(
+         'atom_research_history.' || expected.table_name
+       )
+      WHERE policy.oid IS NULL
+        OR policy.polcmd <> expected.policy_command::"char"
+        OR NOT policy.polpermissive
+        OR policy.polroles <> ARRAY[
+          (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer')
+        ]
+        OR (expected.policy_command = 'r' AND (
+          pg_get_expr(policy.polqual, policy.polrelid) IS DISTINCT FROM 'true'
+          OR policy.polwithcheck IS NOT NULL
+        ))
+        OR (expected.policy_command = 'a' AND (
+          pg_get_expr(policy.polwithcheck, policy.polrelid)
+            IS DISTINCT FROM 'true'
+          OR policy.polqual IS NOT NULL
+        ))
+    )
+  THEN
+    RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_POLICY_MISMATCH';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM (VALUES
+      ('hist8_bars_snapshot_scan_idx','bars'),
+      ('hist8_bars_session_lookup_idx','bars'),
+      ('hist8_manifests_import_idx','manifests')
+    ) expected(index_name, table_name)
+    LEFT JOIN pg_class index_object
+      ON index_object.oid = to_regclass(
+        'atom_research_history.' || expected.index_name
+      )
+    LEFT JOIN pg_index index_metadata
+      ON index_metadata.indexrelid = index_object.oid
+    WHERE index_object.oid IS NULL
+      OR index_object.relkind <> 'i'
+      OR index_metadata.indrelid <> to_regclass(
+        'atom_research_history.' || expected.table_name
+      )
+      OR NOT index_metadata.indisvalid OR NOT index_metadata.indisready
+  ) OR EXISTS (
+    SELECT 1
+    FROM (VALUES
+      ('hist8_raw_length_matches','raw_responses'),
+      ('hist8_retrieval_artifact_required','manifests'),
+      ('hist8_snapshot_member_required','manifests'),
+      ('hist8_snapshot_member_bar_fk','manifests'),
+      ('hist8_bar_interval','bars'),
+      ('hist8_bar_duration','bars'),
+      ('hist8_bar_ohlc','bars'),
+      ('hist8_bar_volume_semantics','bars'),
+      ('hist8_bar_lineage','bars'),
+      ('hist8_bar_identity_pair','bars')
+    ) expected(constraint_name, table_name)
+    LEFT JOIN pg_constraint constraint_object
+      ON constraint_object.conname = expected.constraint_name
+     AND constraint_object.conrelid = to_regclass(
+       'atom_research_history.' || expected.table_name
+     )
+    WHERE constraint_object.oid IS NULL
+      OR NOT constraint_object.convalidated
+  ) THEN
+    RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_PROTECTION_MISMATCH';
+  END IF;
+
   IF NOT has_database_privilege('atom_hist8_importer', current_database(), 'CONNECT')
     OR NOT has_schema_privilege(
       'atom_hist8_importer', 'atom_research_history', 'USAGE'
@@ -446,9 +730,7 @@ BEGIN
     SELECT 1
     FROM pg_proc p
     JOIN pg_namespace n ON n.oid = p.pronamespace
-    WHERE n.nspname NOT IN (
-        'pg_catalog','information_schema','atom_research_history'
-      )
+    WHERE n.nspname NOT IN ('pg_catalog','information_schema')
       AND n.nspname NOT LIKE 'pg_toast%'
       AND n.nspname NOT LIKE 'pg_temp_%'
       AND has_schema_privilege('atom_hist8_importer', n.oid, 'USAGE')
@@ -487,6 +769,70 @@ BEGIN
       AND acl.privilege_type IN ('SELECT', 'UPDATE')
   ) THEN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_LARGE_OBJECT_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  -- A long-lived importer must not gain access when a legacy owner later
+  -- creates a table in any schema the importer can use. PostgreSQL relation
+  -- defaults are global plus schema-specific, so inspect both without
+  -- rewriting any unrelated owner's defaults.
+  IF EXISTS (
+    SELECT 1
+    FROM pg_namespace n
+    JOIN pg_roles creator ON (
+      creator.rolsuper
+      OR creator.oid = n.nspowner
+      OR has_schema_privilege(creator.oid, n.oid, 'CREATE')
+    )
+    LEFT JOIN pg_default_acl global_defaults
+      ON global_defaults.defaclrole = creator.oid
+     AND global_defaults.defaclnamespace = 0
+     AND global_defaults.defaclobjtype = 'r'
+    LEFT JOIN pg_default_acl schema_defaults
+      ON schema_defaults.defaclrole = creator.oid
+     AND schema_defaults.defaclnamespace = n.oid
+     AND schema_defaults.defaclobjtype = 'r'
+    WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+      AND n.nspname NOT LIKE 'pg_toast%'
+      AND n.nspname NOT LIKE 'pg_temp_%'
+      AND has_schema_privilege(
+        'atom_hist8_importer', n.oid, 'USAGE'
+      )
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM unnest(COALESCE(
+            global_defaults.defaclacl,
+            acldefault('r', creator.oid)
+          )) entry(aclitem)
+          CROSS JOIN LATERAL aclexplode(ARRAY[entry.aclitem]) acl
+          WHERE acl.grantee IN (
+              0,
+              (SELECT oid FROM pg_roles
+               WHERE rolname = 'atom_hist8_importer')
+            )
+            AND acl.privilege_type IN (
+              'SELECT','INSERT','UPDATE','DELETE','TRUNCATE',
+              'REFERENCES','TRIGGER'
+            )
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM unnest(schema_defaults.defaclacl) entry(aclitem)
+          CROSS JOIN LATERAL aclexplode(ARRAY[entry.aclitem]) acl
+          WHERE acl.grantee IN (
+              0,
+              (SELECT oid FROM pg_roles
+               WHERE rolname = 'atom_hist8_importer')
+            )
+            AND acl.privilege_type IN (
+              'SELECT','INSERT','UPDATE','DELETE','TRUNCATE',
+              'REFERENCES','TRIGGER'
+            )
+        )
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'HIST8_FUTURE_TABLE_DEFAULT_BOUNDARY_UNSATISFIED';
   END IF;
 
   -- Ownership itself grants durable access. Reject any catalog routine the
