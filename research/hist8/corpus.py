@@ -75,6 +75,7 @@ COINBASE_WINDOW_MINUTES = 300
 REPLAY_PAGE_BATCH_SIZE = 8
 SNAPSHOT_SCAN_BATCH_SIZE = 10_000
 SNAPSHOT_SESSION_BATCH_SIZE = 32
+POSTGRES_BIGINT_MAX = (1 << 63) - 1
 IMPORTER_CONNECT_TIMEOUT_SECONDS = 15
 IMPORTER_SESSION_OPTIONS = (
     "-c statement_timeout=60000 "
@@ -563,12 +564,24 @@ def coinbase_pages(
 
 
 def _strip_secret_query(url: str) -> tuple[str, dict[str, str]]:
-    parsed = urlparse(url)
-    if (parsed.scheme != "https" or parsed.hostname != "api.massive.com"
-            or parsed.port is not None or parsed.username is not None
-            or parsed.password is not None or parsed.fragment):
+    try:
+        if not isinstance(url, str) or not url:
+            raise ValueError("pagination URL is empty")
+        parsed = urlparse(url)
+        scheme = parsed.scheme
+        hostname = parsed.hostname
+        port = parsed.port
+        username = parsed.username
+        password = parsed.password
+        fragment = parsed.fragment
+        decoded_path = unquote(parsed.path, errors="strict")
+    except (TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise Hist8Error("Massive pagination resource mismatch") from exc
+    if (scheme != "https" or hostname != "api.massive.com"
+            or port is not None or username is not None
+            or password is not None or fragment):
         raise Hist8Error("Massive pagination resource mismatch")
-    segments = unquote(parsed.path).strip("/").split("/")
+    segments = decoded_path.strip("/").split("/")
     expected_prefix = [
         "v2", "aggs", "ticker", "I:COMP", "range", "1", "minute",
     ]
@@ -579,19 +592,28 @@ def _strip_secret_query(url: str) -> tuple[str, dict[str, str]]:
     frozen_end_ms = int(END.timestamp() * 1000)
     if start_token == "2024-09-01":
         page_start_ms = frozen_start_ms
+        canonical_start_token = start_token
     elif (start_token.isascii() and start_token.isdigit()
           and len(start_token) <= len(str(frozen_end_ms))):
         try:
             page_start_ms = int(start_token)
         except ValueError as exc:
             raise Hist8Error("Massive pagination resource mismatch") from exc
+        canonical_start_token = str(page_start_ms)
     else:
         raise Hist8Error("Massive pagination resource mismatch")
     if (not frozen_start_ms <= page_start_ms < frozen_end_ms
             or end_token not in {"2026-09-01", str(frozen_end_ms)}):
         raise Hist8Error("Massive pagination resource mismatch")
+    try:
+        query_pairs = parse_qsl(
+            parsed.query, keep_blank_values=True, errors="strict",
+            max_num_fields=8,
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise Hist8Error("Massive pagination parameter mismatch") from exc
     supplied: dict[str, str] = {}
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+    for key, value in query_pairs:
         normalized_key = key.lower()
         if normalized_key not in {
             "sort", "limit", "cursor", "apikey",
@@ -605,8 +627,15 @@ def _strip_secret_query(url: str) -> tuple[str, dict[str, str]]:
     if not cursor:
         raise Hist8Error("Massive pagination parameter mismatch")
     # Provider next_url examples contain only a cursor. Rebuild every request
-    # from the frozen semantic parameters, and never retain a URL API key.
-    endpoint = f"https://api.massive.com{parsed.path}"
+    # from the frozen semantic parameters and canonical path encoding, and
+    # never retain a URL API key or provider-controlled encoding variant.
+    canonical_end_token = (
+        "2026-09-01" if end_token == "2026-09-01" else str(frozen_end_ms)
+    )
+    endpoint = (
+        "https://api.massive.com/v2/aggs/ticker/I%3ACOMP/range/1/minute/"
+        f"{canonical_start_token}/{canonical_end_token}"
+    )
     return endpoint, {**MASSIVE_FROZEN_PARAMS, "cursor": cursor}
 
 
@@ -1166,9 +1195,23 @@ class Hist8Store:
                 self._verify_canonical_provenance(cursor, (stored,))
         return _source_bar_from_canonical(stored)
 
-    def add_attempt(self, import_id: str, kind: str, metadata: Mapping[str, object]) -> None:
+    def add_attempt(
+        self, import_id: str, kind: str, metadata: Mapping[str, object],
+    ) -> None:
+        if (kind not in {"IMPORT_ATTEMPT", "REPLAY_ATTEMPT"}
+                or not isinstance(import_id, str)
+                or not 1 <= len(import_id) <= 128):
+            raise Hist8Error("attempt manifest identity mismatch")
+        try:
+            canonical_metadata = _canonical(dict(metadata))
+        except (TypeError, ValueError) as exc:
+            raise Hist8Error("attempt manifest identity mismatch") from exc
+        if not isinstance(canonical_metadata, dict):
+            raise Hist8Error("attempt manifest identity mismatch")
         payload = {"corpus_id": CORPUS_ID, "import_id": import_id,
-                   "kind": kind, "sequence_no": 0, "metadata": metadata}
+                   "kind": kind, "sequence_no": 0,
+                   "metadata": canonical_metadata}
+        manifest_id = _manifest_id(payload)
         with self._connection_factory() as connection:
             self._verify(connection)
             with connection.cursor() as cursor:
@@ -1176,10 +1219,46 @@ class Hist8Store:
                     """insert into atom_research_history.manifests
                     (manifest_id, corpus_id, manifest_kind, import_id, sequence_no,
                      metadata_json) values (%s,%s,%s,%s,0,%s)
-                    on conflict (manifest_id) do nothing""",
-                    (_manifest_id(payload), CORPUS_ID, kind, import_id,
-                     json.dumps(_canonical(metadata))),
+                    on conflict do nothing""",
+                    (manifest_id, CORPUS_ID, kind, import_id,
+                     json.dumps(canonical_metadata)),
                 )
+            connection.commit()
+            self._verify(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """select manifest_id,corpus_id,import_id,manifest_kind,
+                              sequence_no,metadata_json
+                       from atom_research_history.manifests
+                       where corpus_id=%s and import_id=%s
+                         and manifest_kind=%s and sequence_no=0""",
+                    (CORPUS_ID, import_id, kind),
+                )
+                records = cursor.fetchall()
+        if len(records) != 1:
+            raise Hist8ConflictError("attempt manifest readback mismatch")
+        (stored_manifest_id, stored_corpus_id, stored_import_id,
+         stored_kind, stored_sequence, stored_metadata) = records[0]
+        try:
+            canonical_stored_metadata = _canonical(stored_metadata)
+            stored_identity = _manifest_id({
+                "corpus_id": stored_corpus_id,
+                "import_id": stored_import_id,
+                "kind": stored_kind,
+                "sequence_no": stored_sequence,
+                "metadata": canonical_stored_metadata,
+            })
+        except (TypeError, ValueError) as exc:
+            raise Hist8ConflictError(
+                "attempt manifest readback mismatch"
+            ) from exc
+        if (stored_manifest_id != manifest_id
+                or stored_identity != stored_manifest_id
+                or stored_corpus_id != CORPUS_ID
+                or stored_import_id != import_id or stored_kind != kind
+                or stored_sequence != 0
+                or canonical_stored_metadata != canonical_metadata):
+            raise Hist8ConflictError("attempt manifest readback mismatch")
 
     def store_page(self, import_id: str, sequence: int, page: RawPage) -> int:
         if tuple(page.instruments) not in (
@@ -1801,7 +1880,16 @@ class Hist8Store:
                     ),
                 )
 
-    def seal_snapshot(self, import_id: str, metadata: Mapping[str, object]) -> str:
+    def seal_snapshot(
+        self, import_id: str, metadata: Mapping[str, object], *,
+        expected_membership_sha256: str | None = None,
+    ) -> str:
+        if (expected_membership_sha256 is not None
+                and (not isinstance(expected_membership_sha256, str)
+                     or re.fullmatch(
+                         r"[0-9a-f]{64}", expected_membership_sha256,
+                     ) is None)):
+            raise Hist8Error("expected snapshot membership is invalid")
         digest = hashlib.sha256()
         counts: dict[str, int] = {}
         lock_connection = self._connection_factory()
@@ -1910,8 +1998,14 @@ class Hist8Store:
                     key = f"{instrument}/{timeframe}"
                     counts[key] = counts.get(key, 0) + 1
                     last_sequence = sequence
+            membership_sha256 = digest.hexdigest()
+            if (expected_membership_sha256 is not None
+                    and membership_sha256 != expected_membership_sha256):
+                raise Hist8ConflictError(
+                    "replay membership differs from sealed source snapshot"
+                )
             snapshot = {
-                **dict(metadata), "membership_sha256": digest.hexdigest(),
+                **dict(metadata), "membership_sha256": membership_sha256,
                 "row_counts": {key: counts.get(key, 0) for key in
                                (f"{i}/{t}" for i in INSTRUMENTS for t in TIMEFRAMES)},
             }
@@ -1932,7 +2026,7 @@ class Hist8Store:
             if (recorded["manifest_id"] != manifest_id
                     or _canonical(recorded["metadata"]) != _canonical(snapshot)):
                 raise Hist8ConflictError("snapshot manifest readback mismatch")
-            return digest.hexdigest()
+            return membership_sha256
         finally:
             lock_connection.rollback()
             if lock_acquired:
@@ -2046,7 +2140,8 @@ def _validate_bar_identity(row: Bar) -> None:
                 or not row.volume.is_finite() or row.volume < 0
             )
             or row.trade_count is not None and (
-                type(row.trade_count) is not int or row.trade_count < 0
+                type(row.trade_count) is not int
+                or not 0 <= row.trade_count <= POSTGRES_BIGINT_MAX
             )
             or row.vwap is not None and (
                 not isinstance(row.vwap, Decimal)
@@ -2187,10 +2282,13 @@ def _verify_materialized_session(
                     item.volume for item in inputs if item.volume is not None
                 ))
             )
-            expected_trade_count = (
-                None if any(item.trade_count is None for item in inputs)
-                else sum(item.trade_count or 0 for item in inputs)
-            )
+            expected_trade_count = None
+            if not any(item.trade_count is None for item in inputs):
+                expected_trade_count = sum(
+                    item.trade_count or 0 for item in inputs
+                )
+                if expected_trade_count > POSTGRES_BIGINT_MAX:
+                    raise Hist8ConflictError("derived aggregation mismatch")
             if (row.lineage != expected_lineage
                     or row.open != inputs[0].open
                     or row.high != max(item.high for item in inputs)
@@ -2227,7 +2325,9 @@ def _validate_source_bar(row: SourceBar) -> None:
         raise Hist8Error("invalid OHLC ordering")
     if row.volume is not None and (not row.volume.is_finite() or row.volume < 0):
         raise Hist8Error("invalid volume")
-    if row.trade_count is not None and row.trade_count < 0:
+    if (row.trade_count is not None
+            and (type(row.trade_count) is not int
+                 or not 0 <= row.trade_count <= POSTGRES_BIGINT_MAX)):
         raise Hist8Error("invalid trade count")
     if row.vwap is not None and (not row.vwap.is_finite() or row.vwap <= 0):
         raise Hist8Error("invalid vwap")
@@ -2458,9 +2558,13 @@ def derive_session(
         volume = None if first.instrument == "NASDAQ" else _exact_decimal_sum(tuple(
             item.volume for item in window if item.volume is not None
         ))
-        trade_count = None if any(item.trade_count is None for item in window) else sum(
-            item.trade_count or 0 for item in window
-        )
+        trade_count = None
+        if not any(item.trade_count is None for item in window):
+            trade_count = sum(item.trade_count or 0 for item in window)
+            if trade_count > POSTGRES_BIGINT_MAX:
+                raise Hist8Error(
+                    "derived trade count exceeds PostgreSQL bigint"
+                )
         bar = Bar(
             "", "", CORPUS_ID, first.instrument, timeframe,
             first.bar_start_utc, last.bar_end_utc, first.session_date,
@@ -2912,11 +3016,7 @@ def execute(
         "code_identity": code_identity,
         "source_statuses": source_statuses,
         "instrument_results": results,
-    })
-    if source_membership is not None and membership != source_membership:
-        raise Hist8ConflictError(
-            "replay membership differs from sealed source snapshot"
-        )
+    }, expected_membership_sha256=source_membership)
     return {"source_import_id": chosen, "attempt_id": attempt_id,
             "membership_sha256": membership,
             "source_statuses": source_statuses, "instrument_results": results}

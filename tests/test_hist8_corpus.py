@@ -229,6 +229,24 @@ def test_malformed_source_rows_are_counted_and_valid_rows_survive() -> None:
     assert rejected == [3]
 
 
+def test_alpaca_trade_count_is_bounded_to_postgresql_bigint() -> None:
+    start = "2025-01-02T14:30:00Z"
+    page = _raw_page({"bars": {"SPY": [
+        {"t": start, "o": "100", "h": "101", "l": "99",
+         "c": "100", "v": "5", "n": 9223372036854775807},
+        {"t": start, "o": "100", "h": "101", "l": "99",
+         "c": "100", "v": "5", "n": 9223372036854775808},
+    ]}})
+    rejected = [0]
+
+    parsed = corpus.parse_source_page(
+        page, "SPY", rejection_counter=rejected,
+    )
+
+    assert [row.trade_count for row in parsed] == [9223372036854775807]
+    assert rejected == [1]
+
+
 def test_canonical_decimal_hashing_preserves_precision_without_context_rounding() -> None:
     left = Decimal("12345678901234567890123456780")
     right = Decimal("12345678901234567890123456781")
@@ -247,6 +265,16 @@ def test_massive_identity_pagination_and_fractional_timestamp_fail_closed() -> N
             "https://api.massive.com/v2/aggs/ticker/I%3ACOMP/range/1/minute/"
             + "9" * 5000 + "/2026-09-01?cursor=next"
         )
+    for malformed_url in (
+        "https://api.massive.com:notaport/v2/aggs/ticker/I%3ACOMP/range/1/"
+        "minute/2024-09-01/2026-09-01?cursor=next",
+        "https://[api.massive.com/v2/aggs/ticker/I%3ACOMP/range/1/minute/"
+        "2024-09-01/2026-09-01?cursor=next",
+    ):
+        with pytest.raises(
+            corpus.Hist8Error, match="pagination resource mismatch",
+        ):
+            corpus._strip_secret_query(malformed_url)
 
     endpoint, params = corpus._strip_secret_query(
         corpus.MASSIVE_URL + "?cursor=next&apiKey=must-not-be-retained"
@@ -263,6 +291,14 @@ def test_massive_identity_pagination_and_fractional_timestamp_fail_closed() -> N
         "/I%3ACOMP/range/1/minute/1725148860000/2026-09-01"
     )
     assert provider_cursor_params == {
+        "sort": "asc", "limit": "50000", "cursor": "opaque",
+    }
+    normalized_endpoint, normalized_params = corpus._strip_secret_query(
+        "https://api.massive.com/v2/aggs/ticker/I%3aCOMP/range/1/minute/"
+        "2024-09-01/2026-09-01?cursor=opaque"
+    )
+    assert normalized_endpoint == corpus.MASSIVE_URL
+    assert normalized_params == {
         "sort": "asc", "limit": "50000", "cursor": "opaque",
     }
     for query in (
@@ -626,6 +662,59 @@ def test_massive_pagination_integer_limit_is_contained_to_one_provider(
     assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
 
 
+@pytest.mark.parametrize("malformed_next_url", (
+    "https://api.massive.com:notaport/v2/aggs/ticker/I%3ACOMP/range/1/"
+    "minute/2024-09-01/2026-09-01?cursor=next",
+    "https://[api.massive.com/v2/aggs/ticker/I%3ACOMP/range/1/minute/"
+    "2024-09-01/2026-09-01?cursor=next",
+))
+def test_massive_malformed_pagination_url_is_contained_to_one_provider(
+    monkeypatch, malformed_next_url,
+) -> None:
+    stored = []
+    real_massive_pages = corpus.massive_pages
+
+    def alpaca(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "alpaca"}, instruments=corpus.EQUITIES,
+        )
+
+    def coinbase(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "coinbase"}, source="COINBASE",
+            instruments=("BTC-USD",),
+        )
+
+    def massive(*_args, **_kwargs):
+        yield from real_massive_pages(
+            "key", opener=lambda *_a, **_k: _Response({
+                "ticker": "I:COMP", "status": "OK", "results": [],
+                "next_url": malformed_next_url,
+            }),
+        )
+
+    class Store:
+        def store_page(self, import_id, sequence, page):
+            assert import_id == "massive-malformed-url-attempt"
+            stored.append(page.source)
+            return sequence + len(page.instruments)
+
+    monkeypatch.setattr(corpus, "alpaca_pages", alpaca)
+    monkeypatch.setattr(corpus, "coinbase_pages", coinbase)
+    monkeypatch.setattr(corpus, "massive_pages", massive)
+    result = corpus.acquire(Store(), "massive-malformed-url-attempt")
+
+    assert stored == ["ALPACA", "COINBASE", "MASSIVE"]
+    assert result["retrieval_associations"] == 8
+    assert result["source_statuses"]["NASDAQ"] == {
+        "source": "MASSIVE", "availability": "UNAVAILABLE",
+        "retrieval_associations": 1, "failure_type": "Hist8Error",
+        "reason": "Massive pagination resource mismatch",
+    }
+    assert result["source_statuses"]["SPY"]["availability"] == "AVAILABLE"
+    assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
+
+
 def test_malformed_alpaca_page_shape_is_contained_to_one_provider(
     monkeypatch,
 ) -> None:
@@ -797,6 +886,33 @@ def test_derived_volume_sum_preserves_every_decimal_digit() -> None:
         minutes, "5m", "attempt", session_open=start,
     )[0]
     assert derived.volume == Decimal("10000000000000000000000000004")
+
+
+def test_derived_trade_count_cannot_overflow_postgresql_bigint() -> None:
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
+    counts = [9223372036854775807, 1, 0, 0, 0]
+    minutes = tuple(corpus.canonical_bar(
+        replace(
+            _source_bar(start + timedelta(minutes=index)),
+            trade_count=trade_count,
+        ),
+        session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
+        import_id="attempt", eligible=True,
+    ) for index, trade_count in enumerate(counts))
+
+    with pytest.raises(corpus.Hist8Error, match="trade count"):
+        corpus.derive_session(
+            minutes, "5m", "attempt", session_open=start,
+        )
+
+    oversized = corpus._finish_bar(replace(
+        minutes[0], trade_count=9223372036854775808,
+    ))
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="bar semantic identity mismatch",
+    ):
+        corpus._validate_bar_identity(oversized)
 
 
 @pytest.mark.parametrize("mutation", (
@@ -1658,6 +1774,127 @@ def test_sealed_snapshot_recomputes_manifest_identity() -> None:
         store.sealed_snapshot_state(import_id)
 
 
+def test_attempt_manifest_conflict_is_committed_then_verified(monkeypatch) -> None:
+    import_id = "attempt-integrity"
+    metadata = {
+        "authorization": "ATOM-HIST8-CORPUS-AMENDMENT-1",
+        "project_ref": corpus.PROJECT_REF,
+    }
+    payload = {
+        "corpus_id": corpus.CORPUS_ID, "import_id": import_id,
+        "kind": "IMPORT_ATTEMPT", "sequence_no": 0,
+        "metadata": metadata,
+    }
+    events = []
+
+    class Cursor:
+        rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, params=None):
+            events.append((query, params))
+            if "select manifest_id,corpus_id,import_id,manifest_kind" in query:
+                self.rows = [(
+                    corpus._manifest_id(payload), corpus.CORPUS_ID,
+                    import_id, "IMPORT_ATTEMPT", 0,
+                    {**metadata, "project_ref": "corrupted-project"},
+                )]
+
+        def fetchall(self):
+            return list(self.rows)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            events.append(("COMMIT", None))
+
+    store = corpus.Hist8Store(Connection)
+    monkeypatch.setattr(store, "_verify", lambda _connection: None)
+
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="attempt manifest readback mismatch",
+    ):
+        store.add_attempt(import_id, "IMPORT_ATTEMPT", metadata)
+
+    assert any(query == "COMMIT" for query, _params in events)
+
+
+def test_replay_membership_mismatch_precedes_snapshot_write(monkeypatch) -> None:
+    events = []
+
+    class Cursor:
+        rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, params=None):
+            events.append((query, params))
+            if "select max(sequence_no)" in query:
+                self.rows = [(None,)]
+            elif "pg_advisory_unlock" in query:
+                self.rows = [(True,)]
+
+        def fetchone(self):
+            return self.rows[0]
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            events.append(("COMMIT", None))
+
+        def rollback(self):
+            events.append(("ROLLBACK", None))
+
+        def close(self):
+            events.append(("CLOSE", None))
+
+    store = corpus.Hist8Store(Connection)
+    monkeypatch.setattr(store, "_verify", lambda _connection: None)
+    monkeypatch.setattr(
+        store, "_verify_snapshot_derivations",
+        lambda _import_id, _source_statuses=None: None,
+    )
+
+    with pytest.raises(
+        corpus.Hist8ConflictError,
+        match="replay membership differs from sealed source snapshot",
+    ):
+        store.seal_snapshot(
+            "replay-attempt", {},
+            expected_membership_sha256="a" * 64,
+        )
+
+    assert not any(
+        "insert into atom_research_history.manifests" in query.lower()
+        for query, _params in events if isinstance(query, str)
+    )
+
+
 def test_snapshot_derivation_validation_precedes_seal_write(monkeypatch) -> None:
     events = []
 
@@ -1949,6 +2186,7 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
 
     class Store:
         attempts = []
+        seal_inputs = []
 
         def sealed_snapshot_state(self, import_id):
             assert import_id == "source-attempt"
@@ -1968,8 +2206,15 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
             raise AssertionError((import_id, instrument))
             return iter(())
 
-        def seal_snapshot(self, import_id, metadata):
-            return "b" * 64
+        def seal_snapshot(
+            self, import_id, metadata, *, expected_membership_sha256=None,
+        ):
+            self.seal_inputs.append((
+                import_id, metadata, expected_membership_sha256,
+            ))
+            raise corpus.Hist8ConflictError(
+                "replay membership differs from sealed source snapshot"
+            )
 
     store = Store()
     monkeypatch.setattr(
@@ -2002,6 +2247,7 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
         "sha256:" + "d" * 64
     )
     assert store.attempts[0][2]["code_identity"] == TEST_CODE_IDENTITY
+    assert store.seal_inputs[0][2] == "a" * 64
     assert materialized == [
         (instrument, instrument == "NASDAQ")
         for instrument in corpus.INSTRUMENTS
@@ -2077,7 +2323,10 @@ def test_execute_seals_partial_availability_without_substitution(monkeypatch) ->
                 http_status=403,
             )
 
-        def seal_snapshot(self, import_id, metadata):
+        def seal_snapshot(
+            self, import_id, metadata, *, expected_membership_sha256=None,
+        ):
+            assert expected_membership_sha256 is None
             self.snapshots.append((import_id, metadata))
             return "e" * 64
 
@@ -3317,6 +3566,54 @@ def test_schema_enforces_importer_boundary_in_postgres(monkeypatch) -> None:
                         corpus.Hist8Error, match="database identity mismatch",
                     ):
                         corpus.Hist8Store._verify(timezone_connection)
+                attempt_metadata = {
+                    "authorization": "ATOM-HIST8-CORPUS-AMENDMENT-1",
+                    "project_ref": corpus.PROJECT_REF,
+                }
+                store.add_attempt(
+                    "attempt-integrity", "IMPORT_ATTEMPT", attempt_metadata,
+                )
+                cursor.execute(
+                    "alter table atom_research_history.manifests disable "
+                    "trigger hist8_manifests_reject_update_delete"
+                )
+                cursor.execute(
+                    """update atom_research_history.manifests
+                       set metadata_json=%s::jsonb
+                       where import_id='attempt-integrity'
+                         and manifest_kind='IMPORT_ATTEMPT'""",
+                    (json.dumps({
+                        **attempt_metadata,
+                        "project_ref": "corrupted-project",
+                    }),),
+                )
+                cursor.execute(
+                    "alter table atom_research_history.manifests enable "
+                    "trigger hist8_manifests_reject_update_delete"
+                )
+                with pytest.raises(
+                    corpus.Hist8ConflictError,
+                    match="attempt manifest readback mismatch",
+                ):
+                    store.add_attempt(
+                        "attempt-integrity", "IMPORT_ATTEMPT",
+                        attempt_metadata,
+                    )
+                with pytest.raises(
+                    corpus.Hist8ConflictError,
+                    match="replay membership differs from sealed source snapshot",
+                ):
+                    store.seal_snapshot(
+                        "attempt-replay-mismatch", {},
+                        expected_membership_sha256="a" * 64,
+                    )
+                cursor.execute(
+                    """select count(*)
+                       from atom_research_history.manifests
+                       where import_id='attempt-replay-mismatch'
+                         and manifest_kind='SNAPSHOT'"""
+                )
+                assert cursor.fetchone()[0] == 0
                 page = _raw_page(
                     {"retained": "first"}, instruments=corpus.EQUITIES,
                 )
