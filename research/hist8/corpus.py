@@ -6,7 +6,6 @@ import argparse
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
-import gzip
 import hashlib
 from http.client import HTTPException, IncompleteRead
 import json
@@ -79,6 +78,9 @@ POSTGRES_BIGINT_MAX = (1 << 63) - 1
 # PostgreSQL's documented implementation limits for unconstrained numeric.
 POSTGRES_NUMERIC_MAX_INTEGER_DIGITS = 131_072
 POSTGRES_NUMERIC_MAX_FRACTIONAL_DIGITS = 16_383
+PROVIDER_RAW_BODY_MAX_BYTES = 16 * 1024 * 1024
+PROVIDER_DECODED_BODY_MAX_BYTES = 64 * 1024 * 1024
+PROVIDER_READ_CHUNK_BYTES = 64 * 1024
 IMPORTER_CONNECT_TIMEOUT_SECONDS = 15
 IMPORTER_SESSION_OPTIONS = (
     "-c statement_timeout=60000 "
@@ -134,14 +136,7 @@ class RawPage:
     body: bytes
 
     def decoded_body(self) -> bytes:
-        encoding = (self.content_encoding or "").lower().strip()
-        if not encoding or encoding == "identity":
-            return self.body
-        if encoding == "gzip":
-            return gzip.decompress(self.body)
-        if encoding == "deflate":
-            return zlib.decompress(self.body)
-        raise Hist8Error(f"unsupported content encoding: {encoding}")
+        return _decode_provider_body(self.body, self.content_encoding)
 
     def payload(self) -> object:
         try:
@@ -453,6 +448,67 @@ def _postgres_numeric_fields_fit(row: SourceBar | Bar) -> bool:
     )
 
 
+def _read_bounded_provider_body(stream: object) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        # Read one byte beyond the limit so an exact-limit body is accepted
+        # only after the stream proves that it has ended.
+        size = min(PROVIDER_READ_CHUNK_BYTES, PROVIDER_RAW_BODY_MAX_BYTES - total + 1)
+        chunk = stream.read(size)
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise Hist8Error("provider response body is not bytes")
+        if not chunk:
+            return b"".join(chunks)
+        data = bytes(chunk)
+        total += len(data)
+        if total > PROVIDER_RAW_BODY_MAX_BYTES:
+            raise Hist8Error("provider response body exceeds raw byte limit")
+        chunks.append(data)
+
+
+def _decompress_provider_body(body: bytes, *, wbits: int) -> bytes:
+    decompressor = zlib.decompressobj(wbits)
+    decoded = decompressor.decompress(
+        body, PROVIDER_DECODED_BODY_MAX_BYTES + 1,
+    )
+    if (len(decoded) > PROVIDER_DECODED_BODY_MAX_BYTES
+            or decompressor.unconsumed_tail):
+        raise Hist8Error("provider decoded body exceeds byte limit")
+    decoded += decompressor.flush(
+        PROVIDER_DECODED_BODY_MAX_BYTES - len(decoded) + 1,
+    )
+    if len(decoded) > PROVIDER_DECODED_BODY_MAX_BYTES:
+        raise Hist8Error("provider decoded body exceeds byte limit")
+    if not decompressor.eof or decompressor.unused_data:
+        raise zlib.error("incomplete or trailing compressed provider body")
+    return decoded
+
+
+def _decode_provider_body(body: bytes, content_encoding: str | None) -> bytes:
+    if len(body) > PROVIDER_RAW_BODY_MAX_BYTES:
+        raise Hist8Error("provider response body exceeds raw byte limit")
+    encoding = (content_encoding or "").lower().strip()
+    if not encoding or encoding == "identity":
+        return body
+    if encoding == "gzip":
+        return _decompress_provider_body(
+            body, wbits=16 + zlib.MAX_WBITS,
+        )
+    if encoding == "deflate":
+        return _decompress_provider_body(body, wbits=zlib.MAX_WBITS)
+    raise Hist8Error(f"unsupported content encoding: {encoding}")
+
+
+def _validate_downloaded_provider_body(
+    body: bytes, headers: Mapping[str, str],
+) -> None:
+    try:
+        _decode_provider_body(body, headers.get("content-encoding"))
+    except (EOFError, OSError, zlib.error) as exc:
+        raise Hist8Error("provider response is not valid decimal JSON") from exc
+
+
 def _http_get(
     url: str, *, headers: Mapping[str, str], timeout: int = 30,
     opener: Callable[..., object] = _no_redirect_urlopen,
@@ -469,9 +525,10 @@ def _http_get(
                 for name, value in response.headers.items()
             }
             try:
-                body = response.read()
+                body = _read_bounded_provider_body(response)
             except IncompleteRead as exc:
                 raise Hist8Error("provider response body incomplete") from exc
+            _validate_downloaded_provider_body(body, headers)
             return int(response.status), headers, body
     except HTTPError as exc:
         with exc:
@@ -480,11 +537,12 @@ def _http_get(
                 for name, value in exc.headers.items()
             }
             try:
-                body = exc.read()
+                body = _read_bounded_provider_body(exc)
             except IncompleteRead as incomplete:
                 raise Hist8Error(
                     "provider response body incomplete"
                 ) from incomplete
+            _validate_downloaded_provider_body(body, headers)
             return int(exc.code), headers, body
     except HTTPException as exc:
         raise Hist8Error("provider HTTP protocol failure") from exc

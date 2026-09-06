@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+import zlib
 
 import pytest
 
@@ -90,6 +91,7 @@ class _Response:
 
     def __init__(self, payload: object) -> None:
         self._body = json.dumps(payload, separators=(",", ":")).encode()
+        self._offset = 0
 
     def __enter__(self):
         return self
@@ -97,8 +99,12 @@ class _Response:
     def __exit__(self, *_args):
         return None
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self._body) - self._offset
+        start = self._offset
+        self._offset = min(len(self._body), start + size)
+        return self._body[start:self._offset]
 
 
 def test_calendar_is_complete_and_hash_bound() -> None:
@@ -496,7 +502,7 @@ def test_incomplete_http_read_is_contained_to_one_provider(monkeypatch) -> None:
     stored = []
 
     class TruncatedResponse(_Response):
-        def read(self) -> bytes:
+        def read(self, _size: int = -1) -> bytes:
             raise IncompleteRead(b'{"partial":', 128)
 
     def alpaca(*_args, **_kwargs):
@@ -539,6 +545,119 @@ def test_incomplete_http_read_is_contained_to_one_provider(monkeypatch) -> None:
         "source": "ALPACA", "availability": "UNAVAILABLE",
         "retrieval_associations": 0, "failure_type": "Hist8Error",
         "reason": "provider response body incomplete",
+    }
+    assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
+    assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
+
+
+def test_oversized_raw_http_body_is_contained_to_one_provider(monkeypatch) -> None:
+    stored = []
+    real_alpaca_pages = corpus.alpaca_pages
+    response = _Response({})
+    response._body = b"x" * 33
+    requested_sizes = []
+    original_read = response.read
+
+    def bounded_read(size: int = -1) -> bytes:
+        requested_sizes.append(size)
+        return original_read(size)
+
+    response.read = bounded_read
+
+    def alpaca(*_args, **_kwargs):
+        yield from real_alpaca_pages(
+            "key", "secret", opener=lambda *_args, **_kwargs: response,
+        )
+
+    def coinbase(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "coinbase"}, source="COINBASE",
+            instruments=("BTC-USD",),
+        )
+
+    def massive(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "massive"}, source="MASSIVE",
+            instruments=("NASDAQ",),
+        )
+
+    class Store:
+        def store_page(self, _import_id, sequence, page):
+            stored.append(page.source)
+            return sequence + len(page.instruments)
+
+    monkeypatch.setattr(corpus, "PROVIDER_RAW_BODY_MAX_BYTES", 32)
+    monkeypatch.setattr(corpus, "alpaca_pages", alpaca)
+    monkeypatch.setattr(corpus, "coinbase_pages", coinbase)
+    monkeypatch.setattr(corpus, "massive_pages", massive)
+    result = corpus.acquire(Store(), "raw-limit-attempt")
+
+    assert requested_sizes == [33]
+    assert stored == ["COINBASE", "MASSIVE"]
+    assert result["retrieval_associations"] == 2
+    assert result["source_statuses"]["SPY"] == {
+        "source": "ALPACA", "availability": "UNAVAILABLE",
+        "retrieval_associations": 0, "failure_type": "Hist8Error",
+        "reason": "provider response body exceeds raw byte limit",
+    }
+    assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
+    assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
+
+
+@pytest.mark.parametrize("content_encoding", ("gzip", "deflate"))
+def test_oversized_decoded_http_body_is_contained_to_one_provider(
+    monkeypatch, content_encoding,
+) -> None:
+    stored = []
+    real_alpaca_pages = corpus.alpaca_pages
+    decoded = json.dumps({
+        "bars": {symbol: [] for symbol in corpus.EQUITIES},
+        "padding": "x" * 128,
+    }).encode()
+    response = _Response({})
+    response._body = (
+        gzip.compress(decoded) if content_encoding == "gzip"
+        else zlib.compress(decoded)
+    )
+    response.headers = {
+        "Content-Type": "application/json",
+        "Content-Encoding": content_encoding,
+    }
+
+    def alpaca(*_args, **_kwargs):
+        yield from real_alpaca_pages(
+            "key", "secret", opener=lambda *_args, **_kwargs: response,
+        )
+
+    def coinbase(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "coinbase"}, source="COINBASE",
+            instruments=("BTC-USD",),
+        )
+
+    def massive(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "massive"}, source="MASSIVE",
+            instruments=("NASDAQ",),
+        )
+
+    class Store:
+        def store_page(self, _import_id, sequence, page):
+            stored.append(page.source)
+            return sequence + len(page.instruments)
+
+    monkeypatch.setattr(corpus, "PROVIDER_DECODED_BODY_MAX_BYTES", 64)
+    monkeypatch.setattr(corpus, "alpaca_pages", alpaca)
+    monkeypatch.setattr(corpus, "coinbase_pages", coinbase)
+    monkeypatch.setattr(corpus, "massive_pages", massive)
+    result = corpus.acquire(Store(), "decoded-limit-attempt")
+
+    assert stored == ["COINBASE", "MASSIVE"]
+    assert result["retrieval_associations"] == 2
+    assert result["source_statuses"]["SPY"] == {
+        "source": "ALPACA", "availability": "UNAVAILABLE",
+        "retrieval_associations": 0, "failure_type": "Hist8Error",
+        "reason": "provider decoded body exceeds byte limit",
     }
     assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
     assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
@@ -595,12 +714,18 @@ def test_malformed_http_status_line_is_contained_to_one_provider(monkeypatch) ->
     assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
 
 
-@pytest.mark.parametrize("malformed_body", (
-    b'{"bars":{},"next_page_token":' + b"9" * 5000 + b"}",
-    b"[" * 10000 + b"0" + b"]" * 10000,
+@pytest.mark.parametrize(("malformed_body", "expected_reasons"), (
+    (
+        b'{"bars":{},"next_page_token":' + b"9" * 5000 + b"}",
+        {"provider response is not valid decimal JSON", "invalid Alpaca pagination"},
+    ),
+    (
+        b"[" * 10000 + b"0" + b"]" * 10000,
+        {"provider response is not valid decimal JSON", "malformed Alpaca page"},
+    ),
 ))
 def test_json_parser_limits_are_contained_to_one_provider(
-    monkeypatch, malformed_body,
+    monkeypatch, malformed_body, expected_reasons,
 ) -> None:
     stored = []
     real_alpaca_pages = corpus.alpaca_pages
@@ -609,14 +734,21 @@ def test_json_parser_limits_are_contained_to_one_provider(
         status = 200
         headers = {"Content-Type": "application/json"}
 
+        def __init__(self):
+            self._offset = 0
+
         def __enter__(self):
             return self
 
         def __exit__(self, *_args):
             return None
 
-        def read(self):
-            return malformed_body
+        def read(self, size: int = -1):
+            if size < 0:
+                size = len(malformed_body) - self._offset
+            start = self._offset
+            self._offset = min(len(malformed_body), start + size)
+            return malformed_body[start:self._offset]
 
     def alpaca(*_args, **_kwargs):
         yield from real_alpaca_pages(
@@ -649,11 +781,12 @@ def test_json_parser_limits_are_contained_to_one_provider(
 
     assert stored == ["ALPACA", "COINBASE", "MASSIVE"]
     assert result["retrieval_associations"] == 8
-    assert result["source_statuses"]["SPY"] == {
+    status = result["source_statuses"]["SPY"]
+    assert {key: value for key, value in status.items() if key != "reason"} == {
         "source": "ALPACA", "availability": "UNAVAILABLE",
         "retrieval_associations": 1, "failure_type": "Hist8Error",
-        "reason": "provider response is not valid decimal JSON",
     }
+    assert status["reason"] in expected_reasons
     assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
     assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
 
