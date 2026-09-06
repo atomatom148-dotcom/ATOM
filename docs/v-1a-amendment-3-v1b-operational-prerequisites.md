@@ -7,6 +7,7 @@
 **Sole documentation-PR path:** `docs/v-1a-amendment-3-v1b-operational-prerequisites.md`  
 **Inspected repository:** `atomatom148-dotcom/ATOM`  
 **Inspected main:** `f0035147a646fc7d4c7002c8a2706f4987f6a10c`  
+**Corrects PR:** #325 at reviewed head `87d36e93b80ec0fc3b29613b400efa921d8e0750`; that head is superseded by the corrected final head and may not satisfy the merge gate.  
 **Implementation owner:** Codex; one separate implementation PR and one implementation owner.  
 **Approval, merge, credentials, infrastructure and budget authority:** Owner.
 
@@ -72,7 +73,31 @@ runtime_manifest_sha256's literal value
 
 For a new-seal invocation, after the complete permitted import/native closure has been loaded and before any database connection or evidence access, derive those values from the actual process that will perform that invocation. Preserve, without alteration, the four-component coverage, path normalization, ordering, duplicate rejection, source/bytecode restrictions, regular-file rules, executable mappings, exact native-library coverage, `dlsym` resolution, non-ASLR file-offset construction and canonical hashing algorithms in §13.2.1.
 
-Verify the frozen version/platform/float fields and exact libpq/dependency literals first. Then construct the complete observed runtime body with the original exact key set. Freeze that body and its digest in memory. Do not substitute a value supplied by an operator, an earlier build, a developer computer, CI, an earlier Render instance or a pre-merge Render probe. No pre-merge fingerprint run is a prerequisite or authority for these host-dependent values.
+Verify the frozen version/platform/float fields and exact libpq/dependency literals first. Then construct the complete observed runtime body with the original exact key set. Freeze that body and its digest in memory. Do not substitute a value supplied by an operator, a developer computer, CI, a different Render build, or a pre-merge probe on unrelated build/runtime provenance. No pre-merge CPU-specific fingerprint is a prerequisite or authority for host-dependent dispatch values.
+
+Installed runtime bytes are not self-authenticating merely because the invocation hashes them. Before any V-1B database connection, evidence access, readiness scan or consuming seal, an Owner-controlled non-consuming runtime-provenance acceptance must exist for the exact successful Render build from which V-1B one-off jobs will be created. The provenance probe runs as a separate one-off job derived from that exact successful build while the base service remains on the inert §5 command, with the database URI and `ATOM_V1B_GITHUB_TOKEN` absent from the probe environment. It may read only local repository/build/runtime files and non-secret Render build identity. It computes the unchanged §13.2.1 byte coverage for `python_executable_sha256`, `stdlib_tree_sha256`, `dependency_tree_sha256`, and `loaded_native_tree_sha256` and emits no libm dispatch baseline, database value, evidence count, readiness value or protected statistic.
+
+The retained non-secret `ATOM-V1B-RUNTIME-PROVENANCE-1` control-plane record binds exactly:
+
+```text
+schema_version = ATOM-V1B-RUNTIME-PROVENANCE-1
+render_service_id = srv-daa7thgae00c73a2lmn0
+render_build_id = exact successful Render build identifier
+render_deploy_id = exact deployment/configuration identifier, when Render exposes one; otherwise null
+repository = atomatom148-dotcom/ATOM
+execution_source_sha = exact 40-lowercase-hex reviewed implementation/main SHA used for that build
+build_command = pip install -r requirements.txt
+python_version = 3.14.3
+runtime_artifact_components = exact four-component §13.2.1 object
+runtime_artifact_sha256 = sha256(canonical_json(runtime_artifact_components))
+probe_generated_at_utc = exact probe/control-plane UTC timestamp
+```
+
+`render_build_id` is mandatory. The Owner retains the complete canonical record and its SHA-256 in the private V-1B operational acceptance record. Independent implementation acceptance verifies that the probe came from the same exact successful build identity later selected for V-1B jobs, the source SHA and reviewed implementation bytes match authenticated GitHub history, and the four component digests are approved before the first database/evidence-capable V-1B invocation. A record from a different build, source SHA, service, or mutable/unverifiable build identity is unusable.
+
+Every evidence-capable new-seal invocation independently recomputes the same four artifact component digests before any database connection or evidence access and requires exact equality to that approved provenance record. Those approved byte digests flow unchanged into the invocation’s `runtime_artifact_sha256` and `runtime_manifest_sha256`, which remain bound into readiness identity, run identity and seal. The provenance record adds no receipt/seal key and is not research evidence.
+
+`libm_dispatch` remains invocation-derived because its non-ASLR symbol offset can depend on the actual CPU dispatch selected for that process. It is accepted only when both `log` and `exp` resolve inside the exact authenticated libm/native artifact already covered by the approved `loaded_native_tree_sha256`, using the unchanged mapping and offset rules. The resulting dispatch object/digest is bound into the invocation runtime manifest and, once sealed, is immutable for recovery. This authenticates installed bytes without reintroducing a cross-CPU pre-merge dispatch literal.
 
 The existing formulas remain:
 
@@ -92,7 +117,7 @@ Insert the invocation-derived `runtime_manifest_sha256` into the existing Amendm
 
 Recompute the complete observed runtime body and digest before the seal/protected-computation transition and at final verification immediately before receipt construction. Require exact canonical-body equality and exact digest equality to the invocation’s initial frozen runtime. Recheck all existing source/CA bindings as already required. No later import, dynamic module load, changed component, changed native mapping or changed `log`/`exp` dispatch is accepted.
 
-For exact recovery, validate the original retained seal first under Amendment 2A §10.2. Independently derive the recovery process’s full runtime body using the same algorithms. Its digest must equal the runtime digest in both sealed identity bodies; those bodies and the sealed readiness/run/seal hashes must also verify exactly. An available original full runtime object must agree exactly as well. Recovery must never choose its newly observed body as a replacement baseline or rewrite any sealed field. Recheck against that same sealed digest at final verification.
+For exact recovery, validate the original retained seal first under Amendment 2A §10.2. Before database or evidence access, independently authenticate the recovery job’s `render_build_id` against the retained approved `ATOM-V1B-RUNTIME-PROVENANCE-1` record, recompute all four byte digests, and require exact equality to that approved record. Independently derive the recovery process’s full runtime body using the same algorithms. Its complete runtime body and digest—including the invocation-dependent `libm_dispatch` object and digest—must equal the runtime identity frozen into both original sealed identity bodies; those bodies and the sealed readiness/run/seal hashes must also verify exactly. Recovery may never adopt a newly observed body, a new CPU dispatch or a different successful build as a replacement baseline. Recheck the approved artifact bytes and exact sealed runtime identity again at final verification.
 
 A different recovery CPU dispatch, artifact/native hash or version is a mismatch, not a new look. Use only the existing timing-dependent failure routes: pre-evidence new-seal failures are `BLOCKED`; pre-seal failures after evidence access are null-seal PRE-CELL INVALID; accepted-seal recovery or other post-seal failures consume the original identity under Amendment 2A §8.6. Final verification failure after truthful cells exist uses the applicable existing post-evaluation authority-invalid route. No partial protected value is emitted.
 
@@ -117,6 +142,8 @@ all write permissions  = none
 ```
 
 No classic PAT, additional repository, account/organization permission, administrative permission, Pull requests permission, Checks permission or write scope is authorized. Token scope is verified by the Owner at provisioning; a successful `GET` alone is not proof of least privilege.
+
+Before acceptance for any evidence-capable V-1B invocation, retain non-secret GitHub control-plane evidence proving the same fine-grained PAT’s exact (1) resource owner `atomatom148-dotcom`, (2) repository selection of only `atomatom148-dotcom/ATOM`, and (3) repository permissions Contents: read plus implicit Metadata: read, with every other optional permission No access and every write permission absent. The evidence may be a timestamped settings export or screenshots plus the token’s non-secret name/identifier, but must never contain the token value, token hash, authorization header or recovery code. The Owner-controlled V-1B operational acceptance record stores or references those artifacts; the independent acceptance reviewer must inspect them. Missing, ambiguous, stale, cropped or non-correlatable scope evidence is `BLOCKED`; successful API reads cannot cure it.
 
 The scorecard’s sole token source is that exact Render-injected environment variable, read directly in memory. Missing, empty, malformed, expired, revoked, rejected or insufficient authentication fails closed under the existing timing rules. No command-line argument, stdin, local file, `.env` load, secret-file mount, Git credential helper, `gh` login/configuration, `GH_TOKEN`, `GITHUB_TOKEN`, other environment alias, unauthenticated request or fallback credential may supply it. Local non-network Git object/worktree checks remain permitted; Git/CLI credential discovery does not.
 
@@ -175,7 +202,13 @@ It must not execute during V-1B setup or invocation. No sleep, polling loop, cro
 
 ### 5.2 Closed command registry
 
-From the verified repository root, configure the service’s selected per-manifest command, and the corresponding one-off job’s `startCommand`, to exactly one row below:
+During all V-1B setup, provenance, invocation, recovery and cleanup operations, the base background service start command remains permanently inert and exactly:
+
+```text
+python -c "raise SystemExit(0)"
+```
+
+No scorecard command is ever stored as the base service’s start command. Each authorized scorecard command exists only in the explicitly created one-off job’s `startCommand`. From the verified repository root, that one-off `startCommand` is exactly one row below:
 
 ```text
 python -m quant.volatility_scorecard --manifest-id v1b-early-4
@@ -207,27 +240,62 @@ Only three substitutions are allowed: `manifest_id` is one exact registry value;
 
 The scorecard still independently performs every original §10.2 file/schema/hash/manifest check before repository or database access. A prelude failure or platform command-size limit authorizes no truncation, alternative payload source, automatic retry or new-seal fallback. Resolve the same retained-seal recovery under the existing failure/incident rules. No new durable store is created.
 
-### 5.3 Native one-off lifecycle; no continuous worker execution
+### 5.3 Recovery startCommand capacity gate
+
+The inline-hex recovery design is authorized only if its complete maximum command is proven to fit Render’s accepted `startCommand` capacity before operational activation and before any consuming seal can exist.
+
+During the implementation PR, derive a finite upper bound `max_seal_bytes` for every canonical `ATOM-V1B-MANIFEST-SEAL-1` record permitted by the frozen schema and the implementation’s validated input-length bounds. The bound includes the final newline and every legal manifest/lineage/cohort representation. If any seal field affecting serialized size lacks an enforceable finite maximum, the inline-hex recovery design is unproven and V-1B is `BLOCKED` for documentation-first redesign.
+
+Render the exact §5.2 recovery template with a maximum-size valid synthetic seal fixture and maximum-length legal substitutions. Measure UTF-8 bytes, not characters:
+
+```text
+max_recovery_startCommand_bytes = len(utf8(exact rendered recovery startCommand))
+                                = fixed template/substitutions + 2 * max_seal_bytes
+recovery_capacity_margin_bytes  = 4096
+required_startCommand_capacity  = max_recovery_startCommand_bytes + 4096
+```
+
+Before activation, retain non-secret action-time vendor/control-plane evidence establishing Render’s accepted `startCommand` limit in bytes for this exact one-off-job mechanism. The evidence must be authoritative enough for independent review: current Render documentation, API/schema/control-plane limit disclosure, or Render support confirmation tied to this product behavior. A guessed shell/OS `ARG_MAX`, an observed shorter command, or successful local execution is not proof of the Render field limit.
+
+Acceptance requires:
+
+```text
+accepted_render_startCommand_limit_bytes >= required_startCommand_capacity
+```
+
+The implementation acceptance record retains `max_seal_bytes`, the exact measured command byte count, the 4096-byte margin, the accepted Render limit, evidence source/date and PASS/FAIL arithmetic. If the limit is unavailable, ambiguous, smaller, measured in an incompatible unit, or the inequality fails, V-1B is `BLOCKED` before any evidence-capable activation or consuming seal and requires documentation-first recovery redesign. Truncation, compression, alternate payload storage, a new environment variable, network retrieval, or discovering the problem during recovery is forbidden.
+
+### 5.4 Native one-off lifecycle; no continuous worker execution
 
 The containment mechanism is one Render native one-off job attached to this exact existing base service, not an indefinitely running background-worker start process. This is the sole narrow exception permitting a transient execution instance derived from the existing benchmark service; it grants no new permanent service or autonomous launcher.
 
 The Owner-controlled Render control plane launches the job. The scorecard receives no infrastructure token and cannot launch, repeat or suspend jobs itself. Use the existing 4c-8g capacity only, with no simultaneous benchmark daemon and no parallel V-1B job. Before launch verify the job will inherit the exact authorized successful build and configured environment, not merely the most recent deploy request. The runtime must still prove the original frozen service identity and actual execution SHA; an incompatible job identity is not relabeled to pass.
 
-Keep the base service suspended while a V-1B command is configured and while its one-off job runs. If Render requires an active service to prepare the new successful build, the sole temporary preparation start command is:
-
-```text
-python -c "raise SystemExit(0)"
-```
-
-That command performs no database or repository-authority access and no V-1B invocation. Resume is permitted only with that exact preparation command, only for the Owner-authorized build, followed by verified suspension before selecting or launching a V-1B command. It must never become an E-1 or scorecard fallback. If the exact build/configuration cannot be obtained under this containment, stop; do not resume a continuous scorecard worker.
+Keep the base service suspended except for any Render-required build/configuration preparation. Whenever the base service is resumed for such preparation, its start command remains exactly `python -c "raise SystemExit(0)"`; it is never replaced by E-1, a V-1B scorecard, recovery staging, sleep loop or another workload. The inert command performs no database or repository-authority access and no V-1B invocation. After preparation, verify suspension before creating a one-off job. If the exact build/configuration cannot be obtained while preserving this invariant, stop; do not resume a continuous scorecard worker.
 
 Create exactly one job per authorized invocation; do not automatically retry a job-creation request with an uncertain outcome. Resolve the existing job identity/status through the control plane first. Before another invocation, inspect prior job completion, retained logs/seals and official receipts under the existing one-look rules. A crash, deployment event or lost API acknowledgement cannot authorize a replacement identity.
 
 The job ends when the one-shot command exits. Capture the complete seal through the existing execution-log sink before protected calculation, and retain the first complete canonical evaluated or negative receipt and its hash before runtime teardown can destroy the only copy. Logging that complete frozen receipt after construction is permitted; logging partial protected values is not. Preserve exact HOLD/WAIT/usage outputs and their no-file requirements. No new receipt schema or automatic publication is introduced.
 
-After every invocation, including HOLD, WAIT, usage failure, BLOCKED, INVALID or evaluated completion, verify that the job has terminated and that the base service is suspended. A protective stop must cancel the running one-off job and suspend/verify the base service; suspending the parent alone is insufficient. Loss of a seal, result or execution-status proof follows the existing incident rules and never permits an unverified rerun.
+After every invocation, including HOLD, WAIT, usage failure, BLOCKED, INVALID or evaluated completion, verify that the job has terminated and that the base service is suspended with the inert base command still configured. A protective stop must cancel the running one-off job and suspend/verify the base service; suspending the parent alone is insufficient. Loss of a seal, result or execution-status proof follows the existing incident rules and never permits an unverified rerun.
+
+After all authorized V-1B invocations have terminated, every manifest is either terminally recorded or otherwise closed by Owner decision, and independent review confirms that no hash-valid seal remains without a terminal receipt and no valid exact recovery remains pending, remove `ATOM_V1B_GITHUB_TOKEN` from Render and revoke the dedicated fine-grained PAT in GitHub. Retain non-secret evidence of Render-secret removal and PAT revocation in the operational closure record. This cleanup is mandatory on normal completion, not only rollback. If a valid recovery remains pending, the token may persist only for that bounded recovery window and may not be used for unrelated work; removal and revocation are immediate once the final recovery obligation closes.
 
 ## 6. One same-role password rotation; exact URI invariants
+
+### 6.1 Exposure record and bounded blast radius
+
+The old `atom_e1_scorecard_reader` credential is treated as exposed. This public amendment deliberately does not reproduce the credential, any secret-bearing artifact, or sensitive exposure mechanics, and it does not invent facts that have not been verified. Before rotation or V-1B activation, the Owner must create and retain the authoritative private incident record:
+
+```text
+ATOM-SEC-INCIDENT-V1B-READER-CREDENTIAL-2026-09-06
+```
+
+That private record must state, without copying the secret itself: the exact exposure vector; first known exposure timestamp; last possible exposure timestamp; discovery timestamp; every known secret-bearing artifact/location; whether each artifact was deleted, redacted, access-restricted or necessarily retained; disposition timestamp and control plane; and rotation completion timestamp. The exposure window is exactly from first known exposure until the old password is successfully invalidated by rotation; uncertainty is recorded as uncertainty rather than narrowed by assumption. If an artifact cannot be removed, the record identifies its retained location, access controls and retention reason. The private incident record is security/operations evidence, not V-1 statistical evidence, and is not added to this public PR.
+
+The credential’s authority is bounded to the already frozen role `atom_e1_scorecard_reader`: LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS, no role memberships, no database/schema create path, and no INSERT/UPDATE/DELETE/TRUNCATE authority under the V-1A catalog-wide checks. Its intended blast radius is therefore disclosure of rows readable through that role’s existing SELECT/RLS/proof-function authority, not database mutation or RLS bypass. This does not prove the credential was unused; the private incident record records any available access-log review and its limits. Discovery of a write path, BYPASSRLS, broader membership, different target or unexplained access is a new material incident and stops V-1B for separate review.
+
+### 6.2 Rotation
 
 After the required merges and before any V-1B connection, authorize exactly one password rotation for:
 
@@ -279,7 +347,7 @@ If approved and absent, enable only that project’s dedicated direct-database I
 
 After propagation, verify the same direct hostname resolves to a usable IPv4 address and the later approved invocation passes the pinned-CA `verify-full` connection checks. Do not replace the URI hostname with an IP literal, add `hostaddr`, edit `/etc/hosts`, use a proxy, substitute Supavisor/PgBouncer, choose a different port, weaken TLS or move to another project. No static IP literal becomes a new frozen identity. Connection/catalog verification is later setup/execution work, not work performed in this documentation phase.
 
-Any inability to confirm price, enable the approved add-on or establish the exact direct connection remains a blocker; it is not authority for an alternative route. This grant does not enable IPv4 for HIST8’s separate legacy project.
+Any inability to confirm price, enable the approved add-on or establish the exact direct connection remains a blocker; it is not authority for an alternative route. This grant does not enable IPv4 for HIST8’s separate project `pjbjpgnmniwcajqkuhge`. HIST8 remains outside PR #325 and receives no connectivity, TLS, credential, migration or execution authority from this amendment. Any dedicated-IPv4 authority for HIST8 requires a separate documentation-first follow-on amendment under HIST8’s own controlling corpus law, with its own action-time cost confirmation and exact direct-host/no-pooler constraints. Do not add that follow-on decision or any HIST8 path to PR #325.
 
 ## 8. Exact operational and repository rollback
 
@@ -289,7 +357,7 @@ Rollback is exactly:
 
 1. Cancel and verify termination of any running V-1B one-off job; suspend and verify the named base service. Preserve every seal, complete receipt and required log. Classify a crossed seal only through existing Amendment 2A rules.
 2. Restore the action-time non-secret configuration only while the base service remains suspended. The historical E-1 command may be restored as an inert configuration value only; this amendment authorizes no E-1 execution or restoration of its sleep loop to a running service. Restore the previous `PYTHON_VERSION`/authorized-SHA presence and value if those fields were changed, without launching the reverted runtime. Leave all untouched settings untouched.
-3. Remove the newly added `ATOM_V1B_GITHUB_TOKEN` from this service and revoke that dedicated PAT through the Owner’s secure control plane. Do not install another token or credential fallback.
+3. Remove the newly added `ATOM_V1B_GITHUB_TOKEN` from this service and revoke that dedicated PAT through the Owner’s secure control plane. Do not install another token or credential fallback. This is the rollback path for the same cleanup independently required on normal completion by §5.4.
 4. Keep the newly rotated database password and its conforming reader URI. The exposed password and obsolete TLS configuration are excluded from restoration, including a platform’s automatic environment rollback. If a safe URI cannot be retained, remove the URI and remain suspended rather than restoring the exposed credential.
 5. Repository rollback follows Amendment 2A §10.3 exactly: a separately reviewed revert of only the verified V-1B implementation merge’s first-parent diff on then-current `main`. Never reset history or revert a later per-invocation head containing receipts. Preserve all freezes, this amendment, the eight evidence files, seals and receipts. A non-clean revert requires a reviewed rollback plan; no unrelated refactor or ad-hoc privilege rollback.
 6. Do not automatically disable an IPv4 add-on already relied on by other direct clients. Disabling the newly enabled project-wide add-on requires a separate Owner instruction after connection-impact and billing confirmation. It is not a means to restore an old password or erase a consumed look.
@@ -311,12 +379,13 @@ certs/supabase-prod-ca-2021.crt
 
 Retain every existing V-1A/TLS/2A test. Add focused tests within the existing test module proving:
 
-- Frozen versions/libpq/dependencies/source bindings still reject mismatch, while invocation-derived artifact/native/dispatch hashes need no pre-merge host fingerprint; initial, pre-seal, final and recovery hashes bind exactly to the existing identities. CPU/native drift after sealing cannot be accepted or rebaselined.
-- The sole token source and scope contract, no fallback or secret serialization, required authenticated reads, exact repository/default-ref equality, signed merge/ancestry/blob/worktree proof and recovery’s separate current-head check. Unprotected `main` alone is accepted; an unverifiable/stale/wrong ref or changed source is not.
-- The closed nine-command registry, original two CLI options, exact HOLD/WAIT/usage behavior, early-terminal prerequisite, retained-seal recovery, no loop/automatic retry, first-complete-receipt retention, and unchanged one-look/failure routing. Mocked control-plane tests do not claim live one-shot acceptance.
+- Frozen versions/libpq/dependencies/source bindings still reject mismatch; a same-build non-consuming provenance probe produces the exact approved four-component artifact record; every evidence-capable invocation and recovery independently matches those byte digests before database/evidence access; and invocation-derived CPU dispatch needs no cross-CPU pre-merge literal while still binding into the sealed runtime identity. A different build, changed installed byte or post-seal CPU/native drift cannot be accepted or rebaselined.
+- The sole token source and scope contract, retained non-secret PAT control-plane evidence for resource owner/sole-repository selection/exact permissions, no fallback or secret serialization, required authenticated reads, exact repository/default-ref equality, signed merge/ancestry/blob/worktree proof and recovery’s separate current-head check. Unprotected `main` alone is accepted; an unverifiable/stale/wrong ref, unproven/over-broad token scope or changed source is not.
+- The base service can contain only the inert `python -c "raise SystemExit(0)"` command during V-1B operations; the closed nine scorecard commands and recovery staging template can appear only in one-off-job `startCommand`; original two CLI options, exact HOLD/WAIT/usage behavior, early-terminal prerequisite, retained-seal recovery, no loop/automatic retry, first-complete-receipt retention, and unchanged one-look/failure routing. Mocked control-plane tests do not claim live one-shot acceptance.
+- The recovery-capacity calculation has a finite schema/input upper bound, measures UTF-8 bytes of the complete maximum rendered recovery command including doubled seal bytes, adds exactly 4096 bytes of margin, and fails activation when the authoritative Render limit is unavailable or below required capacity.
 - URI changes cannot alter any non-password identity/TLS field beyond the previously authorized pinned-root correction, and rollback never restores the exposed credential. Use synthetic credentials only.
 
-Before operational activation, the Owner’s acceptance record must additionally prove the actual restricted-token reads, exact successful build and runtime identity, native one-off containment, complete output/seal capture, absence of a concurrently running benchmark daemon, terminal job status plus parent suspension, rotated-URI verification and—if purchased—the separately approved IPv4 action. Missing evidence is pending or `BLOCKED`, never an inferred `PASS`. Setup must succeed before a consuming seal; no trial protected run is a connectivity test.
+Before operational activation, the Owner’s acceptance record must additionally prove: the approved same-build `ATOM-V1B-RUNTIME-PROVENANCE-1` record and independent byte equality; retained non-secret PAT scope evidence plus actual restricted-token reads; the exact successful build/runtime identity; the §5.3 recovery-command capacity arithmetic and authoritative Render-limit evidence; native one-off containment with the base command remaining inert; complete output/seal capture; absence of a concurrently running benchmark daemon; terminal job status plus parent suspension; the private incident-record identifier and completed old-password rotation; rotated-URI verification; and—if purchased—the separately approved V-1B IPv4 action. Missing evidence is pending or `BLOCKED`, never an inferred `PASS`. Setup must succeed before a consuming seal; no trial protected run is a connectivity test.
 
 Both this amendment PR and the separate implementation PR require independent review on their exact final heads, all actual required checks green, zero unresolved P1/P2/material findings, and Owner merge. Earlier-head reviews and generic green badges do not suffice. No waiver, bypass, self-review substitute, merge delegation or deadline exception is granted. Codex handles repository implementation, tests, commits and PR preparation; ChatGPT Pro authors the freeze and performs final architecture/receipt audits.
 
@@ -338,11 +407,12 @@ this one-file documentation amendment
 → Owner implementation merge
 → Owner-controlled exact setup, secure rotation and action-time IPv4 confirmation
 → exact authorized one-off invocation; original readiness and seal rules
-→ verified job termination and worker suspension
+→ verified job termination and worker suspension with inert base command preserved
+→ when no valid recovery remains pending: remove Render PAT secret + revoke dedicated PAT
 → unchanged receipt publication and final audit
 ```
 
-If the required work cannot fit these exact boundaries, stop for a documentation-first decision. Tuesday’s deadline supplies priority, not permission to weaken proof.
+If the required work cannot fit these exact boundaries, stop for a documentation-first decision. HIST8’s IPv4 issue is explicitly deferred to a separate follow-on amendment and is not part of PR #325. Tuesday’s deadline supplies priority, not permission to weaken proof.
 
 ---
 
