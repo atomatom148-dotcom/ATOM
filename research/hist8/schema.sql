@@ -462,6 +462,52 @@ BEGIN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_ROUTINE_BOUNDARY_UNSATISFIED';
   END IF;
 
+  IF EXISTS (
+    SELECT 1
+    FROM pg_namespace n
+    WHERE n.nspname NOT IN (
+        'pg_catalog','information_schema','public','atom_research_history'
+      )
+      AND n.nspname NOT LIKE 'pg_toast%'
+      AND n.nspname NOT LIKE 'pg_temp_%'
+      AND has_schema_privilege('atom_hist8_importer', n.oid, 'USAGE')
+  ) THEN
+    RAISE EXCEPTION 'HIST8_EFFECTIVE_SCHEMA_USAGE_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_largeobject_metadata object
+    CROSS JOIN LATERAL aclexplode(
+      COALESCE(object.lomacl, acldefault('L', object.lomowner))
+    ) acl
+    WHERE acl.grantee IN (
+        0, (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer')
+      )
+      AND acl.privilege_type IN ('SELECT', 'UPDATE')
+  ) THEN
+    RAISE EXCEPTION 'HIST8_EFFECTIVE_LARGE_OBJECT_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  -- Ownership itself grants durable access. Reject any catalog routine the
+  -- importer can execute that creates a new large object, because that object
+  -- would fall outside the three-table HIST8 boundary after this check ends.
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'pg_catalog'
+      AND p.proname IN (
+        'lo_creat', 'lo_create', 'lo_from_bytea', 'lo_import'
+      )
+      AND has_function_privilege(
+        'atom_hist8_importer', p.oid, 'EXECUTE'
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'HIST8_EFFECTIVE_LARGE_OBJECT_CREATE_BOUNDARY_UNSATISFIED';
+  END IF;
+
   -- PostgreSQL grants EXECUTE on new routines to PUBLIC by default. Require
   -- every role that can create in a schema visible to the importer to have a
   -- non-PUBLIC routine default, so later legacy DDL cannot silently expand the
@@ -509,52 +555,6 @@ BEGIN
   ) THEN
     RAISE EXCEPTION
       'HIST8_FUTURE_ROUTINE_DEFAULT_BOUNDARY_UNSATISFIED';
-  END IF;
-
-  IF EXISTS (
-    SELECT 1
-    FROM pg_namespace n
-    WHERE n.nspname NOT IN (
-        'pg_catalog','information_schema','public','atom_research_history'
-      )
-      AND n.nspname NOT LIKE 'pg_toast%'
-      AND n.nspname NOT LIKE 'pg_temp_%'
-      AND has_schema_privilege('atom_hist8_importer', n.oid, 'USAGE')
-  ) THEN
-    RAISE EXCEPTION 'HIST8_EFFECTIVE_SCHEMA_USAGE_BOUNDARY_UNSATISFIED';
-  END IF;
-
-  IF EXISTS (
-    SELECT 1
-    FROM pg_largeobject_metadata object
-    CROSS JOIN LATERAL aclexplode(
-      COALESCE(object.lomacl, acldefault('L', object.lomowner))
-    ) acl
-    WHERE acl.grantee IN (
-        0, (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer')
-      )
-      AND acl.privilege_type IN ('SELECT', 'UPDATE')
-  ) THEN
-    RAISE EXCEPTION 'HIST8_EFFECTIVE_LARGE_OBJECT_BOUNDARY_UNSATISFIED';
-  END IF;
-
-  -- Ownership itself grants durable access. Reject any catalog routine the
-  -- importer can execute that creates a new large object, because that object
-  -- would fall outside the three-table HIST8 boundary after this check ends.
-  IF EXISTS (
-    SELECT 1
-    FROM pg_proc p
-    JOIN pg_namespace n ON n.oid = p.pronamespace
-    WHERE n.nspname = 'pg_catalog'
-      AND p.proname IN (
-        'lo_creat', 'lo_create', 'lo_from_bytea', 'lo_import'
-      )
-      AND has_function_privilege(
-        'atom_hist8_importer', p.oid, 'EXECUTE'
-      )
-  ) THEN
-    RAISE EXCEPTION
-      'HIST8_EFFECTIVE_LARGE_OBJECT_CREATE_BOUNDARY_UNSATISFIED';
   END IF;
 
   IF EXISTS (
