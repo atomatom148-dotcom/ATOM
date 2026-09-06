@@ -444,6 +444,15 @@ def _postgres_numeric_fits(value: object) -> bool:
     )
 
 
+def _postgres_numeric_fields_fit(row: SourceBar | Bar) -> bool:
+    return all(
+        value is None or _postgres_numeric_fits(value)
+        for value in (
+            row.open, row.high, row.low, row.close, row.volume, row.vwap,
+        )
+    )
+
+
 def _http_get(
     url: str, *, headers: Mapping[str, str], timeout: int = 30,
     opener: Callable[..., object] = _no_redirect_urlopen,
@@ -2551,7 +2560,8 @@ def canonical_bar(
     row: SourceBar, *, session_date: str, calendar_hash: str,
     import_id: str, eligible: bool, calendar_id: str | None = None,
 ) -> Bar:
-    _validate_source_bar(row)
+    if not _postgres_numeric_fields_fit(row):
+        raise Hist8Error("provider decimal exceeds PostgreSQL numeric capacity")
     bar = Bar(
         "", "", CORPUS_ID, row.instrument, "1m", row.start,
         row.start + timedelta(minutes=1), session_date,
@@ -2577,8 +2587,8 @@ def derive_session(
     if not minutes or any(row.timeframe != "1m" or not row.research_eligible
                           for row in minutes):
         return ()
-    for row in minutes:
-        _validate_bar_identity(row)
+    if any(not _postgres_numeric_fields_fit(row) for row in minutes):
+        raise Hist8ConflictError("bar decimal exceeds PostgreSQL numeric capacity")
     if minutes[0].bar_start_utc != session_open:
         raise Hist8Error("derivation must anchor at session open")
     output: list[Bar] = []

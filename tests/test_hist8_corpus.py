@@ -277,7 +277,7 @@ def test_provider_decimals_are_bounded_to_postgresql_numeric() -> None:
     assert rejected == [3]
     assert corpus.canonical_bytes(Decimal("0e-1000000")) == b'"0"'
     oversized = Decimal("1e1000000")
-    with pytest.raises(corpus.Hist8Error, match="invalid OHLC"):
+    with pytest.raises(corpus.Hist8Error, match="numeric capacity"):
         corpus.canonical_bar(
             replace(
                 _source_bar(datetime(2025, 1, 2, 14, 30, tzinfo=UTC)),
