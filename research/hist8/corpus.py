@@ -33,6 +33,16 @@ IMPORT_DATABASE_ENV = "ATOM_HIST8_IMPORT_DATABASE_URL"
 INSTALLER_ROLE = "postgres"
 EQUITIES = ("COIN", "QQQ", "SPY", "NVDA", "XLE", "GLD")
 INSTRUMENTS = (*EQUITIES, "BTC-USD", "NASDAQ")
+SOURCE_INSTRUMENTS = (
+    ("ALPACA", EQUITIES),
+    ("COINBASE", ("BTC-USD",)),
+    ("MASSIVE", ("NASDAQ",)),
+)
+INSTRUMENT_SOURCE = {
+    instrument: source
+    for source, instruments in SOURCE_INSTRUMENTS
+    for instrument in instruments
+}
 TIMEFRAMES = ("1m", "5m", "15m", "30m", "1H")
 TIMEFRAME_MINUTES = {"5m": 5, "15m": 15, "30m": 30, "1H": 60}
 PARTITIONS = {
@@ -110,7 +120,10 @@ class RawPage:
             return json.loads(
                 self.decoded_body().decode("utf-8"), parse_float=Decimal,
             )
-        except (UnicodeDecodeError, json.JSONDecodeError, InvalidOperation) as exc:
+        except (
+            UnicodeDecodeError, json.JSONDecodeError, InvalidOperation,
+            OSError, zlib.error,
+        ) as exc:
             raise Hist8Error("provider response is not valid decimal JSON") from exc
 
 
@@ -761,23 +774,35 @@ class Hist8Store:
             for _, page in batch:
                 yield page
 
-    def sealed_snapshot_digest(self, import_id: str) -> str:
+    def sealed_snapshot_state(self, import_id: str) -> dict[str, object]:
         with self._connection_factory() as connection:
             self._verify(connection)
             with connection.cursor() as cursor:
                 cursor.execute(
-                    """select metadata_json->>'membership_sha256'
+                    """select manifest_id,metadata_json
                        from atom_research_history.manifests
                        where corpus_id=%s and import_id=%s
                          and manifest_kind='SNAPSHOT'""",
                     (CORPUS_ID, import_id),
                 )
                 rows = cursor.fetchall()
-        if (len(rows) != 1 or not isinstance(rows[0][0], str)
-                or len(rows[0][0]) != 64
-                or any(character not in "0123456789abcdef" for character in rows[0][0])):
+        if len(rows) != 1 or not isinstance(rows[0][1], Mapping):
             raise Hist8Error("sealed source snapshot missing or invalid")
-        return rows[0][0]
+        manifest_id, metadata = rows[0]
+        membership = metadata.get("membership_sha256")
+        if (not isinstance(manifest_id, str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_id)
+                or not isinstance(membership, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", membership)):
+            raise Hist8Error("sealed source snapshot missing or invalid")
+        return {
+            "manifest_id": manifest_id,
+            "metadata": dict(metadata),
+            "membership_sha256": membership,
+        }
+
+    def sealed_snapshot_digest(self, import_id: str) -> str:
+        return str(self.sealed_snapshot_state(import_id)["membership_sha256"])
 
     def _record_bar_conflict(
         self, row: Bar, existing_bar_id: str, existing_content_hash: str,
@@ -1374,18 +1399,115 @@ def materialize_instrument(
     return result
 
 
-def acquire(store: Hist8Store, import_id: str) -> int:
+def _validated_source_statuses(value: object) -> dict[str, dict[str, object]]:
+    if not isinstance(value, Mapping) or set(value) != set(INSTRUMENTS):
+        raise Hist8Error("instrument source statuses missing or invalid")
+    validated: dict[str, dict[str, object]] = {}
+    for instrument in INSTRUMENTS:
+        status = value[instrument]
+        if not isinstance(status, Mapping):
+            raise Hist8Error("instrument source status is invalid")
+        availability = status.get("availability")
+        expected_keys = {"source", "availability", "retrieval_associations"}
+        if availability == "UNAVAILABLE":
+            expected_keys.update(("failure_type", "reason"))
+        count = status.get("retrieval_associations")
+        if (set(status) != expected_keys
+                or status.get("source") != INSTRUMENT_SOURCE[instrument]
+                or availability not in ("AVAILABLE", "UNAVAILABLE")
+                or type(count) is not int or count < 0):
+            raise Hist8Error("instrument source status is invalid")
+        if availability == "UNAVAILABLE" and (
+            not isinstance(status.get("failure_type"), str)
+            or not status["failure_type"]
+            or not isinstance(status.get("reason"), str)
+            or not status["reason"]
+        ):
+            raise Hist8Error("instrument source status is invalid")
+        validated[instrument] = dict(status)
+    return validated
+
+
+def _provider_failure(exc: BaseException) -> dict[str, str]:
+    reason = str(exc) if isinstance(exc, Hist8Error) else "provider transport unavailable"
+    reason = " ".join(reason.split())[:256] or "provider unavailable"
+    return {"failure_type": type(exc).__name__, "reason": reason}
+
+
+def acquire(store: Hist8Store, import_id: str) -> dict[str, object]:
     sequence = 1
-    sources = (
-        alpaca_pages(os.environ.get("ALPACA_API_KEY", ""),
-                     os.environ.get("ALPACA_API_SECRET", "")),
-        coinbase_pages(),
-        massive_pages(os.environ.get("MASSIVE_API_KEY", "")),
+    statuses: dict[str, dict[str, object]] = {}
+    sources: tuple[
+        tuple[str, tuple[str, ...], Callable[[], Iterator[RawPage]]], ...
+    ] = (
+        ("ALPACA", EQUITIES, lambda: alpaca_pages(
+            os.environ.get("ALPACA_API_KEY", ""),
+            os.environ.get("ALPACA_API_SECRET", ""),
+        )),
+        ("COINBASE", ("BTC-USD",), coinbase_pages),
+        ("MASSIVE", ("NASDAQ",), lambda: massive_pages(
+            os.environ.get("MASSIVE_API_KEY", ""),
+        )),
     )
-    for pages in sources:
-        for page in pages:
-            sequence = store.store_page(import_id, sequence, page)
-    return sequence - 1
+    for source, instruments, page_factory in sources:
+        association_counts = {instrument: 0 for instrument in instruments}
+        failure: BaseException | None = None
+        try:
+            pages = iter(page_factory())
+        except (Hist8Error, OSError) as exc:
+            failure = exc
+        else:
+            while True:
+                try:
+                    page = next(pages)
+                except StopIteration:
+                    break
+                except (Hist8Error, OSError) as exc:
+                    failure = exc
+                    break
+                if (page.source != source
+                        or tuple(page.instruments) != instruments):
+                    failure = Hist8Error("provider source identity mismatch")
+                    break
+                # Storage/integrity errors are deliberately outside the provider
+                # exception handlers and remain fatal to the whole attempt.
+                sequence = store.store_page(import_id, sequence, page)
+                for instrument in page.instruments:
+                    association_counts[instrument] += 1
+        for instrument in instruments:
+            status: dict[str, object] = {
+                "source": source,
+                "availability": "AVAILABLE" if failure is None else "UNAVAILABLE",
+                "retrieval_associations": association_counts[instrument],
+            }
+            if failure is not None:
+                status.update(_provider_failure(failure))
+            statuses[instrument] = status
+    return {
+        "retrieval_associations": sequence - 1,
+        "source_statuses": _validated_source_statuses(statuses),
+    }
+
+
+def _unavailable_instrument_result(
+    calendar: Mapping[str, object], instrument: str,
+) -> dict[str, int]:
+    definitions = _session_definitions(calendar, instrument)
+    expected_minutes = sum(row[2] for row in definitions.values())
+    result = {
+        "inserted": 0, "idempotent": 0, "provider_duplicates": 0,
+        "rejected": 0, "expected_minutes": expected_minutes,
+        "observed_minutes": 0, "missing_minutes": expected_minutes,
+        "eligible_sessions": 0, "incomplete_sessions": len(definitions),
+    }
+    for timeframe, width in TIMEFRAME_MINUTES.items():
+        result[f"excluded_{timeframe}_windows"] = sum(
+            row[2] // width for row in definitions.values()
+        )
+        result[f"residual_{timeframe}_tail_minutes"] = sum(
+            row[2] % width for row in definitions.values()
+        )
+    return result
 
 
 def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> dict[str, object]:
@@ -1395,8 +1517,20 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
     calendar = load_calendar()
     store = Hist8Store.from_environment()
     kind = "IMPORT_ATTEMPT" if acquire_sources else "REPLAY_ATTEMPT"
+    source_snapshot = (
+        None if acquire_sources else store.sealed_snapshot_state(chosen)
+    )
     source_membership = (
-        None if acquire_sources else store.sealed_snapshot_digest(chosen)
+        None if source_snapshot is None
+        else str(source_snapshot["membership_sha256"])
+    )
+    source_snapshot_manifest_id = (
+        None if source_snapshot is None else str(source_snapshot["manifest_id"])
+    )
+    source_statuses = (
+        None if source_snapshot is None else _validated_source_statuses(
+            source_snapshot["metadata"].get("source_statuses")
+        )
     )
     attempt_id = chosen if acquire_sources else f"hist8-replay-{uuid.uuid4()}"
     store.add_attempt(attempt_id, kind, {
@@ -1406,15 +1540,33 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
         "schema": "atom_research_history", "calendar_sha256": calendar["schedule_sha256"],
         "partitions": PARTITIONS,
         "expected_membership_sha256": source_membership,
+        "source_snapshot_manifest_id": source_snapshot_manifest_id,
     })
-    retrieval_associations = acquire(store, chosen) if acquire_sources else 0
-    results = {instrument: materialize_instrument(
-        store, chosen, instrument, calendar, attempt_id=attempt_id,
-    )
-               for instrument in INSTRUMENTS}
+    if acquire_sources:
+        acquisition = acquire(store, chosen)
+        retrieval_associations = int(acquisition["retrieval_associations"])
+        source_statuses = _validated_source_statuses(
+            acquisition["source_statuses"]
+        )
+    else:
+        retrieval_associations = 0
+    assert source_statuses is not None
+    results: dict[str, dict[str, object]] = {}
+    for instrument in INSTRUMENTS:
+        source_status = source_statuses[instrument]
+        metrics = (
+            materialize_instrument(
+                store, chosen, instrument, calendar, attempt_id=attempt_id,
+            )
+            if source_status["availability"] == "AVAILABLE"
+            else _unavailable_instrument_result(calendar, instrument)
+        )
+        results[instrument] = {**source_status, **metrics}
     membership = store.seal_snapshot(attempt_id, {
         "attempt_kind": kind, "retrieval_associations": retrieval_associations,
         "source_import_id": chosen,
+        "source_snapshot_manifest_id": source_snapshot_manifest_id,
+        "source_statuses": source_statuses,
         "instrument_results": results,
     })
     if source_membership is not None and membership != source_membership:
@@ -1423,7 +1575,7 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
         )
     return {"source_import_id": chosen, "attempt_id": attempt_id,
             "membership_sha256": membership,
-            "instrument_results": results}
+            "source_statuses": source_statuses, "instrument_results": results}
 
 
 def main(argv: Sequence[str] | None = None) -> int:

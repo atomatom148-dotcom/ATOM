@@ -222,17 +222,19 @@ SECURITY INVOKER
 SET search_path = pg_catalog
 AS $function$
 BEGIN
-  PERFORM pg_catalog.pg_advisory_xact_lock(
-    pg_catalog.hashtextextended(NEW.import_id, 0)
-  );
-  IF NEW.manifest_kind = 'SNAPSHOT_MEMBER' AND EXISTS (
-    SELECT 1
-    FROM atom_research_history.manifests
-    WHERE corpus_id = NEW.corpus_id
-      AND import_id = NEW.import_id
-      AND manifest_kind = 'SNAPSHOT'
-  ) THEN
-    RAISE EXCEPTION 'HIST8 snapshot membership is sealed';
+  IF NEW.manifest_kind IN ('SNAPSHOT_MEMBER', 'RETRIEVAL') THEN
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended(NEW.import_id, 0)
+    );
+    IF EXISTS (
+      SELECT 1
+      FROM atom_research_history.manifests
+      WHERE corpus_id = NEW.corpus_id
+        AND import_id = NEW.import_id
+        AND manifest_kind = 'SNAPSHOT'
+    ) THEN
+      RAISE EXCEPTION 'HIST8 import evidence is sealed';
+    END IF;
   END IF;
   RETURN NEW;
 END
@@ -393,9 +395,8 @@ BEGIN
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind IN ('r','p','v','m','f')
-      -- Supabase's platform-managed extension statistics are not application data.
       AND n.nspname NOT IN (
-        'pg_catalog','information_schema','extensions','atom_research_history'
+        'pg_catalog','information_schema','atom_research_history'
       )
       AND (has_table_privilege('atom_hist8_importer', c.oid, 'SELECT')
         OR has_table_privilege('atom_hist8_importer', c.oid, 'INSERT')
@@ -414,7 +415,7 @@ BEGIN
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind IN ('r','p','v','m','f')
       AND n.nspname NOT IN (
-        'pg_catalog','information_schema','extensions','atom_research_history'
+        'pg_catalog','information_schema','atom_research_history'
       )
       AND has_any_column_privilege(
         'atom_hist8_importer', c.oid, 'SELECT,INSERT,UPDATE,REFERENCES'
@@ -428,10 +429,11 @@ BEGIN
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind = 'S'
-      AND n.nspname NOT LIKE 'pg_%'
       AND n.nspname NOT IN (
-        'information_schema','extensions','atom_research_history'
+        'pg_catalog','information_schema','atom_research_history'
       )
+      AND n.nspname NOT LIKE 'pg_toast%'
+      AND n.nspname NOT LIKE 'pg_temp_%'
       AND has_schema_privilege('atom_hist8_importer', n.oid, 'USAGE')
       AND (has_sequence_privilege('atom_hist8_importer', c.oid, 'USAGE')
         OR has_sequence_privilege('atom_hist8_importer', c.oid, 'SELECT')
@@ -444,10 +446,11 @@ BEGIN
     SELECT 1
     FROM pg_proc p
     JOIN pg_namespace n ON n.oid = p.pronamespace
-    WHERE n.nspname NOT LIKE 'pg_%'
-      AND n.nspname NOT IN (
-        'information_schema','extensions','atom_research_history'
+    WHERE n.nspname NOT IN (
+        'pg_catalog','information_schema','atom_research_history'
       )
+      AND n.nspname NOT LIKE 'pg_toast%'
+      AND n.nspname NOT LIKE 'pg_temp_%'
       AND has_schema_privilege('atom_hist8_importer', n.oid, 'USAGE')
       -- Trigger/event-trigger routines cannot be invoked directly. Their ACLs
       -- convey no capability because the importer has no DML/DDL on their hosts.
@@ -462,13 +465,27 @@ BEGIN
   IF EXISTS (
     SELECT 1
     FROM pg_namespace n
-    WHERE n.nspname NOT LIKE 'pg_%'
-      AND n.nspname NOT IN (
-        'information_schema','extensions','public','atom_research_history'
+    WHERE n.nspname NOT IN (
+        'pg_catalog','information_schema','public','atom_research_history'
       )
+      AND n.nspname NOT LIKE 'pg_toast%'
+      AND n.nspname NOT LIKE 'pg_temp_%'
       AND has_schema_privilege('atom_hist8_importer', n.oid, 'USAGE')
   ) THEN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_SCHEMA_USAGE_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_largeobject_metadata object
+    WHERE has_largeobject_privilege(
+            'atom_hist8_importer', object.oid, 'SELECT'
+          )
+       OR has_largeobject_privilege(
+            'atom_hist8_importer', object.oid, 'UPDATE'
+          )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_EFFECTIVE_LARGE_OBJECT_BOUNDARY_UNSATISFIED';
   END IF;
 
   IF EXISTS (
