@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 import gzip
 import hashlib
 import json
@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 import uuid
 import zlib
 
@@ -55,6 +55,18 @@ class Hist8Error(RuntimeError):
 
 class Hist8ConflictError(Hist8Error):
     pass
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, _request, _file, _code, _message, _headers, _new_url):
+        return None
+
+
+_NO_REDIRECT_OPENER = build_opener(_RejectRedirects())
+
+
+def _no_redirect_urlopen(request: Request, *, timeout: int):
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +193,20 @@ def sha256(value: object) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _exact_decimal_sum(values: Sequence[Decimal]) -> Decimal:
+    if not values:
+        return Decimal(0)
+    minimum_exponent = min(value.as_tuple().exponent for value in values)
+    maximum_adjusted = max(value.adjusted() for value in values)
+    precision = max(
+        28,
+        maximum_adjusted - minimum_exponent + 1 + len(str(len(values))),
+    )
+    with localcontext() as context:
+        context.prec = precision
+        return sum(values, Decimal(0))
+
+
 def load_calendar(path: Path | None = None) -> dict[str, object]:
     target = path or Path(__file__).with_name("calendar_manifest.json")
     data = json.loads(target.read_text(encoding="utf-8"))
@@ -251,12 +277,15 @@ def _integer(value: object, *, name: str) -> int:
 
 def _http_get(
     url: str, *, headers: Mapping[str, str], timeout: int = 30,
-    opener: Callable[..., object] = urlopen,
+    opener: Callable[..., object] = _no_redirect_urlopen,
 ) -> tuple[int, Mapping[str, str], bytes]:
     request = Request(url, headers=dict(headers), method="GET")
     try:
         response = opener(request, timeout=timeout)
         with response:
+            final_url = response.geturl() if hasattr(response, "geturl") else url
+            if final_url != url:
+                raise Hist8Error("provider redirect is forbidden")
             return int(response.status), dict(response.headers.items()), response.read()
     except HTTPError as exc:
         with exc:
@@ -279,7 +308,7 @@ def _build_page(
 
 
 def alpaca_pages(
-    key: str, secret: str, *, opener: Callable[..., object] = urlopen,
+    key: str, secret: str, *, opener: Callable[..., object] = _no_redirect_urlopen,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> Iterator[RawPage]:
     if not key or not secret:
@@ -319,7 +348,7 @@ def alpaca_pages(
 
 
 def coinbase_pages(
-    *, opener: Callable[..., object] = urlopen,
+    *, opener: Callable[..., object] = _no_redirect_urlopen,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> Iterator[RawPage]:
     cursor = START
@@ -358,7 +387,7 @@ def _strip_secret_query(url: str) -> tuple[str, dict[str, str]]:
 
 
 def massive_pages(
-    key: str, *, opener: Callable[..., object] = urlopen,
+    key: str, *, opener: Callable[..., object] = _no_redirect_urlopen,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> Iterator[RawPage]:
     if not key:
@@ -467,6 +496,7 @@ class Hist8Store:
 
     def store_page(self, import_id: str, sequence: int, page: RawPage) -> int:
         artifact_id = _artifact_id(page.body)
+        manifest_ids: list[str] = []
         with self._connection_factory() as connection:
             self._verify(connection)
             with connection.cursor() as cursor:
@@ -499,6 +529,8 @@ class Hist8Store:
                         "content_encoding": page.content_encoding,
                         "artifact_id": artifact_id, "byte_length": len(page.body),
                     }
+                    manifest_id = _manifest_id(payload)
+                    manifest_ids.append(manifest_id)
                     cursor.execute(
                         """insert into atom_research_history.manifests
                         (manifest_id, corpus_id, manifest_kind, import_id, sequence_no,
@@ -507,12 +539,41 @@ class Hist8Store:
                          artifact_id, artifact_byte_length, metadata_json)
                         values (%s,%s,'RETRIEVAL',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
                         on conflict (manifest_id) do nothing""",
-                        (_manifest_id(payload), CORPUS_ID, import_id, number,
+                        (manifest_id, CORPUS_ID, import_id, number,
                          page.source, page.feed, page.product, instrument,
                          page.endpoint, json.dumps(dict(page.request_params)),
-                         page.retrieved_at, page.http_status, page.content_type,
-                         page.content_encoding, artifact_id, len(page.body)),
+                        page.retrieved_at, page.http_status, page.content_type,
+                        page.content_encoding, artifact_id, len(page.body)),
                     )
+            # End the atomic byte/provenance transaction before attesting it.
+            connection.commit()
+            self._verify(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "select body,byte_length from atom_research_history.raw_responses "
+                    "where artifact_id=%s", (artifact_id,),
+                )
+                committed = cursor.fetchone()
+                if committed is None:
+                    raise Hist8ConflictError("raw artifact missing after commit")
+                committed_body, committed_length = committed
+                durable = bytes(committed_body)
+                if (durable != page.body or committed_length != len(page.body)
+                        or _artifact_id(durable) != artifact_id):
+                    raise Hist8ConflictError("raw artifact post-commit mismatch")
+                cursor.execute(
+                    """select manifest_id,artifact_id,artifact_byte_length
+                       from atom_research_history.manifests
+                       where manifest_id = any(%s)""", (manifest_ids,),
+                )
+                durable_manifests = {
+                    row[0]: (row[1], row[2]) for row in cursor.fetchall()
+                }
+                if durable_manifests != {
+                    manifest_id: (artifact_id, len(page.body))
+                    for manifest_id in manifest_ids
+                }:
+                    raise Hist8ConflictError("retrieval provenance post-commit mismatch")
         return sequence + len(page.instruments)
 
     def retrieval_pages(self, import_id: str, instrument: str) -> Iterator[RawPage]:
@@ -537,6 +598,24 @@ class Hist8Store:
                     )
         finally:
             connection.close()
+
+    def sealed_snapshot_digest(self, import_id: str) -> str:
+        with self._connection_factory() as connection:
+            self._verify(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """select metadata_json->>'membership_sha256'
+                       from atom_research_history.manifests
+                       where corpus_id=%s and import_id=%s
+                         and manifest_kind='SNAPSHOT'""",
+                    (CORPUS_ID, import_id),
+                )
+                rows = cursor.fetchall()
+        if (len(rows) != 1 or not isinstance(rows[0][0], str)
+                or len(rows[0][0]) != 64
+                or any(character not in "0123456789abcdef" for character in rows[0][0])):
+            raise Hist8Error("sealed source snapshot missing or invalid")
+        return rows[0][0]
 
     def insert_bars(self, rows: Sequence[Bar]) -> tuple[int, int]:
         if not rows:
@@ -811,9 +890,13 @@ def _session_for(row: SourceBar, definitions: Mapping[str, tuple[datetime, datet
 
 def _content_payload(row: Bar) -> dict[str, object]:
     payload = asdict(row)
-    # Eligibility is snapshot state, not canonical bar identity. This permits a
-    # later append-only backfill to mark an existing minute eligible.
-    for key in ("bar_id", "content_hash", "import_id", "research_eligible"):
+    # Eligibility is snapshot state, while retrieval artifact/locator identify
+    # the first immutable provenance row rather than provider semantics. Omitting
+    # both lets a page reshuffle backfill reuse that original row and lineage.
+    for key in (
+        "bar_id", "content_hash", "import_id", "research_eligible",
+        "source_artifact_id", "source_record_locator",
+    ):
         payload.pop(key)
     payload["lineage"] = list(row.lineage)
     return payload
@@ -858,9 +941,9 @@ def derive_session(
         ):
             continue
         first, last = window[0], window[-1]
-        volume = None if first.instrument == "NASDAQ" else sum(
-            (item.volume for item in window if item.volume is not None), Decimal(0)
-        )
+        volume = None if first.instrument == "NASDAQ" else _exact_decimal_sum(tuple(
+            item.volume for item in window if item.volume is not None
+        ))
         trade_count = None if any(item.trade_count is None for item in window) else sum(
             item.trade_count or 0 for item in window
         )
@@ -997,6 +1080,9 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
     calendar = load_calendar()
     store = Hist8Store.from_environment()
     kind = "IMPORT_ATTEMPT" if acquire_sources else "REPLAY_ATTEMPT"
+    source_membership = (
+        None if acquire_sources else store.sealed_snapshot_digest(chosen)
+    )
     attempt_id = chosen if acquire_sources else f"hist8-replay-{uuid.uuid4()}"
     store.add_attempt(attempt_id, kind, {
         "authorization": "ATOM-HIST8-CORPUS-AMENDMENT-1",
@@ -1004,6 +1090,7 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
         "project_ref": PROJECT_REF, "database": DATABASE_NAME,
         "schema": "atom_research_history", "calendar_sha256": calendar["schedule_sha256"],
         "partitions": PARTITIONS,
+        "expected_membership_sha256": source_membership,
     })
     retrieval_associations = acquire(store, chosen) if acquire_sources else 0
     results = {instrument: materialize_instrument(
@@ -1015,6 +1102,10 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
         "source_import_id": chosen,
         "instrument_results": results,
     })
+    if source_membership is not None and membership != source_membership:
+        raise Hist8ConflictError(
+            "replay membership differs from sealed source snapshot"
+        )
     return {"source_import_id": chosen, "attempt_id": attempt_id,
             "membership_sha256": membership,
             "instrument_results": results}

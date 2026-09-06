@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -128,6 +129,18 @@ def test_massive_identity_pagination_and_fractional_timestamp_fail_closed() -> N
         corpus.parse_source_page(page, "NASDAQ")
 
 
+def test_provider_redirect_is_rejected_before_response_acceptance() -> None:
+    response = _Response({"bars": {symbol: [] for symbol in corpus.EQUITIES}})
+    response.geturl = lambda: "https://attacker.example/redirected"
+    with pytest.raises(corpus.Hist8Error, match="redirect is forbidden"):
+        corpus._http_get(
+            corpus.ALPACA_URL, headers={"APCA-API-KEY-ID": "secret"},
+            opener=lambda *_args, **_kwargs: response,
+        )
+    assert any(isinstance(handler, corpus._RejectRedirects)
+               for handler in corpus._NO_REDIRECT_OPENER.handlers)
+
+
 def test_complete_session_is_eligible_and_derives_deterministically() -> None:
     start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
     minute_bars = tuple(corpus.canonical_bar(
@@ -160,14 +173,31 @@ def test_eligibility_is_snapshot_state_not_canonical_bar_identity() -> None:
         source, session_date="2025-01-02", calendar_hash="b" * 64,
         import_id="attempt-1", eligible=False,
     )
+    reshuffled = replace(
+        source, artifact_id="sha256:" + "c" * 64, locator="$[17]",
+    )
     complete = corpus.canonical_bar(
-        source, session_date="2025-01-02", calendar_hash="b" * 64,
+        reshuffled, session_date="2025-01-02", calendar_hash="b" * 64,
         import_id="attempt-2", eligible=True,
     )
     assert incomplete.bar_id == complete.bar_id
     assert incomplete.content_hash == complete.content_hash
     assert incomplete.research_eligible is False
     assert complete.research_eligible is True
+
+
+def test_derived_volume_sum_preserves_every_decimal_digit() -> None:
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
+    volumes = [Decimal("10000000000000000000000000000")] + [Decimal(1)] * 4
+    minutes = tuple(corpus.canonical_bar(
+        replace(_source_bar(start + timedelta(minutes=index)), volume=volume),
+        session_date="2025-01-02", calendar_hash="b" * 64,
+        import_id="attempt", eligible=True,
+    ) for index, volume in enumerate(volumes))
+    derived = corpus.derive_session(
+        minutes, "5m", "attempt", session_open=start,
+    )[0]
+    assert derived.volume == Decimal("10000000000000000000000000004")
 
 
 def test_incomplete_session_is_stored_but_not_derived() -> None:
@@ -258,10 +288,41 @@ def test_database_url_must_bind_exact_project_database_and_role(monkeypatch) -> 
     assert isinstance(corpus.Hist8Store.from_environment(), corpus.Hist8Store)
 
 
+def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
+    class Store:
+        attempts = []
+
+        def sealed_snapshot_digest(self, import_id):
+            assert import_id == "source-attempt"
+            return "a" * 64
+
+        def add_attempt(self, import_id, kind, metadata):
+            self.attempts.append((import_id, kind, metadata))
+
+        def seal_snapshot(self, import_id, metadata):
+            return "b" * 64
+
+    store = Store()
+    monkeypatch.setattr(
+        corpus.Hist8Store, "from_environment", classmethod(lambda _cls: store),
+    )
+    monkeypatch.setattr(corpus, "load_calendar", lambda: {
+        "schedule_sha256": "c" * 64,
+    })
+    monkeypatch.setattr(
+        corpus, "materialize_instrument",
+        lambda *_args, **_kwargs: {"inserted": 0},
+    )
+    with pytest.raises(corpus.Hist8ConflictError, match="differs from sealed"):
+        corpus.execute("source-attempt", acquire_sources=False)
+    assert store.attempts[0][1] == "REPLAY_ATTEMPT"
+    assert store.attempts[0][2]["expected_membership_sha256"] == "a" * 64
+
+
 def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
     sql = Path("research/hist8/schema.sql").read_text(encoding="utf-8")
     assert sql.count("CREATE TABLE atom_research_history.") == 3
-    assert "CREATE SCHEMA IF NOT EXISTS atom_research_history" in sql
+    assert "CREATE SCHEMA atom_research_history AUTHORIZATION postgres" in sql
     assert "GRANT SELECT, INSERT ON atom_research_history.raw_responses" in sql
     assert "GRANT UPDATE" not in sql
     assert "GRANT DELETE" not in sql
@@ -274,6 +335,11 @@ def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
     assert "acl.grantee NOT IN" in sql
     assert "'SNAPSHOT_MEMBER'" in sql
     assert "member_research_eligible boolean" in sql
+    assert "HIST8_RESEARCH_SCHEMA_ALREADY_EXISTS" in sql
+    assert "HIST8_EFFECTIVE_SEQUENCE_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_EFFECTIVE_ROUTINE_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_EFFECTIVE_SCHEMA_USAGE_BOUNDARY_UNSATISFIED" in sql
+    assert "hist8_bars_session_lookup_idx" in sql
 
 
 def test_schema_enforces_importer_boundary_in_postgres() -> None:
@@ -295,6 +361,7 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                         f"create role {role} nologin nosuperuser nocreatedb "
                         "nocreaterole noreplication nobypassrls"
                     )
+                cursor.execute("create role hist8_forbidden nologin")
                 cursor.execute("create table public.coin_v8_market_bars (id bigint)")
                 cursor.execute("create table public.coin_v8_ai_decision_logs (id bigint)")
 
@@ -311,13 +378,22 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 assert cursor.fetchone()[0] is True
                 cursor.execute("drop role atom_hist8_importer")
 
-                cursor.execute("create role hist8_forbidden nologin")
                 cursor.execute(
                     "create schema atom_research_history authorization postgres"
                 )
+                with pytest.raises(psycopg.Error, match="SCHEMA_ALREADY_EXISTS"):
+                    cursor.execute(sql)
+                connection.rollback()
                 cursor.execute(
-                    "alter default privileges for role postgres in schema "
-                    "atom_research_history grant select on tables to hist8_forbidden"
+                    "select count(*) from pg_roles "
+                    "where rolname='atom_hist8_importer'"
+                )
+                assert cursor.fetchone()[0] == 0
+                cursor.execute("drop schema atom_research_history")
+
+                cursor.execute(
+                    "alter default privileges for role postgres "
+                    "grant select on tables to hist8_forbidden"
                 )
                 with pytest.raises(
                     psycopg.Error, match="FOREIGN_ROLE_ACCESS_BOUNDARY_UNSATISFIED"
@@ -335,10 +411,41 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 )
                 assert cursor.fetchone()[0] == 0
                 cursor.execute(
-                    "alter default privileges for role postgres in schema "
-                    "atom_research_history revoke select on tables from hist8_forbidden"
+                    "alter default privileges for role postgres "
+                    "revoke select on tables from hist8_forbidden"
                 )
-                cursor.execute("drop schema atom_research_history")
+
+                cursor.execute(
+                    "create function public.hist8_callable() returns integer "
+                    "language sql immutable as 'select 1'"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="ROUTINE_BOUNDARY_UNSATISFIED"
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute("drop function public.hist8_callable()")
+
+                cursor.execute("create sequence public.hist8_forbidden_sequence")
+                cursor.execute(
+                    "grant usage,select,update on sequence "
+                    "public.hist8_forbidden_sequence to public"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="SEQUENCE_BOUNDARY_UNSATISFIED"
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute("drop sequence public.hist8_forbidden_sequence")
+
+                cursor.execute("create schema hist8_visible")
+                cursor.execute("grant usage on schema hist8_visible to public")
+                with pytest.raises(
+                    psycopg.Error, match="SCHEMA_USAGE_BOUNDARY_UNSATISFIED"
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute("drop schema hist8_visible")
 
                 cursor.execute(sql)
                 cursor.execute(
@@ -349,18 +456,22 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 assert cursor.fetchone() == (
                     True, False, False, False, False, False, False,
                 )
+
+                def importer_connection():
+                    importer = psycopg.connect(dsn, autocommit=False)
+                    importer.execute("set role atom_hist8_importer")
+                    return importer
+
+                store = corpus.Hist8Store(importer_connection)
+                page = _raw_page({"retained": "first"})
+                artifact_id = "sha256:" + corpus.sha256(page.body)
+                assert store.store_page("raw-attempt-1", 1, page) == 2
                 cursor.execute("set role atom_hist8_importer")
-                artifact_id = "sha256:" + "e" * 64
-                cursor.execute(
-                    """insert into atom_research_history.raw_responses
-                       (artifact_id, body, byte_length) values (%s,%s,%s)""",
-                    (artifact_id, b"{}", 2),
-                )
                 cursor.execute(
                     "select body from atom_research_history.raw_responses "
                     "where artifact_id=%s", (artifact_id,),
                 )
-                assert bytes(cursor.fetchone()[0]) == b"{}"
+                assert bytes(cursor.fetchone()[0]) == page.body
                 with pytest.raises(psycopg.Error):
                     cursor.execute(
                         "update atom_research_history.raw_responses "
@@ -373,12 +484,11 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 )
                 assert cursor.fetchone()[0] == 3
 
-                def importer_connection():
-                    importer = psycopg.connect(dsn, autocommit=False)
-                    importer.execute("set role atom_hist8_importer")
-                    return importer
-
-                store = corpus.Hist8Store(importer_connection)
+                reshuffled_page = _raw_page({"retained": "reshuffled"})
+                reshuffled_artifact = "sha256:" + corpus.sha256(
+                    reshuffled_page.body
+                )
+                assert store.store_page("raw-attempt-2", 1, reshuffled_page) == 2
                 start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
                 source = _source_bar(start, artifact=artifact_id)
                 incomplete = corpus.canonical_bar(
@@ -386,7 +496,10 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                     import_id="attempt-incomplete", eligible=False,
                 )
                 complete = corpus.canonical_bar(
-                    source, session_date="2025-01-02", calendar_hash="b" * 64,
+                    replace(
+                        source, artifact_id=reshuffled_artifact, locator="$[17]",
+                    ),
+                    session_date="2025-01-02", calendar_hash="b" * 64,
                     import_id="attempt-complete", eligible=True,
                 )
                 assert store.insert_bars((incomplete,)) == (1, 0)
@@ -394,6 +507,17 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 incomplete_digest = store.seal_snapshot("attempt-incomplete", {})
                 complete_digest = store.seal_snapshot("attempt-complete", {})
                 assert incomplete_digest != complete_digest
+                assert store.sealed_snapshot_digest(
+                    "attempt-incomplete"
+                ) == incomplete_digest
+                with pytest.raises(corpus.Hist8Error, match="snapshot missing"):
+                    store.sealed_snapshot_digest("not-an-attempt")
+                cursor.execute(
+                    """select source_artifact_id,source_record_locator
+                       from atom_research_history.bars
+                       where bar_id=%s""", (incomplete.bar_id,),
+                )
+                assert cursor.fetchone() == (artifact_id, "$[0]")
                 cursor.execute(
                     """select import_id,member_research_eligible
                        from atom_research_history.manifests
@@ -410,5 +534,12 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 cursor.execute("drop schema if exists atom_research_history cascade")
                 cursor.execute("drop table if exists public.coin_v8_market_bars")
                 cursor.execute("drop table if exists public.coin_v8_ai_decision_logs")
+                cursor.execute("drop function if exists public.hist8_callable()")
+                cursor.execute("drop sequence if exists public.hist8_forbidden_sequence")
+                cursor.execute("drop schema if exists hist8_visible")
+                cursor.execute(
+                    "alter default privileges for role postgres "
+                    "revoke select on tables from hist8_forbidden"
+                )
                 for role in managed_roles:
                     cursor.execute(f"drop role if exists {role}")

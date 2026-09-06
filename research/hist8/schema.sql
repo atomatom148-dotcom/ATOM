@@ -21,6 +21,10 @@ BEGIN
       'HIST8_PROJECT_MISMATCH: not legacy V8 project pjbjpgnmniwcajqkuhge';
   END IF;
 
+  IF to_regnamespace('atom_research_history') IS NOT NULL THEN
+    RAISE EXCEPTION 'HIST8_RESEARCH_SCHEMA_ALREADY_EXISTS';
+  END IF;
+
   -- Never adopt a coincidentally named principal. This installer is deliberately
   -- one-shot; a repeat deployment must first be proved from the execution receipt.
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'atom_hist8_importer') THEN
@@ -41,7 +45,9 @@ BEGIN
 END
 $hist8$;
 
-CREATE SCHEMA IF NOT EXISTS atom_research_history AUTHORIZATION postgres;
+CREATE SCHEMA atom_research_history AUTHORIZATION postgres;
+ALTER ROLE atom_hist8_importer
+  SET search_path = atom_research_history, pg_catalog;
 REVOKE ALL ON SCHEMA atom_research_history FROM PUBLIC, anon, authenticated, service_role;
 GRANT USAGE ON SCHEMA atom_research_history TO atom_hist8_importer;
 
@@ -181,6 +187,9 @@ ALTER TABLE atom_research_history.manifests
 
 CREATE INDEX hist8_bars_snapshot_scan_idx
   ON atom_research_history.bars (corpus_id, instrument, timeframe, bar_start_utc);
+CREATE INDEX hist8_bars_session_lookup_idx
+  ON atom_research_history.bars
+  (corpus_id, instrument, session_date, timeframe, bar_start_utc);
 CREATE INDEX hist8_manifests_import_idx
   ON atom_research_history.manifests (corpus_id, import_id, manifest_kind, sequence_no);
 
@@ -349,6 +358,54 @@ BEGIN
         OR has_table_privilege('atom_hist8_importer', c.oid, 'TRUNCATE'))
   ) THEN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_PRIVILEGE_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'S'
+      AND n.nspname NOT LIKE 'pg_%'
+      AND n.nspname NOT IN (
+        'information_schema','extensions','atom_research_history'
+      )
+      AND has_schema_privilege('atom_hist8_importer', n.oid, 'USAGE')
+      AND (has_sequence_privilege('atom_hist8_importer', c.oid, 'USAGE')
+        OR has_sequence_privilege('atom_hist8_importer', c.oid, 'SELECT')
+        OR has_sequence_privilege('atom_hist8_importer', c.oid, 'UPDATE'))
+  ) THEN
+    RAISE EXCEPTION 'HIST8_EFFECTIVE_SEQUENCE_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname NOT LIKE 'pg_%'
+      AND n.nspname NOT IN (
+        'information_schema','extensions','atom_research_history'
+      )
+      AND has_schema_privilege('atom_hist8_importer', n.oid, 'USAGE')
+      -- Trigger/event-trigger routines cannot be invoked directly. Their ACLs
+      -- convey no capability because the importer has no DML/DDL on their hosts.
+      AND p.prorettype NOT IN (
+        'pg_catalog.trigger'::regtype, 'pg_catalog.event_trigger'::regtype
+      )
+      AND has_function_privilege('atom_hist8_importer', p.oid, 'EXECUTE')
+  ) THEN
+    RAISE EXCEPTION 'HIST8_EFFECTIVE_ROUTINE_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_namespace n
+    WHERE n.nspname NOT LIKE 'pg_%'
+      AND n.nspname NOT IN (
+        'information_schema','extensions','public','atom_research_history'
+      )
+      AND has_schema_privilege('atom_hist8_importer', n.oid, 'USAGE')
+  ) THEN
+    RAISE EXCEPTION 'HIST8_EFFECTIVE_SCHEMA_USAGE_BOUNDARY_UNSATISFIED';
   END IF;
 
   IF EXISTS (
