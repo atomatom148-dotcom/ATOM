@@ -10,6 +10,7 @@ DO $hist8_install$
 DECLARE
   research_schema_exists boolean;
   importer_role_exists boolean;
+  protection_signature text;
 BEGIN
   -- The reviewed installer sets this marker only after establishing a
   -- verify-full TLS session to the frozen direct project endpoint. Refuse
@@ -307,11 +308,40 @@ GRANT SELECT, INSERT ON atom_research_history.raw_responses,
   atom_research_history.manifests, atom_research_history.bars
   TO atom_hist8_importer;
 
+  -- Seal every normalized constraint definition from this reviewed creation.
+  -- The retry verifier recomputes this catalog signature, so a renamed,
+  -- weakened, added, removed, or action-modified protection cannot be adopted.
+  SELECT md5(string_agg(
+           format('%s.%s|%s|%s|%s|%s', schema.nspname,
+                  table_object.relname, constraint_object.conname,
+                  constraint_object.contype,
+                  constraint_object.convalidated,
+                  pg_get_constraintdef(constraint_object.oid, true)),
+           E'\n' ORDER BY table_object.relname, constraint_object.conname
+         ))
+    INTO protection_signature
+  FROM pg_constraint constraint_object
+  JOIN pg_class table_object
+    ON table_object.oid = constraint_object.conrelid
+  JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
+  WHERE schema.nspname = 'atom_research_history'
+    AND table_object.relname IN ('raw_responses','manifests','bars');
+  IF protection_signature IS NULL THEN
+    RAISE EXCEPTION 'HIST8_INSTALLATION_PROTECTION_SIGNATURE_MISSING';
+  END IF;
+  EXECUTE format(
+    'COMMENT ON SCHEMA atom_research_history IS %L',
+    'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1:'
+      || protection_signature
+  );
+
   END IF;
 END
 $hist8_install$;
 
 DO $hist8_verify$
+DECLARE
+  protection_signature text;
 BEGIN
   -- This block is also the retry path after an ambiguous client disconnect.
   -- It is deliberately read-only: an existing pair is accepted only when the
@@ -329,8 +359,8 @@ BEGIN
   ) OR EXISTS (
     SELECT 1
     FROM pg_auth_members membership
-    JOIN pg_roles role ON role.oid = membership.member
-    WHERE role.rolname = 'atom_hist8_importer'
+    WHERE membership.member = 'atom_hist8_importer'::regrole
+       OR membership.roleid = 'atom_hist8_importer'::regrole
   ) OR (SELECT count(*)
         FROM pg_db_role_setting setting
         WHERE setting.setrole = 'atom_hist8_importer'::regrole) <> 1
@@ -345,13 +375,29 @@ BEGIN
     RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_ROLE_MISMATCH';
   END IF;
 
+  SELECT md5(string_agg(
+           format('%s.%s|%s|%s|%s|%s', schema.nspname,
+                  table_object.relname, constraint_object.conname,
+                  constraint_object.contype,
+                  constraint_object.convalidated,
+                  pg_get_constraintdef(constraint_object.oid, true)),
+           E'\n' ORDER BY table_object.relname, constraint_object.conname
+         ))
+    INTO protection_signature
+  FROM pg_constraint constraint_object
+  JOIN pg_class table_object
+    ON table_object.oid = constraint_object.conrelid
+  JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
+  WHERE schema.nspname = 'atom_research_history'
+    AND table_object.relname IN ('raw_responses','manifests','bars');
+
   IF NOT EXISTS (
     SELECT 1
     FROM pg_namespace schema
     WHERE schema.nspname = 'atom_research_history'
       AND schema.nspowner = 'postgres'::regrole
-      AND obj_description(schema.oid, 'pg_namespace') =
-        'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1'
+      AND obj_description(schema.oid, 'pg_namespace') LIKE
+        'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1:%'
   ) THEN
     RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_SCHEMA_MISMATCH';
   END IF;
@@ -531,7 +577,14 @@ BEGIN
     RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_POLICY_MISMATCH';
   END IF;
 
-  IF EXISTS (
+  IF protection_signature IS NULL
+    OR (SELECT obj_description(schema.oid, 'pg_namespace')
+        FROM pg_namespace schema
+        WHERE schema.nspname = 'atom_research_history')
+       IS DISTINCT FROM
+         'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1:'
+           || protection_signature
+    OR EXISTS (
     SELECT 1
     FROM (VALUES
       ('hist8_bars_snapshot_scan_idx','bars'),
@@ -553,23 +606,24 @@ BEGIN
   ) OR EXISTS (
     SELECT 1
     FROM (VALUES
-      ('hist8_raw_length_matches','raw_responses'),
-      ('hist8_retrieval_artifact_required','manifests'),
-      ('hist8_snapshot_member_required','manifests'),
-      ('hist8_snapshot_member_bar_fk','manifests'),
-      ('hist8_bar_interval','bars'),
-      ('hist8_bar_duration','bars'),
-      ('hist8_bar_ohlc','bars'),
-      ('hist8_bar_volume_semantics','bars'),
-      ('hist8_bar_lineage','bars'),
-      ('hist8_bar_identity_pair','bars')
-    ) expected(constraint_name, table_name)
+      ('hist8_raw_length_matches','raw_responses','c'),
+      ('hist8_retrieval_artifact_required','manifests','c'),
+      ('hist8_snapshot_member_required','manifests','c'),
+      ('hist8_snapshot_member_bar_fk','manifests','f'),
+      ('hist8_bar_interval','bars','c'),
+      ('hist8_bar_duration','bars','c'),
+      ('hist8_bar_ohlc','bars','c'),
+      ('hist8_bar_volume_semantics','bars','c'),
+      ('hist8_bar_lineage','bars','c'),
+      ('hist8_bar_identity_pair','bars','u')
+    ) expected(constraint_name, table_name, constraint_type)
     LEFT JOIN pg_constraint constraint_object
       ON constraint_object.conname = expected.constraint_name
      AND constraint_object.conrelid = to_regclass(
        'atom_research_history.' || expected.table_name
      )
     WHERE constraint_object.oid IS NULL
+      OR constraint_object.contype <> expected.constraint_type::"char"
       OR NOT constraint_object.convalidated
   ) THEN
     RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_PROTECTION_MISMATCH';

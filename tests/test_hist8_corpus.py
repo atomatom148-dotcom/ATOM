@@ -1621,6 +1621,58 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 cursor.execute("alter role atom_hist8_importer noinherit")
                 cursor.execute(sql)
                 cursor.execute(
+                    "grant atom_hist8_importer to hist8_forbidden"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="EXISTING_INSTALLATION_ROLE_MISMATCH"
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    """select exists (
+                         select 1 from pg_auth_members
+                         where roleid='atom_hist8_importer'::regrole
+                           and member='hist8_forbidden'::regrole
+                       )"""
+                )
+                assert cursor.fetchone()[0] is True
+                cursor.execute(
+                    "revoke atom_hist8_importer from hist8_forbidden"
+                )
+                cursor.execute(sql)
+                cursor.execute(
+                    "alter table atom_research_history.raw_responses "
+                    "drop constraint hist8_raw_length_matches"
+                )
+                cursor.execute(
+                    "alter table atom_research_history.raw_responses "
+                    "add constraint hist8_raw_length_matches check (true)"
+                )
+                with pytest.raises(
+                    psycopg.Error,
+                    match="EXISTING_INSTALLATION_PROTECTION_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    """select pg_get_constraintdef(oid, true)
+                       from pg_constraint
+                       where conrelid=
+                         'atom_research_history.raw_responses'::regclass
+                         and conname='hist8_raw_length_matches'"""
+                )
+                assert cursor.fetchone()[0] == "CHECK (true)"
+                cursor.execute(
+                    "alter table atom_research_history.raw_responses "
+                    "drop constraint hist8_raw_length_matches"
+                )
+                cursor.execute(
+                    "alter table atom_research_history.raw_responses "
+                    "add constraint hist8_raw_length_matches "
+                    "check (byte_length = octet_length(body))"
+                )
+                cursor.execute(sql)
+                cursor.execute(
                     """select rolcanlogin, rolinherit, rolsuper, rolcreatedb,
                               rolcreaterole, rolreplication, rolbypassrls
                        from pg_roles where rolname='atom_hist8_importer'"""
