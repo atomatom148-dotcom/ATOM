@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 import gzip
 import hashlib
+from http.client import IncompleteRead
 import json
 import os
 from pathlib import Path
@@ -328,14 +329,24 @@ def _http_get(
                 str(name).lower(): str(value)
                 for name, value in response.headers.items()
             }
-            return int(response.status), headers, response.read()
+            try:
+                body = response.read()
+            except IncompleteRead as exc:
+                raise Hist8Error("provider response body incomplete") from exc
+            return int(response.status), headers, body
     except HTTPError as exc:
         with exc:
             headers = {
                 str(name).lower(): str(value)
                 for name, value in exc.headers.items()
             }
-            return int(exc.code), headers, exc.read()
+            try:
+                body = exc.read()
+            except IncompleteRead as incomplete:
+                raise Hist8Error(
+                    "provider response body incomplete"
+                ) from incomplete
+            return int(exc.code), headers, body
 
 
 def _build_page(
@@ -797,22 +808,39 @@ class Hist8Store:
             self._verify(connection)
             with connection.cursor() as cursor:
                 cursor.execute(
-                    """select manifest_id,metadata_json
+                    """select corpus_id,import_id,manifest_kind,sequence_no,
+                              manifest_id,metadata_json
                        from atom_research_history.manifests
                        where corpus_id=%s and import_id=%s
                          and manifest_kind='SNAPSHOT'""",
                     (CORPUS_ID, import_id),
                 )
                 rows = cursor.fetchall()
-        if len(rows) != 1 or not isinstance(rows[0][1], Mapping):
+        if len(rows) != 1 or not isinstance(rows[0][5], Mapping):
             raise Hist8Error("sealed source snapshot missing or invalid")
-        manifest_id, metadata = rows[0]
+        (stored_corpus_id, stored_import_id, manifest_kind, sequence_no,
+         manifest_id, metadata) = rows[0]
         membership = metadata.get("membership_sha256")
-        if (not isinstance(manifest_id, str)
+        if (stored_corpus_id != CORPUS_ID
+                or stored_import_id != import_id
+                or manifest_kind != "SNAPSHOT"
+                or sequence_no != 0
+                or not isinstance(manifest_id, str)
                 or not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_id)
                 or not isinstance(membership, str)
                 or not re.fullmatch(r"[0-9a-f]{64}", membership)):
             raise Hist8Error("sealed source snapshot missing or invalid")
+        expected_manifest_id = _manifest_id({
+            "corpus_id": stored_corpus_id,
+            "import_id": stored_import_id,
+            "kind": manifest_kind,
+            "sequence_no": sequence_no,
+            "metadata": metadata,
+        })
+        if manifest_id != expected_manifest_id:
+            raise Hist8ConflictError(
+                "sealed source snapshot manifest identity mismatch"
+            )
         return {
             "manifest_id": manifest_id,
             "metadata": dict(metadata),

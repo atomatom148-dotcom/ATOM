@@ -489,6 +489,25 @@ BEGIN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_LARGE_OBJECT_BOUNDARY_UNSATISFIED';
   END IF;
 
+  -- Ownership itself grants durable access. Reject any catalog routine the
+  -- importer can execute that creates a new large object, because that object
+  -- would fall outside the three-table HIST8 boundary after this check ends.
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'pg_catalog'
+      AND p.proname IN (
+        'lo_creat', 'lo_create', 'lo_from_bytea', 'lo_import'
+      )
+      AND has_function_privilege(
+        'atom_hist8_importer', p.oid, 'EXECUTE'
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'HIST8_EFFECTIVE_LARGE_OBJECT_CREATE_BOUNDARY_UNSATISFIED';
+  END IF;
+
   IF EXISTS (
     SELECT 1 FROM pg_namespace n
     WHERE n.nspname NOT LIKE 'pg_temp_%'

@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import gzip
+from http.client import IncompleteRead
 import json
 import os
 from pathlib import Path
@@ -208,6 +209,59 @@ def test_provider_response_headers_are_case_insensitive() -> None:
     assert page.content_type == "application/json"
     assert page.content_encoding == "gzip"
     assert page.payload() == payload
+
+
+def test_incomplete_http_read_is_contained_to_one_provider(monkeypatch) -> None:
+    calls = []
+    stored = []
+
+    class TruncatedResponse(_Response):
+        def read(self) -> bytes:
+            raise IncompleteRead(b'{"partial":', 128)
+
+    def alpaca(*_args, **_kwargs):
+        calls.append("ALPACA")
+        corpus._http_get(
+            corpus.ALPACA_URL, headers={},
+            opener=lambda *_args, **_kwargs: TruncatedResponse({}),
+        )
+        yield  # pragma: no cover
+
+    def coinbase(*_args, **_kwargs):
+        calls.append("COINBASE")
+        yield _raw_page(
+            {"complete": "coinbase"}, source="COINBASE",
+            instruments=("BTC-USD",),
+        )
+
+    def massive(*_args, **_kwargs):
+        calls.append("MASSIVE")
+        yield _raw_page(
+            {"complete": "massive"}, source="MASSIVE",
+            instruments=("NASDAQ",),
+        )
+
+    class Store:
+        def store_page(self, import_id, sequence, page):
+            assert import_id == "truncated-attempt"
+            stored.append(page.source)
+            return sequence + len(page.instruments)
+
+    monkeypatch.setattr(corpus, "alpaca_pages", alpaca)
+    monkeypatch.setattr(corpus, "coinbase_pages", coinbase)
+    monkeypatch.setattr(corpus, "massive_pages", massive)
+    result = corpus.acquire(Store(), "truncated-attempt")
+
+    assert calls == ["ALPACA", "COINBASE", "MASSIVE"]
+    assert stored == ["COINBASE", "MASSIVE"]
+    assert result["retrieval_associations"] == 2
+    assert result["source_statuses"]["SPY"] == {
+        "source": "ALPACA", "availability": "UNAVAILABLE",
+        "retrieval_associations": 0, "failure_type": "Hist8Error",
+        "reason": "provider response body incomplete",
+    }
+    assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
+    assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
 
 
 def test_acquisition_continues_after_provider_unavailability(monkeypatch) -> None:
@@ -523,6 +577,58 @@ def test_identical_insert_race_uses_actual_affected_row_count() -> None:
 
     store = corpus.Hist8Store(Connection)
     assert store.insert_bars((row,)) == (0, 1)
+
+
+def test_sealed_snapshot_recomputes_manifest_identity() -> None:
+    import_id = "source-attempt"
+    metadata = {
+        "membership_sha256": "a" * 64,
+        "source_statuses": {},
+    }
+
+    class Cursor:
+        rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, params=None):
+            if ("select current_user" in query
+                    and "current_database()" in query):
+                self.rows = [(corpus.IMPORTER_ROLE, corpus.DATABASE_NAME)]
+            elif "manifest_kind='SNAPSHOT'" in query:
+                assert params == (corpus.CORPUS_ID, import_id)
+                self.rows = [(
+                    corpus.CORPUS_ID, import_id, "SNAPSHOT", 0,
+                    "sha256:" + "b" * 64, metadata,
+                )]
+            else:
+                raise AssertionError(query)
+
+        def fetchone(self):
+            return self.rows[0]
+
+        def fetchall(self):
+            return list(self.rows)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def cursor(self):
+            return Cursor()
+
+    store = corpus.Hist8Store(Connection)
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="manifest identity mismatch"
+    ):
+        store.sealed_snapshot_state(import_id)
 
 
 def test_database_url_must_bind_exact_project_database_and_role(monkeypatch) -> None:
@@ -843,6 +949,7 @@ def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
     assert "HIST8_DATABASE_PRIVILEGE_BOUNDARY_UNSATISFIED" in sql
     assert "HIST8_EFFECTIVE_COLUMN_PRIVILEGE_BOUNDARY_UNSATISFIED" in sql
     assert "HIST8_EFFECTIVE_LARGE_OBJECT_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_EFFECTIVE_LARGE_OBJECT_CREATE_BOUNDARY_UNSATISFIED" in sql
     assert "HIST8_ENDPOINT_IDENTITY_UNVERIFIED" in sql
     assert "'BAR_CONFLICT'" in sql
     assert "'REFERENCES'" in sql and "'TRIGGER'" in sql
@@ -869,6 +976,7 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
     restore_public_temporary = False
     extensions_schema_created = False
     large_object_oid = None
+    large_object_create_routines = []
     with psycopg.connect(dsn, autocommit=True) as connection:
         try:
             with connection.cursor() as cursor:
@@ -967,6 +1075,45 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                         pgsql.SQL("revoke connect on database {} from public").format(
                             pgsql.Identifier(database)
                         )
+                    )
+
+                cursor.execute(
+                    """select format('%I.%I(%s)', n.nspname, p.proname,
+                                      pg_catalog.oidvectortypes(p.proargtypes)),
+                              exists (
+                                select 1
+                                from aclexplode(coalesce(
+                                  p.proacl, acldefault('f', p.proowner)
+                                )) acl
+                                where acl.grantee=0
+                                  and acl.privilege_type='EXECUTE'
+                              )
+                       from pg_proc p
+                       join pg_namespace n on n.oid=p.pronamespace
+                       where n.nspname='pg_catalog'
+                         and p.proname in (
+                           'lo_creat','lo_create','lo_from_bytea','lo_import'
+                         )
+                       order by p.oid"""
+                )
+                large_object_create_routines = cursor.fetchall()
+                assert large_object_create_routines
+                for routine, _was_public in large_object_create_routines:
+                    cursor.execute(
+                        pgsql.SQL(
+                            "grant execute on function {} to public"
+                        ).format(pgsql.SQL(routine))
+                    )
+                with pytest.raises(
+                    psycopg.Error, match="LARGE_OBJECT_CREATE_BOUNDARY"
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                for routine, _was_public in large_object_create_routines:
+                    cursor.execute(
+                        pgsql.SQL(
+                            "revoke execute on function {} from public"
+                        ).format(pgsql.SQL(routine))
                     )
 
                 cursor.execute(
@@ -1268,6 +1415,18 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                     cursor.execute("drop schema if exists extensions cascade")
                 if large_object_oid is not None:
                     cursor.execute("select lo_unlink(%s)", (large_object_oid,))
+                for routine, was_public in large_object_create_routines:
+                    cursor.execute(
+                        pgsql.SQL(
+                            "revoke execute on function {} from public"
+                        ).format(pgsql.SQL(routine))
+                    )
+                    if was_public:
+                        cursor.execute(
+                            pgsql.SQL(
+                                "grant execute on function {} to public"
+                            ).format(pgsql.SQL(routine))
+                        )
                 cursor.execute(
                     "alter default privileges for role postgres "
                     "revoke select on tables from hist8_forbidden"
