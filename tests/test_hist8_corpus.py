@@ -785,6 +785,71 @@ def test_provider_request_parameter_encoding_failure_is_controlled() -> None:
         )
 
 
+def test_massive_normalized_request_loop_is_contained_to_one_provider(
+    monkeypatch,
+) -> None:
+    stored = []
+    calls = [0]
+    real_massive_pages = corpus.massive_pages
+    first_next_url = (
+        corpus.MASSIVE_URL.replace("I%3A", "I%3a")
+        + "?cursor=repeat&apiKey=first"
+    )
+    second_next_url = corpus.MASSIVE_URL + "?cursor=repeat&apiKey=second"
+    assert corpus._strip_secret_query(first_next_url) == (
+        corpus._strip_secret_query(second_next_url)
+    )
+
+    def alpaca(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "alpaca"}, instruments=corpus.EQUITIES,
+        )
+
+    def coinbase(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "coinbase"}, source="COINBASE",
+            instruments=("BTC-USD",),
+        )
+
+    def opener(*_args, **_kwargs):
+        calls[0] += 1
+        if calls[0] == 1:
+            next_url = first_next_url
+        elif calls[0] == 2:
+            next_url = second_next_url
+        else:
+            raise AssertionError("normalized Massive request was repeated")
+        return _Response({
+            "ticker": "I:COMP", "status": "OK", "results": [],
+            "next_url": next_url,
+        })
+
+    def massive(*_args, **_kwargs):
+        yield from real_massive_pages("key", opener=opener)
+
+    class Store:
+        def store_page(self, import_id, sequence, page):
+            assert import_id == "massive-normalized-loop-attempt"
+            stored.append(page.source)
+            return sequence + len(page.instruments)
+
+    monkeypatch.setattr(corpus, "alpaca_pages", alpaca)
+    monkeypatch.setattr(corpus, "coinbase_pages", coinbase)
+    monkeypatch.setattr(corpus, "massive_pages", massive)
+    result = corpus.acquire(Store(), "massive-normalized-loop-attempt")
+
+    assert calls == [2]
+    assert stored == ["ALPACA", "COINBASE", "MASSIVE", "MASSIVE"]
+    assert result["retrieval_associations"] == 9
+    assert result["source_statuses"]["NASDAQ"] == {
+        "source": "MASSIVE", "availability": "UNAVAILABLE",
+        "retrieval_associations": 2, "failure_type": "Hist8Error",
+        "reason": "invalid Massive pagination",
+    }
+    assert result["source_statuses"]["SPY"]["availability"] == "AVAILABLE"
+    assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
+
+
 def test_malformed_alpaca_page_shape_is_contained_to_one_provider(
     monkeypatch,
 ) -> None:

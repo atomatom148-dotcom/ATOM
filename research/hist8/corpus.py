@@ -683,8 +683,12 @@ def massive_pages(
         raise Hist8Error("Massive credential missing")
     endpoint = MASSIVE_URL
     params = dict(MASSIVE_FROZEN_PARAMS)
-    seen: set[str] = set()
+    seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
     for _ in range(100):
+        request_identity = (endpoint, tuple(sorted(params.items())))
+        if request_identity in seen:
+            raise Hist8Error("invalid Massive pagination")
+        seen.add(request_identity)
         page = _build_page(
             source="MASSIVE", feed="I:COMP", product="I:COMP minute index OHLC",
             instruments=("NASDAQ",), endpoint=endpoint, params=params,
@@ -699,9 +703,8 @@ def massive_pages(
         next_url = payload.get("next_url")
         if next_url is None:
             return
-        if not isinstance(next_url, str) or not next_url or next_url in seen:
+        if not isinstance(next_url, str) or not next_url:
             raise Hist8Error("invalid Massive pagination")
-        seen.add(next_url)
         endpoint, params = _strip_secret_query(next_url)
     raise Hist8Error("Massive page bound exceeded")
 
