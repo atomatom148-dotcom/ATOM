@@ -25,6 +25,9 @@ import zlib
 CORPUS_ID = "HIST8_20240901_20260901_V1"
 DERIVATION_VERSION = "HIST8_DERIVE_1"
 CALENDAR_VERSION = "HIST8_CALENDAR_1"
+CALENDAR_SCHEDULE_SHA256 = (
+    "74463f0a85b14361599d9abf0caa0f3cbce12c79e10a15c37ffcd58348f3d446"
+)
 START = datetime(2024, 9, 1, tzinfo=timezone.utc)
 END = datetime(2026, 9, 1, tzinfo=timezone.utc)
 PROJECT_REF = "pjbjpgnmniwcajqkuhge"
@@ -61,11 +64,17 @@ MASSIVE_URL = (
     "https://api.massive.com/v2/aggs/ticker/I%3ACOMP/range/1/minute/"
     "2024-09-01/2026-09-01"
 )
-MASSIVE_FROZEN_PARAMS = {
-    "adjusted": "false", "sort": "asc", "limit": "50000",
+MASSIVE_FROZEN_PARAMS = {"sort": "asc", "limit": "50000"}
+ALPACA_FROZEN_PARAMS = {
+    "symbols": ",".join(EQUITIES), "timeframe": "1Min",
+    "start": "2024-09-01T00:00:00Z", "end": "2026-09-01T00:00:00Z",
+    "limit": "10000", "adjustment": "raw", "feed": "sip",
+    "sort": "asc", "asof": "2026-09-01", "currency": "USD",
 }
+COINBASE_WINDOW_MINUTES = 300
 REPLAY_PAGE_BATCH_SIZE = 8
 SNAPSHOT_SCAN_BATCH_SIZE = 10_000
+SNAPSHOT_SESSION_BATCH_SIZE = 32
 IMPORTER_CONNECT_TIMEOUT_SECONDS = 15
 IMPORTER_SESSION_OPTIONS = (
     "-c statement_timeout=60000 "
@@ -135,7 +144,7 @@ class RawPage:
                 self.decoded_body().decode("utf-8"), parse_float=Decimal,
             )
         except (
-            UnicodeDecodeError, json.JSONDecodeError, InvalidOperation,
+            UnicodeDecodeError, ValueError, RecursionError, InvalidOperation,
             EOFError, OSError, zlib.error,
         ) as exc:
             raise Hist8Error("provider response is not valid decimal JSON") from exc
@@ -185,7 +194,7 @@ class Bar:
     feed: str
     product: str
     adjustment: str
-    currency: str
+    price_unit: str
     import_id: str
     derivation_version: str | None
     source_artifact_id: str | None
@@ -304,6 +313,15 @@ def _execution_code_identity() -> dict[str, object]:
     }
 
 
+def _require_reviewed_implementation(
+    code_identity: Mapping[str, object], expected_commit: str,
+) -> None:
+    if (not isinstance(expected_commit, str)
+            or re.fullmatch(r"[0-9a-f]{40,64}", expected_commit) is None
+            or code_identity.get("implementation_commit") != expected_commit):
+        raise Hist8Error("reviewed implementation commit mismatch")
+
+
 def _exact_decimal_sum(values: Sequence[Decimal]) -> Decimal:
     if not values:
         return Decimal(0)
@@ -318,9 +336,19 @@ def _exact_decimal_sum(values: Sequence[Decimal]) -> Decimal:
         return sum(values, Decimal(0))
 
 
-def load_calendar(path: Path | None = None) -> dict[str, object]:
-    target = path or Path(__file__).with_name("calendar_manifest.json")
-    data = json.loads(target.read_text(encoding="utf-8"))
+def load_calendar(
+    path: Path | None = None, *, expected_file_sha256: str | None = None,
+) -> dict[str, object]:
+    target = path or Path(__file__).resolve().with_name("calendar_manifest.json")
+    try:
+        body = target.read_bytes()
+        data = json.loads(body.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise Hist8Error("calendar artifact is unreadable") from exc
+    if (expected_file_sha256 is not None
+            and (re.fullmatch(r"[0-9a-f]{64}", expected_file_sha256) is None
+                 or hashlib.sha256(body).hexdigest() != expected_file_sha256)):
+        raise Hist8Error("calendar artifact identity mismatch")
     if data.get("calendar_manifest_version") != CALENDAR_VERSION:
         raise Hist8Error("calendar version mismatch")
     if data.get("corpus_id") != CORPUS_ID:
@@ -339,7 +367,8 @@ def load_calendar(path: Path | None = None) -> dict[str, object]:
     payload = {
         key: data[key] for key in data if key != "schedule_sha256"
     }
-    if sha256(payload) != data.get("schedule_sha256"):
+    if (data.get("schedule_sha256") != CALENDAR_SCHEDULE_SHA256
+            or sha256(payload) != CALENDAR_SCHEDULE_SHA256):
         raise Hist8Error("calendar schedule hash mismatch")
     sessions = data["us_cash_sessions"]
     if not isinstance(sessions, list) or not sessions:
@@ -445,6 +474,33 @@ def _build_page(
     )
 
 
+def _validate_provider_page_envelope(page: RawPage) -> object:
+    payload = page.payload()
+    if page.source == "ALPACA":
+        if not isinstance(payload, dict):
+            raise Hist8Error("malformed Alpaca page")
+        bars = payload.get("bars")
+        if (not isinstance(bars, dict)
+                or not set(bars).issubset(EQUITIES)
+                or any(not isinstance(rows, list) for rows in bars.values())):
+            raise Hist8Error("malformed Alpaca page")
+        return payload
+    if page.source == "COINBASE":
+        if not isinstance(payload, list):
+            raise Hist8Error("malformed Coinbase page")
+        return payload
+    if page.source == "MASSIVE":
+        if (not isinstance(payload, dict)
+                or not isinstance(payload.get("results", []), list)):
+            raise Hist8Error("malformed Massive page")
+        if payload.get("ticker") != "I:COMP":
+            raise Hist8Error("Massive ticker identity mismatch")
+        if payload.get("status") != "OK":
+            raise Hist8Error("Massive response status mismatch")
+        return payload
+    raise Hist8Error("unknown source")
+
+
 def alpaca_pages(
     key: str, secret: str, *, opener: Callable[..., object] = _no_redirect_urlopen,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -454,13 +510,7 @@ def alpaca_pages(
     token: str | None = None
     seen: set[str] = set()
     for _ in range(1000):
-        params = {
-            "symbols": ",".join(EQUITIES), "timeframe": "1Min",
-            "start": START.isoformat().replace("+00:00", "Z"),
-            "end": END.isoformat().replace("+00:00", "Z"),
-            "limit": "10000", "adjustment": "raw", "feed": "sip",
-            "sort": "asc", "asof": "2026-09-01", "currency": "USD",
-        }
+        params = dict(ALPACA_FROZEN_PARAMS)
         if token is not None:
             params["page_token"] = token
         page = _build_page(
@@ -472,14 +522,8 @@ def alpaca_pages(
         yield page
         if page.http_status != 200:
             raise Hist8Error(f"Alpaca HTTP {page.http_status}")
-        payload = page.payload()
-        if not isinstance(payload, dict):
-            raise Hist8Error("malformed Alpaca page")
-        bars = payload.get("bars")
-        if (not isinstance(bars, dict)
-                or not set(bars).issubset(EQUITIES)
-                or any(not isinstance(rows, list) for rows in bars.values())):
-            raise Hist8Error("malformed Alpaca page")
+        payload = _validate_provider_page_envelope(page)
+        assert isinstance(payload, dict)
         next_token = payload.get("next_page_token")
         if next_token is None:
             return
@@ -498,7 +542,7 @@ def coinbase_pages(
     for _ in range(4000):
         if cursor >= END:
             return
-        stop = min(cursor + timedelta(minutes=300), END)
+        stop = min(cursor + timedelta(minutes=COINBASE_WINDOW_MINUTES), END)
         params = {
             "granularity": "60",
             "start": cursor.isoformat().replace("+00:00", "Z"),
@@ -510,8 +554,9 @@ def coinbase_pages(
             headers={"User-Agent": "ATOM-HIST8/1"}, opener=opener, clock=clock,
         )
         yield page
-        if page.http_status != 200 or not isinstance(page.payload(), list):
+        if page.http_status != 200:
             raise Hist8Error(f"Coinbase HTTP/payload failure {page.http_status}")
+        _validate_provider_page_envelope(page)
         cursor = stop
     raise Hist8Error("Coinbase request bound exceeded")
 
@@ -544,7 +589,7 @@ def _strip_secret_query(url: str) -> tuple[str, dict[str, str]]:
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):
         normalized_key = key.lower()
         if normalized_key not in {
-            "adjusted", "sort", "limit", "cursor", "apikey",
+            "sort", "limit", "cursor", "apikey",
         } or normalized_key in supplied:
             raise Hist8Error("Massive pagination parameter mismatch")
         supplied[normalized_key] = value
@@ -579,13 +624,8 @@ def massive_pages(
         yield page
         if page.http_status != 200:
             raise Hist8Error(f"Massive HTTP {page.http_status}")
-        payload = page.payload()
-        if not isinstance(payload, dict) or not isinstance(payload.get("results", []), list):
-            raise Hist8Error("malformed Massive page")
-        if payload.get("ticker") != "I:COMP":
-            raise Hist8Error("Massive ticker identity mismatch")
-        if payload.get("adjusted") is not False:
-            raise Hist8Error("Massive adjustment identity mismatch")
+        payload = _validate_provider_page_envelope(page)
+        assert isinstance(payload, dict)
         next_url = payload.get("next_url")
         if next_url is None:
             return
@@ -626,6 +666,123 @@ def _retrieval_manifest_payload(
     }
 
 
+def _validate_page_identity(page: RawPage, instrument: str) -> None:
+    if (instrument not in INSTRUMENTS or instrument not in page.instruments
+            or not isinstance(page.body, bytes)
+            or not isinstance(page.retrieved_at, datetime)
+            or page.retrieved_at.tzinfo is None
+            or page.retrieved_at.utcoffset() != timedelta(0)
+            or type(page.http_status) is not int
+            or not 100 <= page.http_status <= 599
+            or not isinstance(page.request_params, Mapping)
+            or any(not isinstance(key, str) or not isinstance(value, str)
+                   for key, value in page.request_params.items())):
+        raise Hist8Error("provider page identity mismatch")
+    params = dict(page.request_params)
+    if instrument in EQUITIES:
+        expected = dict(ALPACA_FROZEN_PARAMS)
+        token = params.pop("page_token", None)
+        if (page.source != "ALPACA" or page.feed != "SIP"
+                or page.product != "1Min trade OHLCV"
+                or page.endpoint != ALPACA_URL or params != expected
+                or token is not None
+                and (not isinstance(token, str) or not token)):
+            raise Hist8Error("provider page identity mismatch")
+        return
+    if instrument == "BTC-USD":
+        if (page.source != "COINBASE" or page.feed != "EXCHANGE"
+                or page.product != "BTC-USD granularity=60"
+                or page.endpoint != COINBASE_URL
+                or set(params) != {"granularity", "start", "end"}
+                or params.get("granularity") != "60"):
+            raise Hist8Error("provider page identity mismatch")
+        try:
+            start = _iso_utc(params["start"])
+            stop = _iso_utc(params["end"])
+        except (KeyError, Hist8Error):
+            raise Hist8Error("provider page identity mismatch") from None
+        start_text = start.isoformat().replace("+00:00", "Z")
+        stop_text = stop.isoformat().replace("+00:00", "Z")
+        offset = start - START
+        if (params["start"] != start_text or params["end"] != stop_text
+                or not START <= start < END
+                or offset % timedelta(minutes=COINBASE_WINDOW_MINUTES)
+                or stop != min(
+                    start + timedelta(minutes=COINBASE_WINDOW_MINUTES), END
+                )):
+            raise Hist8Error("provider page identity mismatch")
+        return
+    if instrument == "NASDAQ":
+        if (page.source != "MASSIVE" or page.feed != "I:COMP"
+                or page.product != "I:COMP minute index OHLC"):
+            raise Hist8Error("provider page identity mismatch")
+        if page.endpoint == MASSIVE_URL and params == MASSIVE_FROZEN_PARAMS:
+            return
+        try:
+            endpoint, normalized = _strip_secret_query(
+                page.endpoint + "?" + urlencode(params)
+            )
+        except (Hist8Error, ValueError):
+            raise Hist8Error("provider page identity mismatch") from None
+        if endpoint != page.endpoint or normalized != params:
+            raise Hist8Error("provider page identity mismatch")
+        return
+    raise Hist8Error("provider page identity mismatch")
+
+
+def _first_page_request(instrument: str) -> tuple[str, dict[str, str]]:
+    if instrument in EQUITIES:
+        return ALPACA_URL, dict(ALPACA_FROZEN_PARAMS)
+    if instrument == "BTC-USD":
+        return COINBASE_URL, {
+            "granularity": "60",
+            "start": START.isoformat().replace("+00:00", "Z"),
+            "end": min(
+                START + timedelta(minutes=COINBASE_WINDOW_MINUTES), END,
+            ).isoformat().replace("+00:00", "Z"),
+        }
+    if instrument == "NASDAQ":
+        return MASSIVE_URL, dict(MASSIVE_FROZEN_PARAMS)
+    raise Hist8Error("provider page identity mismatch")
+
+
+def _next_page_request(
+    page: RawPage, instrument: str,
+) -> tuple[str, dict[str, str]] | None:
+    payload = page.payload()
+    if instrument in EQUITIES:
+        if not isinstance(payload, Mapping):
+            raise Hist8Error("malformed Alpaca page")
+        token = payload.get("next_page_token")
+        if token is None:
+            return None
+        if not isinstance(token, str) or not token:
+            raise Hist8Error("invalid Alpaca pagination")
+        return ALPACA_URL, {**ALPACA_FROZEN_PARAMS, "page_token": token}
+    if instrument == "BTC-USD":
+        params = dict(page.request_params)
+        stop = _iso_utc(params["end"])
+        if stop == END:
+            return None
+        return COINBASE_URL, {
+            "granularity": "60",
+            "start": stop.isoformat().replace("+00:00", "Z"),
+            "end": min(
+                stop + timedelta(minutes=COINBASE_WINDOW_MINUTES), END,
+            ).isoformat().replace("+00:00", "Z"),
+        }
+    if instrument == "NASDAQ":
+        if not isinstance(payload, Mapping):
+            raise Hist8Error("malformed Massive page")
+        next_url = payload.get("next_url")
+        if next_url is None:
+            return None
+        if not isinstance(next_url, str) or not next_url:
+            raise Hist8Error("invalid Massive pagination")
+        return _strip_secret_query(next_url)
+    raise Hist8Error("provider page identity mismatch")
+
+
 def _verified_retrieval_record(
     record: Sequence[object], *, import_id: str, instrument: str,
 ) -> tuple[int, RawPage]:
@@ -654,12 +811,13 @@ def _verified_retrieval_record(
         content_encoding, body,
     )
     try:
+        _validate_page_identity(page, instrument)
         expected_manifest_id = _manifest_id(
             _retrieval_manifest_payload(
                 import_id, sequence_no, page, instrument,
             )
         )
-    except (TypeError, ValueError) as exc:
+    except (Hist8Error, TypeError, ValueError) as exc:
         raise Hist8ConflictError(
             "retained retrieval manifest identity mismatch"
         ) from exc
@@ -763,7 +921,8 @@ def _validate_database_url(
 
 
 def install_schema(
-    connection: object, *, schema_path: Path | None = None,
+    connection: object, *, expected_implementation_commit: str,
+    schema_path: Path | None = None,
 ) -> dict[str, object]:
     """Install over an already-authorized, verify-full privileged connection."""
     info = getattr(connection, "info", None)
@@ -779,9 +938,26 @@ def install_schema(
             or parameters.get("sslrootcert") != "system"
             or parameters.get("hostaddr") not in (None, "")):
         raise Hist8Error("HIST8 installer endpoint identity mismatch")
-    target = schema_path or Path(__file__).with_name("schema.sql")
-    sql = target.read_text(encoding="utf-8")
-    if (not sql.lstrip().startswith("-- ATOM-HIST8-CORPUS-AMENDMENT-1")
+    code_identity = _execution_code_identity()
+    _require_reviewed_implementation(
+        code_identity, expected_implementation_commit,
+    )
+    canonical_target = Path(__file__).resolve().with_name("schema.sql")
+    target = schema_path or canonical_target
+    try:
+        if target.resolve(strict=True) != canonical_target.resolve(strict=True):
+            raise Hist8Error("HIST8 schema artifact mismatch")
+        schema_bytes = target.read_bytes()
+        sql = schema_bytes.decode("utf-8")
+        expected_schema = code_identity["files"]["research/hist8/schema.sql"]
+    except (KeyError, TypeError, UnicodeDecodeError, OSError) as exc:
+        raise Hist8Error("HIST8 schema artifact mismatch") from exc
+    if (not isinstance(expected_schema, Mapping)
+            or expected_schema.get("sha256") != hashlib.sha256(
+                schema_bytes
+            ).hexdigest()
+            or expected_schema.get("byte_length") != len(schema_bytes)
+            or not sql.lstrip().startswith("-- ATOM-HIST8-CORPUS-AMENDMENT-1")
             or not sql.rstrip().endswith("COMMIT;")):
         raise Hist8Error("HIST8 schema artifact mismatch")
     with connection.cursor() as cursor:
@@ -818,6 +994,7 @@ def install_schema(
         "host": DATABASE_HOST,
         "schema": "atom_research_history",
         "tables": table_count,
+        "implementation_commit": code_identity["implementation_commit"],
     }
 
 
@@ -851,9 +1028,17 @@ class Hist8Store:
     @staticmethod
     def _verify(connection: object) -> None:
         with connection.cursor() as cursor:
-            cursor.execute("select current_user, current_database()")
-            user, database = cursor.fetchone()
-        if user != IMPORTER_ROLE or database != DATABASE_NAME:
+            cursor.execute(
+                "select current_user, current_database(), "
+                "current_setting('session_replication_role'), "
+                "current_setting('lo_compat_privileges')"
+            )
+            user, database, replication_role, lo_compat_privileges = (
+                cursor.fetchone()
+            )
+        if (user != IMPORTER_ROLE or database != DATABASE_NAME
+                or replication_role != "origin"
+                or lo_compat_privileges != "off"):
             raise Hist8Error("HIST8 database identity mismatch")
 
     def _verify_canonical_provenance(
@@ -956,7 +1141,7 @@ class Hist8Store:
                               timeframe,bar_start_utc,bar_end_utc,session_date,
                               calendar_id,calendar_sha256,open,high,low,close,
                               volume,trade_count,vwap,volume_unit,source,feed,
-                              product,adjustment,currency,import_id,
+                              product,adjustment,price_unit,import_id,
                               derivation_version,source_artifact_id,
                               source_record_locator,lineage_json
                        from atom_research_history.bars
@@ -989,6 +1174,12 @@ class Hist8Store:
                 )
 
     def store_page(self, import_id: str, sequence: int, page: RawPage) -> int:
+        if tuple(page.instruments) not in (
+            EQUITIES, ("BTC-USD",), ("NASDAQ",),
+        ):
+            raise Hist8Error("provider page instrument set mismatch")
+        for instrument in page.instruments:
+            _validate_page_identity(page, instrument)
         artifact_id = _artifact_id(page.body)
         expected_manifests: dict[str, tuple[int, str]] = {}
         with self._connection_factory() as connection:
@@ -1239,9 +1430,22 @@ class Hist8Store:
                 or _canonical(recorded[1]) != metadata):
             raise Hist8ConflictError("bar conflict evidence mismatch")
 
-    def insert_bars(self, rows: Sequence[Bar]) -> tuple[int, int]:
+    def insert_bars(
+        self, rows: Sequence[Bar], *, session_open: datetime,
+        session_close: datetime, expected_minutes: int,
+        expected_session_date: str, expected_calendar_id: str,
+        expected_calendar_sha256: str, source_chain_complete: bool = True,
+    ) -> tuple[int, int]:
         if not rows:
             return 0, 0
+        _verify_materialized_session(
+            rows, session_open=session_open, session_close=session_close,
+            expected_minutes=expected_minutes,
+            expected_session_date=expected_session_date,
+            expected_calendar_id=expected_calendar_id,
+            expected_calendar_sha256=expected_calendar_sha256,
+            source_chain_complete=source_chain_complete,
+        )
         if len({row.import_id for row in rows}) != 1:
             raise Hist8ConflictError("mixed snapshot attempt identity")
         keys = [(row.corpus_id, row.instrument, row.timeframe, row.bar_start_utc)
@@ -1259,7 +1463,7 @@ class Hist8Store:
                                   timeframe,bar_start_utc,bar_end_utc,session_date,
                                   calendar_id,calendar_sha256,open,high,low,close,
                                   volume,trade_count,vwap,volume_unit,source,feed,
-                                  product,adjustment,currency,import_id,
+                                  product,adjustment,price_unit,import_id,
                                   derivation_version,source_artifact_id,
                                   source_record_locator,lineage_json
                            from atom_research_history.bars
@@ -1297,7 +1501,7 @@ class Hist8Store:
                             (bar_id,content_hash,corpus_id,instrument,timeframe,bar_start_utc,
                              bar_end_utc,session_date,calendar_id,calendar_sha256,open,high,
                              low,close,volume,trade_count,vwap,volume_unit,source,feed,product,
-                             adjustment,currency,import_id,derivation_version,
+                             adjustment,price_unit,import_id,derivation_version,
                              source_artifact_id,source_record_locator,lineage_json)
                             values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                     %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -1314,7 +1518,7 @@ class Hist8Store:
                                   timeframe,bar_start_utc,bar_end_utc,session_date,
                                   calendar_id,calendar_sha256,open,high,low,close,
                                   volume,trade_count,vwap,volume_unit,source,feed,
-                                  product,adjustment,currency,import_id,
+                                  product,adjustment,price_unit,import_id,
                                   derivation_version,source_artifact_id,
                                   source_record_locator,lineage_json
                            from atom_research_history.bars
@@ -1333,6 +1537,7 @@ class Hist8Store:
                     self._verify_canonical_provenance(
                         cursor, tuple(verified.values()),
                     )
+                    verified_attempt_rows: list[Bar] = []
                     for row in rows:
                         actual = verified.get((row.timeframe, row.bar_start_utc))
                         if actual is None:
@@ -1343,6 +1548,19 @@ class Hist8Store:
                                 actual.import_id,
                             )
                             raise Hist8ConflictError("same-key bar conflict")
+                        verified_attempt_rows.append(replace(
+                            actual, research_eligible=row.research_eligible,
+                        ))
+                    _verify_materialized_session(
+                        verified_attempt_rows,
+                        session_open=session_open,
+                        session_close=session_close,
+                        expected_minutes=expected_minutes,
+                        expected_session_date=expected_session_date,
+                        expected_calendar_id=expected_calendar_id,
+                        expected_calendar_sha256=expected_calendar_sha256,
+                        source_chain_complete=source_chain_complete,
+                    )
 
                     members = []
                     expected_members = {}
@@ -1408,6 +1626,118 @@ class Hist8Store:
             raise
         return inserted, len(rows) - inserted
 
+    def _verify_snapshot_derivations(
+        self, import_id: str,
+        source_statuses: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> None:
+        calendar = load_calendar()
+        with self._connection_factory() as connection:
+            self._verify(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """select distinct b.instrument,b.session_date
+                       from atom_research_history.manifests m
+                       join atom_research_history.bars b
+                         on b.bar_id=m.member_bar_id
+                        and b.content_hash=m.member_content_hash
+                       where m.corpus_id=%s and m.import_id=%s
+                         and m.manifest_kind='SNAPSHOT_MEMBER'
+                       order by b.instrument,b.session_date""",
+                    (CORPUS_ID, import_id),
+                )
+                session_keys = cursor.fetchall()
+        for offset in range(0, len(session_keys), SNAPSHOT_SESSION_BATCH_SIZE):
+            batch = session_keys[offset:offset + SNAPSHOT_SESSION_BATCH_SIZE]
+            instruments = [key[0] for key in batch]
+            session_dates = [key[1] for key in batch]
+            with self._connection_factory() as connection:
+                self._verify(connection)
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """with target(instrument,session_date) as (
+                             select * from unnest(%s::text[],%s::text[])
+                           )
+                           select m.manifest_id,m.corpus_id,m.import_id,
+                                  m.manifest_kind,m.sequence_no,m.instrument,
+                                  m.member_timeframe,m.member_bar_start_utc,
+                                  m.member_bar_id,m.member_content_hash,
+                                  m.member_provenance_hash,
+                                  m.member_research_eligible,
+                                  b.bar_id,b.content_hash,b.corpus_id,
+                                  b.instrument,b.timeframe,b.bar_start_utc,
+                                  b.bar_end_utc,b.session_date,b.calendar_id,
+                                  b.calendar_sha256,b.open,b.high,b.low,b.close,
+                                  b.volume,b.trade_count,b.vwap,b.volume_unit,
+                                  b.source,b.feed,b.product,b.adjustment,
+                                  b.price_unit,b.import_id,b.derivation_version,
+                                  b.source_artifact_id,b.source_record_locator,
+                                  b.lineage_json
+                           from atom_research_history.manifests m
+                           join atom_research_history.bars b
+                             on b.bar_id=m.member_bar_id
+                            and b.content_hash=m.member_content_hash
+                           join target
+                             on target.instrument=b.instrument
+                            and target.session_date=b.session_date
+                           where m.corpus_id=%s and m.import_id=%s
+                             and m.manifest_kind='SNAPSHOT_MEMBER'
+                           order by b.instrument,b.session_date,b.timeframe,
+                                    b.bar_start_utc""",
+                        (instruments, session_dates, CORPUS_ID, import_id),
+                    )
+                    records = cursor.fetchall()
+            grouped: dict[tuple[str, str], list[Bar]] = {
+                (str(instrument), str(session_date)): []
+                for instrument, session_date in batch
+            }
+            seen: set[tuple[str, str, datetime]] = set()
+            for record in records:
+                sequence, member = _verified_snapshot_member_record(
+                    record[:12], import_id=import_id,
+                )
+                (instrument, timeframe, bar_start_utc, bar_id,
+                 content_hash, provenance_hash, eligible) = member
+                row = _verified_stored_bar(record[12:])
+                if (row.instrument != instrument or row.timeframe != timeframe
+                        or row.bar_start_utc != bar_start_utc
+                        or row.bar_id != bar_id
+                        or row.content_hash != content_hash
+                        or _bar_provenance_hash(row) != provenance_hash
+                        or _membership_sequence(row) != sequence):
+                    raise Hist8ConflictError(
+                        "snapshot member bar identity mismatch"
+                    )
+                key = (row.instrument, row.timeframe, row.bar_start_utc)
+                if key in seen:
+                    raise Hist8ConflictError(
+                        "duplicate snapshot member identity"
+                    )
+                seen.add(key)
+                grouped[(row.instrument, row.session_date)].append(replace(
+                    row, research_eligible=eligible,
+                ))
+            for (instrument, session_date), rows in grouped.items():
+                definitions = _session_definitions(calendar, instrument)
+                bounds = definitions.get(session_date)
+                if bounds is None or not rows:
+                    raise Hist8ConflictError(
+                        "snapshot session boundary mismatch"
+                    )
+                _verify_materialized_session(
+                    rows, session_open=bounds[0], session_close=bounds[1],
+                    expected_minutes=bounds[2],
+                    expected_session_date=session_date,
+                    expected_calendar_id=str(
+                        calendar["instrument_calendars"][instrument]
+                    ),
+                    expected_calendar_sha256=str(calendar["schedule_sha256"]),
+                    source_chain_complete=(
+                        source_statuses is None
+                        or source_statuses[instrument]["availability"]
+                        == "AVAILABLE"
+                    ),
+                )
+
     def seal_snapshot(self, import_id: str, metadata: Mapping[str, object]) -> str:
         digest = hashlib.sha256()
         counts: dict[str, int] = {}
@@ -1425,6 +1755,11 @@ class Hist8Store:
                 )
             lock_connection.commit()
             lock_acquired = True
+            source_statuses = (
+                None if "source_statuses" not in metadata
+                else _validated_source_statuses(metadata["source_statuses"])
+            )
+            self._verify_snapshot_derivations(import_id, source_statuses)
             with self._connection_factory() as read_connection:
                 self._verify(read_connection)
                 with read_connection.cursor() as cursor:
@@ -1455,7 +1790,7 @@ class Hist8Store:
                                       b.calendar_sha256,b.open,b.high,b.low,
                                       b.close,b.volume,b.trade_count,b.vwap,
                                       b.volume_unit,b.source,b.feed,b.product,
-                                      b.adjustment,b.currency,b.import_id,
+                                      b.adjustment,b.price_unit,b.import_id,
                                       b.derivation_version,b.source_artifact_id,
                                       b.source_record_locator,b.lineage_json
                                from atom_research_history.manifests m
@@ -1559,7 +1894,7 @@ def _bar_values(row: Bar) -> tuple[object, ...]:
         values["calendar_sha256"], values["open"], values["high"], values["low"],
         values["close"], values["volume"], values["trade_count"], values["vwap"],
         values["volume_unit"], values["source"], values["feed"], values["product"],
-        values["adjustment"], values["currency"], values["import_id"],
+        values["adjustment"], values["price_unit"], values["import_id"],
         values["derivation_version"], values["source_artifact_id"],
         values["source_record_locator"], json.dumps(list(row.lineage)),
     )
@@ -1582,6 +1917,7 @@ def _verified_stored_bar(record: Sequence[object]) -> Bar:
     if (stored.content_hash != expected_hash
             or stored.bar_id != "hist8bar:" + expected_hash):
         raise Hist8ConflictError("stored bar identity mismatch")
+    _validate_bar_identity(stored)
     return stored
 
 
@@ -1609,6 +1945,198 @@ def _bar_provenance_hash(row: Bar) -> str:
         })
     except (TypeError, ValueError) as exc:
         raise Hist8ConflictError("bar provenance identity mismatch") from exc
+
+
+def _validate_bar_identity(row: Bar) -> None:
+    duration = 1 if row.timeframe == "1m" else TIMEFRAME_MINUTES.get(
+        row.timeframe
+    )
+    if (row.corpus_id != CORPUS_ID or row.instrument not in INSTRUMENTS
+            or duration is None or not isinstance(row.bar_start_utc, datetime)
+            or row.bar_start_utc.tzinfo is None
+            or row.bar_start_utc.utcoffset() != timedelta(0)
+            or row.bar_start_utc.second or row.bar_start_utc.microsecond
+            or row.bar_end_utc != row.bar_start_utc + timedelta(minutes=duration)
+            or not isinstance(row.session_date, str)
+            or not isinstance(row.calendar_id, str) or not row.calendar_id
+            or not isinstance(row.calendar_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", row.calendar_sha256) is None
+            or not isinstance(row.import_id, str)
+            or not 1 <= len(row.import_id) <= 128
+            or not isinstance(row.research_eligible, bool)):
+        raise Hist8ConflictError("bar semantic identity mismatch")
+    expected_calendar_id = (
+        "BTC_UTC_DAY" if row.instrument == "BTC-USD"
+        else "NASDAQ_CASH_RTH" if row.instrument == "NASDAQ"
+        else "US_CASH_RTH"
+    )
+    if (row.calendar_id != expected_calendar_id
+            or row.calendar_sha256 != CALENDAR_SCHEDULE_SHA256):
+        raise Hist8ConflictError("bar calendar identity mismatch")
+    if any(not isinstance(value, Decimal) or not value.is_finite() or value <= 0
+           for value in (row.open, row.high, row.low, row.close)):
+        raise Hist8ConflictError("bar semantic identity mismatch")
+    if (row.low > min(row.open, row.close)
+            or max(row.open, row.close) > row.high
+            or row.volume is not None and (
+                not isinstance(row.volume, Decimal)
+                or not row.volume.is_finite() or row.volume < 0
+            )
+            or row.trade_count is not None and (
+                type(row.trade_count) is not int or row.trade_count < 0
+            )
+            or row.vwap is not None and (
+                not isinstance(row.vwap, Decimal)
+                or not row.vwap.is_finite() or row.vwap <= 0
+            )):
+        raise Hist8ConflictError("bar semantic identity mismatch")
+    if row.instrument in EQUITIES:
+        expected_source = (
+            "ALPACA", "SIP", f"{row.instrument}:1Min", "raw", "SHARES",
+        )
+    elif row.instrument == "BTC-USD":
+        expected_source = (
+            "COINBASE", "EXCHANGE", "BTC-USD:60", "none", "BTC",
+        )
+    else:
+        expected_source = (
+            "MASSIVE", "I:COMP", "I:COMP:minute", "none",
+            "NOT_APPLICABLE",
+        )
+    if ((row.source, row.feed, row.product, row.adjustment, row.volume_unit)
+            != expected_source
+            or row.price_unit != (
+                "INDEX_POINTS" if row.instrument == "NASDAQ" else "USD"
+            )
+            or row.instrument == "NASDAQ" and row.volume is not None
+            or row.instrument != "NASDAQ" and row.volume is None):
+        raise Hist8ConflictError("bar source identity mismatch")
+    if row.timeframe == "1m":
+        if (row.derivation_version is not None
+                or not isinstance(row.source_artifact_id, str)
+                or re.fullmatch(
+                    r"sha256:[0-9a-f]{64}", row.source_artifact_id,
+                ) is None
+                or not isinstance(row.source_record_locator, str)
+                or not row.source_record_locator or row.lineage):
+            raise Hist8ConflictError("canonical provenance shape mismatch")
+    elif (row.derivation_version != DERIVATION_VERSION
+          or row.source_artifact_id is not None
+          or row.source_record_locator is not None or not row.lineage
+          or any(not isinstance(item, str) or re.fullmatch(
+              r"hist8bar:[0-9a-f]{64}\|[0-9a-f]{64}", item,
+          ) is None for item in row.lineage)):
+        raise Hist8ConflictError("derived provenance shape mismatch")
+    try:
+        expected_hash = sha256(_content_payload(row))
+    except (TypeError, ValueError) as exc:
+        raise Hist8ConflictError("bar semantic identity mismatch") from exc
+    if (row.content_hash != expected_hash
+            or row.bar_id != "hist8bar:" + expected_hash):
+        raise Hist8ConflictError("bar semantic identity mismatch")
+
+
+def _verify_materialized_session(
+    rows: Sequence[Bar], *, session_open: datetime,
+    session_close: datetime, expected_minutes: int,
+    expected_session_date: str, expected_calendar_id: str,
+    expected_calendar_sha256: str, source_chain_complete: bool = True,
+) -> None:
+    if (not rows or type(expected_minutes) is not int or expected_minutes <= 0
+            or session_open.tzinfo is None
+            or session_open.utcoffset() != timedelta(0)
+            or session_open.second or session_open.microsecond
+            or session_close != session_open + timedelta(minutes=expected_minutes)
+            or not isinstance(expected_session_date, str)
+            or not expected_session_date
+            or not isinstance(expected_calendar_id, str)
+            or not expected_calendar_id
+            or type(source_chain_complete) is not bool
+            or re.fullmatch(
+                r"[0-9a-f]{64}", expected_calendar_sha256,
+            ) is None):
+        raise Hist8ConflictError("materialized session boundary mismatch")
+    for row in rows:
+        _validate_bar_identity(row)
+    first = rows[0]
+    common_identity = (
+        first.corpus_id, first.instrument, first.session_date,
+        first.calendar_id, first.calendar_sha256, first.volume_unit,
+        first.source, first.feed, first.product, first.adjustment,
+        first.price_unit,
+    )
+    if (first.session_date != expected_session_date
+            or first.calendar_id != expected_calendar_id
+            or first.calendar_sha256 != expected_calendar_sha256):
+        raise Hist8ConflictError("materialized calendar identity mismatch")
+    if any((
+        row.corpus_id, row.instrument, row.session_date,
+        row.calendar_id, row.calendar_sha256, row.volume_unit,
+        row.source, row.feed, row.product, row.adjustment, row.price_unit,
+    ) != common_identity for row in rows):
+        raise Hist8ConflictError("materialized session identity mismatch")
+    keys = [(row.timeframe, row.bar_start_utc) for row in rows]
+    if len(keys) != len(set(keys)):
+        raise Hist8ConflictError("duplicate materialized bar identity")
+    canonical = {
+        row.bar_start_utc: row for row in rows if row.timeframe == "1m"
+    }
+    expected_starts = tuple(
+        session_open + timedelta(minutes=index)
+        for index in range(expected_minutes)
+    )
+    if not set(canonical).issubset(expected_starts):
+        raise Hist8ConflictError("canonical session membership mismatch")
+    grid_complete = tuple(sorted(canonical)) == expected_starts
+    eligible = grid_complete and source_chain_complete
+    derived = [row for row in rows if row.timeframe != "1m"]
+    if any(row.research_eligible is not eligible for row in canonical.values()):
+        raise Hist8ConflictError("canonical eligibility mismatch")
+    if not eligible:
+        if derived:
+            raise Hist8ConflictError("incomplete session has derived bars")
+        return
+    if any(not row.research_eligible for row in derived):
+        raise Hist8ConflictError("derived eligibility mismatch")
+    for timeframe, width in TIMEFRAME_MINUTES.items():
+        actual = {
+            row.bar_start_utc: row for row in derived
+            if row.timeframe == timeframe
+        }
+        expected_derived_starts = tuple(
+            session_open + timedelta(minutes=index)
+            for index in range(0, expected_minutes - width + 1, width)
+        )
+        if tuple(sorted(actual)) != expected_derived_starts:
+            raise Hist8ConflictError("derived window membership mismatch")
+        for start in expected_derived_starts:
+            row = actual[start]
+            inputs = tuple(
+                canonical[start + timedelta(minutes=index)]
+                for index in range(width)
+            )
+            expected_lineage = tuple(
+                f"{item.bar_id}|{item.content_hash}" for item in inputs
+            )
+            expected_volume = (
+                None if first.instrument == "NASDAQ"
+                else _exact_decimal_sum(tuple(
+                    item.volume for item in inputs if item.volume is not None
+                ))
+            )
+            expected_trade_count = (
+                None if any(item.trade_count is None for item in inputs)
+                else sum(item.trade_count or 0 for item in inputs)
+            )
+            if (row.lineage != expected_lineage
+                    or row.open != inputs[0].open
+                    or row.high != max(item.high for item in inputs)
+                    or row.low != min(item.low for item in inputs)
+                    or row.close != inputs[-1].close
+                    or row.volume != expected_volume
+                    or row.trade_count != expected_trade_count
+                    or row.vwap is not None):
+                raise Hist8ConflictError("derived aggregation mismatch")
 
 
 def _source_bar_from_canonical(row: Bar) -> SourceBar:
@@ -1644,6 +2172,28 @@ def _validate_source_bar(row: SourceBar) -> None:
         raise Hist8Error("NASDAQ volume must be null")
     if row.instrument != "NASDAQ" and row.volume is None:
         raise Hist8Error("volume is required")
+    if row.instrument in EQUITIES:
+        expected_identity = (
+            "ALPACA", "SIP", f"{row.instrument}:1Min", "raw", "SHARES",
+        )
+    elif row.instrument == "BTC-USD":
+        expected_identity = (
+            "COINBASE", "EXCHANGE", "BTC-USD:60", "none", "BTC",
+        )
+        if row.trade_count is not None or row.vwap is not None:
+            raise Hist8Error("BTC-USD trade count and vwap must be null")
+    elif row.instrument == "NASDAQ":
+        expected_identity = (
+            "MASSIVE", "I:COMP", "I:COMP:minute", "none",
+            "NOT_APPLICABLE",
+        )
+        if row.trade_count is not None or row.vwap is not None:
+            raise Hist8Error("NASDAQ trade count and vwap must be null")
+    else:
+        raise Hist8Error("unauthorized instrument")
+    if (row.source, row.feed, row.product, row.adjustment, row.volume_unit
+            ) != expected_identity:
+        raise Hist8Error("provider source identity mismatch")
 
 
 def _source_bar_payload(row: SourceBar) -> tuple[object, ...]:
@@ -1676,6 +2226,7 @@ def _parse_or_reject_source_row(
 def parse_source_page(
     page: RawPage, instrument: str, *, rejection_counter: list[int] | None = None,
 ) -> tuple[SourceBar, ...]:
+    _validate_page_identity(page, instrument)
     artifact = _artifact_id(page.body)
     payload = page.payload()
     rows: list[SourceBar] = []
@@ -1729,6 +2280,8 @@ def parse_source_page(
             raise Hist8Error("malformed Massive page")
         if payload.get("ticker") != "I:COMP":
             raise Hist8Error("Massive ticker identity mismatch")
+        if payload.get("status") != "OK":
+            raise Hist8Error("Massive response status mismatch")
         source_rows = payload.get("results", [])
         if not isinstance(source_rows, list):
             raise Hist8Error("malformed Massive page")
@@ -1806,10 +2359,16 @@ def canonical_bar(
     bar = Bar(
         "", "", CORPUS_ID, row.instrument, "1m", row.start,
         row.start + timedelta(minutes=1), session_date,
-        calendar_id or ("BTC_UTC_DAY" if row.instrument == "BTC-USD" else "US_CASH_RTH"),
+        calendar_id or (
+            "BTC_UTC_DAY" if row.instrument == "BTC-USD"
+            else "NASDAQ_CASH_RTH" if row.instrument == "NASDAQ"
+            else "US_CASH_RTH"
+        ),
         calendar_hash, row.open, row.high, row.low, row.close, row.volume,
         row.trade_count, row.vwap, row.volume_unit, row.source, row.feed,
-        row.product, row.adjustment, "USD", import_id, None, row.artifact_id,
+        row.product, row.adjustment,
+        "INDEX_POINTS" if row.instrument == "NASDAQ" else "USD",
+        import_id, None, row.artifact_id,
         row.locator, (), eligible,
     )
     return _finish_bar(bar)
@@ -1845,7 +2404,8 @@ def derive_session(
             first.calendar_id, first.calendar_sha256, first.open,
             max(item.high for item in window), min(item.low for item in window),
             last.close, volume, trade_count, None, first.volume_unit,
-            first.source, first.feed, first.product, first.adjustment, "USD",
+            first.source, first.feed, first.product, first.adjustment,
+            first.price_unit,
             import_id, DERIVATION_VERSION, None, None,
             tuple(f"{item.bar_id}|{item.content_hash}" for item in window), True,
         )
@@ -1856,58 +2416,112 @@ def derive_session(
 def materialize_instrument(
     store: Hist8Store, source_import_id: str, instrument: str,
     calendar: Mapping[str, object], *, attempt_id: str | None = None,
-) -> dict[str, int]:
+    source_unavailable: bool = False,
+) -> dict[str, object]:
+    if type(source_unavailable) is not bool:
+        raise Hist8Error("source availability flag is invalid")
+    unavailable_prefix_count = (
+        _verify_unavailable_page_prefix(
+            store.retrieval_pages(source_import_id, instrument), instrument,
+        )
+        if source_unavailable else None
+    )
     write_attempt_id = attempt_id or source_import_id
     definitions = _session_definitions(calendar, instrument)
     rejected = duplicates = 0
     inserted = idempotent = eligible_sessions = incomplete_sessions = 0
+    source_acquisition_incomplete_sessions = 0
     observed_minutes = missing_minutes = 0
     verified_retrieval_associations = 0
+    usable_retrieval_associations = 0
     excluded_windows = {timeframe: 0 for timeframe in TIMEFRAMES[1:]}
+    source_excluded_windows = {timeframe: 0 for timeframe in TIMEFRAMES[1:]}
     residual_tails = {timeframe: 0 for timeframe in TIMEFRAMES[1:]}
     seen_sessions: set[str] = set()
     calendar_hash = str(calendar["schedule_sha256"])
     calendar_id = str(calendar["instrument_calendars"][instrument])
+    expected_request = _first_page_request(instrument)
+    seen_requests: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
 
     def flush_session(session_date: str, unique: Mapping[datetime, SourceBar]) -> None:
         nonlocal inserted, idempotent, eligible_sessions, incomplete_sessions
+        nonlocal source_acquisition_incomplete_sessions
         nonlocal observed_minutes, missing_minutes
         opened, closed, expected = definitions[session_date]
         expected_times = {opened + timedelta(minutes=index) for index in range(expected)}
-        complete = set(unique) == expected_times and closed == opened + timedelta(minutes=expected)
+        grid_complete = (
+            set(unique) == expected_times
+            and closed == opened + timedelta(minutes=expected)
+        )
+        eligible = grid_complete and not source_unavailable
         seen_sessions.add(session_date)
         observed_minutes += len(unique)
         missing_minutes += len(expected_times - set(unique))
-        if complete:
+        if eligible:
             eligible_sessions += 1
-        else:
+        elif not grid_complete:
             incomplete_sessions += 1
+        else:
+            source_acquisition_incomplete_sessions += 1
+        if not eligible:
             for timeframe, width in TIMEFRAME_MINUTES.items():
                 excluded_windows[timeframe] += expected // width
+                if grid_complete:
+                    source_excluded_windows[timeframe] += expected // width
         for timeframe, width in TIMEFRAME_MINUTES.items():
             residual_tails[timeframe] += expected % width
         canonical = tuple(canonical_bar(
             unique[start], session_date=session_date, calendar_hash=calendar_hash,
-            import_id=write_attempt_id, eligible=complete, calendar_id=calendar_id,
+            import_id=write_attempt_id, eligible=eligible, calendar_id=calendar_id,
         ) for start in sorted(unique))
         all_rows: list[Bar] = list(canonical)
-        if complete:
+        if eligible:
             for timeframe in TIMEFRAMES[1:]:
                 all_rows.extend(derive_session(
                     canonical, timeframe, write_attempt_id, session_open=opened,
                 ))
-        added, same = store.insert_bars(all_rows)
+        added, same = store.insert_bars(
+            all_rows, session_open=opened, session_close=closed,
+            expected_minutes=expected,
+            expected_session_date=session_date,
+            expected_calendar_id=calendar_id,
+            expected_calendar_sha256=calendar_hash,
+            source_chain_complete=not source_unavailable,
+        )
         inserted += added
         idempotent += same
 
     current_session: str | None = None
     current_rows: dict[datetime, SourceBar] = {}
+    terminal_failure = False
     for page in store.retrieval_pages(source_import_id, instrument):
         verified_retrieval_associations += 1
+        request_identity = (
+            page.endpoint, tuple(sorted(dict(page.request_params).items())),
+        )
+        if (terminal_failure
+                or (page.endpoint, dict(page.request_params)) != expected_request
+                or request_identity in seen_requests):
+            raise Hist8ConflictError("retained provider pagination mismatch")
+        seen_requests.add(request_identity)
         if page.http_status != 200:
-            raise Hist8Error(f"stored provider failure {page.http_status}")
+            if not source_unavailable:
+                raise Hist8Error(f"stored provider failure {page.http_status}")
+            terminal_failure = True
+            continue
         invalid = [0]
-        parsed_rows = parse_source_page(page, instrument, rejection_counter=invalid)
+        try:
+            parsed_rows = parse_source_page(
+                page, instrument, rejection_counter=invalid,
+            )
+        except Hist8ConflictError:
+            raise
+        except Hist8Error:
+            if not source_unavailable:
+                raise
+            terminal_failure = True
+            continue
+        usable_retrieval_associations += 1
         rejected += invalid[0]
         for row in parsed_rows:
             if not START <= row.start < END:
@@ -1938,6 +2552,24 @@ def materialize_instrument(
                 duplicates += 1
                 continue
             current_rows[row.start] = row
+        try:
+            expected_request = _next_page_request(page, instrument)
+        except Hist8ConflictError:
+            raise
+        except Hist8Error:
+            if not source_unavailable:
+                raise
+            terminal_failure = True
+    chain_complete = expected_request is None and not terminal_failure
+    if source_unavailable and chain_complete:
+        raise Hist8ConflictError(
+            "unavailable retained provider pagination is complete"
+        )
+    if not source_unavailable and not chain_complete:
+        raise Hist8ConflictError("retained provider pagination incomplete")
+    if (unavailable_prefix_count is not None
+            and verified_retrieval_associations != unavailable_prefix_count):
+        raise Hist8ConflictError("retained provider prefix changed during replay")
     if current_session is not None:
         flush_session(current_session, current_rows)
     for session_date in set(definitions) - seen_sessions:
@@ -1955,11 +2587,57 @@ def materialize_instrument(
         "eligible_sessions": eligible_sessions,
         "incomplete_sessions": incomplete_sessions,
         "verified_retrieval_associations": verified_retrieval_associations,
+        "usable_retrieval_associations": usable_retrieval_associations,
+        "source_chain_complete": chain_complete,
+        "source_acquisition_incomplete_sessions": (
+            source_acquisition_incomplete_sessions
+        ),
     }
     for timeframe in TIMEFRAMES[1:]:
         result[f"excluded_{timeframe}_windows"] = excluded_windows[timeframe]
+        result[f"source_excluded_{timeframe}_windows"] = (
+            source_excluded_windows[timeframe]
+        )
         result[f"residual_{timeframe}_tail_minutes"] = residual_tails[timeframe]
     return result
+
+
+def _verify_unavailable_page_prefix(
+    pages: Iterator[RawPage], instrument: str,
+) -> int:
+    expected_request = _first_page_request(instrument)
+    seen_requests: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+    terminal_failure = False
+    count = 0
+    for page in pages:
+        request_identity = (
+            page.endpoint, tuple(sorted(dict(page.request_params).items())),
+        )
+        if (terminal_failure
+                or (page.endpoint, dict(page.request_params)) != expected_request
+                or request_identity in seen_requests):
+            raise Hist8ConflictError("retained provider pagination mismatch")
+        seen_requests.add(request_identity)
+        count += 1
+        if page.http_status != 200:
+            terminal_failure = True
+            continue
+        try:
+            _validate_provider_page_envelope(page)
+            next_request = _next_page_request(page, instrument)
+        except Hist8ConflictError:
+            raise
+        except Hist8Error:
+            # The acquisition commits each response before adapter validation.
+            # A malformed successful response is valid terminal failure evidence.
+            terminal_failure = True
+            continue
+        if next_request is None:
+            raise Hist8ConflictError(
+                "unavailable retained provider pagination is complete"
+            )
+        expected_request = next_request
+    return count
 
 
 def _validated_source_statuses(value: object) -> dict[str, dict[str, object]]:
@@ -2073,12 +2751,29 @@ def _unavailable_instrument_result(
     return result
 
 
-def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> dict[str, object]:
+def execute(
+    import_id: str | None = None, *, expected_implementation_commit: str,
+    acquire_sources: bool = True,
+) -> dict[str, object]:
     chosen = import_id or f"hist8-{uuid.uuid4()}"
     if len(chosen) > 128:
         raise Hist8Error("import id too long")
-    calendar = load_calendar()
     code_identity = _execution_code_identity()
+    _require_reviewed_implementation(
+        code_identity, expected_implementation_commit,
+    )
+    try:
+        calendar_artifact = code_identity["files"][
+            "research/hist8/calendar_manifest.json"
+        ]
+        expected_calendar_file_sha256 = calendar_artifact["sha256"]
+    except (KeyError, TypeError) as exc:
+        raise Hist8Error("calendar artifact identity mismatch") from exc
+    if not isinstance(expected_calendar_file_sha256, str):
+        raise Hist8Error("calendar artifact identity mismatch")
+    calendar = load_calendar(
+        expected_file_sha256=expected_calendar_file_sha256,
+    )
     store = Hist8Store.from_environment()
     kind = "IMPORT_ATTEMPT" if acquire_sources else "REPLAY_ATTEMPT"
     source_snapshot = (
@@ -2125,18 +2820,10 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
     results: dict[str, dict[str, object]] = {}
     for instrument in INSTRUMENTS:
         source_status = source_statuses[instrument]
-        if source_status["availability"] == "AVAILABLE":
-            metrics: dict[str, object] = materialize_instrument(
-                store, chosen, instrument, calendar, attempt_id=attempt_id,
-            )
-        else:
-            verified = sum(
-                1 for _page in store.retrieval_pages(chosen, instrument)
-            )
-            metrics = {
-                **_unavailable_instrument_result(calendar, instrument),
-                "verified_retrieval_associations": verified,
-            }
+        metrics: dict[str, object] = materialize_instrument(
+            store, chosen, instrument, calendar, attempt_id=attempt_id,
+            source_unavailable=source_status["availability"] == "UNAVAILABLE",
+        )
         if (metrics.get("verified_retrieval_associations")
                 != source_status["retrieval_associations"]):
             raise Hist8ConflictError(
@@ -2164,10 +2851,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("run", "replay"))
     parser.add_argument("--import-id")
+    parser.add_argument("--implementation-commit", required=True)
     args = parser.parse_args(argv)
     if args.command == "replay" and not args.import_id:
         parser.error("replay requires --import-id")
-    result = execute(args.import_id, acquire_sources=args.command == "run")
+    result = execute(
+        args.import_id,
+        expected_implementation_commit=args.implementation_commit,
+        acquire_sources=args.command == "run",
+    )
     print(json.dumps(_canonical(result), sort_keys=True, separators=(",", ":")))
     return 0
 

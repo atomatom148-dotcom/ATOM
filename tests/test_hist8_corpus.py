@@ -39,10 +39,48 @@ def _source_bar(start: datetime, *, artifact: str = "sha256:" + "a" * 64) -> cor
 
 
 def _raw_page(body: object, *, source: str = "ALPACA", instruments=("SPY",)) -> corpus.RawPage:
+    if source == "ALPACA":
+        feed = "SIP"
+        product = "1Min trade OHLCV"
+        endpoint = corpus.ALPACA_URL
+        request_params = dict(corpus.ALPACA_FROZEN_PARAMS)
+    elif source == "COINBASE":
+        feed = "EXCHANGE"
+        product = "BTC-USD granularity=60"
+        endpoint = corpus.COINBASE_URL
+        request_params = {
+            "granularity": "60", "start": "2024-09-01T00:00:00Z",
+            "end": "2024-09-01T05:00:00Z",
+        }
+    elif source == "MASSIVE":
+        feed = "I:COMP"
+        product = "I:COMP minute index OHLC"
+        endpoint = corpus.MASSIVE_URL
+        request_params = dict(corpus.MASSIVE_FROZEN_PARAMS)
+    else:
+        raise AssertionError(source)
     return corpus.RawPage(
-        source, "SIP", "1Min", instruments, "https://example.invalid",
-        {}, datetime(2026, 9, 2, tzinfo=UTC), 200, "application/json", None,
+        source, feed, product, instruments, endpoint, request_params,
+        datetime(2026, 9, 2, tzinfo=UTC), 200, "application/json", None,
         json.dumps(body, separators=(",", ":")).encode(),
+    )
+
+
+def _retrieval_record(
+    page: corpus.RawPage, instrument: str, *, import_id: str = "attempt",
+    sequence_no: int = 1,
+) -> tuple[object, ...]:
+    payload = corpus._retrieval_manifest_payload(
+        import_id, sequence_no, page, instrument,
+    )
+    artifact_id = "sha256:" + corpus.sha256(page.body)
+    return (
+        corpus._manifest_id(payload), corpus.CORPUS_ID, import_id,
+        "RETRIEVAL", sequence_no, page.source, page.feed, page.product,
+        instrument, page.endpoint, dict(page.request_params),
+        page.retrieved_at, page.http_status, page.content_type,
+        page.content_encoding, artifact_id, len(page.body), len(page.body),
+        page.body,
     )
 
 
@@ -79,6 +117,24 @@ def test_calendar_is_complete_and_hash_bound() -> None:
     assert corpus.sha256({
         key: tampered[key] for key in tampered if key != "schedule_sha256"
     }) != manifest["schedule_sha256"]
+
+
+def test_calendar_rejects_self_consistent_nonreviewed_schedule(tmp_path) -> None:
+    manifest = corpus.load_calendar()
+    tampered = dict(manifest)
+    tampered["timezone_database_version"] = "unreviewed-tzdb"
+    tampered["schedule_sha256"] = corpus.sha256({
+        key: tampered[key] for key in tampered if key != "schedule_sha256"
+    })
+    path = tmp_path / "calendar_manifest.json"
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(corpus.Hist8Error, match="calendar schedule hash mismatch"):
+        corpus.load_calendar(path)
+
+
+def test_calendar_file_bytes_are_bound_to_execution_identity() -> None:
+    with pytest.raises(corpus.Hist8Error, match="artifact identity mismatch"):
+        corpus.load_calendar(expected_file_sha256="0" * 64)
 
 
 def test_alpaca_request_is_sip_raw_and_bounded() -> None:
@@ -126,6 +182,33 @@ def test_parser_preserves_decimal_values_and_raw_lineage() -> None:
         corpus.parse_source_page(sub_microsecond, "SPY")
 
 
+def test_retained_manifest_rejects_self_consistent_wrong_provider_binding() -> None:
+    page = _raw_page([], source="COINBASE", instruments=("QQQ",))
+    record = _retrieval_record(page, "QQQ")
+    with pytest.raises(
+        corpus.Hist8ConflictError,
+        match="retained retrieval manifest identity mismatch",
+    ):
+        corpus._verified_retrieval_record(
+            record, import_id="attempt", instrument="QQQ",
+        )
+
+
+@pytest.mark.parametrize("page", (
+    replace(
+        _raw_page({"bars": {"SPY": []}}),
+        feed="IEX",
+    ),
+    replace(
+        _raw_page({"bars": {"SPY": []}}),
+        request_params={**corpus.ALPACA_FROZEN_PARAMS, "feed": "iex"},
+    ),
+))
+def test_parser_rejects_provider_identity_drift(page) -> None:
+    with pytest.raises(corpus.Hist8Error):
+        corpus.parse_source_page(page, "SPY")
+
+
 def test_malformed_source_rows_are_counted_and_valid_rows_survive() -> None:
     start = "2025-01-02T14:30:00Z"
     page = _raw_page({"bars": {"SPY": [
@@ -165,8 +248,7 @@ def test_massive_identity_pagination_and_fractional_timestamp_fail_closed() -> N
     )
     assert endpoint == corpus.MASSIVE_URL
     assert params == {
-        "adjusted": "false", "sort": "asc", "limit": "50000",
-        "cursor": "next",
+        "sort": "asc", "limit": "50000", "cursor": "next",
     }
     provider_cursor_endpoint, provider_cursor_params = corpus._strip_secret_query(
         "https://api.massive.com/v2/aggs/ticker/I%3ACOMP/range/1/minute/"
@@ -176,8 +258,7 @@ def test_massive_identity_pagination_and_fractional_timestamp_fail_closed() -> N
         "/I%3ACOMP/range/1/minute/1725148860000/2026-09-01"
     )
     assert provider_cursor_params == {
-        "adjusted": "false", "sort": "asc", "limit": "50000",
-        "cursor": "opaque",
+        "sort": "asc", "limit": "50000", "cursor": "opaque",
     }
     for query in (
         "cursor=next&adjusted=true",
@@ -193,23 +274,52 @@ def test_massive_identity_pagination_and_fractional_timestamp_fail_closed() -> N
     with pytest.raises(corpus.Hist8Error, match="ticker identity mismatch"):
         list(corpus.massive_pages("key", opener=lambda *_args, **_kwargs: wrong_ticker))
 
-    wrong_adjustment = _Response({
-        "ticker": "I:COMP", "adjusted": True, "results": [],
+    documented_response = _Response({
+        "ticker": "I:COMP", "status": "OK", "results": [],
     })
-    with pytest.raises(corpus.Hist8Error, match="adjustment identity mismatch"):
-        list(corpus.massive_pages(
-            "key", opener=lambda *_args, **_kwargs: wrong_adjustment,
-        ))
+    assert len(list(corpus.massive_pages(
+        "key", opener=lambda *_args, **_kwargs: documented_response,
+    ))) == 1
 
     page = corpus.RawPage(
         "MASSIVE", "I:COMP", "I:COMP minute index OHLC", ("NASDAQ",),
-        corpus.MASSIVE_URL, {}, datetime(2026, 9, 2, tzinfo=UTC), 200,
+        corpus.MASSIVE_URL, dict(corpus.MASSIVE_FROZEN_PARAMS),
+        datetime(2026, 9, 2, tzinfo=UTC), 200,
         "application/json", None,
-        (b'{"ticker":"I:COMP","results":[{"t":1000.5,"o":1,'
+        (b'{"ticker":"I:COMP","status":"OK",'
+         b'"results":[{"t":1000.5,"o":1,'
          b'"h":1,"l":1,"c":1}]}'),
     )
     with pytest.raises(corpus.Hist8Error, match="timestamp is not an integer"):
         corpus.parse_source_page(page, "NASDAQ")
+
+
+def test_nasdaq_ohlc_is_bound_as_index_points() -> None:
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
+    page = _raw_page({
+        "ticker": "I:COMP", "status": "OK",
+        "results": [{
+            "t": int(start.timestamp() * 1000),
+            "o": "19000.1", "h": "19001.2", "l": "18999.9",
+            "c": "19000.8",
+        }],
+    }, source="MASSIVE", instruments=("NASDAQ",))
+    source = corpus.parse_source_page(page, "NASDAQ")[0]
+    bar = corpus.canonical_bar(
+        source, session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
+        calendar_id="NASDAQ_CASH_RTH", import_id="attempt", eligible=False,
+    )
+    assert bar.price_unit == "INDEX_POINTS"
+    assert bar.volume is None
+    assert bar.volume_unit == "NOT_APPLICABLE"
+
+    failed = _raw_page(
+        {"ticker": "I:COMP", "status": "ERROR", "results": []},
+        source="MASSIVE", instruments=("NASDAQ",),
+    )
+    with pytest.raises(corpus.Hist8Error, match="response status mismatch"):
+        corpus.parse_source_page(failed, "NASDAQ")
 
 
 def test_provider_redirect_is_rejected_before_response_acceptance() -> None:
@@ -397,6 +507,69 @@ def test_malformed_http_status_line_is_contained_to_one_provider(monkeypatch) ->
     assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
 
 
+@pytest.mark.parametrize("malformed_body", (
+    b'{"bars":{},"next_page_token":' + b"9" * 5000 + b"}",
+    b"[" * 10000 + b"0" + b"]" * 10000,
+))
+def test_json_parser_limits_are_contained_to_one_provider(
+    monkeypatch, malformed_body,
+) -> None:
+    stored = []
+    real_alpaca_pages = corpus.alpaca_pages
+
+    class MalformedResponse:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return malformed_body
+
+    def alpaca(*_args, **_kwargs):
+        yield from real_alpaca_pages(
+            "key", "secret",
+            opener=lambda *_args, **_kwargs: MalformedResponse(),
+        )
+
+    def coinbase(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "coinbase"}, source="COINBASE",
+            instruments=("BTC-USD",),
+        )
+
+    def massive(*_args, **_kwargs):
+        yield _raw_page(
+            {"complete": "massive"}, source="MASSIVE",
+            instruments=("NASDAQ",),
+        )
+
+    class Store:
+        def store_page(self, import_id, sequence, page):
+            assert import_id == "json-limit-attempt"
+            stored.append(page.source)
+            return sequence + len(page.instruments)
+
+    monkeypatch.setattr(corpus, "alpaca_pages", alpaca)
+    monkeypatch.setattr(corpus, "coinbase_pages", coinbase)
+    monkeypatch.setattr(corpus, "massive_pages", massive)
+    result = corpus.acquire(Store(), "json-limit-attempt")
+
+    assert stored == ["ALPACA", "COINBASE", "MASSIVE"]
+    assert result["retrieval_associations"] == 8
+    assert result["source_statuses"]["SPY"] == {
+        "source": "ALPACA", "availability": "UNAVAILABLE",
+        "retrieval_associations": 1, "failure_type": "Hist8Error",
+        "reason": "provider response is not valid decimal JSON",
+    }
+    assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
+    assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
+
+
 def test_malformed_alpaca_page_shape_is_contained_to_one_provider(
     monkeypatch,
 ) -> None:
@@ -511,7 +684,8 @@ def test_complete_session_is_eligible_and_derives_deterministically() -> None:
     start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
     minute_bars = tuple(corpus.canonical_bar(
         _source_bar(start + timedelta(minutes=index)),
-        session_date="2025-01-02", calendar_hash="b" * 64,
+        session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
         import_id="attempt-1", eligible=True,
     ) for index in range(5))
     first = corpus.derive_session(
@@ -536,14 +710,16 @@ def test_eligibility_is_snapshot_state_not_canonical_bar_identity() -> None:
     start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
     source = _source_bar(start)
     incomplete = corpus.canonical_bar(
-        source, session_date="2025-01-02", calendar_hash="b" * 64,
+        source, session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
         import_id="attempt-1", eligible=False,
     )
     reshuffled = replace(
         source, artifact_id="sha256:" + "c" * 64, locator="$[17]",
     )
     complete = corpus.canonical_bar(
-        reshuffled, session_date="2025-01-02", calendar_hash="b" * 64,
+        reshuffled, session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
         import_id="attempt-2", eligible=True,
     )
     assert incomplete.bar_id == complete.bar_id
@@ -557,13 +733,152 @@ def test_derived_volume_sum_preserves_every_decimal_digit() -> None:
     volumes = [Decimal("10000000000000000000000000000")] + [Decimal(1)] * 4
     minutes = tuple(corpus.canonical_bar(
         replace(_source_bar(start + timedelta(minutes=index)), volume=volume),
-        session_date="2025-01-02", calendar_hash="b" * 64,
+        session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
         import_id="attempt", eligible=True,
     ) for index, volume in enumerate(volumes))
     derived = corpus.derive_session(
         minutes, "5m", "attempt", session_open=start,
     )[0]
     assert derived.volume == Decimal("10000000000000000000000000004")
+
+
+@pytest.mark.parametrize("mutation", (
+    "open", "high", "low", "close", "volume", "trade_count", "vwap",
+    "short_lineage", "reversed_lineage", "wrong_lineage_hash",
+))
+def test_independent_session_verifier_rejects_rehashed_derived_tampering(
+    mutation,
+) -> None:
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
+    minutes = tuple(corpus.canonical_bar(
+        _source_bar(start + timedelta(minutes=index)),
+        session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
+        import_id="attempt", eligible=True,
+    ) for index in range(5))
+    derived = corpus.derive_session(
+        minutes, "5m", "attempt", session_open=start,
+    )[0]
+    changes = {
+        "open": {"open": Decimal("101")},
+        "high": {"high": Decimal("104")},
+        "low": {"low": Decimal("98")},
+        "close": {"close": Decimal("101")},
+        "volume": {"volume": Decimal("51")},
+        "trade_count": {"trade_count": 11},
+        "vwap": {"vwap": Decimal("101")},
+        "short_lineage": {"lineage": derived.lineage[:-1]},
+        "reversed_lineage": {"lineage": tuple(reversed(derived.lineage))},
+        "wrong_lineage_hash": {
+            "lineage": (*derived.lineage[:-1], "hist8bar:" + "c" * 64
+                        + "|" + "d" * 64),
+        },
+    }[mutation]
+    tampered = corpus._finish_bar(replace(derived, **changes))
+    rows = (*minutes, tampered)
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="derived aggregation mismatch",
+    ):
+        corpus._verify_materialized_session(
+            rows, session_open=start,
+            session_close=start + timedelta(minutes=5), expected_minutes=5,
+            expected_session_date="2025-01-02",
+            expected_calendar_id="US_CASH_RTH",
+            expected_calendar_sha256=corpus.CALENDAR_SCHEDULE_SHA256,
+        )
+
+
+def test_independent_session_verifier_rejects_membership_and_eligibility_drift() -> None:
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
+    minutes = tuple(corpus.canonical_bar(
+        _source_bar(start + timedelta(minutes=index)),
+        session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
+        import_id="attempt", eligible=True,
+    ) for index in range(5))
+    derived = corpus.derive_session(
+        minutes, "5m", "attempt", session_open=start,
+    )[0]
+    kwargs = {
+        "session_open": start,
+        "session_close": start + timedelta(minutes=5),
+        "expected_minutes": 5,
+        "expected_session_date": "2025-01-02",
+        "expected_calendar_id": "US_CASH_RTH",
+        "expected_calendar_sha256": corpus.CALENDAR_SCHEDULE_SHA256,
+    }
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="derived window membership mismatch",
+    ):
+        corpus._verify_materialized_session(minutes, **kwargs)
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="incomplete session has derived bars",
+    ):
+        corpus._verify_materialized_session((
+            *(replace(row, research_eligible=False) for row in minutes[:-1]),
+            derived,
+        ), **kwargs)
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="canonical eligibility mismatch",
+    ):
+        corpus._verify_materialized_session(
+            (replace(minutes[0], research_eligible=False), *minutes[1:], derived),
+            **kwargs,
+        )
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="derived eligibility mismatch",
+    ):
+        corpus._verify_materialized_session(
+            (*minutes, replace(derived, research_eligible=False)), **kwargs,
+        )
+
+
+@pytest.mark.parametrize("field,value", (
+    ("calendar_id", "WRONG_CALENDAR"),
+    ("calendar_sha256", "0" * 64),
+    ("session_date", "2025-01-03"),
+))
+def test_independent_session_verifier_rejects_rehashed_calendar_drift(
+    field, value,
+) -> None:
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
+    row = corpus.canonical_bar(
+        _source_bar(start), session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
+        import_id="attempt", eligible=True,
+    )
+    tampered = corpus._finish_bar(replace(row, **{field: value}))
+    with pytest.raises(
+        corpus.Hist8ConflictError,
+        match="(?:bar|materialized) calendar identity mismatch",
+    ):
+        corpus._verify_materialized_session(
+            (tampered,), session_open=start,
+            session_close=start + timedelta(minutes=1), expected_minutes=1,
+            expected_session_date="2025-01-02",
+            expected_calendar_id="US_CASH_RTH",
+            expected_calendar_sha256=corpus.CALENDAR_SCHEDULE_SHA256,
+        )
+
+
+def test_independent_session_verifier_rejects_out_of_session_canonical_bar() -> None:
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
+    row = corpus.canonical_bar(
+        _source_bar(start + timedelta(days=1)), session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
+        import_id="attempt", eligible=False,
+    )
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="canonical session membership mismatch",
+    ):
+        corpus._verify_materialized_session(
+            (row,), session_open=start,
+            session_close=start + timedelta(minutes=1), expected_minutes=1,
+            expected_session_date="2025-01-02",
+            expected_calendar_id="US_CASH_RTH",
+            expected_calendar_sha256=corpus.CALENDAR_SCHEDULE_SHA256,
+        )
 
 
 def test_incomplete_session_is_stored_but_not_derived() -> None:
@@ -580,7 +895,7 @@ def test_incomplete_session_is_stored_but_not_derived() -> None:
             assert (import_id, instrument) == ("source-1", "SPY")
             yield _raw_page(body)
 
-        def insert_bars(self, rows):
+        def insert_bars(self, rows, **_kwargs):
             self.inserted.extend(rows)
             return len(rows), 0
 
@@ -602,6 +917,183 @@ def test_incomplete_session_is_stored_but_not_derived() -> None:
     assert store.inserted[0].research_eligible is False
 
 
+def test_unavailable_source_materializes_valid_prefix_as_ineligible() -> None:
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
+    first = _raw_page({
+        "bars": {"SPY": [{
+            "t": start.isoformat(), "o": 100, "h": 101, "l": 99,
+            "c": 100, "v": 1,
+        }]},
+        "next_page_token": "page-2",
+    })
+    terminal = replace(
+        _raw_page({"error": "unavailable"}),
+        request_params={
+            **corpus.ALPACA_FROZEN_PARAMS, "page_token": "page-2",
+        },
+        http_status=503,
+    )
+
+    class Store:
+        inserted = []
+
+        def retrieval_pages(self, *_args):
+            yield first
+            yield terminal
+
+        def insert_bars(self, rows, **_kwargs):
+            self.inserted.extend(rows)
+            return len(rows), 0
+
+    calendar = {
+        "schedule_sha256": "b" * 64,
+        "instrument_calendars": {"SPY": "US_CASH_RTH"},
+        "us_cash_sessions": [{
+            "date": "2025-01-02", "open_utc": "2025-01-02T14:30:00Z",
+            "close_utc": "2025-01-02T14:31:00Z", "expected_minutes": 1,
+        }],
+    }
+    store = Store()
+    result = corpus.materialize_instrument(
+        store, "source", "SPY", calendar, source_unavailable=True,
+    )
+    assert len(store.inserted) == 1
+    assert store.inserted[0].timeframe == "1m"
+    assert store.inserted[0].research_eligible is False
+    assert result["verified_retrieval_associations"] == 2
+    assert result["usable_retrieval_associations"] == 1
+    assert result["source_chain_complete"] is False
+    assert result["source_acquisition_incomplete_sessions"] == 1
+    assert result["eligible_sessions"] == 0
+    assert result["incomplete_sessions"] == 0
+
+
+def test_unavailable_source_rejects_complete_or_post_terminal_chain() -> None:
+    complete = _raw_page({"bars": {"SPY": []}, "next_page_token": None})
+    terminal = replace(complete, http_status=503)
+
+    class Store:
+        def __init__(self, pages):
+            self.pages = pages
+
+        def retrieval_pages(self, *_args):
+            yield from self.pages
+
+        def insert_bars(self, *_args, **_kwargs):
+            raise AssertionError("no bars should be inserted")
+
+    calendar = {
+        "schedule_sha256": "b" * 64,
+        "instrument_calendars": {"SPY": "US_CASH_RTH"},
+        "us_cash_sessions": [],
+    }
+    with pytest.raises(
+        corpus.Hist8ConflictError,
+        match="unavailable retained provider pagination is complete",
+    ):
+        corpus.materialize_instrument(
+            Store((complete,)), "source", "SPY", calendar,
+            source_unavailable=True,
+        )
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="retained provider pagination mismatch",
+    ):
+        corpus.materialize_instrument(
+            Store((terminal, complete)), "source", "SPY", calendar,
+            source_unavailable=True,
+        )
+
+
+def test_unavailable_source_keeps_rows_from_invalid_continuation_page() -> None:
+    start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
+    page = _raw_page({
+        "bars": {"SPY": [{
+            "t": (start + timedelta(minutes=index)).isoformat(),
+            "o": 100, "h": 101, "l": 99, "c": 100, "v": 1,
+        } for index in range(5)]},
+        "next_page_token": 7,
+    })
+
+    class Store:
+        inserted = []
+
+        def retrieval_pages(self, *_args):
+            yield page
+
+        def insert_bars(self, rows, **kwargs):
+            assert kwargs["source_chain_complete"] is False
+            self.inserted.extend(rows)
+            return len(rows), 0
+
+    calendar = {
+        "schedule_sha256": corpus.CALENDAR_SCHEDULE_SHA256,
+        "instrument_calendars": {"SPY": "US_CASH_RTH"},
+        "us_cash_sessions": [{
+            "date": "2025-01-02", "open_utc": "2025-01-02T14:30:00Z",
+            "close_utc": "2025-01-02T14:35:00Z", "expected_minutes": 5,
+        }],
+    }
+    store = Store()
+    result = corpus.materialize_instrument(
+        store, "source", "SPY", calendar, source_unavailable=True,
+    )
+    assert len(store.inserted) == 5
+    assert {row.timeframe for row in store.inserted} == {"1m"}
+    assert not any(row.research_eligible for row in store.inserted)
+    assert result["usable_retrieval_associations"] == 1
+    assert result["source_acquisition_incomplete_sessions"] == 1
+    assert result["source_excluded_5m_windows"] == 1
+
+
+def test_materialization_rejects_noncontiguous_coinbase_pages() -> None:
+    first = _raw_page([], source="COINBASE", instruments=("BTC-USD",))
+    second = replace(first, request_params={
+        "granularity": "60", "start": "2024-09-01T10:00:00Z",
+        "end": "2024-09-01T15:00:00Z",
+    })
+
+    class Store:
+        def retrieval_pages(self, *_args):
+            yield first
+            yield second
+
+        def insert_bars(self, *_args, **_kwargs):
+            raise AssertionError("pagination must fail before insertion")
+
+    calendar = {
+        "schedule_sha256": "d" * 64,
+        "instrument_calendars": {"BTC-USD": "BTC_UTC_DAY"},
+        "btc_utc_dates": [],
+    }
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="retained provider pagination mismatch",
+    ):
+        corpus.materialize_instrument(Store(), "source", "BTC-USD", calendar)
+
+
+def test_materialization_rejects_incomplete_alpaca_page_chain() -> None:
+    page = _raw_page({
+        "bars": {"SPY": []}, "next_page_token": "missing-page",
+    })
+
+    class Store:
+        def retrieval_pages(self, *_args):
+            yield page
+
+        def insert_bars(self, *_args, **_kwargs):
+            raise AssertionError("empty pages must not insert")
+
+    calendar = {
+        "schedule_sha256": "d" * 64,
+        "instrument_calendars": {"SPY": "US_CASH_RTH"},
+        "us_cash_sessions": [],
+    }
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="retained provider pagination incomplete",
+    ):
+        corpus.materialize_instrument(Store(), "source", "SPY", calendar)
+
+
 def test_identical_overlap_with_different_lineage_is_idempotent_provider_data() -> None:
     start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
     item = {"t": start.isoformat(), "o": 100, "h": 101, "l": 99,
@@ -611,10 +1103,17 @@ def test_identical_overlap_with_different_lineage_is_idempotent_provider_data() 
         inserted = []
 
         def retrieval_pages(self, _import_id, _instrument):
-            yield _raw_page({"bars": {"SPY": [item]}})
-            yield _raw_page({"bars": {"SPY": [item]}, "page": 2})
+            yield _raw_page({
+                "bars": {"SPY": [item]}, "next_page_token": "page-2",
+            })
+            yield replace(
+                _raw_page({"bars": {"SPY": [item]}, "page": 2}),
+                request_params={
+                    **corpus.ALPACA_FROZEN_PARAMS, "page_token": "page-2",
+                },
+            )
 
-        def insert_bars(self, rows):
+        def insert_bars(self, rows, **_kwargs):
             self.inserted.extend(rows)
             return len(rows), 0
 
@@ -645,12 +1144,21 @@ def test_identical_overlap_after_session_flush_uses_stored_canonical_row() -> No
         canonical = {}
 
         def retrieval_pages(self, _import_id, _instrument):
-            yield _raw_page({"bars": {"SPY": [item(first), item(second)]},
-                             "page": 1})
-            yield _raw_page({"bars": {"SPY": [item(first), item(second)]},
-                             "page": 2})
+            yield _raw_page({
+                "bars": {"SPY": [item(first), item(second)]},
+                "page": 1, "next_page_token": "page-2",
+            })
+            yield replace(
+                _raw_page({
+                    "bars": {"SPY": [item(first), item(second)]},
+                    "page": 2,
+                }),
+                request_params={
+                    **corpus.ALPACA_FROZEN_PARAMS, "page_token": "page-2",
+                },
+            )
 
-        def insert_bars(self, rows):
+        def insert_bars(self, rows, **_kwargs):
             for row in rows:
                 if row.timeframe == "1m":
                     self.canonical[row.bar_start_utc] = (
@@ -700,10 +1208,18 @@ def test_conflicting_overlap_after_session_flush_fails_closed() -> None:
         canonical = {}
 
         def retrieval_pages(self, _import_id, _instrument):
-            yield _raw_page({"bars": {"SPY": [original, later]}, "page": 1})
-            yield _raw_page({"bars": {"SPY": [changed]}, "page": 2})
+            yield _raw_page({
+                "bars": {"SPY": [original, later]}, "page": 1,
+                "next_page_token": "page-2",
+            })
+            yield replace(
+                _raw_page({"bars": {"SPY": [changed]}, "page": 2}),
+                request_params={
+                    **corpus.ALPACA_FROZEN_PARAMS, "page_token": "page-2",
+                },
+            )
 
-        def insert_bars(self, rows):
+        def insert_bars(self, rows, **_kwargs):
             for row in rows:
                 if row.timeframe == "1m":
                     self.canonical[row.bar_start_utc] = (
@@ -745,7 +1261,8 @@ def test_replay_pages_release_each_bounded_read_transaction() -> None:
     for sequence in range(1, 10):
         body = json.dumps({"sequence": sequence}).encode()
         page = corpus.RawPage(
-            "ALPACA", "SIP", "1Min", ("SPY",), corpus.ALPACA_URL, {},
+            "ALPACA", "SIP", "1Min trade OHLCV", ("SPY",),
+            corpus.ALPACA_URL, dict(corpus.ALPACA_FROZEN_PARAMS),
             datetime(2026, 9, 2, tzinfo=UTC), 200, "application/json",
             None, body,
         )
@@ -756,8 +1273,9 @@ def test_replay_pages_release_each_bounded_read_transaction() -> None:
         )
         retained.append((
             manifest_id, corpus.CORPUS_ID, "source-import", "RETRIEVAL",
-            sequence, "ALPACA", "SIP", "1Min", "SPY", corpus.ALPACA_URL,
-            {}, datetime(2026, 9, 2, tzinfo=UTC), 200, "application/json",
+            sequence, "ALPACA", "SIP", "1Min trade OHLCV", "SPY",
+            corpus.ALPACA_URL, dict(corpus.ALPACA_FROZEN_PARAMS),
+            datetime(2026, 9, 2, tzinfo=UTC), 200, "application/json",
             None, "sha256:" + corpus.sha256(body), len(body), len(body), body,
         ))
 
@@ -773,7 +1291,9 @@ def test_replay_pages_release_each_bounded_read_transaction() -> None:
         def execute(self, query, params=None):
             if ("select current_user" in query
                     and "current_database()" in query):
-                self.rows = [(corpus.IMPORTER_ROLE, corpus.DATABASE_NAME)]
+                self.rows = [(
+                    corpus.IMPORTER_ROLE, corpus.DATABASE_NAME, "origin", "off",
+                )]
             elif "select max(sequence_no)" in query:
                 self.rows = [(retained[-1][4],)]
             elif "m.sequence_no>%s" in query:
@@ -831,7 +1351,8 @@ def test_identical_insert_race_uses_actual_affected_row_count(monkeypatch) -> No
     start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
     row = corpus.canonical_bar(
         _source_bar(start), session_date="2025-01-02",
-        calendar_hash="b" * 64, import_id="race-attempt", eligible=True,
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
+        import_id="race-attempt", eligible=True,
     )
     state = {"bar_selects": 0}
     winning = replace(row, import_id="winning-attempt")
@@ -855,7 +1376,9 @@ def test_identical_insert_race_uses_actual_affected_row_count(monkeypatch) -> No
         def execute(self, query, params=None):
             if ("select current_user" in query
                     and "current_database()" in query):
-                self.rows = [(corpus.IMPORTER_ROLE, corpus.DATABASE_NAME)]
+                self.rows = [(
+                    corpus.IMPORTER_ROLE, corpus.DATABASE_NAME, "origin", "off",
+                )]
             elif "select bar_id,content_hash,corpus_id" in query:
                 state["bar_selects"] += 1
                 self.rows = (
@@ -905,13 +1428,20 @@ def test_identical_insert_race_uses_actual_affected_row_count(monkeypatch) -> No
             return Cursor()
 
     store = corpus.Hist8Store(Connection)
-    assert store.insert_bars((row,)) == (0, 1)
+    assert store.insert_bars(
+        (row,), session_open=start,
+        session_close=start + timedelta(minutes=1), expected_minutes=1,
+        expected_session_date=row.session_date,
+        expected_calendar_id=row.calendar_id,
+        expected_calendar_sha256=row.calendar_sha256,
+    ) == (0, 1)
 
 
 def test_insert_recomputes_stored_bar_hash() -> None:
     row = corpus.canonical_bar(
         _source_bar(datetime(2025, 1, 2, 14, 30, tzinfo=UTC)),
-        session_date="2025-01-02", calendar_hash="b" * 64,
+        session_date="2025-01-02",
+        calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
         import_id="source-attempt", eligible=True,
     )
     corrupted = list(corpus._bar_values(row))
@@ -930,7 +1460,9 @@ def test_insert_recomputes_stored_bar_hash() -> None:
         def execute(self, query, params=None):
             if ("select current_user" in query
                     and "current_database()" in query):
-                self.rows = [(corpus.IMPORTER_ROLE, corpus.DATABASE_NAME)]
+                self.rows = [(
+                    corpus.IMPORTER_ROLE, corpus.DATABASE_NAME, "origin", "off",
+                )]
             elif "select bar_id,content_hash,corpus_id" in query:
                 self.rows = [tuple(corrupted)]
             else:
@@ -953,7 +1485,13 @@ def test_insert_recomputes_stored_bar_hash() -> None:
             return Cursor()
 
     with pytest.raises(corpus.Hist8ConflictError, match="stored bar identity"):
-        corpus.Hist8Store(Connection).insert_bars((row,))
+        corpus.Hist8Store(Connection).insert_bars(
+            (row,), session_open=row.bar_start_utc,
+            session_close=row.bar_end_utc, expected_minutes=1,
+            expected_session_date=row.session_date,
+            expected_calendar_id=row.calendar_id,
+            expected_calendar_sha256=row.calendar_sha256,
+        )
 
 
 def test_sealed_snapshot_recomputes_manifest_identity() -> None:
@@ -975,7 +1513,9 @@ def test_sealed_snapshot_recomputes_manifest_identity() -> None:
         def execute(self, query, params=None):
             if ("select current_user" in query
                     and "current_database()" in query):
-                self.rows = [(corpus.IMPORTER_ROLE, corpus.DATABASE_NAME)]
+                self.rows = [(
+                    corpus.IMPORTER_ROLE, corpus.DATABASE_NAME, "origin", "off",
+                )]
             elif "manifest_kind='SNAPSHOT'" in query:
                 assert params == (corpus.CORPUS_ID, import_id)
                 self.rows = [(
@@ -1006,6 +1546,52 @@ def test_sealed_snapshot_recomputes_manifest_identity() -> None:
         corpus.Hist8ConflictError, match="manifest identity mismatch"
     ):
         store.sealed_snapshot_state(import_id)
+
+
+def test_snapshot_derivation_validation_precedes_seal_write(monkeypatch) -> None:
+    events = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, params=None):
+            events.append((query, params))
+
+        def fetchone(self):
+            return (True,)
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            events.append(("COMMIT", None))
+
+        def rollback(self):
+            events.append(("ROLLBACK", None))
+
+        def close(self):
+            events.append(("CLOSE", None))
+
+    store = corpus.Hist8Store(Connection)
+    monkeypatch.setattr(store, "_verify", lambda _connection: None)
+    monkeypatch.setattr(
+        store, "_verify_snapshot_derivations",
+        lambda _import_id, _source_statuses=None: (_ for _ in ()).throw(
+            corpus.Hist8ConflictError("derived seal mismatch")
+        ),
+    )
+    with pytest.raises(corpus.Hist8ConflictError, match="derived seal mismatch"):
+        store.seal_snapshot("attempt", {})
+    assert not any(
+        "insert into atom_research_history.manifests" in query.lower()
+        for query, _params in events if isinstance(query, str)
+    )
+    assert any("pg_advisory_unlock" in query for query, _params in events)
 
 
 def test_database_url_must_bind_exact_project_database_and_role(monkeypatch) -> None:
@@ -1049,7 +1635,40 @@ def test_database_url_must_bind_exact_project_database_and_role(monkeypatch) -> 
     )
 
 
-def test_schema_installer_verifies_direct_tls_endpoint_before_sql() -> None:
+@pytest.mark.parametrize(
+    ("replication_role", "lo_compat_privileges"),
+    (("replica", "off"), ("local", "off"), ("origin", "on")),
+)
+def test_store_rejects_unsafe_database_session(
+    replication_role, lo_compat_privileges,
+) -> None:
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, _query):
+            return None
+
+        def fetchone(self):
+            return (
+                corpus.IMPORTER_ROLE, corpus.DATABASE_NAME, replication_role,
+                lo_compat_privileges,
+            )
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    with pytest.raises(corpus.Hist8Error, match="database identity mismatch"):
+        corpus.Hist8Store._verify(Connection())
+
+
+def test_schema_installer_verifies_direct_tls_endpoint_before_sql(
+    monkeypatch, tmp_path,
+) -> None:
     events = []
     assert "ATOM_HIST8_INSTALL_DATABASE_URL" not in Path(
         "research/hist8/corpus.py"
@@ -1099,15 +1718,102 @@ def test_schema_installer_verifies_direct_tls_endpoint_before_sql() -> None:
         def cursor(self):
             return self._cursor
 
-    result = corpus.install_schema(Connection())
+    schema_bytes = Path("research/hist8/schema.sql").read_bytes()
+    installer_identity = {
+        **TEST_CODE_IDENTITY,
+        "files": {
+            **TEST_CODE_IDENTITY["files"],
+            "research/hist8/schema.sql": {
+                "git_blob": "c" * 40,
+                "sha256": corpus.sha256(schema_bytes),
+                "byte_length": len(schema_bytes),
+            },
+        },
+    }
+    monkeypatch.setattr(
+        corpus, "_execution_code_identity", lambda: installer_identity,
+    )
+    result = corpus.install_schema(
+        Connection(), expected_implementation_commit="f" * 40,
+    )
     assert result["project_ref"] == corpus.PROJECT_REF
+    assert result["implementation_commit"] == "f" * 40
     assert "pg_stat_ssl" in events[0][0]
     assert "set_config('atom.hist8_verified_project_ref'" in events[1][0]
     assert events[1][1] == (corpus.PROJECT_REF,)
     assert "CREATE ROLE atom_hist8_importer" in events[2][0]
 
     with pytest.raises(corpus.Hist8Error, match="endpoint identity"):
-        corpus.install_schema(Connection(host="wrong.example"))
+        corpus.install_schema(
+            Connection(host="wrong.example"),
+            expected_implementation_commit="f" * 40,
+        )
+
+    substituted = tmp_path / "schema.sql"
+    substituted.write_text(
+        "-- ATOM-HIST8-CORPUS-AMENDMENT-1\n"
+        "BEGIN; SELECT 'unreviewed'; COMMIT;\n",
+        encoding="utf-8",
+    )
+    event_count = len(events)
+    with pytest.raises(corpus.Hist8Error, match="schema artifact mismatch"):
+        corpus.install_schema(
+            Connection(), expected_implementation_commit="f" * 40,
+            schema_path=substituted,
+        )
+    assert len(events) == event_count
+
+    bad_identity = {
+        **installer_identity,
+        "files": {
+            **installer_identity["files"],
+            "research/hist8/schema.sql": {
+                **installer_identity["files"]["research/hist8/schema.sql"],
+                "sha256": "0" * 64,
+            },
+        },
+    }
+    monkeypatch.setattr(
+        corpus, "_execution_code_identity", lambda: bad_identity,
+    )
+
+    class NoCursorConnection(Connection):
+        def cursor(self):
+            raise AssertionError("identity mismatch must precede cursor use")
+
+    with pytest.raises(corpus.Hist8Error, match="schema artifact mismatch"):
+        corpus.install_schema(
+            NoCursorConnection(), expected_implementation_commit="f" * 40,
+        )
+
+    monkeypatch.setattr(
+        corpus, "_execution_code_identity", lambda: installer_identity,
+    )
+    with pytest.raises(
+        corpus.Hist8Error, match="reviewed implementation commit mismatch",
+    ):
+        corpus.install_schema(
+            NoCursorConnection(), expected_implementation_commit="e" * 40,
+        )
+
+
+def test_execute_rejects_unreviewed_commit_before_database_access(monkeypatch) -> None:
+    monkeypatch.setattr(corpus, "load_calendar", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        corpus, "_execution_code_identity", lambda: TEST_CODE_IDENTITY,
+    )
+    monkeypatch.setattr(
+        corpus.Hist8Store, "from_environment",
+        classmethod(lambda _cls: (_ for _ in ()).throw(
+            AssertionError("commit mismatch must precede database access")
+        )),
+    )
+    with pytest.raises(
+        corpus.Hist8Error, match="reviewed implementation commit mismatch",
+    ):
+        corpus.execute(
+            "attempt", expected_implementation_commit="e" * 40,
+        )
 
 
 def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
@@ -1124,7 +1830,6 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
         for instrument in corpus.INSTRUMENTS
     }
     materialized = []
-    unavailable_replays = []
 
     class Store:
         attempts = []
@@ -1144,7 +1849,7 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
             self.attempts.append((import_id, kind, metadata))
 
         def retrieval_pages(self, import_id, instrument):
-            unavailable_replays.append((import_id, instrument))
+            raise AssertionError((import_id, instrument))
             return iter(())
 
         def seal_snapshot(self, import_id, metadata):
@@ -1154,7 +1859,7 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(
         corpus.Hist8Store, "from_environment", classmethod(lambda _cls: store),
     )
-    monkeypatch.setattr(corpus, "load_calendar", lambda: {
+    monkeypatch.setattr(corpus, "load_calendar", lambda **_kwargs: {
         "schedule_sha256": "c" * 64,
     })
     monkeypatch.setattr(
@@ -1163,25 +1868,28 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(
         corpus, "materialize_instrument",
         lambda _store, _source, instrument, _calendar, **_kwargs: (
-            materialized.append(instrument) or {
+            materialized.append((
+                instrument, _kwargs.get("source_unavailable"),
+            )) or {
                 "inserted": 0, "verified_retrieval_associations": 0,
             }
         ),
     )
-    monkeypatch.setattr(
-        corpus, "_unavailable_instrument_result",
-        lambda *_args, **_kwargs: {"inserted": 0},
-    )
     with pytest.raises(corpus.Hist8ConflictError, match="differs from sealed"):
-        corpus.execute("source-attempt", acquire_sources=False)
+        corpus.execute(
+            "source-attempt", expected_implementation_commit="f" * 40,
+            acquire_sources=False,
+        )
     assert store.attempts[0][1] == "REPLAY_ATTEMPT"
     assert store.attempts[0][2]["expected_membership_sha256"] == "a" * 64
     assert store.attempts[0][2]["source_snapshot_manifest_id"] == (
         "sha256:" + "d" * 64
     )
     assert store.attempts[0][2]["code_identity"] == TEST_CODE_IDENTITY
-    assert materialized == list(corpus.INSTRUMENTS[:-1])
-    assert unavailable_replays == [("source-attempt", "NASDAQ")]
+    assert materialized == [
+        (instrument, instrument == "NASDAQ")
+        for instrument in corpus.INSTRUMENTS
+    ]
 
 
 def test_replay_rejects_different_execution_code_identity(monkeypatch) -> None:
@@ -1206,7 +1914,7 @@ def test_replay_rejects_different_execution_code_identity(monkeypatch) -> None:
         corpus.Hist8Store, "from_environment",
         classmethod(lambda _cls: Store()),
     )
-    monkeypatch.setattr(corpus, "load_calendar", lambda: {
+    monkeypatch.setattr(corpus, "load_calendar", lambda **_kwargs: {
         "schedule_sha256": "c" * 64,
     })
     monkeypatch.setattr(
@@ -1216,7 +1924,10 @@ def test_replay_rejects_different_execution_code_identity(monkeypatch) -> None:
     with pytest.raises(
         corpus.Hist8ConflictError, match="code identity differs",
     ):
-        corpus.execute("source-attempt", acquire_sources=False)
+        corpus.execute(
+            "source-attempt", expected_implementation_commit="f" * 40,
+            acquire_sources=False,
+        )
 
 
 def test_execute_seals_partial_availability_without_substitution(monkeypatch) -> None:
@@ -1242,9 +1953,12 @@ def test_execute_seals_partial_availability_without_substitution(monkeypatch) ->
 
         def retrieval_pages(self, import_id, instrument):
             assert (import_id, instrument) == ("partial-source", "NASDAQ")
-            yield _raw_page(
-                {"partial": "massive"}, source="MASSIVE",
-                instruments=("NASDAQ",),
+            yield replace(
+                _raw_page(
+                    {"partial": "massive"}, source="MASSIVE",
+                    instruments=("NASDAQ",),
+                ),
+                http_status=403,
             )
 
         def seal_snapshot(self, import_id, metadata):
@@ -1256,7 +1970,7 @@ def test_execute_seals_partial_availability_without_substitution(monkeypatch) ->
     monkeypatch.setattr(
         corpus.Hist8Store, "from_environment", classmethod(lambda _cls: store),
     )
-    monkeypatch.setattr(corpus, "load_calendar", lambda: {
+    monkeypatch.setattr(corpus, "load_calendar", lambda **_kwargs: {
         "schedule_sha256": "c" * 64,
     })
     monkeypatch.setattr(
@@ -1268,21 +1982,25 @@ def test_execute_seals_partial_availability_without_substitution(monkeypatch) ->
     monkeypatch.setattr(
         corpus, "materialize_instrument",
         lambda _store, _source, instrument, _calendar, **_kwargs: (
-            materialized.append(instrument) or {
+            materialized.append((
+                instrument, _kwargs.get("source_unavailable"),
+            )) or {
                 "inserted": 3, "verified_retrieval_associations": 1,
             }
         ),
     )
-    monkeypatch.setattr(
-        corpus, "_unavailable_instrument_result",
-        lambda *_args, **_kwargs: {"inserted": 0},
+
+    result = corpus.execute(
+        "partial-source", expected_implementation_commit="f" * 40,
+        acquire_sources=True,
     )
 
-    result = corpus.execute("partial-source", acquire_sources=True)
-
     assert result["membership_sha256"] == "e" * 64
-    assert materialized == list(corpus.INSTRUMENTS[:-1])
-    assert result["instrument_results"]["NASDAQ"]["inserted"] == 0
+    assert materialized == [
+        (instrument, instrument == "NASDAQ")
+        for instrument in corpus.INSTRUMENTS
+    ]
+    assert result["instrument_results"]["NASDAQ"]["inserted"] == 3
     assert result["instrument_results"]["NASDAQ"]["availability"] == "UNAVAILABLE"
     snapshot_metadata = store.snapshots[0][1]
     assert snapshot_metadata["retrieval_associations"] == 8
@@ -1332,26 +2050,25 @@ def test_unavailable_replay_still_verifies_retained_artifacts(monkeypatch) -> No
     monkeypatch.setattr(
         corpus.Hist8Store, "from_environment", classmethod(lambda _cls: Store()),
     )
-    monkeypatch.setattr(corpus, "load_calendar", lambda: {
+    monkeypatch.setattr(corpus, "load_calendar", lambda **_kwargs: {
         "schedule_sha256": "c" * 64,
     })
     monkeypatch.setattr(
         corpus, "_execution_code_identity", lambda: TEST_CODE_IDENTITY,
     )
-    monkeypatch.setattr(
-        corpus, "materialize_instrument",
-        lambda *_args, **_kwargs: {
-            "inserted": 0, "verified_retrieval_associations": 0,
-        },
-    )
-    monkeypatch.setattr(
-        corpus, "_unavailable_instrument_result",
-        lambda *_args, **_kwargs: {"inserted": 0},
-    )
+    def materialize(store, source_import_id, instrument, *_args, **_kwargs):
+        if instrument == "NASDAQ":
+            tuple(store.retrieval_pages(source_import_id, instrument))
+        return {"inserted": 0, "verified_retrieval_associations": 0}
+
+    monkeypatch.setattr(corpus, "materialize_instrument", materialize)
     with pytest.raises(
         corpus.Hist8ConflictError, match="artifact replay mismatch"
     ):
-        corpus.execute("partial-source", acquire_sources=False)
+        corpus.execute(
+            "partial-source", expected_implementation_commit="f" * 40,
+            acquire_sources=False,
+        )
 
 
 def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
@@ -1394,11 +2111,34 @@ def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
     assert "column_object.attnotnull" in sql
     assert "pg_get_indexdef(index_object.oid)" in sql
     assert "pg_get_triggerdef(trigger_object.oid, true)" in sql
+    assert "trigger_object.tgisinternal" in sql
     assert "FROM pg_rewrite rewrite_object" in sql
     assert "manifests_import_id_sequence_no_manifest_kind_key" in sql
+    assert "hist8_retrieval_source_identity" in sql
+    assert "hist8_bar_source_identity" in sql
+    assert "hist8_bar_calendar_identity" in sql
+    assert "hist8_bar_price_unit_semantics" in sql
+    assert "price_unit text NOT NULL" in sql
+    assert "currency text NOT NULL" not in sql
+    assert "pg_parameter_acl" in sql
+    assert "edge.is_grantable" in sql
+    assert "FROM pg_shdepend dependency" in sql
+    assert "pg_publication_namespace" in sql
+    assert "pg_subscription_rel" in sql
+    assert "has_foreign_data_wrapper_privilege" in sql
+    assert "HIST8_FUTURE_SEQUENCE_DEFAULT_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_FUTURE_SCHEMA_DEFAULT_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_CUSTOM_CATALOG_ROUTINE_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_CUSTOM_CATALOG_RELATION_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_CUSTOM_CATALOG_SEQUENCE_BOUNDARY_UNSATISFIED" in sql
+    assert "membership.grantor = 10::oid" in sql
+    assert "AND NOT membership.inherit_option" in sql
+    assert "AND NOT membership.set_option" in sql
+    assert "HIST8_LO_COMPAT_PRIVILEGES_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_MAINTAIN_PRIVILEGE_BOUNDARY_UNSATISFIED" in sql
 
 
-def test_schema_enforces_importer_boundary_in_postgres() -> None:
+def test_schema_enforces_importer_boundary_in_postgres(monkeypatch) -> None:
     dsn = os.environ.get("H2C_TEST_DATABASE_URL")
     if not dsn:
         pytest.skip("CI PostgreSQL is not available")
@@ -1416,10 +2156,71 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
     restore_public_temporary = False
     extensions_schema_created = False
     large_object_oid = None
+    lo_compat_database_set = False
     large_object_create_routines = []
     future_table_default_roles = []
     future_routine_default_roles = []
+    restore_public_sequence_default = False
+    restore_public_schema_default = False
     with psycopg.connect(dsn, autocommit=True) as connection:
+        test_host = str(connection.info.host or "")
+        if test_host not in {
+            "localhost", "127.0.0.1", "::1", "postgres",
+        } and not test_host.startswith("/"):
+            pytest.fail("H2C_TEST_DATABASE_URL must target disposable local PostgreSQL")
+        with connection.cursor() as preflight_cursor:
+            preflight_cursor.execute(
+                """select current_user = 'postgres',
+                          current_database() = 'postgres',
+                          not exists (
+                            select 1 from pg_roles
+                            where rolname::text = any(%s::text[])
+                          ),
+                          to_regnamespace('atom_research_history') is null,
+                          to_regnamespace('hist8_visible') is null,
+                          to_regclass('public.coin_v8_market_bars') is null,
+                          to_regclass('public.coin_v8_ai_decision_logs') is null,
+                          to_regclass('public.hist8_column_forbidden') is null,
+                          to_regclass('public.hist8_trigger_forbidden') is null,
+                          to_regclass('public.hist8_forbidden_sequence') is null,
+                          to_regprocedure('public.hist8_callable()') is null,
+                          to_regprocedure(
+                            'information_schema.hist8_escape()'
+                          ) is null,
+                          to_regclass(
+                            'information_schema.hist8_escape_view'
+                          ) is null,
+                          to_regclass(
+                            'information_schema.hist8_escape_seq'
+                          ) is null,
+                          current_setting('lo_compat_privileges') = 'off',
+                          not exists (
+                            select 1
+                            from pg_db_role_setting setting
+                            cross join lateral
+                              unnest(setting.setconfig) config(value)
+                            where setting.setrole=0
+                              and setting.setdatabase in (
+                                0, (select oid from pg_database
+                                    where datname=current_database())
+                              )
+                              and split_part(config.value,'=',1)=
+                                'lo_compat_privileges'
+                          ),
+                          not exists (
+                            select 1 from pg_publication
+                            where pubname in ('hist8_all','hist8_explicit')
+                          ),
+                          not exists (
+                            select 1 from pg_foreign_data_wrapper
+                            where fdwname = 'hist8_fdw'
+                          )""",
+                (list(managed_roles),),
+            )
+            if not all(preflight_cursor.fetchone()):
+                pytest.fail(
+                    "H2C_TEST_DATABASE_URL is not a pristine disposable database"
+                )
         try:
             with connection.cursor() as cursor:
                 for role in ("anon", "authenticated", "service_role"):
@@ -1781,10 +2582,272 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 connection.rollback()
                 cursor.execute("drop schema hist8_visible")
 
+                cursor.execute("create publication hist8_all for all tables")
+                with pytest.raises(
+                    psycopg.Error, match="REPLICATION_BOUNDARY_UNSATISFIED",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute("drop publication hist8_all")
+
+                cursor.execute(
+                    "create foreign data wrapper hist8_fdw no handler"
+                )
+                cursor.execute(
+                    "grant usage on foreign data wrapper hist8_fdw to public"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="FOREIGN_SERVER_BOUNDARY_UNSATISFIED",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute("drop foreign data wrapper hist8_fdw")
+
+                cursor.execute(
+                    "select exists (select 1 from pg_default_acl defaults "
+                    "cross join lateral aclexplode(defaults.defaclacl) acl "
+                    "where defaults.defaclrole='postgres'::regrole "
+                    "and defaults.defaclnamespace=0 "
+                    "and defaults.defaclobjtype='S' and acl.grantee=0 "
+                    "and acl.privilege_type='USAGE')"
+                )
+                restore_public_sequence_default = cursor.fetchone()[0]
+                cursor.execute(
+                    "alter default privileges for role postgres "
+                    "grant usage on sequences to public"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="FUTURE_SEQUENCE_DEFAULT_BOUNDARY",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "alter default privileges for role postgres "
+                    "revoke usage on sequences from public"
+                )
+
+                cursor.execute(
+                    "select exists (select 1 from pg_default_acl defaults "
+                    "cross join lateral aclexplode(defaults.defaclacl) acl "
+                    "where defaults.defaclrole='postgres'::regrole "
+                    "and defaults.defaclnamespace=0 "
+                    "and defaults.defaclobjtype='n' and acl.grantee=0 "
+                    "and acl.privilege_type='USAGE')"
+                )
+                restore_public_schema_default = cursor.fetchone()[0]
+                cursor.execute(
+                    "alter default privileges for role postgres "
+                    "grant usage on schemas to public"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="FUTURE_SCHEMA_DEFAULT_BOUNDARY",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "alter default privileges for role postgres "
+                    "revoke usage on schemas from public"
+                )
+
+                cursor.execute(
+                    "create function information_schema.hist8_escape() "
+                    "returns bigint "
+                    "language sql security definer set search_path=pg_catalog "
+                    "as 'select count(*) from public.coin_v8_market_bars'"
+                )
+                cursor.execute(
+                    "grant execute on function "
+                    "information_schema.hist8_escape() to public"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="CUSTOM_CATALOG_ROUTINE_BOUNDARY",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "drop function information_schema.hist8_escape()"
+                )
+
+                cursor.execute(
+                    "create view information_schema.hist8_escape_view as "
+                    "select id from public.coin_v8_market_bars"
+                )
+                cursor.execute(
+                    "grant select on "
+                    "information_schema.hist8_escape_view to public"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="CUSTOM_CATALOG_RELATION_BOUNDARY",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "drop view information_schema.hist8_escape_view"
+                )
+
+                cursor.execute(
+                    "create sequence information_schema.hist8_escape_seq"
+                )
+                cursor.execute(
+                    "grant usage, select, update on sequence "
+                    "information_schema.hist8_escape_seq to public"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="CUSTOM_CATALOG_SEQUENCE_BOUNDARY",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "drop sequence information_schema.hist8_escape_seq"
+                )
+
                 cursor.execute(sql)
                 # An ambiguous disconnect after COMMIT can be retried without
                 # mutating the exact prior installation.
                 cursor.execute(sql)
+
+                # PostgreSQL 16+ creates this administration-only edge when a
+                # non-superuser CREATEROLE installer creates the importer.
+                # Reproduce it under the bootstrap-superuser fixture: the
+                # exact edge is accepted, but any SET capability is rejected.
+                cursor.execute(
+                    "grant atom_hist8_importer to postgres with "
+                    "admin true, inherit false, set false"
+                )
+                cursor.execute(sql)
+                cursor.execute(
+                    "grant atom_hist8_importer to postgres with set true"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="EXISTING_INSTALLATION_ROLE_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "revoke atom_hist8_importer from postgres"
+                )
+                cursor.execute(sql)
+
+                cursor.execute(
+                    "select lo_from_bytea(0, decode('deadbeef','hex'))"
+                )
+                large_object_oid = cursor.fetchone()[0]
+                cursor.execute(
+                    pgsql.SQL(
+                        "alter database {} set lo_compat_privileges=on"
+                    ).format(pgsql.Identifier(current_database_name))
+                )
+                lo_compat_database_set = True
+                with pytest.raises(
+                    psycopg.Error, match="LO_COMPAT_PRIVILEGES_BOUNDARY",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                with psycopg.connect(dsn, autocommit=True) as bypass_connection:
+                    with bypass_connection.cursor() as bypass_cursor:
+                        bypass_cursor.execute("set role atom_hist8_importer")
+                        bypass_cursor.execute(
+                            "select lo_get(%s)", (large_object_oid,),
+                        )
+                        assert bytes(bypass_cursor.fetchone()[0]) == bytes.fromhex(
+                            "deadbeef"
+                        )
+                cursor.execute(
+                    pgsql.SQL(
+                        "alter database {} reset lo_compat_privileges"
+                    ).format(pgsql.Identifier(current_database_name))
+                )
+                lo_compat_database_set = False
+                cursor.execute(sql)
+                with psycopg.connect(dsn, autocommit=True) as safe_connection:
+                    with safe_connection.cursor() as safe_cursor:
+                        safe_cursor.execute("set role atom_hist8_importer")
+                        with pytest.raises(
+                            psycopg.Error,
+                            match="permission denied for large object",
+                        ):
+                            safe_cursor.execute(
+                                "select lo_get(%s)", (large_object_oid,),
+                            )
+                cursor.execute("select lo_unlink(%s)", (large_object_oid,))
+                assert cursor.fetchone()[0] == 1
+                large_object_oid = None
+
+                cursor.execute(
+                    "grant select on atom_research_history.raw_responses "
+                    "to atom_hist8_importer with grant option"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="HIST8_IMPORTER_ACL_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "revoke grant option for select on "
+                    "atom_research_history.raw_responses "
+                    "from atom_hist8_importer cascade"
+                )
+                cursor.execute(sql)
+
+                cursor.execute(
+                    "grant set on parameter session_replication_role "
+                    "to atom_hist8_importer"
+                )
+                with pytest.raises(
+                    psycopg.Error,
+                    match="IMPORTER_ACL_MISMATCH|PARAMETER_PRIVILEGE_BOUNDARY",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "revoke set on parameter session_replication_role "
+                    "from atom_hist8_importer"
+                )
+                cursor.execute(sql)
+
+                cursor.execute(
+                    "alter role atom_hist8_importer "
+                    "set session_replication_role=replica"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="EXISTING_INSTALLATION_ROLE_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "alter role atom_hist8_importer "
+                    "reset session_replication_role"
+                )
+                cursor.execute(sql)
+
+                cursor.execute(
+                    "create publication hist8_explicit for table "
+                    "atom_research_history.bars"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="REPLICATION_BOUNDARY_UNSATISFIED",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute("drop publication hist8_explicit")
+                cursor.execute(sql)
+
+                cursor.execute("show server_version_num")
+                if int(cursor.fetchone()[0]) >= 170000:
+                    cursor.execute(
+                        "grant maintain on public.coin_v8_market_bars to public"
+                    )
+                    with pytest.raises(
+                        psycopg.Error,
+                        match="MAINTAIN_PRIVILEGE_BOUNDARY_UNSATISFIED",
+                    ):
+                        cursor.execute(sql)
+                    connection.rollback()
+                    cursor.execute(
+                        "revoke maintain on public.coin_v8_market_bars from public"
+                    )
+                    cursor.execute(sql)
+
                 cursor.execute(
                     "create view atom_research_history.hist8_forbidden_view "
                     "as select id from public.coin_v8_market_bars"
@@ -1954,6 +3017,74 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 cursor.execute(sql)
 
                 cursor.execute(
+                    """do $disable_hist8_fk$
+                       declare trigger_name name;
+                       begin
+                         for trigger_name in
+                           select trigger_object.tgname
+                           from pg_trigger trigger_object
+                           join pg_constraint constraint_object
+                             on constraint_object.oid =
+                                trigger_object.tgconstraint
+                           where trigger_object.tgrelid =
+                             'atom_research_history.manifests'::regclass
+                             and trigger_object.tgisinternal
+                             and constraint_object.conname =
+                               'hist8_snapshot_member_bar_fk'
+                         loop
+                           execute format(
+                             'alter table atom_research_history.manifests '
+                             'disable trigger %I', trigger_name
+                           );
+                         end loop;
+                       end
+                       $disable_hist8_fk$"""
+                )
+                with pytest.raises(
+                    psycopg.Error,
+                    match="EXISTING_INSTALLATION_PROTECTION_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "select count(*) from pg_trigger trigger_object "
+                    "join pg_constraint constraint_object on "
+                    "constraint_object.oid=trigger_object.tgconstraint "
+                    "where trigger_object.tgrelid="
+                    "'atom_research_history.manifests'::regclass "
+                    "and trigger_object.tgisinternal "
+                    "and trigger_object.tgenabled='D' "
+                    "and constraint_object.conname="
+                    "'hist8_snapshot_member_bar_fk'"
+                )
+                assert cursor.fetchone()[0] == 2
+                cursor.execute(
+                    """do $enable_hist8_fk$
+                       declare trigger_name name;
+                       begin
+                         for trigger_name in
+                           select trigger_object.tgname
+                           from pg_trigger trigger_object
+                           join pg_constraint constraint_object
+                             on constraint_object.oid =
+                                trigger_object.tgconstraint
+                           where trigger_object.tgrelid =
+                             'atom_research_history.manifests'::regclass
+                             and trigger_object.tgisinternal
+                             and constraint_object.conname =
+                               'hist8_snapshot_member_bar_fk'
+                         loop
+                           execute format(
+                             'alter table atom_research_history.manifests '
+                             'enable trigger %I', trigger_name
+                           );
+                         end loop;
+                       end
+                       $enable_hist8_fk$"""
+                )
+                cursor.execute(sql)
+
+                cursor.execute(
                     "create rule hist8_forbidden_rewrite as on insert to "
                     "atom_research_history.raw_responses do also nothing"
                 )
@@ -2060,9 +3191,11 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                     return importer
 
                 store = corpus.Hist8Store(importer_connection)
-                page = _raw_page({"retained": "first"})
+                page = _raw_page(
+                    {"retained": "first"}, instruments=corpus.EQUITIES,
+                )
                 artifact_id = "sha256:" + corpus.sha256(page.body)
-                assert store.store_page("raw-attempt-1", 1, page) == 2
+                assert store.store_page("raw-attempt-1", 1, page) == 7
                 corrupted_body = page.body.replace(b"first", b"FIRST")
                 assert len(corrupted_body) == len(page.body)
                 cursor.execute(
@@ -2105,7 +3238,10 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 ):
                     store.store_page(
                         "raw-attempt-1", 2,
-                        _raw_page({"retained": "late-association"}),
+                        _raw_page(
+                            {"retained": "late-association"},
+                            instruments=corpus.EQUITIES,
+                        ),
                     )
                 cursor.execute("set role atom_hist8_importer")
                 cursor.execute(
@@ -2130,49 +3266,81 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                     "t": start.isoformat(), "o": 100, "h": 103, "l": 99,
                     "c": 102, "v": 10, "n": 2, "vw": 101,
                 }
+                provider_item_2 = {
+                    **provider_item,
+                    "t": (start + timedelta(minutes=1)).isoformat(),
+                }
                 canonical_page = _raw_page({
                     "bars": {"SPY": [provider_item]}, "page": 1,
-                })
+                }, instruments=corpus.EQUITIES)
                 reshuffled_page = _raw_page({
-                    "bars": {"SPY": [provider_item]}, "page": 2,
-                })
+                    "bars": {"SPY": [provider_item, provider_item_2]},
+                    "page": 2,
+                }, instruments=corpus.EQUITIES)
                 assert store.store_page(
                     "attempt-incomplete", 1, canonical_page
-                ) == 2
+                ) == 7
                 assert store.store_page(
                     "attempt-complete", 1, reshuffled_page
-                ) == 2
+                ) == 7
                 source = corpus.parse_source_page(canonical_page, "SPY")[0]
-                complete_source = corpus.parse_source_page(
+                complete_sources = corpus.parse_source_page(
                     reshuffled_page, "SPY"
-                )[0]
+                )
                 incomplete = corpus.canonical_bar(
-                    source, session_date="2025-01-02", calendar_hash="b" * 64,
+                    source, session_date="2025-01-02",
+                    calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
                     import_id="attempt-incomplete", eligible=False,
                 )
-                complete = corpus.canonical_bar(
+                complete_rows = tuple(corpus.canonical_bar(
                     complete_source,
-                    session_date="2025-01-02", calendar_hash="b" * 64,
+                    session_date="2025-01-02",
+                    calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
                     import_id="attempt-complete", eligible=True,
-                )
-                assert store.insert_bars((incomplete,)) == (1, 0)
-                assert store.insert_bars((complete,)) == (0, 1)
+                ) for complete_source in complete_sources)
+                complete = complete_rows[0]
+                assert store.insert_bars(
+                    (incomplete,), session_open=incomplete.bar_start_utc,
+                    session_close=incomplete.bar_end_utc + timedelta(minutes=1),
+                    expected_minutes=2,
+                    expected_session_date="2025-01-02",
+                    expected_calendar_id="US_CASH_RTH",
+                    expected_calendar_sha256=corpus.CALENDAR_SCHEDULE_SHA256,
+                ) == (1, 0)
+                assert store.insert_bars(
+                    complete_rows, session_open=complete.bar_start_utc,
+                    session_close=complete.bar_start_utc + timedelta(minutes=2),
+                    expected_minutes=2,
+                    expected_session_date="2025-01-02",
+                    expected_calendar_id="US_CASH_RTH",
+                    expected_calendar_sha256=corpus.CALENDAR_SCHEDULE_SHA256,
+                ) == (1, 1)
                 conflict_page = _raw_page({
                     "bars": {"SPY": [{**provider_item, "c": 101}]},
                     "page": 3,
-                })
+                }, instruments=corpus.EQUITIES)
                 assert store.store_page(
                     "attempt-conflict", 1, conflict_page
-                ) == 2
+                ) == 7
                 conflicting = corpus.canonical_bar(
                     corpus.parse_source_page(conflict_page, "SPY")[0],
-                    session_date="2025-01-02", calendar_hash="b" * 64,
+                    session_date="2025-01-02",
+                    calendar_hash=corpus.CALENDAR_SCHEDULE_SHA256,
                     import_id="attempt-conflict", eligible=True,
                 )
                 with pytest.raises(
                     corpus.Hist8ConflictError, match="same-key bar conflict"
                 ):
-                    store.insert_bars((conflicting,))
+                    store.insert_bars(
+                        (conflicting,), session_open=conflicting.bar_start_utc,
+                        session_close=conflicting.bar_end_utc,
+                        expected_minutes=1,
+                        expected_session_date="2025-01-02",
+                        expected_calendar_id="US_CASH_RTH",
+                        expected_calendar_sha256=(
+                            corpus.CALENDAR_SCHEDULE_SHA256
+                        ),
+                    )
                 cursor.execute(
                     """select metadata_json
                        from atom_research_history.manifests
@@ -2187,6 +3355,18 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 assert conflict_metadata["candidate"]["content_hash"] == (
                     conflicting.content_hash
                 )
+                monkeypatch.setattr(corpus, "load_calendar", lambda **_kwargs: {
+                    "schedule_sha256": corpus.CALENDAR_SCHEDULE_SHA256,
+                    "instrument_calendars": {"SPY": "US_CASH_RTH"},
+                    "us_cash_sessions": [{
+                        "date": "2025-01-02",
+                        "open_utc": start.isoformat().replace("+00:00", "Z"),
+                        "close_utc": (
+                            start + timedelta(minutes=2)
+                        ).isoformat().replace("+00:00", "Z"),
+                        "expected_minutes": 2,
+                    }],
+                })
                 incomplete_digest = store.seal_snapshot("attempt-incomplete", {})
                 complete_digest = store.seal_snapshot("attempt-complete", {})
                 assert incomplete_digest != complete_digest
@@ -2221,7 +3401,16 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                     corpus.Hist8ConflictError,
                     match="provenance does not resolve",
                 ):
-                    store.insert_bars((complete,))
+                    store.insert_bars(
+                        (complete,), session_open=complete.bar_start_utc,
+                        session_close=complete.bar_end_utc,
+                        expected_minutes=1,
+                        expected_session_date="2025-01-02",
+                        expected_calendar_id="US_CASH_RTH",
+                        expected_calendar_sha256=(
+                            corpus.CALENDAR_SCHEDULE_SHA256
+                        ),
+                    )
                 cursor.execute(
                     "alter table atom_research_history.bars "
                     "disable trigger hist8_bars_reject_update_delete"
@@ -2240,17 +3429,66 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                               member_provenance_hash
                        from atom_research_history.manifests
                        where manifest_kind='SNAPSHOT_MEMBER'
-                       order by import_id"""
+                       order by import_id,member_bar_start_utc"""
                 )
                 original_provenance = corpus._bar_provenance_hash(incomplete)
                 assert cursor.fetchall() == [
                     ("attempt-complete", True, original_provenance),
+                    (
+                        "attempt-complete", True,
+                        corpus._bar_provenance_hash(complete_rows[1]),
+                    ),
                     ("attempt-incomplete", False, original_provenance),
                 ]
         finally:
             connection.rollback()
             with connection.cursor() as cursor:
                 cursor.execute("reset role")
+                if lo_compat_database_set and current_database_name:
+                    cursor.execute(
+                        pgsql.SQL(
+                            "alter database {} reset lo_compat_privileges"
+                        ).format(pgsql.Identifier(current_database_name))
+                    )
+                cursor.execute("drop publication if exists hist8_all")
+                cursor.execute("drop publication if exists hist8_explicit")
+                cursor.execute(
+                    "drop sequence if exists "
+                    "information_schema.hist8_escape_seq"
+                )
+                cursor.execute(
+                    "drop view if exists "
+                    "information_schema.hist8_escape_view"
+                )
+                cursor.execute(
+                    "drop function if exists "
+                    "information_schema.hist8_escape()"
+                )
+                cursor.execute(
+                    "drop foreign data wrapper if exists hist8_fdw cascade"
+                )
+                cursor.execute(
+                    "select exists (select 1 from pg_roles "
+                    "where rolname='atom_hist8_importer')"
+                )
+                if cursor.fetchone()[0]:
+                    cursor.execute(
+                        "alter role atom_hist8_importer "
+                        "reset session_replication_role"
+                    )
+                    cursor.execute(
+                        "revoke set on parameter session_replication_role "
+                        "from atom_hist8_importer"
+                    )
+                cursor.execute(
+                    "select current_setting('server_version_num')::integer, "
+                    "to_regclass('public.coin_v8_market_bars') is not null"
+                )
+                server_version, legacy_table_exists = cursor.fetchone()
+                if server_version >= 170000 and legacy_table_exists:
+                    cursor.execute(
+                        "revoke maintain on public.coin_v8_market_bars from public"
+                    )
                 cursor.execute("drop schema if exists atom_research_history cascade")
                 cursor.execute("drop table if exists public.coin_v8_market_bars")
                 cursor.execute("drop table if exists public.coin_v8_ai_decision_logs")
@@ -2311,6 +3549,24 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                     "alter default privileges for role postgres "
                     "revoke usage on schemas from hist8_forbidden"
                 )
+                cursor.execute(
+                    "alter default privileges for role postgres "
+                    "revoke usage on sequences from public"
+                )
+                if restore_public_sequence_default:
+                    cursor.execute(
+                        "alter default privileges for role postgres "
+                        "grant usage on sequences to public"
+                    )
+                cursor.execute(
+                    "alter default privileges for role postgres "
+                    "revoke usage on schemas from public"
+                )
+                if restore_public_schema_default:
+                    cursor.execute(
+                        "alter default privileges for role postgres "
+                        "grant usage on schemas to public"
+                    )
                 for database in other_connectable_databases:
                     cursor.execute(
                         pgsql.SQL("grant connect on database {} to public").format(

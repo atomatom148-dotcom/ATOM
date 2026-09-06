@@ -73,7 +73,7 @@ COMMENT ON ROLE atom_hist8_importer IS
 COMMENT ON SCHEMA atom_research_history IS
   'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1';
 ALTER ROLE atom_hist8_importer
-  SET search_path = atom_research_history, pg_catalog;
+  SET search_path = pg_catalog;
 REVOKE ALL ON SCHEMA atom_research_history FROM PUBLIC, anon, authenticated, service_role;
 GRANT USAGE ON SCHEMA atom_research_history TO atom_hist8_importer;
 
@@ -129,9 +129,33 @@ CREATE TABLE atom_research_history.manifests (
   CONSTRAINT hist8_retrieval_artifact_required CHECK (
     manifest_kind <> 'RETRIEVAL'
     OR (source IS NOT NULL AND feed IS NOT NULL AND product IS NOT NULL
-        AND endpoint IS NOT NULL AND retrieved_at IS NOT NULL
+        AND instrument IS NOT NULL AND endpoint IS NOT NULL
+        AND retrieved_at IS NOT NULL
         AND http_status IS NOT NULL AND artifact_id IS NOT NULL
         AND artifact_byte_length IS NOT NULL)
+  ),
+  CONSTRAINT hist8_retrieval_source_identity CHECK (
+    manifest_kind <> 'RETRIEVAL'
+    OR (
+      source = 'ALPACA' AND feed = 'SIP'
+      AND product = '1Min trade OHLCV'
+      AND instrument IN ('COIN','QQQ','SPY','NVDA','XLE','GLD')
+      AND endpoint = 'https://data.alpaca.markets/v2/stocks/bars'
+    )
+    OR (
+      source = 'COINBASE' AND feed = 'EXCHANGE'
+      AND product = 'BTC-USD granularity=60'
+      AND instrument = 'BTC-USD'
+      AND endpoint =
+        'https://api.exchange.coinbase.com/products/BTC-USD/candles'
+    )
+    OR (
+      source = 'MASSIVE' AND feed = 'I:COMP'
+      AND product = 'I:COMP minute index OHLC'
+      AND instrument = 'NASDAQ'
+      AND endpoint ~
+        '^https://api[.]massive[.]com/v2/aggs/ticker/I(%3A|:)COMP/range/1/minute/(2024-09-01|[0-9]+)/(2026-09-01|[0-9]+)$'
+    )
   ),
   CONSTRAINT hist8_snapshot_member_required CHECK (
     (manifest_kind = 'SNAPSHOT_MEMBER'
@@ -173,7 +197,7 @@ CREATE TABLE atom_research_history.bars (
   feed text NOT NULL,
   product text NOT NULL,
   adjustment text NOT NULL,
-  currency text NOT NULL CHECK (currency = 'USD'),
+  price_unit text NOT NULL,
   import_id text NOT NULL CHECK (length(import_id) BETWEEN 1 AND 128),
   derivation_version text,
   source_artifact_id text REFERENCES atom_research_history.raw_responses(artifact_id)
@@ -198,6 +222,39 @@ CREATE TABLE atom_research_history.bars (
     (instrument = 'NASDAQ' AND volume IS NULL AND volume_unit = 'NOT_APPLICABLE')
     OR (instrument <> 'NASDAQ' AND volume IS NOT NULL AND volume_unit IN ('SHARES','BTC'))
   ),
+  CONSTRAINT hist8_bar_price_unit_semantics CHECK (
+    (instrument = 'NASDAQ' AND price_unit = 'INDEX_POINTS')
+    OR (instrument <> 'NASDAQ' AND price_unit = 'USD')
+  ),
+  CONSTRAINT hist8_bar_calendar_identity CHECK (
+    calendar_sha256 =
+      '74463f0a85b14361599d9abf0caa0f3cbce12c79e10a15c37ffcd58348f3d446'
+    AND (
+      (instrument IN ('COIN','QQQ','SPY','NVDA','XLE','GLD')
+        AND calendar_id = 'US_CASH_RTH')
+      OR (instrument = 'BTC-USD' AND calendar_id = 'BTC_UTC_DAY')
+      OR (instrument = 'NASDAQ' AND calendar_id = 'NASDAQ_CASH_RTH')
+    )
+  ),
+  CONSTRAINT hist8_bar_source_identity CHECK (
+    (instrument IN ('COIN','QQQ','SPY','NVDA','XLE','GLD')
+      AND source = 'ALPACA' AND feed = 'SIP'
+      AND product = instrument || ':1Min'
+      AND adjustment = 'raw' AND volume_unit = 'SHARES'
+      AND price_unit = 'USD')
+    OR (instrument = 'BTC-USD'
+      AND source = 'COINBASE' AND feed = 'EXCHANGE'
+      AND product = 'BTC-USD:60'
+      AND adjustment = 'none' AND volume_unit = 'BTC'
+      AND price_unit = 'USD'
+      AND trade_count IS NULL AND vwap IS NULL)
+    OR (instrument = 'NASDAQ'
+      AND source = 'MASSIVE' AND feed = 'I:COMP'
+      AND product = 'I:COMP:minute'
+      AND adjustment = 'none' AND volume_unit = 'NOT_APPLICABLE'
+      AND price_unit = 'INDEX_POINTS'
+      AND volume IS NULL AND trade_count IS NULL AND vwap IS NULL)
+  ),
   CONSTRAINT hist8_bar_lineage CHECK (
     (timeframe = '1m' AND derivation_version IS NULL
       AND source_artifact_id IS NOT NULL AND source_record_locator IS NOT NULL
@@ -217,8 +274,6 @@ ALTER TABLE atom_research_history.manifests
   REFERENCES atom_research_history.bars (bar_id, content_hash)
   ON DELETE RESTRICT;
 
-CREATE INDEX hist8_bars_snapshot_scan_idx
-  ON atom_research_history.bars (corpus_id, instrument, timeframe, bar_start_utc);
 CREATE INDEX hist8_bars_session_lookup_idx
   ON atom_research_history.bars
   (corpus_id, instrument, session_date, timeframe, bar_start_utc);
@@ -418,8 +473,10 @@ GRANT SELECT, INSERT ON atom_research_history.raw_responses,
   SELECT md5(jsonb_agg(jsonb_build_array(
            schema.nspname, table_object.relname, trigger_object.tgname,
            trigger_object.tgfoid, trigger_object.tgtype,
-           trigger_object.tgenabled::text, trigger_object.tgconstraint,
-           trigger_object.tgconstrrelid, trigger_object.tgdeferrable,
+           trigger_object.tgenabled::text, trigger_object.tgisinternal,
+           trigger_object.tgconstraint, trigger_object.tgconstrrelid,
+           trigger_object.tgconstrindid, trigger_object.tgparentid,
+           trigger_object.tgdeferrable,
            trigger_object.tginitdeferred, trigger_object.tgnargs,
            encode(trigger_object.tgargs, 'hex'),
            trigger_object.tgattr::text, trigger_object.tgoldtable,
@@ -430,8 +487,7 @@ GRANT SELECT, INSERT ON atom_research_history.raw_responses,
   FROM pg_trigger trigger_object
   JOIN pg_class table_object ON table_object.oid = trigger_object.tgrelid
   JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
-  WHERE schema.nspname = 'atom_research_history'
-    AND NOT trigger_object.tgisinternal;
+  WHERE schema.nspname = 'atom_research_history';
 
   IF column_signature IS NULL OR index_signature IS NULL
     OR trigger_signature IS NULL
@@ -475,7 +531,19 @@ BEGIN
     SELECT 1
     FROM pg_auth_members membership
     WHERE membership.member = 'atom_hist8_importer'::regrole
-       OR membership.roleid = 'atom_hist8_importer'::regrole
+       OR (
+         membership.roleid = 'atom_hist8_importer'::regrole
+         AND NOT (
+           -- PostgreSQL 16+ automatically grants this administration-only
+           -- edge when a non-superuser CREATEROLE installer creates a role.
+           -- It gives the importer no inherited or SET ROLE capability.
+           membership.member = 'postgres'::regrole
+           AND membership.grantor = 10::oid
+           AND membership.admin_option
+           AND NOT membership.inherit_option
+           AND NOT membership.set_option
+         )
+       )
   ) OR (SELECT count(*)
         FROM pg_db_role_setting setting
         WHERE setting.setrole = 'atom_hist8_importer'::regrole) <> 1
@@ -485,9 +553,34 @@ BEGIN
       WHERE setting.setrole = 'atom_hist8_importer'::regrole
         AND setting.setdatabase = 0
         AND setting.setconfig =
-          ARRAY['search_path=atom_research_history, pg_catalog']
+          ARRAY['search_path=pg_catalog']
+  ) OR current_setting('session_replication_role') <> 'origin'
+    OR EXISTS (
+      SELECT 1
+      FROM pg_db_role_setting setting
+      CROSS JOIN LATERAL unnest(setting.setconfig) config(value)
+      WHERE setting.setrole IN (0, 'atom_hist8_importer'::regrole)
+        AND setting.setdatabase IN (
+          0, (SELECT oid FROM pg_database WHERE datname = current_database())
+        )
+        AND split_part(config.value, '=', 1) = 'session_replication_role'
+        AND split_part(config.value, '=', 2) <> 'origin'
   ) THEN
     RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_ROLE_MISMATCH';
+  END IF;
+
+  IF current_setting('lo_compat_privileges') <> 'off' OR EXISTS (
+      SELECT 1
+      FROM pg_db_role_setting setting
+      CROSS JOIN LATERAL unnest(setting.setconfig) config(value)
+      WHERE setting.setrole IN (0, 'atom_hist8_importer'::regrole)
+        AND setting.setdatabase IN (
+          0, (SELECT oid FROM pg_database WHERE datname = current_database())
+        )
+        AND split_part(config.value, '=', 1) = 'lo_compat_privileges'
+        AND split_part(config.value, '=', 2) <> 'off'
+  ) THEN
+    RAISE EXCEPTION 'HIST8_LO_COMPAT_PRIVILEGES_BOUNDARY_UNSATISFIED';
   END IF;
 
   SELECT md5(string_agg(
@@ -581,8 +674,10 @@ BEGIN
   SELECT md5(jsonb_agg(jsonb_build_array(
            schema.nspname, table_object.relname, trigger_object.tgname,
            trigger_object.tgfoid, trigger_object.tgtype,
-           trigger_object.tgenabled::text, trigger_object.tgconstraint,
-           trigger_object.tgconstrrelid, trigger_object.tgdeferrable,
+           trigger_object.tgenabled::text, trigger_object.tgisinternal,
+           trigger_object.tgconstraint, trigger_object.tgconstrrelid,
+           trigger_object.tgconstrindid, trigger_object.tgparentid,
+           trigger_object.tgdeferrable,
            trigger_object.tginitdeferred, trigger_object.tgnargs,
            encode(trigger_object.tgargs, 'hex'),
            trigger_object.tgattr::text, trigger_object.tgoldtable,
@@ -593,8 +688,7 @@ BEGIN
   FROM pg_trigger trigger_object
   JOIN pg_class table_object ON table_object.oid = trigger_object.tgrelid
   JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
-  WHERE schema.nspname = 'atom_research_history'
-    AND NOT trigger_object.tgisinternal;
+  WHERE schema.nspname = 'atom_research_history';
 
   IF NOT EXISTS (
     SELECT 1
@@ -616,7 +710,7 @@ BEGIN
         FROM pg_class object
         JOIN pg_namespace schema ON schema.oid = object.relnamespace
         WHERE schema.nspname = 'atom_research_history'
-          AND object.relkind = 'i') <> 10
+          AND object.relkind = 'i') <> 9
     OR EXISTS (
       SELECT 1
       FROM pg_class object
@@ -634,7 +728,6 @@ BEGIN
             'bars_content_hash_key',
             'bars_corpus_id_instrument_timeframe_bar_start_utc_key',
             'hist8_bar_identity_pair',
-            'hist8_bars_snapshot_scan_idx',
             'hist8_bars_session_lookup_idx',
             'hist8_manifests_import_idx'
           ))
@@ -667,7 +760,7 @@ BEGIN
           'bar_id','content_hash','corpus_id','instrument','timeframe',
           'bar_start_utc','bar_end_utc','session_date','calendar_id',
           'calendar_sha256','open','high','low','close','volume','trade_count',
-          'vwap','volume_unit','source','feed','product','adjustment','currency',
+          'vwap','volume_unit','source','feed','product','adjustment','price_unit',
           'import_id','derivation_version','source_artifact_id',
           'source_record_locator','lineage_json','created_at'
         ]::text[], ARRAY[
@@ -743,6 +836,56 @@ BEGIN
     )
   THEN
     RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_TABLE_MISMATCH';
+  END IF;
+
+  IF (SELECT count(*) FROM pg_type type_object
+      WHERE type_object.typnamespace =
+        'atom_research_history'::regnamespace) <> 6
+    OR EXISTS (
+      SELECT 1 FROM pg_type type_object
+      WHERE type_object.typnamespace =
+        'atom_research_history'::regnamespace
+        AND type_object.typname NOT IN (
+          'raw_responses','_raw_responses','manifests','_manifests',
+          'bars','_bars'
+        )
+    )
+    OR EXISTS (SELECT 1 FROM pg_operator object
+               WHERE object.oprnamespace =
+                 'atom_research_history'::regnamespace)
+    OR EXISTS (SELECT 1 FROM pg_collation object
+               WHERE object.collnamespace =
+                 'atom_research_history'::regnamespace)
+    OR EXISTS (SELECT 1 FROM pg_conversion object
+               WHERE object.connamespace =
+                 'atom_research_history'::regnamespace)
+    OR EXISTS (SELECT 1 FROM pg_opclass object
+               WHERE object.opcnamespace =
+                 'atom_research_history'::regnamespace)
+    OR EXISTS (SELECT 1 FROM pg_opfamily object
+               WHERE object.opfnamespace =
+                 'atom_research_history'::regnamespace)
+    OR EXISTS (SELECT 1 FROM pg_ts_config object
+               WHERE object.cfgnamespace =
+                 'atom_research_history'::regnamespace)
+    OR EXISTS (SELECT 1 FROM pg_ts_dict object
+               WHERE object.dictnamespace =
+                 'atom_research_history'::regnamespace)
+    OR EXISTS (SELECT 1 FROM pg_ts_parser object
+               WHERE object.prsnamespace =
+                 'atom_research_history'::regnamespace)
+    OR EXISTS (SELECT 1 FROM pg_ts_template object
+               WHERE object.tmplnamespace =
+                 'atom_research_history'::regnamespace)
+    OR EXISTS (SELECT 1 FROM pg_statistic_ext object
+               WHERE object.stxnamespace =
+                 'atom_research_history'::regnamespace)
+    OR EXISTS (SELECT 1 FROM pg_extension object
+               WHERE object.extnamespace =
+                 'atom_research_history'::regnamespace)
+  THEN
+    RAISE EXCEPTION
+      'HIST8_EXISTING_INSTALLATION_NAMESPACE_OBJECT_MISMATCH';
   END IF;
 
   IF (SELECT count(*)
@@ -860,7 +1003,6 @@ BEGIN
     OR EXISTS (
     SELECT 1
     FROM (VALUES
-      ('hist8_bars_snapshot_scan_idx','bars'),
       ('hist8_bars_session_lookup_idx','bars'),
       ('hist8_manifests_import_idx','manifests')
     ) expected(index_name, table_name)
@@ -881,12 +1023,16 @@ BEGIN
     FROM (VALUES
       ('hist8_raw_length_matches','raw_responses','c'),
       ('hist8_retrieval_artifact_required','manifests','c'),
+      ('hist8_retrieval_source_identity','manifests','c'),
       ('hist8_snapshot_member_required','manifests','c'),
       ('hist8_snapshot_member_bar_fk','manifests','f'),
       ('hist8_bar_interval','bars','c'),
       ('hist8_bar_duration','bars','c'),
       ('hist8_bar_ohlc','bars','c'),
       ('hist8_bar_volume_semantics','bars','c'),
+      ('hist8_bar_price_unit_semantics','bars','c'),
+      ('hist8_bar_calendar_identity','bars','c'),
+      ('hist8_bar_source_identity','bars','c'),
       ('hist8_bar_lineage','bars','c'),
       ('hist8_bar_identity_pair','bars','u')
     ) expected(constraint_name, table_name, constraint_type)
@@ -900,6 +1046,174 @@ BEGIN
       OR NOT constraint_object.convalidated
   ) THEN
     RAISE EXCEPTION 'HIST8_EXISTING_INSTALLATION_PROTECTION_MISMATCH';
+  END IF;
+
+  -- The importer receives exactly seven explicit, non-delegable ACL edges:
+  -- schema USAGE plus SELECT/INSERT on the three reviewed tables. Inspect all
+  -- supported PostgreSQL ACL catalogs so WITH GRANT OPTION or an omitted class
+  -- cannot turn the long-lived credential into a privilege grantor.
+  IF EXISTS (
+    WITH acl_edges AS (
+      SELECT 'database'::text AS catalog_name, database_object.oid AS object_oid,
+             0::integer AS sub_id, acl.*
+      FROM pg_database database_object
+      CROSS JOIN LATERAL aclexplode(database_object.datacl) acl
+      UNION ALL
+      SELECT 'schema', schema_object.oid, 0, acl.*
+      FROM pg_namespace schema_object
+      CROSS JOIN LATERAL aclexplode(schema_object.nspacl) acl
+      UNION ALL
+      SELECT 'relation', relation_object.oid, 0, acl.*
+      FROM pg_class relation_object
+      CROSS JOIN LATERAL aclexplode(relation_object.relacl) acl
+      UNION ALL
+      SELECT 'column', column_object.attrelid, column_object.attnum, acl.*
+      FROM pg_attribute column_object
+      CROSS JOIN LATERAL aclexplode(column_object.attacl) acl
+      UNION ALL
+      SELECT 'routine', routine_object.oid, 0, acl.*
+      FROM pg_proc routine_object
+      CROSS JOIN LATERAL aclexplode(routine_object.proacl) acl
+      UNION ALL
+      SELECT 'type', type_object.oid, 0, acl.*
+      FROM pg_type type_object
+      CROSS JOIN LATERAL aclexplode(type_object.typacl) acl
+      UNION ALL
+      SELECT 'language', language_object.oid, 0, acl.*
+      FROM pg_language language_object
+      CROSS JOIN LATERAL aclexplode(language_object.lanacl) acl
+      UNION ALL
+      SELECT 'large_object', object.oid, 0, acl.*
+      FROM pg_largeobject_metadata object
+      CROSS JOIN LATERAL aclexplode(object.lomacl) acl
+      UNION ALL
+      SELECT 'foreign_data_wrapper', object.oid, 0, acl.*
+      FROM pg_foreign_data_wrapper object
+      CROSS JOIN LATERAL aclexplode(object.fdwacl) acl
+      UNION ALL
+      SELECT 'foreign_server', object.oid, 0, acl.*
+      FROM pg_foreign_server object
+      CROSS JOIN LATERAL aclexplode(object.srvacl) acl
+      UNION ALL
+      SELECT 'tablespace', object.oid, 0, acl.*
+      FROM pg_tablespace object
+      CROSS JOIN LATERAL aclexplode(object.spcacl) acl
+      UNION ALL
+      SELECT 'parameter', object.oid, 0, acl.*
+      FROM pg_parameter_acl object
+      CROSS JOIN LATERAL aclexplode(object.paracl) acl
+      UNION ALL
+      SELECT 'default_acl', object.oid, 0, acl.*
+      FROM pg_default_acl object
+      CROSS JOIN LATERAL aclexplode(object.defaclacl) acl
+    )
+    SELECT 1
+    FROM acl_edges edge
+    WHERE (edge.grantee = 'atom_hist8_importer'::regrole
+           OR edge.grantor = 'atom_hist8_importer'::regrole)
+      AND NOT (
+        edge.grantor = 'postgres'::regrole
+        AND edge.grantee = 'atom_hist8_importer'::regrole
+        AND NOT edge.is_grantable
+        AND (
+          (edge.catalog_name = 'schema'
+           AND edge.object_oid = 'atom_research_history'::regnamespace
+           AND edge.privilege_type = 'USAGE')
+          OR
+          (edge.catalog_name = 'relation'
+           AND edge.object_oid IN (
+             'atom_research_history.raw_responses'::regclass,
+             'atom_research_history.manifests'::regclass,
+             'atom_research_history.bars'::regclass
+           )
+           AND edge.privilege_type IN ('SELECT','INSERT'))
+        )
+      )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_IMPORTER_ACL_MISMATCH';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_parameter_acl parameter_object
+    CROSS JOIN LATERAL aclexplode(parameter_object.paracl) acl
+    WHERE acl.grantee IN (0, 'atom_hist8_importer'::regrole)
+  ) THEN
+    RAISE EXCEPTION 'HIST8_PARAMETER_PRIVILEGE_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_shdepend dependency
+    WHERE dependency.refclassid = 'pg_authid'::regclass
+      AND dependency.refobjid = 'atom_hist8_importer'::regrole
+      AND dependency.deptype = 'o'
+  ) THEN
+    RAISE EXCEPTION 'HIST8_IMPORTER_OWNERSHIP_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  -- Per-database catalogs above cannot inspect ACLs in another database.
+  -- pg_shdepend is cluster-wide, so reject every remote ACL dependency and
+  -- permit current-database dependencies only for the seven exact local edges.
+  IF EXISTS (
+    SELECT 1
+    FROM pg_shdepend dependency
+    WHERE dependency.refclassid = 'pg_authid'::regclass
+      AND dependency.refobjid = 'atom_hist8_importer'::regrole
+      AND dependency.deptype = 'a'
+      AND NOT (
+        dependency.dbid = (
+          SELECT oid FROM pg_database WHERE datname = current_database()
+        )
+        AND dependency.objsubid = 0
+        AND (
+          (dependency.classid = 'pg_namespace'::regclass
+           AND dependency.objid = 'atom_research_history'::regnamespace)
+          OR
+          (dependency.classid = 'pg_class'::regclass
+           AND dependency.objid IN (
+             'atom_research_history.raw_responses'::regclass,
+             'atom_research_history.manifests'::regclass,
+             'atom_research_history.bars'::regclass
+           ))
+        )
+      )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_IMPORTER_REMOTE_ACL_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_shdepend dependency
+    WHERE dependency.refclassid = 'pg_authid'::regclass
+      AND dependency.refobjid = 'atom_hist8_importer'::regrole
+      AND dependency.deptype = 'r'
+      AND NOT (
+        dependency.dbid = (
+          SELECT oid FROM pg_database WHERE datname = current_database()
+        )
+        AND dependency.classid = 'pg_policy'::regclass
+        AND dependency.objsubid = 0
+        AND dependency.objid IN (
+          SELECT policy.oid
+          FROM pg_policy policy
+          JOIN pg_class table_object ON table_object.oid = policy.polrelid
+          JOIN pg_namespace schema ON schema.oid = table_object.relnamespace
+          WHERE schema.nspname = 'atom_research_history'
+        )
+      )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_IMPORTER_ROLE_DEPENDENCY_MISMATCH';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_shdepend dependency
+    WHERE dependency.refclassid = 'pg_authid'::regclass
+      AND dependency.refobjid = 'atom_hist8_importer'::regrole
+      AND dependency.deptype NOT IN ('a','o','r')
+  ) THEN
+    RAISE EXCEPTION 'HIST8_IMPORTER_UNKNOWN_DEPENDENCY_MISMATCH';
   END IF;
 
   IF NOT has_database_privilege('atom_hist8_importer', current_database(), 'CONNECT')
@@ -946,6 +1260,49 @@ BEGIN
       )
   ) THEN
     RAISE EXCEPTION 'HIST8_OTHER_DATABASE_CONNECT_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  -- Replication and foreign-server paths can export or indirectly expose the
+  -- three private tables without granting ordinary table privileges.
+  IF EXISTS (
+    SELECT 1 FROM pg_publication publication
+    WHERE publication.puballtables
+  ) OR EXISTS (
+    SELECT 1 FROM pg_publication_rel membership
+    WHERE membership.prrelid IN (
+      'atom_research_history.raw_responses'::regclass,
+      'atom_research_history.manifests'::regclass,
+      'atom_research_history.bars'::regclass
+    )
+  ) OR EXISTS (
+    SELECT 1 FROM pg_publication_namespace membership
+    WHERE membership.pnnspid = 'atom_research_history'::regnamespace
+  ) OR EXISTS (
+    SELECT 1 FROM pg_subscription_rel membership
+    WHERE membership.srrelid IN (
+      'atom_research_history.raw_responses'::regclass,
+      'atom_research_history.manifests'::regclass,
+      'atom_research_history.bars'::regclass
+    )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_REPLICATION_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM pg_foreign_data_wrapper object
+    WHERE has_foreign_data_wrapper_privilege(
+      'atom_hist8_importer', object.oid, 'USAGE'
+    )
+  ) OR EXISTS (
+    SELECT 1 FROM pg_foreign_server object
+    WHERE has_server_privilege(
+      'atom_hist8_importer', object.oid, 'USAGE'
+    )
+  ) OR EXISTS (
+    SELECT 1 FROM pg_user_mapping mapping
+    WHERE mapping.umuser IN (0, 'atom_hist8_importer'::regrole)
+  ) THEN
+    RAISE EXCEPTION 'HIST8_FOREIGN_SERVER_BOUNDARY_UNSATISFIED';
   END IF;
 
   IF EXISTS (
@@ -1020,6 +1377,21 @@ BEGIN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_PRIVILEGE_BOUNDARY_UNSATISFIED';
   END IF;
 
+  -- PostgreSQL 17 added the table MAINTAIN privilege. Keep the SQL parseable
+  -- on PostgreSQL 16 while rejecting that effective capability when present.
+  IF current_setting('server_version_num')::integer >= 170000 THEN
+    IF EXISTS (
+      SELECT 1
+      FROM pg_class relation
+      WHERE relation.relkind IN ('r','p','m','f')
+        AND has_table_privilege(
+          'atom_hist8_importer', relation.oid, 'MAINTAIN'
+        )
+    ) THEN
+      RAISE EXCEPTION 'HIST8_MAINTAIN_PRIVILEGE_BOUNDARY_UNSATISFIED';
+    END IF;
+  END IF;
+
   IF EXISTS (
     SELECT 1
     FROM pg_class c
@@ -1069,6 +1441,68 @@ BEGIN
       AND has_function_privilege('atom_hist8_importer', p.oid, 'EXECUTE')
   ) THEN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_ROUTINE_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  -- Built-in catalog routines are part of PostgreSQL's fixed interface. A
+  -- user or extension routine later installed into pg_catalog is not, and an
+  -- effective PUBLIC EXECUTE grant there would bypass the fixed search path.
+  IF EXISTS (
+    SELECT 1
+    FROM pg_proc routine
+    JOIN pg_namespace schema ON schema.oid = routine.pronamespace
+    WHERE schema.nspname IN ('pg_catalog','information_schema')
+      AND routine.oid >= 16384
+      AND has_function_privilege(
+        'atom_hist8_importer', routine.oid, 'EXECUTE'
+      )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_CUSTOM_CATALOG_ROUTINE_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_class relation
+    JOIN pg_namespace schema ON schema.oid = relation.relnamespace
+    WHERE schema.nspname IN ('pg_catalog','information_schema')
+      AND relation.oid >= 16384
+      AND relation.relkind IN ('r','p','v','m','f')
+      AND (
+        has_table_privilege(
+          'atom_hist8_importer', relation.oid,
+          'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+        )
+        OR has_any_column_privilege(
+          'atom_hist8_importer', relation.oid,
+          'SELECT,INSERT,UPDATE,REFERENCES'
+        )
+      )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_CUSTOM_CATALOG_RELATION_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  -- Sequences are not covered by table/column privilege checks. A custom
+  -- sequence in a built-in catalog schema must therefore be rejected on its
+  -- own whenever the importer can use, inspect, or advance it.
+  IF EXISTS (
+    SELECT 1
+    FROM pg_class sequence_object
+    JOIN pg_namespace schema ON schema.oid = sequence_object.relnamespace
+    WHERE schema.nspname IN ('pg_catalog','information_schema')
+      AND sequence_object.oid >= 16384
+      AND sequence_object.relkind = 'S'
+      AND (
+        has_sequence_privilege(
+          'atom_hist8_importer', sequence_object.oid, 'USAGE'
+        )
+        OR has_sequence_privilege(
+          'atom_hist8_importer', sequence_object.oid, 'SELECT'
+        )
+        OR has_sequence_privilege(
+          'atom_hist8_importer', sequence_object.oid, 'UPDATE'
+        )
+      )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_CUSTOM_CATALOG_SEQUENCE_BOUNDARY_UNSATISFIED';
   END IF;
 
   IF EXISTS (
@@ -1139,7 +1573,7 @@ BEGIN
             )
             AND acl.privilege_type IN (
               'SELECT','INSERT','UPDATE','DELETE','TRUNCATE',
-              'REFERENCES','TRIGGER'
+              'REFERENCES','TRIGGER','MAINTAIN'
             )
         )
         OR EXISTS (
@@ -1153,13 +1587,67 @@ BEGIN
             )
             AND acl.privilege_type IN (
               'SELECT','INSERT','UPDATE','DELETE','TRUNCATE',
-              'REFERENCES','TRIGGER'
+              'REFERENCES','TRIGGER','MAINTAIN'
             )
         )
       )
   ) THEN
     RAISE EXCEPTION
       'HIST8_FUTURE_TABLE_DEFAULT_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  -- Sequence defaults are empty for PUBLIC in a clean PostgreSQL install.
+  -- Reject an explicit PUBLIC/importer default whenever its creator can create
+  -- in a schema currently visible to the importer.
+  IF EXISTS (
+    SELECT 1
+    FROM pg_default_acl defaults
+    JOIN pg_roles creator ON creator.oid = defaults.defaclrole
+    CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
+    WHERE defaults.defaclobjtype = 'S'
+      AND acl.grantee IN (0, 'atom_hist8_importer'::regrole)
+      AND acl.privilege_type IN ('USAGE','SELECT','UPDATE')
+      AND EXISTS (
+        SELECT 1
+        FROM pg_namespace schema
+        WHERE (defaults.defaclnamespace = 0
+               OR defaults.defaclnamespace = schema.oid)
+          AND schema.nspname NOT IN ('pg_catalog','information_schema')
+          AND schema.nspname NOT LIKE 'pg_toast%'
+          AND schema.nspname NOT LIKE 'pg_temp_%'
+          AND has_schema_privilege(
+            'atom_hist8_importer', schema.oid, 'USAGE'
+          )
+          AND (creator.rolsuper OR creator.oid = schema.nspowner
+               OR has_schema_privilege(creator.oid, schema.oid, 'CREATE'))
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'HIST8_FUTURE_SEQUENCE_DEFAULT_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  -- A future schema with PUBLIC USAGE can make later PUBLIC object defaults
+  -- reachable. Only roles capable of creating schemas in this database matter.
+  IF EXISTS (
+    SELECT 1
+    FROM pg_default_acl defaults
+    JOIN pg_roles creator ON creator.oid = defaults.defaclrole
+    CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
+    WHERE defaults.defaclobjtype = 'n'
+      AND defaults.defaclnamespace = 0
+      AND acl.grantee IN (0, 'atom_hist8_importer'::regrole)
+      AND acl.privilege_type IN ('USAGE','CREATE')
+      AND (creator.rolsuper
+           OR creator.oid = (
+             SELECT database_object.datdba FROM pg_database database_object
+             WHERE database_object.datname = current_database()
+           )
+           OR has_database_privilege(
+             creator.oid, current_database(), 'CREATE'
+           ))
+  ) THEN
+    RAISE EXCEPTION
+      'HIST8_FUTURE_SCHEMA_DEFAULT_BOUNDARY_UNSATISFIED';
   END IF;
 
   -- Ownership itself grants durable access. Reject any catalog routine the
@@ -1216,13 +1704,15 @@ BEGIN
             acldefault('f', creator.oid)
           )) entry(aclitem)
           CROSS JOIN LATERAL aclexplode(ARRAY[entry.aclitem]) acl
-          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+          WHERE acl.grantee IN (0, 'atom_hist8_importer'::regrole)
+            AND acl.privilege_type = 'EXECUTE'
         )
         OR EXISTS (
           SELECT 1
           FROM unnest(schema_defaults.defaclacl) entry(aclitem)
           CROSS JOIN LATERAL aclexplode(ARRAY[entry.aclitem]) acl
-          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+          WHERE acl.grantee IN (0, 'atom_hist8_importer'::regrole)
+            AND acl.privilege_type = 'EXECUTE'
         )
       )
   ) THEN
