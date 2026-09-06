@@ -75,6 +75,11 @@ REPLAY_PAGE_BATCH_SIZE = 8
 SNAPSHOT_SCAN_BATCH_SIZE = 10_000
 SNAPSHOT_SESSION_BATCH_SIZE = 32
 POSTGRES_BIGINT_MAX = (1 << 63) - 1
+# Bounds that keep provider epochs representable by Python's UTC datetime.
+MIN_PROVIDER_EPOCH_SECONDS = -62_135_596_800
+MAX_PROVIDER_EPOCH_SECONDS = 253_402_300_799
+MIN_PROVIDER_EPOCH_MILLISECONDS = MIN_PROVIDER_EPOCH_SECONDS * 1000
+MAX_PROVIDER_EPOCH_MILLISECONDS = MAX_PROVIDER_EPOCH_SECONDS * 1000 + 999
 # PostgreSQL's documented implementation limits for unconstrained numeric.
 POSTGRES_NUMERIC_MAX_INTEGER_DIGITS = 131_072
 POSTGRES_NUMERIC_MAX_FRACTIONAL_DIGITS = 16_383
@@ -416,9 +421,17 @@ def _decimal(value: object, *, nullable: bool = False) -> Decimal | None:
     return number
 
 
-def _integer(value: object, *, name: str) -> int:
+def _integer(
+    value: object, *, name: str, minimum: int, maximum: int,
+) -> int:
     number = _decimal(value)
     assert isinstance(number, Decimal)
+    largest_bound = max(Decimal(minimum).copy_abs(), Decimal(maximum).copy_abs())
+    if (not number.is_zero()
+            and number.copy_abs().adjusted() > largest_bound.adjusted()):
+        raise Hist8Error(f"{name} outside allowed range")
+    if number < minimum or number > maximum:
+        raise Hist8Error(f"{name} outside allowed range")
     if number != number.to_integral_value():
         raise Hist8Error(f"{name} is not an integer")
     return int(number)
@@ -2523,7 +2536,8 @@ def parse_source_page(
                     _decimal(item["h"]), _decimal(item["l"]),
                     _decimal(item["c"]), _decimal(item["v"]),
                     None if item.get("n") is None else _integer(
-                        item["n"], name="Alpaca trade count"
+                        item["n"], name="Alpaca trade count", minimum=0,
+                        maximum=POSTGRES_BIGINT_MAX,
                     ),
                     _decimal(item.get("vw"), nullable=True), artifact,
                     f"$.bars.{instrument}[{index}]", "ALPACA", "SIP",
@@ -2539,7 +2553,11 @@ def parse_source_page(
             def coinbase_row() -> SourceBar:
                 if not isinstance(item, list) or len(item) < 6:
                     raise Hist8Error("malformed Coinbase candle")
-                timestamp = _integer(item[0], name="Coinbase timestamp")
+                timestamp = _integer(
+                    item[0], name="Coinbase timestamp",
+                    minimum=MIN_PROVIDER_EPOCH_SECONDS,
+                    maximum=MAX_PROVIDER_EPOCH_SECONDS,
+                )
                 start = datetime.fromtimestamp(timestamp, timezone.utc)
                 return SourceBar(
                     instrument, start, _decimal(item[3]), _decimal(item[2]),
@@ -2564,7 +2582,11 @@ def parse_source_page(
             def massive_row() -> SourceBar:
                 if not isinstance(item, Mapping):
                     raise Hist8Error("malformed Massive bar")
-                milliseconds = _integer(item["t"], name="Massive timestamp")
+                milliseconds = _integer(
+                    item["t"], name="Massive timestamp",
+                    minimum=MIN_PROVIDER_EPOCH_MILLISECONDS,
+                    maximum=MAX_PROVIDER_EPOCH_MILLISECONDS,
+                )
                 if milliseconds % 1000:
                     raise Hist8Error("Massive timestamp is not second aligned")
                 start = datetime.fromtimestamp(

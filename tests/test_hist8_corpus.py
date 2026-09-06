@@ -242,6 +242,8 @@ def test_alpaca_trade_count_is_bounded_to_postgresql_bigint() -> None:
          "c": "100", "v": "5", "n": 9223372036854775807},
         {"t": start, "o": "100", "h": "101", "l": "99",
          "c": "100", "v": "5", "n": 9223372036854775808},
+        {"t": start, "o": "100", "h": "101", "l": "99",
+         "c": "100", "v": "5", "n": "1e1000000000"},
     ]}})
     rejected = [0]
 
@@ -250,7 +252,32 @@ def test_alpaca_trade_count_is_bounded_to_postgresql_bigint() -> None:
     )
 
     assert [row.trade_count for row in parsed] == [9223372036854775807]
-    assert rejected == [1]
+    assert rejected == [2]
+
+
+def test_provider_epoch_magnitude_is_bounded_before_integer_materialization() -> None:
+    valid_start = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
+    coinbase = _raw_page([
+        [int(valid_start.timestamp()), "99", "101", "100", "100", "5"],
+        ["1e1000000000", "99", "101", "100", "100", "5"],
+    ], source="COINBASE", instruments=("BTC-USD",))
+    massive = _raw_page({
+        "ticker": "I:COMP", "status": "OK", "results": [
+            {"t": int(valid_start.timestamp() * 1000),
+             "o": "100", "h": "101", "l": "99", "c": "100"},
+            {"t": "1e1000000000",
+             "o": "100", "h": "101", "l": "99", "c": "100"},
+        ],
+    }, source="MASSIVE", instruments=("NASDAQ",))
+
+    for page, instrument in ((coinbase, "BTC-USD"), (massive, "NASDAQ")):
+        rejected = [0]
+        parsed = corpus.parse_source_page(
+            page, instrument, rejection_counter=rejected,
+        )
+        assert len(parsed) == 1
+        assert parsed[0].start == valid_start
+        assert rejected == [1]
 
 
 def test_provider_decimals_are_bounded_to_postgresql_numeric() -> None:
