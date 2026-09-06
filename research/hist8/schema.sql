@@ -688,7 +688,6 @@ BEGIN
         OR table_object.relowner <> 'postgres'::regrole
         OR NOT table_object.relrowsecurity
         OR NOT table_object.relforcerowsecurity
-        OR table_object.relhasrules
         OR (SELECT count(*) FROM pg_attribute column_object
             WHERE column_object.attrelid = table_object.oid
               AND column_object.attnum > 0

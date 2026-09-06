@@ -1394,7 +1394,7 @@ def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
     assert "column_object.attnotnull" in sql
     assert "pg_get_indexdef(index_object.oid)" in sql
     assert "pg_get_triggerdef(trigger_object.oid, true)" in sql
-    assert "table_object.relhasrules" in sql
+    assert "FROM pg_rewrite rewrite_object" in sql
     assert "manifests_import_id_sequence_no_manifest_kind_key" in sql
 
 
@@ -1973,6 +1973,12 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                     "drop rule hist8_forbidden_rewrite on "
                     "atom_research_history.raw_responses"
                 )
+                cursor.execute(
+                    "select not exists (select 1 from pg_rewrite where "
+                    "ev_class='atom_research_history.raw_responses'::regclass "
+                    "and rulename='hist8_forbidden_rewrite')"
+                )
+                assert cursor.fetchone()[0] is True
                 cursor.execute(sql)
                 cursor.execute("alter role atom_hist8_importer inherit")
                 with pytest.raises(
