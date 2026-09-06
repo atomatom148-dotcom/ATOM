@@ -479,10 +479,12 @@ BEGIN
     SELECT 1
     FROM pg_largeobject_metadata object
     WHERE has_largeobject_privilege(
-            'atom_hist8_importer', object.oid, 'SELECT'
+            (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer'),
+            object.oid, 'SELECT'::text
           )
        OR has_largeobject_privilege(
-            'atom_hist8_importer', object.oid, 'UPDATE'
+            (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer'),
+            object.oid, 'UPDATE'::text
           )
   ) THEN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_LARGE_OBJECT_BOUNDARY_UNSATISFIED';
