@@ -8,11 +8,12 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 import gzip
 import hashlib
-from http.client import IncompleteRead
+from http.client import HTTPException, IncompleteRead
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 from typing import Callable, Iterator, Mapping, Sequence
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse
@@ -70,6 +71,12 @@ IMPORTER_SESSION_OPTIONS = (
     "-c statement_timeout=60000 "
     "-c lock_timeout=5000 "
     "-c idle_in_transaction_session_timeout=60000"
+)
+EXECUTION_CODE_PATHS = (
+    "research/hist8/corpus.py",
+    "research/hist8/schema.sql",
+    "research/hist8/calendar_manifest.json",
+    "tests/test_hist8_corpus.py",
 )
 
 _ISO_TIMESTAMP = re.compile(
@@ -225,6 +232,78 @@ def sha256(value: object) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _git_output(
+    arguments: Sequence[str], *, directory: Path, input_bytes: bytes | None = None,
+) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(directory), *arguments], input=input_bytes,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise Hist8Error("execution code identity is unavailable") from exc
+    if result.returncode != 0:
+        raise Hist8Error("execution code identity is unavailable")
+    return result.stdout.strip()
+
+
+def _execution_code_identity() -> dict[str, object]:
+    module_directory = Path(__file__).resolve().parent
+    root_raw = _git_output(
+        ("rev-parse", "--show-toplevel"), directory=module_directory,
+    )
+    try:
+        repository_root = Path(root_raw.decode("utf-8")).resolve(strict=True)
+    except (UnicodeDecodeError, OSError) as exc:
+        raise Hist8Error("execution code identity is unavailable") from exc
+    commit_raw = _git_output(
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+        directory=repository_root,
+    )
+    try:
+        commit = commit_raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise Hist8Error("execution code identity is unavailable") from exc
+    if re.fullmatch(r"[0-9a-f]{40,64}", commit) is None:
+        raise Hist8Error("execution code identity is unavailable")
+    files: dict[str, dict[str, object]] = {}
+    for relative in EXECUTION_CODE_PATHS:
+        target = (repository_root / relative).resolve(strict=True)
+        if target.parent != (repository_root / relative).parent.resolve():
+            raise Hist8Error("execution code path escapes repository")
+        body = target.read_bytes()
+        blob_raw = _git_output(
+            ("hash-object", "--stdin"), directory=repository_root,
+            input_bytes=body,
+        )
+        tree_raw = _git_output(
+            ("ls-tree", "--full-tree", commit, "--", relative),
+            directory=repository_root,
+        )
+        try:
+            blob = blob_raw.decode("ascii")
+            tree_entry = tree_raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise Hist8Error("execution code identity is unavailable") from exc
+        fields = tree_entry.split("\t", 1)
+        header = fields[0].split()
+        if (len(fields) != 2 or fields[1] != relative or len(header) != 3
+                or header[0] != "100644" or header[1] != "blob"
+                or header[2] != blob):
+            raise Hist8Error("executed code differs from implementation commit")
+        files[relative] = {
+            "git_blob": blob,
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "byte_length": len(body),
+        }
+    return {
+        "identity_version": "HIST8_CODE_IDENTITY_1",
+        "implementation_commit": commit,
+        "files": files,
+    }
+
+
 def _exact_decimal_sum(values: Sequence[Decimal]) -> Decimal:
     if not values:
         return Decimal(0)
@@ -347,6 +426,8 @@ def _http_get(
                     "provider response body incomplete"
                 ) from incomplete
             return int(exc.code), headers, body
+    except HTTPException as exc:
+        raise Hist8Error("provider HTTP protocol failure") from exc
 
 
 def _build_page(
@@ -1992,6 +2073,7 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
     if len(chosen) > 128:
         raise Hist8Error("import id too long")
     calendar = load_calendar()
+    code_identity = _execution_code_identity()
     store = Hist8Store.from_environment()
     kind = "IMPORT_ATTEMPT" if acquire_sources else "REPLAY_ATTEMPT"
     source_snapshot = (
@@ -2004,6 +2086,12 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
     source_snapshot_manifest_id = (
         None if source_snapshot is None else str(source_snapshot["manifest_id"])
     )
+    if (source_snapshot is not None
+            and _canonical(source_snapshot["metadata"].get("code_identity"))
+            != _canonical(code_identity)):
+        raise Hist8ConflictError(
+            "replay execution code identity differs from source snapshot"
+        )
     source_statuses = (
         None if source_snapshot is None else _validated_source_statuses(
             source_snapshot["metadata"].get("source_statuses")
@@ -2015,6 +2103,7 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
         "source_import_id": chosen,
         "project_ref": PROJECT_REF, "database": DATABASE_NAME,
         "schema": "atom_research_history", "calendar_sha256": calendar["schedule_sha256"],
+        "code_identity": code_identity,
         "partitions": PARTITIONS,
         "expected_membership_sha256": source_membership,
         "source_snapshot_manifest_id": source_snapshot_manifest_id,
@@ -2053,6 +2142,7 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
         "attempt_kind": kind, "retrieval_associations": retrieval_associations,
         "source_import_id": chosen,
         "source_snapshot_manifest_id": source_snapshot_manifest_id,
+        "code_identity": code_identity,
         "source_statuses": source_statuses,
         "instrument_results": results,
     })

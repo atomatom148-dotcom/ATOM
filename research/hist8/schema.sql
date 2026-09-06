@@ -11,6 +11,7 @@ DECLARE
   research_schema_exists boolean;
   importer_role_exists boolean;
   protection_signature text;
+  routine_signature text;
 BEGIN
   -- The reviewed installer sets this marker only after establishing a
   -- verify-full TLS session to the frozen direct project endpoint. Refuse
@@ -329,10 +330,29 @@ GRANT SELECT, INSERT ON atom_research_history.raw_responses,
   IF protection_signature IS NULL THEN
     RAISE EXCEPTION 'HIST8_INSTALLATION_PROTECTION_SIGNATURE_MISSING';
   END IF;
+
+  -- Seal the complete normalized definitions of both trigger functions. A
+  -- retry must reject any changed body, even when a replacement happens to
+  -- retain an expected error-message substring.
+  SELECT md5(string_agg(
+           format('%s.%s(%s)|%s|%s', schema.nspname, routine.proname,
+                  pg_get_function_identity_arguments(routine.oid),
+                  routine.proowner,
+                  pg_get_functiondef(routine.oid)),
+           E'\n' ORDER BY routine.proname,
+                          pg_get_function_identity_arguments(routine.oid)
+         ))
+    INTO routine_signature
+  FROM pg_proc routine
+  JOIN pg_namespace schema ON schema.oid = routine.pronamespace
+  WHERE schema.nspname = 'atom_research_history';
+  IF routine_signature IS NULL THEN
+    RAISE EXCEPTION 'HIST8_INSTALLATION_ROUTINE_SIGNATURE_MISSING';
+  END IF;
   EXECUTE format(
     'COMMENT ON SCHEMA atom_research_history IS %L',
     'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1:'
-      || protection_signature
+      || protection_signature || ':' || routine_signature
   );
 
   END IF;
@@ -342,6 +362,7 @@ $hist8_install$;
 DO $hist8_verify$
 DECLARE
   protection_signature text;
+  routine_signature text;
 BEGIN
   -- This block is also the retry path after an ambiguous client disconnect.
   -- It is deliberately read-only: an existing pair is accepted only when the
@@ -391,6 +412,19 @@ BEGIN
   WHERE schema.nspname = 'atom_research_history'
     AND table_object.relname IN ('raw_responses','manifests','bars');
 
+  SELECT md5(string_agg(
+           format('%s.%s(%s)|%s|%s', schema.nspname, routine.proname,
+                  pg_get_function_identity_arguments(routine.oid),
+                  routine.proowner,
+                  pg_get_functiondef(routine.oid)),
+           E'\n' ORDER BY routine.proname,
+                          pg_get_function_identity_arguments(routine.oid)
+         ))
+    INTO routine_signature
+  FROM pg_proc routine
+  JOIN pg_namespace schema ON schema.oid = routine.pronamespace
+  WHERE schema.nspname = 'atom_research_history';
+
   IF NOT EXISTS (
     SELECT 1
     FROM pg_namespace schema
@@ -407,6 +441,34 @@ BEGIN
       JOIN pg_namespace schema ON schema.oid = object.relnamespace
       WHERE schema.nspname = 'atom_research_history'
         AND object.relkind = 'r') <> 3
+    OR (SELECT count(*)
+        FROM pg_class object
+        JOIN pg_namespace schema ON schema.oid = object.relnamespace
+        WHERE schema.nspname = 'atom_research_history'
+          AND object.relkind = 'i') <> 10
+    OR EXISTS (
+      SELECT 1
+      FROM pg_class object
+      JOIN pg_namespace schema ON schema.oid = object.relnamespace
+      WHERE schema.nspname = 'atom_research_history'
+        AND NOT (
+          (object.relkind = 'r' AND object.relname IN (
+            'raw_responses', 'manifests', 'bars'
+          ))
+          OR (object.relkind = 'i' AND object.relname IN (
+            'raw_responses_pkey',
+            'manifests_pkey',
+            'manifests_import_id_sequence_no_manifest_kind_key',
+            'bars_pkey',
+            'bars_content_hash_key',
+            'bars_corpus_id_instrument_timeframe_bar_start_utc_key',
+            'hist8_bar_identity_pair',
+            'hist8_bars_snapshot_scan_idx',
+            'hist8_bars_session_lookup_idx',
+            'hist8_manifests_import_idx'
+          ))
+        )
+    )
     OR EXISTS (
       SELECT 1
       FROM (VALUES
@@ -578,12 +640,13 @@ BEGIN
   END IF;
 
   IF protection_signature IS NULL
+    OR routine_signature IS NULL
     OR (SELECT obj_description(schema.oid, 'pg_namespace')
         FROM pg_namespace schema
         WHERE schema.nspname = 'atom_research_history')
        IS DISTINCT FROM
          'ATOM-HIST8-CORPUS-AMENDMENT-1:INSTALLATION-V1:'
-           || protection_signature
+           || protection_signature || ':' || routine_signature
     OR EXISTS (
     SELECT 1
     FROM (VALUES

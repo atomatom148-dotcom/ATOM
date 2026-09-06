@@ -4,7 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import gzip
-from http.client import IncompleteRead
+from http.client import BadStatusLine, IncompleteRead
 import json
 import os
 from pathlib import Path
@@ -16,6 +16,18 @@ from research.hist8 import corpus
 
 
 UTC = timezone.utc
+TEST_CODE_IDENTITY = {
+    "identity_version": "HIST8_CODE_IDENTITY_1",
+    "implementation_commit": "f" * 40,
+    "files": {
+        path: {
+            "git_blob": "a" * 40,
+            "sha256": "b" * 64,
+            "byte_length": 1,
+        }
+        for path in corpus.EXECUTION_CODE_PATHS
+    },
+}
 
 
 def _source_bar(start: datetime, *, artifact: str = "sha256:" + "a" * 64) -> corpus.SourceBar:
@@ -329,6 +341,57 @@ def test_incomplete_http_read_is_contained_to_one_provider(monkeypatch) -> None:
         "source": "ALPACA", "availability": "UNAVAILABLE",
         "retrieval_associations": 0, "failure_type": "Hist8Error",
         "reason": "provider response body incomplete",
+    }
+    assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
+    assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
+
+
+def test_malformed_http_status_line_is_contained_to_one_provider(monkeypatch) -> None:
+    calls = []
+    stored = []
+
+    def malformed_status_line(*_args, **_kwargs):
+        raise BadStatusLine("malformed status")
+
+    def alpaca(*_args, **_kwargs):
+        calls.append("ALPACA")
+        corpus._http_get(
+            corpus.ALPACA_URL, headers={}, opener=malformed_status_line,
+        )
+        yield  # pragma: no cover
+
+    def coinbase(*_args, **_kwargs):
+        calls.append("COINBASE")
+        yield _raw_page(
+            {"complete": "coinbase"}, source="COINBASE",
+            instruments=("BTC-USD",),
+        )
+
+    def massive(*_args, **_kwargs):
+        calls.append("MASSIVE")
+        yield _raw_page(
+            {"complete": "massive"}, source="MASSIVE",
+            instruments=("NASDAQ",),
+        )
+
+    class Store:
+        def store_page(self, import_id, sequence, page):
+            assert import_id == "protocol-attempt"
+            stored.append(page.source)
+            return sequence + len(page.instruments)
+
+    monkeypatch.setattr(corpus, "alpaca_pages", alpaca)
+    monkeypatch.setattr(corpus, "coinbase_pages", coinbase)
+    monkeypatch.setattr(corpus, "massive_pages", massive)
+    result = corpus.acquire(Store(), "protocol-attempt")
+
+    assert calls == ["ALPACA", "COINBASE", "MASSIVE"]
+    assert stored == ["COINBASE", "MASSIVE"]
+    assert result["retrieval_associations"] == 2
+    assert result["source_statuses"]["SPY"] == {
+        "source": "ALPACA", "availability": "UNAVAILABLE",
+        "retrieval_associations": 0, "failure_type": "Hist8Error",
+        "reason": "provider HTTP protocol failure",
     }
     assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
     assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
@@ -1015,7 +1078,10 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
             return {
                 "manifest_id": "sha256:" + "d" * 64,
                 "membership_sha256": "a" * 64,
-                "metadata": {"source_statuses": statuses},
+                "metadata": {
+                    "code_identity": TEST_CODE_IDENTITY,
+                    "source_statuses": statuses,
+                },
             }
 
         def add_attempt(self, import_id, kind, metadata):
@@ -1036,6 +1102,9 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
         "schedule_sha256": "c" * 64,
     })
     monkeypatch.setattr(
+        corpus, "_execution_code_identity", lambda: TEST_CODE_IDENTITY,
+    )
+    monkeypatch.setattr(
         corpus, "materialize_instrument",
         lambda _store, _source, instrument, _calendar, **_kwargs: (
             materialized.append(instrument) or {
@@ -1054,8 +1123,44 @@ def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
     assert store.attempts[0][2]["source_snapshot_manifest_id"] == (
         "sha256:" + "d" * 64
     )
+    assert store.attempts[0][2]["code_identity"] == TEST_CODE_IDENTITY
     assert materialized == list(corpus.INSTRUMENTS[:-1])
     assert unavailable_replays == [("source-attempt", "NASDAQ")]
+
+
+def test_replay_rejects_different_execution_code_identity(monkeypatch) -> None:
+    source_identity = {
+        **TEST_CODE_IDENTITY,
+        "implementation_commit": "e" * 40,
+    }
+
+    class Store:
+        def sealed_snapshot_state(self, import_id):
+            assert import_id == "source-attempt"
+            return {
+                "manifest_id": "sha256:" + "d" * 64,
+                "membership_sha256": "a" * 64,
+                "metadata": {"code_identity": source_identity},
+            }
+
+        def add_attempt(self, *_args, **_kwargs):
+            raise AssertionError("identity mismatch must precede replay writes")
+
+    monkeypatch.setattr(
+        corpus.Hist8Store, "from_environment",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(corpus, "load_calendar", lambda: {
+        "schedule_sha256": "c" * 64,
+    })
+    monkeypatch.setattr(
+        corpus, "_execution_code_identity", lambda: TEST_CODE_IDENTITY,
+    )
+
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="code identity differs",
+    ):
+        corpus.execute("source-attempt", acquire_sources=False)
 
 
 def test_execute_seals_partial_availability_without_substitution(monkeypatch) -> None:
@@ -1098,6 +1203,9 @@ def test_execute_seals_partial_availability_without_substitution(monkeypatch) ->
     monkeypatch.setattr(corpus, "load_calendar", lambda: {
         "schedule_sha256": "c" * 64,
     })
+    monkeypatch.setattr(
+        corpus, "_execution_code_identity", lambda: TEST_CODE_IDENTITY,
+    )
     monkeypatch.setattr(corpus, "acquire", lambda *_args: {
         "retrieval_associations": 8, "source_statuses": statuses,
     })
@@ -1123,6 +1231,8 @@ def test_execute_seals_partial_availability_without_substitution(monkeypatch) ->
     snapshot_metadata = store.snapshots[0][1]
     assert snapshot_metadata["retrieval_associations"] == 8
     assert snapshot_metadata["source_statuses"] == statuses
+    assert snapshot_metadata["code_identity"] == TEST_CODE_IDENTITY
+    assert store.attempts[0][2]["code_identity"] == TEST_CODE_IDENTITY
 
 
 def test_unavailable_replay_still_verifies_retained_artifacts(monkeypatch) -> None:
@@ -1144,7 +1254,10 @@ def test_unavailable_replay_still_verifies_retained_artifacts(monkeypatch) -> No
             return {
                 "manifest_id": "sha256:" + "f" * 64,
                 "membership_sha256": "a" * 64,
-                "metadata": {"source_statuses": statuses},
+                "metadata": {
+                    "code_identity": TEST_CODE_IDENTITY,
+                    "source_statuses": statuses,
+                },
             }
 
         def add_attempt(self, *_args, **_kwargs):
@@ -1166,6 +1279,9 @@ def test_unavailable_replay_still_verifies_retained_artifacts(monkeypatch) -> No
     monkeypatch.setattr(corpus, "load_calendar", lambda: {
         "schedule_sha256": "c" * 64,
     })
+    monkeypatch.setattr(
+        corpus, "_execution_code_identity", lambda: TEST_CODE_IDENTITY,
+    )
     monkeypatch.setattr(
         corpus, "materialize_instrument",
         lambda *_args, **_kwargs: {
@@ -1218,6 +1334,8 @@ def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
     assert "hist8_bars_session_lookup_idx" in sql
     assert "member_provenance_hash text" in sql
     assert "HIST8_EXISTING_INSTALLATION_ROLE_MISMATCH" in sql
+    assert "pg_get_functiondef(routine.oid)" in sql
+    assert "manifests_import_id_sequence_no_manifest_kind_key" in sql
 
 
 def test_schema_enforces_importer_boundary_in_postgres() -> None:
@@ -1606,6 +1724,69 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 cursor.execute(sql)
                 # An ambiguous disconnect after COMMIT can be retried without
                 # mutating the exact prior installation.
+                cursor.execute(sql)
+                cursor.execute(
+                    "create view atom_research_history.hist8_forbidden_view "
+                    "as select id from public.coin_v8_market_bars"
+                )
+                cursor.execute(
+                    "grant select on "
+                    "atom_research_history.hist8_forbidden_view "
+                    "to atom_hist8_importer"
+                )
+                with pytest.raises(
+                    psycopg.Error,
+                    match="EXISTING_INSTALLATION_TABLE_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "select to_regclass(" 
+                    "'atom_research_history.hist8_forbidden_view') is not null"
+                )
+                assert cursor.fetchone()[0] is True
+                cursor.execute(
+                    "drop view atom_research_history.hist8_forbidden_view"
+                )
+                cursor.execute(sql)
+
+                cursor.execute(
+                    """create or replace function
+                         atom_research_history.guard_snapshot_membership()
+                       returns trigger
+                       language plpgsql
+                       security invoker
+                       set search_path = pg_catalog
+                       as $function$
+                       begin
+                         if false then
+                           raise exception 'HIST8 import evidence is sealed';
+                         end if;
+                         return new;
+                       end
+                       $function$"""
+                )
+                with pytest.raises(
+                    psycopg.Error,
+                    match="EXISTING_INSTALLATION_PROTECTION_MISMATCH",
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "select position('if false' in lower(prosrc)) > 0 "
+                    "from pg_proc where oid="
+                    "'atom_research_history.guard_snapshot_membership()'"
+                    "::regprocedure"
+                )
+                assert cursor.fetchone()[0] is True
+                guard_start = sql.index(
+                    "CREATE OR REPLACE FUNCTION "
+                    "atom_research_history.guard_snapshot_membership()"
+                )
+                guard_end = sql.index("$function$;", guard_start) + len(
+                    "$function$;"
+                )
+                cursor.execute(sql[guard_start:guard_end])
                 cursor.execute(sql)
                 cursor.execute("alter role atom_hist8_importer inherit")
                 with pytest.raises(
