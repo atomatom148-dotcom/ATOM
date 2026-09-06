@@ -99,6 +99,13 @@ def test_parser_preserves_decimal_values_and_raw_lineage() -> None:
     assert row.artifact_id == "sha256:" + corpus.sha256(page.body)
     assert row.locator == "$.bars.SPY[0]"
 
+    sub_microsecond = _raw_page({"bars": {"SPY": [{
+        "t": "2025-01-02T14:30:00.000000001Z", "o": 100, "h": 101,
+        "l": 99, "c": 100, "v": 1,
+    }]}})
+    with pytest.raises(corpus.Hist8Error, match="sub-microsecond"):
+        corpus.parse_source_page(sub_microsecond, "SPY")
+
 
 def test_canonical_decimal_hashing_preserves_precision_without_context_rounding() -> None:
     left = Decimal("12345678901234567890123456780")
@@ -114,9 +121,46 @@ def test_massive_identity_pagination_and_fractional_timestamp_fail_closed() -> N
             "2024-09-01/2026-09-01?cursor=next"
         )
 
+    endpoint, params = corpus._strip_secret_query(
+        corpus.MASSIVE_URL + "?cursor=next&apiKey=must-not-be-retained"
+    )
+    assert endpoint == corpus.MASSIVE_URL
+    assert params == {
+        "adjusted": "false", "sort": "asc", "limit": "50000",
+        "cursor": "next",
+    }
+    provider_cursor_endpoint, provider_cursor_params = corpus._strip_secret_query(
+        "https://api.massive.com/v2/aggs/ticker/I%3ACOMP/range/1/minute/"
+        "1725148860000/2026-09-01?cursor=opaque"
+    )
+    assert provider_cursor_endpoint.endswith(
+        "/I%3ACOMP/range/1/minute/1725148860000/2026-09-01"
+    )
+    assert provider_cursor_params == {
+        "adjusted": "false", "sort": "asc", "limit": "50000",
+        "cursor": "opaque",
+    }
+    for query in (
+        "cursor=next&adjusted=true",
+        "cursor=next&sort=desc",
+        "cursor=next&limit=5",
+        "cursor=next&unexpected=value",
+        "cursor=one&cursor=two",
+    ):
+        with pytest.raises(corpus.Hist8Error, match="parameter mismatch"):
+            corpus._strip_secret_query(corpus.MASSIVE_URL + "?" + query)
+
     wrong_ticker = _Response({"ticker": "SPY", "results": []})
     with pytest.raises(corpus.Hist8Error, match="ticker identity mismatch"):
         list(corpus.massive_pages("key", opener=lambda *_args, **_kwargs: wrong_ticker))
+
+    wrong_adjustment = _Response({
+        "ticker": "I:COMP", "adjusted": True, "results": [],
+    })
+    with pytest.raises(corpus.Hist8Error, match="adjustment identity mismatch"):
+        list(corpus.massive_pages(
+            "key", opener=lambda *_args, **_kwargs: wrong_adjustment,
+        ))
 
     page = corpus.RawPage(
         "MASSIVE", "I:COMP", "I:COMP minute index OHLC", ("NASDAQ",),
@@ -288,6 +332,66 @@ def test_database_url_must_bind_exact_project_database_and_role(monkeypatch) -> 
     assert isinstance(corpus.Hist8Store.from_environment(), corpus.Hist8Store)
 
 
+def test_schema_installer_verifies_direct_tls_endpoint_before_sql() -> None:
+    events = []
+
+    class Cursor:
+        def __init__(self):
+            self.readbacks = iter([
+                ("postgres", "postgres", True),
+                (True, True, 3),
+            ])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, params=None):
+            events.append((query, params))
+
+        def fetchone(self):
+            return next(self.readbacks)
+
+    class Connection:
+        def __init__(self):
+            self._cursor = Cursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def cursor(self):
+            return self._cursor
+
+    def connector(dsn, **kwargs):
+        events.append((dsn, kwargs))
+        return Connection()
+
+    dsn = (
+        f"postgresql://postgres:x@{corpus.DATABASE_HOST}:5432/postgres"
+        "?sslmode=verify-full&sslrootcert=system"
+    )
+    result = corpus.install_schema(dsn, connector=connector)
+    assert result["project_ref"] == corpus.PROJECT_REF
+    assert events[0][0] == dsn
+    assert events[0][1] == {"autocommit": True, "connect_timeout": 15}
+    assert "pg_stat_ssl" in events[1][0]
+    assert "set_config('atom.hist8_verified_project_ref'" in events[2][0]
+    assert events[2][1] == (corpus.PROJECT_REF,)
+    assert "CREATE ROLE atom_hist8_importer" in events[3][0]
+
+    with pytest.raises(corpus.Hist8Error, match="installer credential/project"):
+        corpus.install_schema(
+            "postgresql://postgres:x@wrong.example/postgres"
+            "?sslmode=verify-full&sslrootcert=system",
+            connector=connector,
+        )
+
+
 def test_replay_must_equal_the_sealed_source_snapshot(monkeypatch) -> None:
     class Store:
         attempts = []
@@ -339,6 +443,11 @@ def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
     assert "HIST8_EFFECTIVE_SEQUENCE_BOUNDARY_UNSATISFIED" in sql
     assert "HIST8_EFFECTIVE_ROUTINE_BOUNDARY_UNSATISFIED" in sql
     assert "HIST8_EFFECTIVE_SCHEMA_USAGE_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_FOREIGN_SCHEMA_ACCESS_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_OTHER_DATABASE_CONNECT_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_EFFECTIVE_COLUMN_PRIVILEGE_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_ENDPOINT_IDENTITY_UNVERIFIED" in sql
+    assert "'BAR_CONFLICT'" in sql
     assert "hist8_bars_session_lookup_idx" in sql
 
 
@@ -347,12 +456,14 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
     if not dsn:
         pytest.skip("CI PostgreSQL is not available")
     import psycopg
+    from psycopg import sql as pgsql
 
     sql = Path("research/hist8/schema.sql").read_text(encoding="utf-8")
     managed_roles = (
         "atom_hist8_importer", "hist8_forbidden", "anon",
         "authenticated", "service_role",
     )
+    other_connectable_databases = []
     with psycopg.connect(dsn, autocommit=True) as connection:
         try:
             with connection.cursor() as cursor:
@@ -364,6 +475,21 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 cursor.execute("create role hist8_forbidden nologin")
                 cursor.execute("create table public.coin_v8_market_bars (id bigint)")
                 cursor.execute("create table public.coin_v8_ai_decision_logs (id bigint)")
+
+                with pytest.raises(
+                    psycopg.Error, match="ENDPOINT_IDENTITY_UNVERIFIED"
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "select count(*) from pg_roles "
+                    "where rolname='atom_hist8_importer'"
+                )
+                assert cursor.fetchone()[0] == 0
+                cursor.execute(
+                    "select set_config('atom.hist8_verified_project_ref',%s,false)",
+                    (corpus.PROJECT_REF,),
+                )
 
                 cursor.execute(
                     "create role atom_hist8_importer login noinherit nosuperuser "
@@ -391,6 +517,40 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 assert cursor.fetchone()[0] == 0
                 cursor.execute("drop schema atom_research_history")
 
+                with pytest.raises(
+                    psycopg.Error, match="OTHER_DATABASE_CONNECT_BOUNDARY"
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    """select datname from pg_database
+                       where datname <> current_database() and datallowconn
+                         and has_database_privilege('public',oid,'CONNECT')
+                       order by datname"""
+                )
+                other_connectable_databases = [row[0] for row in cursor.fetchall()]
+                assert other_connectable_databases
+                for database in other_connectable_databases:
+                    cursor.execute(
+                        pgsql.SQL("revoke connect on database {} from public").format(
+                            pgsql.Identifier(database)
+                        )
+                    )
+
+                cursor.execute(
+                    "alter default privileges for role postgres "
+                    "grant usage on schemas to hist8_forbidden"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="FOREIGN_SCHEMA_ACCESS_BOUNDARY"
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute(
+                    "alter default privileges for role postgres "
+                    "revoke usage on schemas from hist8_forbidden"
+                )
+
                 cursor.execute(
                     "alter default privileges for role postgres "
                     "grant select on tables to hist8_forbidden"
@@ -414,6 +574,23 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                     "alter default privileges for role postgres "
                     "revoke select on tables from hist8_forbidden"
                 )
+
+                cursor.execute(
+                    "create table public.hist8_column_forbidden "
+                    "(secret bigint, ordinary bigint)"
+                )
+                cursor.execute(
+                    "revoke all on public.hist8_column_forbidden from public"
+                )
+                cursor.execute(
+                    "grant select(secret) on public.hist8_column_forbidden to public"
+                )
+                with pytest.raises(
+                    psycopg.Error, match="COLUMN_PRIVILEGE_BOUNDARY"
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                cursor.execute("drop table public.hist8_column_forbidden")
 
                 cursor.execute(
                     "create function public.hist8_callable() returns integer "
@@ -504,6 +681,29 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 )
                 assert store.insert_bars((incomplete,)) == (1, 0)
                 assert store.insert_bars((complete,)) == (0, 1)
+                conflicting = corpus.canonical_bar(
+                    replace(source, close=Decimal("101")),
+                    session_date="2025-01-02", calendar_hash="b" * 64,
+                    import_id="attempt-conflict", eligible=True,
+                )
+                with pytest.raises(
+                    corpus.Hist8ConflictError, match="same-key bar conflict"
+                ):
+                    store.insert_bars((conflicting,))
+                cursor.execute(
+                    """select metadata_json
+                       from atom_research_history.manifests
+                       where import_id='attempt-conflict'
+                         and manifest_kind='BAR_CONFLICT'"""
+                )
+                conflict_metadata = cursor.fetchone()[0]
+                assert conflict_metadata["conflict_kind"] == "SAME_CANONICAL_KEY"
+                assert conflict_metadata["existing"]["content_hash"] == (
+                    incomplete.content_hash
+                )
+                assert conflict_metadata["candidate"]["content_hash"] == (
+                    conflicting.content_hash
+                )
                 incomplete_digest = store.seal_snapshot("attempt-incomplete", {})
                 complete_digest = store.seal_snapshot("attempt-complete", {})
                 assert incomplete_digest != complete_digest
@@ -534,6 +734,7 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                 cursor.execute("drop schema if exists atom_research_history cascade")
                 cursor.execute("drop table if exists public.coin_v8_market_bars")
                 cursor.execute("drop table if exists public.coin_v8_ai_decision_logs")
+                cursor.execute("drop table if exists public.hist8_column_forbidden")
                 cursor.execute("drop function if exists public.hist8_callable()")
                 cursor.execute("drop sequence if exists public.hist8_forbidden_sequence")
                 cursor.execute("drop schema if exists hist8_visible")
@@ -541,5 +742,15 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                     "alter default privileges for role postgres "
                     "revoke select on tables from hist8_forbidden"
                 )
+                cursor.execute(
+                    "alter default privileges for role postgres "
+                    "revoke usage on schemas from hist8_forbidden"
+                )
+                for database in other_connectable_databases:
+                    cursor.execute(
+                        pgsql.SQL("grant connect on database {} to public").format(
+                            pgsql.Identifier(database)
+                        )
+                    )
                 for role in managed_roles:
                     cursor.execute(f"drop role if exists {role}")

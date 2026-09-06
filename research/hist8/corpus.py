@@ -11,9 +11,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 from typing import Callable, Iterator, Mapping, Sequence
 from urllib.error import HTTPError
-from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 import uuid
 import zlib
@@ -29,6 +30,8 @@ DATABASE_NAME = "postgres"
 DATABASE_HOST = "db.pjbjpgnmniwcajqkuhge.supabase.co"
 IMPORTER_ROLE = "atom_hist8_importer"
 IMPORT_DATABASE_ENV = "ATOM_HIST8_IMPORT_DATABASE_URL"
+INSTALLER_ROLE = "postgres"
+INSTALL_DATABASE_ENV = "ATOM_HIST8_INSTALL_DATABASE_URL"
 EQUITIES = ("COIN", "QQQ", "SPY", "NVDA", "XLE", "GLD")
 INSTRUMENTS = (*EQUITIES, "BTC-USD", "NASDAQ")
 TIMEFRAMES = ("1m", "5m", "15m", "30m", "1H")
@@ -46,6 +49,14 @@ COINBASE_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 MASSIVE_URL = (
     "https://api.massive.com/v2/aggs/ticker/I%3ACOMP/range/1/minute/"
     "2024-09-01/2026-09-01"
+)
+MASSIVE_FROZEN_PARAMS = {
+    "adjusted": "false", "sort": "asc", "limit": "50000",
+}
+
+_ISO_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.(?P<fraction>\d+))?(?:Z|[+-]\d{2}:\d{2})$"
 )
 
 
@@ -244,6 +255,12 @@ def load_calendar(path: Path | None = None) -> dict[str, object]:
 def _iso_utc(value: object) -> datetime:
     if not isinstance(value, str):
         raise Hist8Error("provider timestamp must be a string")
+    match = _ISO_TIMESTAMP.fullmatch(value)
+    if match is None:
+        raise Hist8Error("invalid provider timestamp")
+    fraction = match.group("fraction") or ""
+    if len(fraction) > 6 and any(digit != "0" for digit in fraction[6:]):
+        raise Hist8Error("provider timestamp has sub-microsecond precision")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -375,15 +392,46 @@ def coinbase_pages(
 
 def _strip_secret_query(url: str) -> tuple[str, dict[str, str]]:
     parsed = urlparse(url)
-    expected = urlparse(MASSIVE_URL)
     if (parsed.scheme != "https" or parsed.hostname != "api.massive.com"
             or parsed.port is not None or parsed.username is not None
-            or parsed.password is not None or parsed.fragment
-            or unquote(parsed.path) != unquote(expected.path)):
+            or parsed.password is not None or parsed.fragment):
         raise Hist8Error("Massive pagination resource mismatch")
-    safe = [(k, v) for k, v in parse_qsl(parsed.query) if k.lower() != "apikey"]
-    endpoint = urlunparse(parsed._replace(query=""))
-    return endpoint, dict(safe)
+    segments = unquote(parsed.path).strip("/").split("/")
+    expected_prefix = [
+        "v2", "aggs", "ticker", "I:COMP", "range", "1", "minute",
+    ]
+    if len(segments) != 9 or segments[:7] != expected_prefix:
+        raise Hist8Error("Massive pagination resource mismatch")
+    start_token, end_token = segments[7:]
+    if start_token == "2024-09-01":
+        page_start_ms = int(START.timestamp() * 1000)
+    elif start_token.isascii() and start_token.isdigit():
+        page_start_ms = int(start_token)
+    else:
+        raise Hist8Error("Massive pagination resource mismatch")
+    frozen_start_ms = int(START.timestamp() * 1000)
+    frozen_end_ms = int(END.timestamp() * 1000)
+    if (not frozen_start_ms <= page_start_ms < frozen_end_ms
+            or end_token not in {"2026-09-01", str(frozen_end_ms)}):
+        raise Hist8Error("Massive pagination resource mismatch")
+    supplied: dict[str, str] = {}
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        normalized_key = key.lower()
+        if normalized_key not in {
+            "adjusted", "sort", "limit", "cursor", "apikey",
+        } or normalized_key in supplied:
+            raise Hist8Error("Massive pagination parameter mismatch")
+        supplied[normalized_key] = value
+    for name, frozen_value in MASSIVE_FROZEN_PARAMS.items():
+        if name in supplied and supplied[name] != frozen_value:
+            raise Hist8Error("Massive pagination parameter mismatch")
+    cursor = supplied.get("cursor")
+    if not cursor:
+        raise Hist8Error("Massive pagination parameter mismatch")
+    # Provider next_url examples contain only a cursor. Rebuild every request
+    # from the frozen semantic parameters, and never retain a URL API key.
+    endpoint = f"https://api.massive.com{parsed.path}"
+    return endpoint, {**MASSIVE_FROZEN_PARAMS, "cursor": cursor}
 
 
 def massive_pages(
@@ -393,7 +441,7 @@ def massive_pages(
     if not key:
         raise Hist8Error("Massive credential missing")
     endpoint = MASSIVE_URL
-    params = {"adjusted": "false", "sort": "asc", "limit": "50000"}
+    params = dict(MASSIVE_FROZEN_PARAMS)
     seen: set[str] = set()
     for _ in range(100):
         page = _build_page(
@@ -410,6 +458,8 @@ def massive_pages(
             raise Hist8Error("malformed Massive page")
         if payload.get("ticker") != "I:COMP":
             raise Hist8Error("Massive ticker identity mismatch")
+        if payload.get("adjusted") is not False:
+            raise Hist8Error("Massive adjustment identity mismatch")
         next_url = payload.get("next_url")
         if next_url is None:
             return
@@ -444,27 +494,104 @@ def _membership_sequence(row: Bar) -> int:
     )
 
 
+def _validate_database_url(
+    dsn: str, *, expected_user: str, purpose: str,
+) -> str:
+    try:
+        parsed = urlparse(dsn)
+        port = parsed.port
+    except ValueError as exc:
+        raise Hist8Error(
+            f"HIST8 {purpose} credential/project mismatch"
+        ) from exc
+    required_query = [
+        ("sslmode", "verify-full"), ("sslrootcert", "system"),
+    ]
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    if (parsed.scheme not in ("postgres", "postgresql")
+            or parsed.hostname != DATABASE_HOST
+            or port not in (None, 5432)
+            or parsed.username != expected_user
+            or not parsed.password
+            or parsed.path != f"/{DATABASE_NAME}"
+            or parsed.fragment
+            or sorted(query_pairs) != sorted(required_query)):
+        raise Hist8Error(f"HIST8 {purpose} credential/project mismatch")
+    return dsn
+
+
+def install_schema(
+    dsn: str | None = None, *, connector: Callable[..., object] | None = None,
+    schema_path: Path | None = None,
+) -> dict[str, object]:
+    """Install only through the frozen direct endpoint with verified TLS."""
+    chosen_dsn = _validate_database_url(
+        dsn if dsn is not None else os.environ.get(INSTALL_DATABASE_ENV, ""),
+        expected_user=INSTALLER_ROLE,
+        purpose="installer",
+    )
+    if connector is None:
+        try:
+            import psycopg
+        except ImportError as exc:
+            raise Hist8Error("psycopg is required") from exc
+        connector = psycopg.connect
+    target = schema_path or Path(__file__).with_name("schema.sql")
+    sql = target.read_text(encoding="utf-8")
+    if (not sql.lstrip().startswith("-- ATOM-HIST8-CORPUS-AMENDMENT-1")
+            or not sql.rstrip().endswith("COMMIT;")):
+        raise Hist8Error("HIST8 schema artifact mismatch")
+    with connector(
+        chosen_dsn, autocommit=True, connect_timeout=15,
+    ) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """select current_user,current_database(),coalesce(
+                       (select ssl from pg_stat_ssl where pid=pg_backend_pid()),
+                       false
+                   )"""
+            )
+            user, database, tls_active = cursor.fetchone()
+            if (user != INSTALLER_ROLE or database != DATABASE_NAME
+                    or tls_active is not True):
+                raise Hist8Error("HIST8 installer endpoint identity mismatch")
+            cursor.execute(
+                "select set_config('atom.hist8_verified_project_ref', %s, false)",
+                (PROJECT_REF,),
+            )
+            cursor.execute(sql)
+            cursor.execute(
+                """select to_regnamespace('atom_research_history') is not null,
+                          exists (
+                            select 1 from pg_roles
+                            where rolname='atom_hist8_importer'
+                          ),
+                          (select count(*) from information_schema.tables
+                           where table_schema='atom_research_history')"""
+            )
+            schema_exists, role_exists, table_count = cursor.fetchone()
+    if schema_exists is not True or role_exists is not True or table_count != 3:
+        raise Hist8Error("HIST8 schema installation readback mismatch")
+    return {
+        "project_ref": PROJECT_REF,
+        "database": DATABASE_NAME,
+        "host": DATABASE_HOST,
+        "schema": "atom_research_history",
+        "tables": table_count,
+    }
+
+
 class Hist8Store:
     def __init__(self, connection_factory: Callable[[], object]) -> None:
         self._connection_factory = connection_factory
 
     @classmethod
     def from_environment(cls) -> "Hist8Store":
-        dsn = os.environ.get(IMPORT_DATABASE_ENV, "")
-        parsed = urlparse(dsn)
-        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
-        required_query = [
-            ("sslmode", "verify-full"), ("sslrootcert", "system"),
-        ]
-        if (parsed.scheme not in ("postgres", "postgresql")
-                or parsed.hostname != DATABASE_HOST
-                or parsed.port not in (None, 5432)
-                or parsed.username != IMPORTER_ROLE
-                or not parsed.password
-                or parsed.path != f"/{DATABASE_NAME}"
-                or parsed.fragment
-                or sorted(query_pairs) != sorted(required_query)):
-            raise Hist8Error("HIST8 importer credential/project mismatch")
+        dsn = _validate_database_url(
+            os.environ.get(IMPORT_DATABASE_ENV, ""),
+            expected_user=IMPORTER_ROLE,
+            purpose="importer",
+        )
         try:
             import psycopg
         except ImportError as exc:
@@ -617,6 +744,66 @@ class Hist8Store:
             raise Hist8Error("sealed source snapshot missing or invalid")
         return rows[0][0]
 
+    def _record_bar_conflict(
+        self, row: Bar, existing_bar_id: str, existing_content_hash: str,
+        existing_import_id: str,
+    ) -> None:
+        sequence = _membership_sequence(row)
+        metadata = _canonical({
+            "conflict_kind": "SAME_CANONICAL_KEY",
+            "canonical_key": {
+                "corpus_id": row.corpus_id,
+                "instrument": row.instrument,
+                "timeframe": row.timeframe,
+                "bar_start_utc": row.bar_start_utc,
+            },
+            "existing": {
+                "bar_id": existing_bar_id,
+                "content_hash": existing_content_hash,
+                "originating_import_id": existing_import_id,
+            },
+            "candidate": {
+                "bar_id": row.bar_id,
+                "content_hash": row.content_hash,
+                "attempt_import_id": row.import_id,
+                "source_artifact_id": row.source_artifact_id,
+                "source_record_locator": row.source_record_locator,
+                "semantic_payload": _content_payload(row),
+            },
+        })
+        payload = {
+            "corpus_id": CORPUS_ID, "import_id": row.import_id,
+            "kind": "BAR_CONFLICT", "sequence_no": sequence,
+            "instrument": row.instrument, "metadata": metadata,
+        }
+        manifest_id = _manifest_id(payload)
+        with self._connection_factory() as connection:
+            self._verify(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """insert into atom_research_history.manifests
+                       (manifest_id,corpus_id,manifest_kind,import_id,sequence_no,
+                        instrument,metadata_json)
+                       values (%s,%s,'BAR_CONFLICT',%s,%s,%s,%s)
+                       on conflict do nothing""",
+                    (manifest_id, CORPUS_ID, row.import_id, sequence,
+                     row.instrument, json.dumps(metadata)),
+                )
+            connection.commit()
+            self._verify(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """select manifest_id,metadata_json
+                       from atom_research_history.manifests
+                       where corpus_id=%s and import_id=%s
+                         and manifest_kind='BAR_CONFLICT' and sequence_no=%s""",
+                    (CORPUS_ID, row.import_id, sequence),
+                )
+                recorded = cursor.fetchone()
+        if (recorded is None or recorded[0] != manifest_id
+                or _canonical(recorded[1]) != metadata):
+            raise Hist8ConflictError("bar conflict evidence mismatch")
+
     def insert_bars(self, rows: Sequence[Bar]) -> tuple[int, int]:
         if not rows:
             return 0, 0
@@ -625,89 +812,117 @@ class Hist8Store:
         if len(keys) != len(set(keys)):
             raise Hist8ConflictError("duplicate generated bar identity")
         inserted = 0
-        with self._connection_factory() as connection:
-            self._verify(connection)
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """select timeframe,bar_start_utc,content_hash from atom_research_history.bars
-                    where corpus_id=%s and instrument=%s and session_date=%s""",
-                    (CORPUS_ID, rows[0].instrument, rows[0].session_date),
-                )
-                existing = {(r[0], r[1]): r[2] for r in cursor.fetchall()}
-                pending = []
-                for row in rows:
-                    key = (row.timeframe, row.bar_start_utc)
-                    if key in existing:
-                        if existing[key] != row.content_hash:
-                            raise Hist8ConflictError("same-key bar conflict")
-                        continue
-                    pending.append(row)
-                if pending:
-                    cursor.executemany(
-                        """insert into atom_research_history.bars
-                        (bar_id,content_hash,corpus_id,instrument,timeframe,bar_start_utc,
-                         bar_end_utc,session_date,calendar_id,calendar_sha256,open,high,
-                         low,close,volume,trade_count,vwap,volume_unit,source,feed,product,
-                         adjustment,currency,import_id,derivation_version,
-                         source_artifact_id,source_record_locator,lineage_json)
-                        values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        on conflict do nothing""", [_bar_values(row) for row in pending],
+        conflict: tuple[Bar, str, str, str] | None = None
+        try:
+            with self._connection_factory() as connection:
+                self._verify(connection)
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """select timeframe,bar_start_utc,bar_id,content_hash,import_id
+                           from atom_research_history.bars
+                           where corpus_id=%s and instrument=%s and session_date=%s""",
+                        (CORPUS_ID, rows[0].instrument, rows[0].session_date),
                     )
-                    inserted = len(pending)
-                cursor.execute(
-                    """select timeframe,bar_start_utc,content_hash from atom_research_history.bars
-                    where corpus_id=%s and instrument=%s and session_date=%s""",
-                    (CORPUS_ID, rows[0].instrument, rows[0].session_date),
-                )
-                verified = {(r[0], r[1]): r[2] for r in cursor.fetchall()}
-                for row in rows:
-                    if verified.get((row.timeframe, row.bar_start_utc)) != row.content_hash:
-                        raise Hist8ConflictError("bar readback mismatch")
-
-                members = []
-                expected_members = {}
-                for row in rows:
-                    sequence = _membership_sequence(row)
-                    payload = {
-                        "corpus_id": CORPUS_ID, "import_id": row.import_id,
-                        "kind": "SNAPSHOT_MEMBER", "sequence_no": sequence,
-                        "instrument": row.instrument, "timeframe": row.timeframe,
-                        "bar_start_utc": row.bar_start_utc, "bar_id": row.bar_id,
-                        "content_hash": row.content_hash,
-                        "research_eligible": row.research_eligible,
+                    existing = {
+                        (record[0], record[1]): (record[2], record[3], record[4])
+                        for record in cursor.fetchall()
                     }
-                    expected_members[sequence] = (
-                        row.bar_id, row.content_hash, row.research_eligible,
+                    pending = []
+                    for row in rows:
+                        key = (row.timeframe, row.bar_start_utc)
+                        if key in existing:
+                            existing_bar_id, existing_hash, existing_import_id = (
+                                existing[key]
+                            )
+                            if existing_hash != row.content_hash:
+                                conflict = (
+                                    row, existing_bar_id, existing_hash,
+                                    existing_import_id,
+                                )
+                                raise Hist8ConflictError("same-key bar conflict")
+                            continue
+                        pending.append(row)
+                    if pending:
+                        cursor.executemany(
+                            """insert into atom_research_history.bars
+                            (bar_id,content_hash,corpus_id,instrument,timeframe,bar_start_utc,
+                             bar_end_utc,session_date,calendar_id,calendar_sha256,open,high,
+                             low,close,volume,trade_count,vwap,volume_unit,source,feed,product,
+                             adjustment,currency,import_id,derivation_version,
+                             source_artifact_id,source_record_locator,lineage_json)
+                            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            on conflict do nothing""",
+                            [_bar_values(row) for row in pending],
+                        )
+                        inserted = len(pending)
+                    cursor.execute(
+                        """select timeframe,bar_start_utc,bar_id,content_hash,import_id
+                           from atom_research_history.bars
+                           where corpus_id=%s and instrument=%s and session_date=%s""",
+                        (CORPUS_ID, rows[0].instrument, rows[0].session_date),
                     )
-                    members.append((
-                        _manifest_id(payload), CORPUS_ID, row.import_id, sequence,
-                        row.instrument, row.bar_id, row.content_hash, row.timeframe,
-                        row.bar_start_utc, row.research_eligible,
-                    ))
-                cursor.executemany(
-                    """insert into atom_research_history.manifests
-                    (manifest_id,corpus_id,manifest_kind,import_id,sequence_no,
-                     instrument,member_bar_id,member_content_hash,member_timeframe,
-                     member_bar_start_utc,member_research_eligible,metadata_json)
-                    values (%s,%s,'SNAPSHOT_MEMBER',%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
-                    on conflict (manifest_id) do nothing""", members,
-                )
-                cursor.execute(
-                    """select sequence_no,member_bar_id,member_content_hash,
-                              member_research_eligible
-                       from atom_research_history.manifests
-                       where corpus_id=%s and import_id=%s
-                         and manifest_kind='SNAPSHOT_MEMBER'
-                         and sequence_no = any(%s)""",
-                    (CORPUS_ID, rows[0].import_id, list(expected_members)),
-                )
-                actual_members = {
-                    record[0]: (record[1], record[2], record[3])
-                    for record in cursor.fetchall()
-                }
-                if actual_members != expected_members:
-                    raise Hist8ConflictError("snapshot membership readback mismatch")
+                    verified = {
+                        (record[0], record[1]): (record[2], record[3], record[4])
+                        for record in cursor.fetchall()
+                    }
+                    for row in rows:
+                        actual = verified.get((row.timeframe, row.bar_start_utc))
+                        if actual is None:
+                            raise Hist8ConflictError("bar readback missing")
+                        if actual[1] != row.content_hash:
+                            conflict = (row, actual[0], actual[1], actual[2])
+                            raise Hist8ConflictError("same-key bar conflict")
+
+                    members = []
+                    expected_members = {}
+                    for row in rows:
+                        sequence = _membership_sequence(row)
+                        payload = {
+                            "corpus_id": CORPUS_ID, "import_id": row.import_id,
+                            "kind": "SNAPSHOT_MEMBER", "sequence_no": sequence,
+                            "instrument": row.instrument, "timeframe": row.timeframe,
+                            "bar_start_utc": row.bar_start_utc, "bar_id": row.bar_id,
+                            "content_hash": row.content_hash,
+                            "research_eligible": row.research_eligible,
+                        }
+                        expected_members[sequence] = (
+                            row.bar_id, row.content_hash, row.research_eligible,
+                        )
+                        members.append((
+                            _manifest_id(payload), CORPUS_ID, row.import_id, sequence,
+                            row.instrument, row.bar_id, row.content_hash, row.timeframe,
+                            row.bar_start_utc, row.research_eligible,
+                        ))
+                    cursor.executemany(
+                        """insert into atom_research_history.manifests
+                        (manifest_id,corpus_id,manifest_kind,import_id,sequence_no,
+                         instrument,member_bar_id,member_content_hash,member_timeframe,
+                         member_bar_start_utc,member_research_eligible,metadata_json)
+                        values (%s,%s,'SNAPSHOT_MEMBER',%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb)
+                        on conflict (manifest_id) do nothing""", members,
+                    )
+                    cursor.execute(
+                        """select sequence_no,member_bar_id,member_content_hash,
+                                  member_research_eligible
+                           from atom_research_history.manifests
+                           where corpus_id=%s and import_id=%s
+                             and manifest_kind='SNAPSHOT_MEMBER'
+                             and sequence_no = any(%s)""",
+                        (CORPUS_ID, rows[0].import_id, list(expected_members)),
+                    )
+                    actual_members = {
+                        record[0]: (record[1], record[2], record[3])
+                        for record in cursor.fetchall()
+                    }
+                    if actual_members != expected_members:
+                        raise Hist8ConflictError(
+                            "snapshot membership readback mismatch"
+                        )
+        except Hist8ConflictError:
+            if conflict is not None:
+                self._record_bar_conflict(*conflict)
+            raise
         return inserted, len(rows) - inserted
 
     def seal_snapshot(self, import_id: str, metadata: Mapping[str, object]) -> str:
@@ -1113,12 +1328,17 @@ def execute(import_id: str | None = None, *, acquire_sources: bool = True) -> di
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("run", "replay"))
+    parser.add_argument("command", choices=("install", "run", "replay"))
     parser.add_argument("--import-id")
     args = parser.parse_args(argv)
     if args.command == "replay" and not args.import_id:
         parser.error("replay requires --import-id")
-    result = execute(args.import_id, acquire_sources=args.command == "run")
+    if args.command == "install":
+        if args.import_id:
+            parser.error("install does not accept --import-id")
+        result = install_schema()
+    else:
+        result = execute(args.import_id, acquire_sources=args.command == "run")
     print(json.dumps(_canonical(result), sort_keys=True, separators=(",", ":")))
     return 0
 
@@ -1130,9 +1350,10 @@ if __name__ == "__main__":
 __all__ = [
     "ALPACA_URL", "CALENDAR_VERSION", "CORPUS_ID", "DATABASE_HOST",
     "DATABASE_NAME", "DERIVATION_VERSION", "END", "EQUITIES", "Hist8Error",
-    "Hist8ConflictError", "Hist8Store", "IMPORTER_ROLE", "INSTRUMENTS",
-    "MASSIVE_URL", "PARTITIONS", "PROJECT_REF", "RawPage", "START", "SourceBar", "TIMEFRAMES",
+    "Hist8ConflictError", "Hist8Store", "IMPORTER_ROLE", "INSTALL_DATABASE_ENV",
+    "INSTRUMENTS", "MASSIVE_URL", "PARTITIONS", "PROJECT_REF", "RawPage",
+    "START", "SourceBar", "TIMEFRAMES",
     "alpaca_pages", "canonical_bar", "canonical_bytes", "coinbase_pages",
-    "derive_session", "execute", "load_calendar", "massive_pages",
+    "derive_session", "execute", "install_schema", "load_calendar", "massive_pages",
     "materialize_instrument", "parse_source_page", "sha256",
 ]

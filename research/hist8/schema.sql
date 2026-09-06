@@ -8,6 +8,15 @@ SET LOCAL statement_timeout = '60s';
 
 DO $hist8$
 BEGIN
+  -- The reviewed installer sets this marker only after establishing a
+  -- verify-full TLS session to the frozen direct project endpoint. Refuse
+  -- ad-hoc execution before any database object is created.
+  IF current_setting('atom.hist8_verified_project_ref', true)
+       IS DISTINCT FROM 'pjbjpgnmniwcajqkuhge'
+  THEN
+    RAISE EXCEPTION 'HIST8_ENDPOINT_IDENTITY_UNVERIFIED';
+  END IF;
+
   IF current_database() <> 'postgres' THEN
     RAISE EXCEPTION 'HIST8_DATABASE_MISMATCH: database %', current_database();
   END IF;
@@ -67,7 +76,7 @@ CREATE TABLE atom_research_history.manifests (
   manifest_kind text NOT NULL
     CHECK (manifest_kind IN (
       'RETRIEVAL', 'IMPORT_ATTEMPT', 'REPLAY_ATTEMPT',
-      'SNAPSHOT_MEMBER', 'SNAPSHOT'
+      'BAR_CONFLICT', 'SNAPSHOT_MEMBER', 'SNAPSHOT'
     )),
   import_id text NOT NULL CHECK (length(import_id) BETWEEN 1 AND 128),
   sequence_no bigint NOT NULL CHECK (sequence_no >= 0),
@@ -306,6 +315,18 @@ BEGIN
 
   IF EXISTS (
     SELECT 1
+    FROM pg_database d
+    WHERE d.datname <> current_database()
+      AND d.datallowconn
+      AND has_database_privilege(
+        'atom_hist8_importer', d.oid, 'CONNECT'
+      )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_OTHER_DATABASE_CONNECT_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
     FROM (VALUES ('raw_responses'), ('manifests'), ('bars')) expected(table_name)
     WHERE NOT has_table_privilege(
         'atom_hist8_importer', 'atom_research_history.' || expected.table_name,
@@ -344,6 +365,21 @@ BEGIN
 
   IF EXISTS (
     SELECT 1
+    FROM pg_namespace n
+    CROSS JOIN LATERAL aclexplode(
+      COALESCE(n.nspacl, acldefault('n', n.nspowner))
+    ) acl
+    WHERE n.nspname = 'atom_research_history'
+      AND acl.grantee NOT IN (
+        n.nspowner,
+        (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer')
+      )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_FOREIGN_SCHEMA_ACCESS_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind IN ('r','p','v','m','f')
@@ -358,6 +394,21 @@ BEGIN
         OR has_table_privilege('atom_hist8_importer', c.oid, 'TRUNCATE'))
   ) THEN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_PRIVILEGE_BOUNDARY_UNSATISFIED';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r','p','v','m','f')
+      AND n.nspname NOT IN (
+        'pg_catalog','information_schema','extensions','atom_research_history'
+      )
+      AND has_any_column_privilege(
+        'atom_hist8_importer', c.oid, 'SELECT,INSERT,UPDATE,REFERENCES'
+      )
+  ) THEN
+    RAISE EXCEPTION 'HIST8_EFFECTIVE_COLUMN_PRIVILEGE_BOUNDARY_UNSATISFIED';
   END IF;
 
   IF EXISTS (
