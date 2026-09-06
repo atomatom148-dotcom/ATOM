@@ -478,14 +478,13 @@ BEGIN
   IF EXISTS (
     SELECT 1
     FROM pg_largeobject_metadata object
-    WHERE has_largeobject_privilege(
-            (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer'),
-            object.oid, 'SELECT'::text
-          )
-       OR has_largeobject_privilege(
-            (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer'),
-            object.oid, 'UPDATE'::text
-          )
+    CROSS JOIN LATERAL aclexplode(
+      COALESCE(object.lomacl, acldefault('L', object.lomowner))
+    ) acl
+    WHERE acl.grantee IN (
+        0, (SELECT oid FROM pg_roles WHERE rolname = 'atom_hist8_importer')
+      )
+      AND acl.privilege_type IN ('SELECT', 'UPDATE')
   ) THEN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_LARGE_OBJECT_BOUNDARY_UNSATISFIED';
   END IF;
