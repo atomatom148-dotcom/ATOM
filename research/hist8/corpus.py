@@ -129,7 +129,7 @@ class RawPage:
             )
         except (
             UnicodeDecodeError, json.JSONDecodeError, InvalidOperation,
-            OSError, zlib.error,
+            EOFError, OSError, zlib.error,
         ) as exc:
             raise Hist8Error("provider response is not valid decimal JSON") from exc
 
@@ -518,6 +518,119 @@ def _manifest_id(payload: Mapping[str, object]) -> str:
     return "sha256:" + sha256(payload)
 
 
+def _retrieval_manifest_payload(
+    import_id: str, sequence_no: int, page: RawPage, instrument: str,
+) -> dict[str, object]:
+    return {
+        "corpus_id": CORPUS_ID,
+        "import_id": import_id,
+        "sequence_no": sequence_no,
+        "source": page.source,
+        "feed": page.feed,
+        "product": page.product,
+        "instrument": instrument,
+        "endpoint": page.endpoint,
+        "request_params": dict(page.request_params),
+        "retrieved_at": page.retrieved_at,
+        "http_status": page.http_status,
+        "content_type": page.content_type,
+        "content_encoding": page.content_encoding,
+        "artifact_id": _artifact_id(page.body),
+        "byte_length": len(page.body),
+    }
+
+
+def _verified_retrieval_record(
+    record: Sequence[object], *, import_id: str, instrument: str,
+) -> tuple[int, RawPage]:
+    if len(record) != 19:
+        raise Hist8ConflictError("retained retrieval record shape mismatch")
+    (manifest_id, stored_corpus_id, stored_import_id, manifest_kind,
+     sequence_no, source, feed, product, stored_instrument, endpoint,
+     request_params, retrieved_at, http_status, content_type,
+     content_encoding, artifact_id, artifact_byte_length, raw_byte_length,
+     stored_body) = record
+    if (stored_corpus_id != CORPUS_ID or stored_import_id != import_id
+            or manifest_kind != "RETRIEVAL"
+            or stored_instrument != instrument
+            or not isinstance(sequence_no, int)
+            or not isinstance(request_params, Mapping)
+            or stored_body is None):
+        raise Hist8ConflictError("retained retrieval manifest identity mismatch")
+    body = bytes(stored_body)
+    if (artifact_id != _artifact_id(body)
+            or artifact_byte_length != len(body)
+            or raw_byte_length != len(body)):
+        raise Hist8ConflictError("retained raw artifact replay mismatch")
+    page = RawPage(
+        str(source), str(feed), str(product), (instrument,), str(endpoint),
+        dict(request_params), retrieved_at, http_status, content_type,
+        content_encoding, body,
+    )
+    try:
+        expected_manifest_id = _manifest_id(
+            _retrieval_manifest_payload(
+                import_id, sequence_no, page, instrument,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise Hist8ConflictError(
+            "retained retrieval manifest identity mismatch"
+        ) from exc
+    if manifest_id != expected_manifest_id:
+        raise Hist8ConflictError("retained retrieval manifest identity mismatch")
+    return sequence_no, page
+
+
+def _snapshot_member_manifest_payload(
+    import_id: str, sequence_no: int, instrument: str, timeframe: str,
+    bar_start_utc: datetime, bar_id: str, content_hash: str,
+    research_eligible: bool,
+) -> dict[str, object]:
+    return {
+        "corpus_id": CORPUS_ID,
+        "import_id": import_id,
+        "kind": "SNAPSHOT_MEMBER",
+        "sequence_no": sequence_no,
+        "instrument": instrument,
+        "timeframe": timeframe,
+        "bar_start_utc": bar_start_utc,
+        "bar_id": bar_id,
+        "content_hash": content_hash,
+        "research_eligible": research_eligible,
+    }
+
+
+def _verified_snapshot_member_record(
+    record: Sequence[object], *, import_id: str,
+) -> tuple[int, tuple[object, ...]]:
+    if len(record) != 11:
+        raise Hist8ConflictError("snapshot member record shape mismatch")
+    (manifest_id, stored_corpus_id, stored_import_id, manifest_kind,
+     sequence_no, instrument, timeframe, bar_start_utc, bar_id,
+     content_hash, research_eligible) = record
+    if (stored_corpus_id != CORPUS_ID or stored_import_id != import_id
+            or manifest_kind != "SNAPSHOT_MEMBER"
+            or not isinstance(sequence_no, int)
+            or not isinstance(instrument, str)
+            or not isinstance(timeframe, str)
+            or not isinstance(bar_start_utc, datetime)
+            or not isinstance(bar_id, str)
+            or not isinstance(content_hash, str)
+            or not isinstance(research_eligible, bool)):
+        raise Hist8ConflictError("snapshot member manifest identity mismatch")
+    expected_manifest_id = _manifest_id(_snapshot_member_manifest_payload(
+        import_id, sequence_no, instrument, timeframe, bar_start_utc,
+        bar_id, content_hash, research_eligible,
+    ))
+    if manifest_id != expected_manifest_id:
+        raise Hist8ConflictError("snapshot member manifest identity mismatch")
+    return sequence_no, (
+        instrument, timeframe, bar_start_utc, bar_id, content_hash,
+        research_eligible,
+    )
+
+
 def _membership_sequence(row: Bar) -> int:
     delta = row.bar_start_utc - START
     total_seconds = delta.days * 86400 + delta.seconds
@@ -665,7 +778,7 @@ class Hist8Store:
 
     def store_page(self, import_id: str, sequence: int, page: RawPage) -> int:
         artifact_id = _artifact_id(page.body)
-        manifest_ids: list[str] = []
+        expected_manifests: dict[str, tuple[int, str]] = {}
         with self._connection_factory() as connection:
             self._verify(connection)
             with connection.cursor() as cursor:
@@ -686,20 +799,11 @@ class Hist8Store:
                     raise Hist8ConflictError("raw artifact identity conflict")
                 for offset, instrument in enumerate(page.instruments):
                     number = sequence + offset
-                    payload = {
-                        "corpus_id": CORPUS_ID, "import_id": import_id,
-                        "sequence_no": number, "source": page.source,
-                        "feed": page.feed, "product": page.product,
-                        "instrument": instrument, "endpoint": page.endpoint,
-                        "request_params": dict(page.request_params),
-                        "retrieved_at": page.retrieved_at,
-                        "http_status": page.http_status,
-                        "content_type": page.content_type,
-                        "content_encoding": page.content_encoding,
-                        "artifact_id": artifact_id, "byte_length": len(page.body),
-                    }
+                    payload = _retrieval_manifest_payload(
+                        import_id, number, page, instrument,
+                    )
                     manifest_id = _manifest_id(payload)
-                    manifest_ids.append(manifest_id)
+                    expected_manifests[manifest_id] = (number, instrument)
                     cursor.execute(
                         """insert into atom_research_history.manifests
                         (manifest_id, corpus_id, manifest_kind, import_id, sequence_no,
@@ -731,17 +835,37 @@ class Hist8Store:
                         or _artifact_id(durable) != artifact_id):
                     raise Hist8ConflictError("raw artifact post-commit mismatch")
                 cursor.execute(
-                    """select manifest_id,artifact_id,artifact_byte_length
-                       from atom_research_history.manifests
-                       where manifest_id = any(%s)""", (manifest_ids,),
+                    """select m.manifest_id,m.corpus_id,m.import_id,
+                              m.manifest_kind,m.sequence_no,m.source,m.feed,
+                              m.product,m.instrument,m.endpoint,m.request_params,
+                              m.retrieved_at,m.http_status,m.content_type,
+                              m.content_encoding,m.artifact_id,
+                              m.artifact_byte_length,r.byte_length,r.body
+                       from atom_research_history.manifests m
+                       left join atom_research_history.raw_responses r
+                         on r.artifact_id=m.artifact_id
+                       where m.manifest_id = any(%s)""",
+                    (list(expected_manifests),),
                 )
-                durable_manifests = {
-                    row[0]: (row[1], row[2]) for row in cursor.fetchall()
-                }
-                if durable_manifests != {
-                    manifest_id: (artifact_id, len(page.body))
-                    for manifest_id in manifest_ids
-                }:
+                durable_manifests: set[str] = set()
+                for record in cursor.fetchall():
+                    expected = expected_manifests.get(record[0])
+                    if expected is None:
+                        raise Hist8ConflictError(
+                            "retrieval provenance post-commit mismatch"
+                        )
+                    recorded_sequence, _recorded_page = (
+                        _verified_retrieval_record(
+                            record, import_id=import_id,
+                            instrument=expected[1],
+                        )
+                    )
+                    if recorded_sequence != expected[0]:
+                        raise Hist8ConflictError(
+                            "retrieval provenance post-commit mismatch"
+                        )
+                    durable_manifests.add(record[0])
+                if durable_manifests != set(expected_manifests):
                     raise Hist8ConflictError("retrieval provenance post-commit mismatch")
         return sequence + len(page.instruments)
 
@@ -766,8 +890,9 @@ class Hist8Store:
                 self._verify(connection)
                 with connection.cursor() as cursor:
                     cursor.execute(
-                        """select m.sequence_no,m.source,m.feed,m.product,
-                                  m.instrument,m.endpoint,m.request_params,
+                        """select m.manifest_id,m.corpus_id,m.import_id,
+                                  m.manifest_kind,m.sequence_no,m.source,m.feed,
+                                  m.product,m.instrument,m.endpoint,m.request_params,
                                   m.retrieved_at,m.http_status,m.content_type,
                                   m.content_encoding,m.artifact_id,
                                   m.artifact_byte_length,r.byte_length,r.body
@@ -785,18 +910,10 @@ class Hist8Store:
                     )
                     records = cursor.fetchall()
                     for record in records:
-                        body = None if record[14] is None else bytes(record[14])
-                        if (body is None or record[11] != _artifact_id(body)
-                                or record[12] != len(body)
-                                or record[13] != len(body)):
-                            raise Hist8ConflictError(
-                                "retained raw artifact replay mismatch"
-                            )
-                        batch.append((record[0], RawPage(
-                            record[1], record[2], record[3], (record[4],),
-                            record[5], record[6], record[7], record[8],
-                            record[9], record[10], body,
-                        )))
+                        batch.append(_verified_retrieval_record(
+                            record, import_id=import_id,
+                            instrument=instrument,
+                        ))
             if not batch:
                 raise Hist8ConflictError("retrieval replay sequence gap")
             last_sequence = batch[-1][0]
@@ -924,15 +1041,28 @@ class Hist8Store:
                 self._verify(connection)
                 with connection.cursor() as cursor:
                     cursor.execute(
-                        """select timeframe,bar_start_utc,bar_id,content_hash,import_id
+                        """select bar_id,content_hash,corpus_id,instrument,
+                                  timeframe,bar_start_utc,bar_end_utc,session_date,
+                                  calendar_id,calendar_sha256,open,high,low,close,
+                                  volume,trade_count,vwap,volume_unit,source,feed,
+                                  product,adjustment,currency,import_id,
+                                  derivation_version,source_artifact_id,
+                                  source_record_locator,lineage_json
                            from atom_research_history.bars
                            where corpus_id=%s and instrument=%s and session_date=%s""",
                         (CORPUS_ID, rows[0].instrument, rows[0].session_date),
                     )
-                    existing = {
-                        (record[0], record[1]): (record[2], record[3], record[4])
-                        for record in cursor.fetchall()
-                    }
+                    existing = {}
+                    for record in cursor.fetchall():
+                        stored = _verified_stored_bar(record)
+                        key = (stored.timeframe, stored.bar_start_utc)
+                        if key in existing:
+                            raise Hist8ConflictError(
+                                "duplicate stored bar identity"
+                            )
+                        existing[key] = (
+                            stored.bar_id, stored.content_hash, stored.import_id,
+                        )
                     pending = []
                     for row in rows:
                         key = (row.timeframe, row.bar_start_utc)
@@ -967,15 +1097,28 @@ class Hist8Store:
                                 "bar insert affected-row count mismatch"
                             )
                     cursor.execute(
-                        """select timeframe,bar_start_utc,bar_id,content_hash,import_id
+                        """select bar_id,content_hash,corpus_id,instrument,
+                                  timeframe,bar_start_utc,bar_end_utc,session_date,
+                                  calendar_id,calendar_sha256,open,high,low,close,
+                                  volume,trade_count,vwap,volume_unit,source,feed,
+                                  product,adjustment,currency,import_id,
+                                  derivation_version,source_artifact_id,
+                                  source_record_locator,lineage_json
                            from atom_research_history.bars
                            where corpus_id=%s and instrument=%s and session_date=%s""",
                         (CORPUS_ID, rows[0].instrument, rows[0].session_date),
                     )
-                    verified = {
-                        (record[0], record[1]): (record[2], record[3], record[4])
-                        for record in cursor.fetchall()
-                    }
+                    verified = {}
+                    for record in cursor.fetchall():
+                        stored = _verified_stored_bar(record)
+                        key = (stored.timeframe, stored.bar_start_utc)
+                        if key in verified:
+                            raise Hist8ConflictError(
+                                "duplicate stored bar identity"
+                            )
+                        verified[key] = (
+                            stored.bar_id, stored.content_hash, stored.import_id,
+                        )
                     for row in rows:
                         actual = verified.get((row.timeframe, row.bar_start_utc))
                         if actual is None:
@@ -988,16 +1131,15 @@ class Hist8Store:
                     expected_members = {}
                     for row in rows:
                         sequence = _membership_sequence(row)
-                        payload = {
-                            "corpus_id": CORPUS_ID, "import_id": row.import_id,
-                            "kind": "SNAPSHOT_MEMBER", "sequence_no": sequence,
-                            "instrument": row.instrument, "timeframe": row.timeframe,
-                            "bar_start_utc": row.bar_start_utc, "bar_id": row.bar_id,
-                            "content_hash": row.content_hash,
-                            "research_eligible": row.research_eligible,
-                        }
+                        payload = _snapshot_member_manifest_payload(
+                            row.import_id, sequence, row.instrument,
+                            row.timeframe, row.bar_start_utc, row.bar_id,
+                            row.content_hash, row.research_eligible,
+                        )
                         expected_members[sequence] = (
-                            row.bar_id, row.content_hash, row.research_eligible,
+                            row.instrument, row.timeframe, row.bar_start_utc,
+                            row.bar_id, row.content_hash,
+                            row.research_eligible,
                         )
                         members.append((
                             _manifest_id(payload), CORPUS_ID, row.import_id, sequence,
@@ -1013,18 +1155,26 @@ class Hist8Store:
                         on conflict (manifest_id) do nothing""", members,
                     )
                     cursor.execute(
-                        """select sequence_no,member_bar_id,member_content_hash,
-                                  member_research_eligible
+                        """select manifest_id,corpus_id,import_id,manifest_kind,
+                                  sequence_no,instrument,member_timeframe,
+                                  member_bar_start_utc,member_bar_id,
+                                  member_content_hash,member_research_eligible
                            from atom_research_history.manifests
                            where corpus_id=%s and import_id=%s
                              and manifest_kind='SNAPSHOT_MEMBER'
                              and sequence_no = any(%s)""",
                         (CORPUS_ID, rows[0].import_id, list(expected_members)),
                     )
-                    actual_members = {
-                        record[0]: (record[1], record[2], record[3])
-                        for record in cursor.fetchall()
-                    }
+                    actual_members = {}
+                    for record in cursor.fetchall():
+                        sequence, member = _verified_snapshot_member_record(
+                            record, import_id=rows[0].import_id,
+                        )
+                        if sequence in actual_members:
+                            raise Hist8ConflictError(
+                                "duplicate snapshot member identity"
+                            )
+                        actual_members[sequence] = member
                     if actual_members != expected_members:
                         raise Hist8ConflictError(
                             "snapshot membership readback mismatch"
@@ -1070,10 +1220,20 @@ class Hist8Store:
                     self._verify(read_connection)
                     with read_connection.cursor() as cursor:
                         cursor.execute(
-                            """select m.sequence_no,m.instrument,
-                                      m.member_timeframe,m.member_bar_id,
-                                      m.member_content_hash,
-                                      m.member_research_eligible,b.bar_id
+                            """select m.manifest_id,m.corpus_id,m.import_id,
+                                      m.manifest_kind,m.sequence_no,m.instrument,
+                                      m.member_timeframe,m.member_bar_start_utc,
+                                      m.member_bar_id,m.member_content_hash,
+                                      m.member_research_eligible,
+                                      b.bar_id,b.content_hash,b.corpus_id,
+                                      b.instrument,b.timeframe,b.bar_start_utc,
+                                      b.bar_end_utc,b.session_date,b.calendar_id,
+                                      b.calendar_sha256,b.open,b.high,b.low,
+                                      b.close,b.volume,b.trade_count,b.vwap,
+                                      b.volume_unit,b.source,b.feed,b.product,
+                                      b.adjustment,b.currency,b.import_id,
+                                      b.derivation_version,b.source_artifact_id,
+                                      b.source_record_locator,b.lineage_json
                                from atom_research_history.manifests m
                                left join atom_research_history.bars b
                                  on b.bar_id=m.member_bar_id
@@ -1089,9 +1249,19 @@ class Hist8Store:
                         members = cursor.fetchall()
                 if not members:
                     raise Hist8ConflictError("snapshot member scan gap")
-                for (sequence, instrument, timeframe, bar_id, content_hash,
-                     eligible, referenced_bar_id) in members:
-                    if referenced_bar_id != bar_id:
+                for record in members:
+                    sequence, member = _verified_snapshot_member_record(
+                        record[:11], import_id=import_id,
+                    )
+                    (instrument, timeframe, bar_start_utc, bar_id,
+                     content_hash, eligible) = member
+                    referenced_bar = _verified_stored_bar(record[11:])
+                    if (referenced_bar.bar_id != bar_id
+                            or referenced_bar.content_hash != content_hash
+                            or referenced_bar.instrument != instrument
+                            or referenced_bar.timeframe != timeframe
+                            or referenced_bar.bar_start_utc != bar_start_utc
+                            or _membership_sequence(referenced_bar) != sequence):
                         raise Hist8ConflictError(
                             "snapshot member bar identity mismatch"
                         )
@@ -1119,15 +1289,9 @@ class Hist8Store:
                 )
             lock_connection.commit()
             self._verify(lock_connection)
-            with lock_connection.cursor() as cursor:
-                cursor.execute(
-                    """select metadata_json
-                       from atom_research_history.manifests
-                       where manifest_id=%s""", (manifest_id,),
-                )
-                recorded = cursor.fetchone()
-            if (recorded is None
-                    or _canonical(recorded[0]) != _canonical(snapshot)):
+            recorded = self.sealed_snapshot_state(import_id)
+            if (recorded["manifest_id"] != manifest_id
+                    or _canonical(recorded["metadata"]) != _canonical(snapshot)):
                 raise Hist8ConflictError("snapshot manifest readback mismatch")
             return digest.hexdigest()
         finally:
@@ -1160,6 +1324,26 @@ def _bar_values(row: Bar) -> tuple[object, ...]:
     )
 
 
+def _verified_stored_bar(record: Sequence[object]) -> Bar:
+    if len(record) != 28 or not isinstance(record[27], list):
+        raise Hist8ConflictError("stored bar record shape mismatch")
+    stored = Bar(
+        record[0], record[1], record[2], record[3], record[4], record[5],
+        record[6], record[7], record[8], record[9], record[10], record[11],
+        record[12], record[13], record[14], record[15], record[16], record[17],
+        record[18], record[19], record[20], record[21], record[22], record[23],
+        record[24], record[25], record[26], tuple(record[27]), False,
+    )
+    try:
+        expected_hash = sha256(_content_payload(stored))
+    except (TypeError, ValueError) as exc:
+        raise Hist8ConflictError("stored bar identity mismatch") from exc
+    if (stored.content_hash != expected_hash
+            or stored.bar_id != "hist8bar:" + expected_hash):
+        raise Hist8ConflictError("stored bar identity mismatch")
+    return stored
+
+
 def _validate_source_bar(row: SourceBar) -> None:
     if (row.start.tzinfo is None or row.start.utcoffset() != timedelta(0)
             or row.start.second or row.start.microsecond):
@@ -1190,6 +1374,24 @@ def _source_bar_payload(row: SourceBar) -> tuple[object, ...]:
     )
 
 
+def _parse_or_reject_source_row(
+    factory: Callable[[], SourceBar], rejection_counter: list[int] | None,
+) -> SourceBar | None:
+    try:
+        row = factory()
+        _validate_source_bar(row)
+        return row
+    except Hist8Error:
+        if rejection_counter is None:
+            raise
+    except (KeyError, IndexError, TypeError, ValueError, OverflowError, OSError) as exc:
+        if rejection_counter is None:
+            raise Hist8Error("malformed provider bar") from exc
+    assert rejection_counter is not None
+    rejection_counter[0] += 1
+    return None
+
+
 def parse_source_page(
     page: RawPage, instrument: str, *, rejection_counter: list[int] | None = None,
 ) -> tuple[SourceBar, ...]:
@@ -1197,59 +1399,82 @@ def parse_source_page(
     payload = page.payload()
     rows: list[SourceBar] = []
     if page.source == "ALPACA":
-        source_rows = payload.get("bars", {}).get(instrument, [])
+        if not isinstance(payload, Mapping):
+            raise Hist8Error("malformed Alpaca page")
+        bars = payload.get("bars")
+        if not isinstance(bars, Mapping):
+            raise Hist8Error("malformed Alpaca page")
+        source_rows = bars.get(instrument, [])
+        if not isinstance(source_rows, list):
+            raise Hist8Error("malformed Alpaca page")
         for index, item in enumerate(source_rows):
-            rows.append(SourceBar(
-                instrument, _iso_utc(item["t"]), _decimal(item["o"]),
-                _decimal(item["h"]), _decimal(item["l"]), _decimal(item["c"]),
-                _decimal(item["v"]),
-                None if item.get("n") is None else _integer(
-                    item["n"], name="Alpaca trade count"
-                ),
-                _decimal(item.get("vw"), nullable=True), artifact,
-                f"$.bars.{instrument}[{index}]", "ALPACA", "SIP",
-                f"{instrument}:1Min", "raw", "SHARES",
-            ))
+            def alpaca_row() -> SourceBar:
+                if not isinstance(item, Mapping):
+                    raise Hist8Error("malformed Alpaca bar")
+                return SourceBar(
+                    instrument, _iso_utc(item["t"]), _decimal(item["o"]),
+                    _decimal(item["h"]), _decimal(item["l"]),
+                    _decimal(item["c"]), _decimal(item["v"]),
+                    None if item.get("n") is None else _integer(
+                        item["n"], name="Alpaca trade count"
+                    ),
+                    _decimal(item.get("vw"), nullable=True), artifact,
+                    f"$.bars.{instrument}[{index}]", "ALPACA", "SIP",
+                    f"{instrument}:1Min", "raw", "SHARES",
+                )
+            row = _parse_or_reject_source_row(alpaca_row, rejection_counter)
+            if row is not None:
+                rows.append(row)
     elif page.source == "COINBASE":
+        if not isinstance(payload, list):
+            raise Hist8Error("malformed Coinbase page")
         for index, item in enumerate(payload):
-            if not isinstance(item, list) or len(item) < 6:
-                raise Hist8Error("malformed Coinbase candle")
-            timestamp = _integer(item[0], name="Coinbase timestamp")
-            start = datetime.fromtimestamp(timestamp, timezone.utc)
-            rows.append(SourceBar(
-                instrument, start, _decimal(item[3]), _decimal(item[2]),
-                _decimal(item[1]), _decimal(item[4]), _decimal(item[5]), None,
-                None, artifact, f"$[{index}]", "COINBASE", "EXCHANGE",
-                "BTC-USD:60", "none", "BTC",
-            ))
+            def coinbase_row() -> SourceBar:
+                if not isinstance(item, list) or len(item) < 6:
+                    raise Hist8Error("malformed Coinbase candle")
+                timestamp = _integer(item[0], name="Coinbase timestamp")
+                start = datetime.fromtimestamp(timestamp, timezone.utc)
+                return SourceBar(
+                    instrument, start, _decimal(item[3]), _decimal(item[2]),
+                    _decimal(item[1]), _decimal(item[4]), _decimal(item[5]),
+                    None, None, artifact, f"$[{index}]", "COINBASE",
+                    "EXCHANGE", "BTC-USD:60", "none", "BTC",
+                )
+            row = _parse_or_reject_source_row(coinbase_row, rejection_counter)
+            if row is not None:
+                rows.append(row)
     elif page.source == "MASSIVE":
+        if not isinstance(payload, Mapping):
+            raise Hist8Error("malformed Massive page")
         if payload.get("ticker") != "I:COMP":
             raise Hist8Error("Massive ticker identity mismatch")
-        for index, item in enumerate(payload.get("results", [])):
-            milliseconds = _integer(item["t"], name="Massive timestamp")
-            if milliseconds % 1000:
-                raise Hist8Error("Massive timestamp is not second aligned")
-            start = datetime.fromtimestamp(milliseconds // 1000, timezone.utc)
-            rows.append(SourceBar(
-                instrument, start, _decimal(item["o"]), _decimal(item["h"]),
-                _decimal(item["l"]), _decimal(item["c"]), None, None, None,
-                artifact, f"$.results[{index}]", "MASSIVE", "I:COMP",
-                "I:COMP:minute", "none", "NOT_APPLICABLE",
-            ))
+        source_rows = payload.get("results", [])
+        if not isinstance(source_rows, list):
+            raise Hist8Error("malformed Massive page")
+        for index, item in enumerate(source_rows):
+            def massive_row() -> SourceBar:
+                if not isinstance(item, Mapping):
+                    raise Hist8Error("malformed Massive bar")
+                milliseconds = _integer(item["t"], name="Massive timestamp")
+                if milliseconds % 1000:
+                    raise Hist8Error("Massive timestamp is not second aligned")
+                start = datetime.fromtimestamp(
+                    milliseconds // 1000, timezone.utc,
+                )
+                return SourceBar(
+                    instrument, start, _decimal(item["o"]),
+                    _decimal(item["h"]), _decimal(item["l"]),
+                    _decimal(item["c"]), None, None, None, artifact,
+                    f"$.results[{index}]", "MASSIVE", "I:COMP",
+                    "I:COMP:minute", "none", "NOT_APPLICABLE",
+                )
+            row = _parse_or_reject_source_row(massive_row, rejection_counter)
+            if row is not None:
+                rows.append(row)
     else:
         raise Hist8Error("unknown source")
     rows.sort(key=lambda row: row.start)
-    valid: list[SourceBar] = []
-    for row in rows:
-        try:
-            _validate_source_bar(row)
-        except Hist8Error:
-            if rejection_counter is None:
-                raise
-            rejection_counter[0] += 1
-            continue
-        valid.append(row)
-    return tuple(valid)
+    return tuple(rows)
 
 
 def _session_definitions(calendar: Mapping[str, object], instrument: str) -> dict[str, tuple[datetime, datetime, int]]:

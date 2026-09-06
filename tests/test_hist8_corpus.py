@@ -114,6 +114,26 @@ def test_parser_preserves_decimal_values_and_raw_lineage() -> None:
         corpus.parse_source_page(sub_microsecond, "SPY")
 
 
+def test_malformed_source_rows_are_counted_and_valid_rows_survive() -> None:
+    start = "2025-01-02T14:30:00Z"
+    page = _raw_page({"bars": {"SPY": [
+        {"t": start, "o": "100", "h": "101", "l": "99",
+         "c": "100", "v": "5"},
+        {"t": start, "o": "100", "h": "101", "l": "99", "v": "5"},
+        {"t": "not-a-timestamp", "o": "100", "h": "101", "l": "99",
+         "c": "100", "v": "5"},
+        {"t": start, "o": "not-a-number", "h": "101", "l": "99",
+         "c": "100", "v": "5"},
+    ]}})
+    rejected = [0]
+    parsed = corpus.parse_source_page(
+        page, "SPY", rejection_counter=rejected,
+    )
+    assert len(parsed) == 1
+    assert parsed[0].open == Decimal("100")
+    assert rejected == [3]
+
+
 def test_canonical_decimal_hashing_preserves_precision_without_context_rounding() -> None:
     left = Decimal("12345678901234567890123456780")
     right = Decimal("12345678901234567890123456781")
@@ -209,6 +229,56 @@ def test_provider_response_headers_are_case_insensitive() -> None:
     assert page.content_type == "application/json"
     assert page.content_encoding == "gzip"
     assert page.payload() == payload
+
+
+def test_truncated_gzip_is_contained_to_one_provider(monkeypatch) -> None:
+    calls = []
+    stored = []
+    truncated = replace(
+        _raw_page({}, instruments=corpus.EQUITIES),
+        body=gzip.compress(b'{"bars":{}}')[:-4], content_encoding="gzip",
+    )
+
+    def alpaca(*_args, **_kwargs):
+        calls.append("ALPACA")
+        yield truncated
+        truncated.payload()
+
+    def coinbase(*_args, **_kwargs):
+        calls.append("COINBASE")
+        yield _raw_page(
+            {"complete": "coinbase"}, source="COINBASE",
+            instruments=("BTC-USD",),
+        )
+
+    def massive(*_args, **_kwargs):
+        calls.append("MASSIVE")
+        yield _raw_page(
+            {"complete": "massive"}, source="MASSIVE",
+            instruments=("NASDAQ",),
+        )
+
+    class Store:
+        def store_page(self, import_id, sequence, page):
+            assert import_id == "gzip-attempt"
+            stored.append(page.source)
+            return sequence + len(page.instruments)
+
+    monkeypatch.setattr(corpus, "alpaca_pages", alpaca)
+    monkeypatch.setattr(corpus, "coinbase_pages", coinbase)
+    monkeypatch.setattr(corpus, "massive_pages", massive)
+    result = corpus.acquire(Store(), "gzip-attempt")
+
+    assert calls == ["ALPACA", "COINBASE", "MASSIVE"]
+    assert stored == ["ALPACA", "COINBASE", "MASSIVE"]
+    assert result["retrieval_associations"] == 8
+    assert result["source_statuses"]["SPY"] == {
+        "source": "ALPACA", "availability": "UNAVAILABLE",
+        "retrieval_associations": 1, "failure_type": "Hist8Error",
+        "reason": "provider response is not valid decimal JSON",
+    }
+    assert result["source_statuses"]["BTC-USD"]["availability"] == "AVAILABLE"
+    assert result["source_statuses"]["NASDAQ"]["availability"] == "AVAILABLE"
 
 
 def test_incomplete_http_read_is_contained_to_one_provider(monkeypatch) -> None:
@@ -452,11 +522,21 @@ def test_replay_pages_release_each_bounded_read_transaction() -> None:
     retained = []
     for sequence in range(1, 10):
         body = json.dumps({"sequence": sequence}).encode()
+        page = corpus.RawPage(
+            "ALPACA", "SIP", "1Min", ("SPY",), corpus.ALPACA_URL, {},
+            datetime(2026, 9, 2, tzinfo=UTC), 200, "application/json",
+            None, body,
+        )
+        manifest_id = corpus._manifest_id(
+            corpus._retrieval_manifest_payload(
+                "source-import", sequence, page, "SPY",
+            )
+        )
         retained.append((
-            sequence, "ALPACA", "SIP", "1Min", "SPY",
-            corpus.ALPACA_URL, {}, datetime(2026, 9, 2, tzinfo=UTC),
-            200, "application/json", None,
-            "sha256:" + corpus.sha256(body), len(body), len(body), body,
+            manifest_id, corpus.CORPUS_ID, "source-import", "RETRIEVAL",
+            sequence, "ALPACA", "SIP", "1Min", "SPY", corpus.ALPACA_URL,
+            {}, datetime(2026, 9, 2, tzinfo=UTC), 200, "application/json",
+            None, "sha256:" + corpus.sha256(body), len(body), len(body), body,
         ))
 
     class Cursor:
@@ -473,12 +553,12 @@ def test_replay_pages_release_each_bounded_read_transaction() -> None:
                     and "current_database()" in query):
                 self.rows = [(corpus.IMPORTER_ROLE, corpus.DATABASE_NAME)]
             elif "select max(sequence_no)" in query:
-                self.rows = [(retained[-1][0],)]
+                self.rows = [(retained[-1][4],)]
             elif "m.sequence_no>%s" in query:
                 last_sequence, upper_sequence, limit = params[3:]
                 self.rows = [
                     row for row in retained
-                    if last_sequence < row[0] <= upper_sequence
+                    if last_sequence < row[4] <= upper_sequence
                 ][:limit]
             else:
                 raise AssertionError(query)
@@ -515,6 +595,14 @@ def test_replay_pages_release_each_bounded_read_transaction() -> None:
     )
     assert len(created_connections) == 3
     assert all(connection.active is False for connection in created_connections)
+    retained[0] = (*retained[0][:9], "https://tampered.invalid",
+                   *retained[0][10:])
+    with pytest.raises(
+        corpus.Hist8ConflictError, match="retrieval manifest identity"
+    ):
+        list(corpus.Hist8Store(connection_factory).retrieval_pages(
+            "source-import", "SPY",
+        ))
 
 
 def test_identical_insert_race_uses_actual_affected_row_count() -> None:
@@ -524,6 +612,9 @@ def test_identical_insert_race_uses_actual_affected_row_count() -> None:
         calendar_hash="b" * 64, import_id="race-attempt", eligible=True,
     )
     state = {"bar_selects": 0}
+    winning = replace(row, import_id="winning-attempt")
+    stored_record = list(corpus._bar_values(winning))
+    stored_record[-1] = list(winning.lineage)
 
     class Cursor:
         rows = []
@@ -539,16 +630,25 @@ def test_identical_insert_race_uses_actual_affected_row_count() -> None:
             if ("select current_user" in query
                     and "current_database()" in query):
                 self.rows = [(corpus.IMPORTER_ROLE, corpus.DATABASE_NAME)]
-            elif "select timeframe,bar_start_utc,bar_id" in query:
+            elif "select bar_id,content_hash,corpus_id" in query:
                 state["bar_selects"] += 1
-                self.rows = [] if state["bar_selects"] == 1 else [(
-                    row.timeframe, row.bar_start_utc, row.bar_id,
-                    row.content_hash, "winning-attempt",
-                )]
-            elif "select sequence_no,member_bar_id" in query:
+                self.rows = (
+                    [] if state["bar_selects"] == 1
+                    else [tuple(stored_record)]
+                )
+            elif ("select manifest_id,corpus_id,import_id,manifest_kind"
+                  in query and "manifest_kind='SNAPSHOT_MEMBER'" in query):
+                sequence = corpus._membership_sequence(row)
+                payload = corpus._snapshot_member_manifest_payload(
+                    row.import_id, sequence, row.instrument, row.timeframe,
+                    row.bar_start_utc, row.bar_id, row.content_hash,
+                    row.research_eligible,
+                )
                 self.rows = [(
-                    corpus._membership_sequence(row), row.bar_id,
-                    row.content_hash, row.research_eligible,
+                    corpus._manifest_id(payload), corpus.CORPUS_ID,
+                    row.import_id, "SNAPSHOT_MEMBER", sequence,
+                    row.instrument, row.timeframe, row.bar_start_utc,
+                    row.bar_id, row.content_hash, row.research_eligible,
                 )]
             else:
                 raise AssertionError(query)
@@ -577,6 +677,54 @@ def test_identical_insert_race_uses_actual_affected_row_count() -> None:
 
     store = corpus.Hist8Store(Connection)
     assert store.insert_bars((row,)) == (0, 1)
+
+
+def test_insert_recomputes_stored_bar_hash() -> None:
+    row = corpus.canonical_bar(
+        _source_bar(datetime(2025, 1, 2, 14, 30, tzinfo=UTC)),
+        session_date="2025-01-02", calendar_hash="b" * 64,
+        import_id="source-attempt", eligible=True,
+    )
+    corrupted = list(corpus._bar_values(row))
+    corrupted[13] = Decimal("101")
+    corrupted[-1] = list(row.lineage)
+
+    class Cursor:
+        rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, params=None):
+            if ("select current_user" in query
+                    and "current_database()" in query):
+                self.rows = [(corpus.IMPORTER_ROLE, corpus.DATABASE_NAME)]
+            elif "select bar_id,content_hash,corpus_id" in query:
+                self.rows = [tuple(corrupted)]
+            else:
+                raise AssertionError(query)
+
+        def fetchone(self):
+            return self.rows[0]
+
+        def fetchall(self):
+            return list(self.rows)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def cursor(self):
+            return Cursor()
+
+    with pytest.raises(corpus.Hist8ConflictError, match="stored bar identity"):
+        corpus.Hist8Store(Connection).insert_bars((row,))
 
 
 def test_sealed_snapshot_recomputes_manifest_identity() -> None:
@@ -943,6 +1091,7 @@ def test_schema_has_exact_private_surface_and_append_only_grants() -> None:
     assert "HIST8_RESEARCH_SCHEMA_ALREADY_EXISTS" in sql
     assert "HIST8_EFFECTIVE_SEQUENCE_BOUNDARY_UNSATISFIED" in sql
     assert "HIST8_EFFECTIVE_ROUTINE_BOUNDARY_UNSATISFIED" in sql
+    assert "HIST8_FUTURE_ROUTINE_DEFAULT_BOUNDARY_UNSATISFIED" in sql
     assert "HIST8_EFFECTIVE_SCHEMA_USAGE_BOUNDARY_UNSATISFIED" in sql
     assert "HIST8_FOREIGN_SCHEMA_ACCESS_BOUNDARY_UNSATISFIED" in sql
     assert "HIST8_OTHER_DATABASE_CONNECT_BOUNDARY_UNSATISFIED" in sql
@@ -977,6 +1126,7 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
     extensions_schema_created = False
     large_object_oid = None
     large_object_create_routines = []
+    future_routine_default_roles = []
     with psycopg.connect(dsn, autocommit=True) as connection:
         try:
             with connection.cursor() as cursor:
@@ -1114,6 +1264,45 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                         pgsql.SQL(
                             "revoke execute on function {} from public"
                         ).format(pgsql.SQL(routine))
+                    )
+
+                cursor.execute(
+                    """select role.rolname, exists (
+                         select 1
+                         from aclexplode(coalesce(defaults.defaclacl,
+                           acldefault('f',role.oid))) acl
+                         where acl.grantee=0
+                           and acl.privilege_type='EXECUTE'
+                       )
+                       from pg_roles role
+                       left join pg_default_acl defaults
+                         on defaults.defaclrole=role.oid
+                        and defaults.defaclnamespace=0
+                        and defaults.defaclobjtype='f'
+                       where role.rolsuper
+                          or role.rolname='pg_database_owner'
+                       order by role.rolname"""
+                )
+                future_routine_default_roles = cursor.fetchall()
+                assert future_routine_default_roles
+                for role, _was_public in future_routine_default_roles:
+                    cursor.execute(
+                        pgsql.SQL(
+                            "alter default privileges for role {} "
+                            "grant execute on functions to public"
+                        ).format(pgsql.Identifier(role))
+                    )
+                with pytest.raises(
+                    psycopg.Error, match="FUTURE_ROUTINE_DEFAULT_BOUNDARY"
+                ):
+                    cursor.execute(sql)
+                connection.rollback()
+                for role, _was_public in future_routine_default_roles:
+                    cursor.execute(
+                        pgsql.SQL(
+                            "alter default privileges for role {} "
+                            "revoke execute on functions from public"
+                        ).format(pgsql.Identifier(role))
                     )
 
                 cursor.execute(
@@ -1426,6 +1615,20 @@ def test_schema_enforces_importer_boundary_in_postgres() -> None:
                             pgsql.SQL(
                                 "grant execute on function {} to public"
                             ).format(pgsql.SQL(routine))
+                        )
+                for role, was_public in future_routine_default_roles:
+                    cursor.execute(
+                        pgsql.SQL(
+                            "alter default privileges for role {} "
+                            "revoke execute on functions from public"
+                        ).format(pgsql.Identifier(role))
+                    )
+                    if was_public:
+                        cursor.execute(
+                            pgsql.SQL(
+                                "alter default privileges for role {} "
+                                "grant execute on functions to public"
+                            ).format(pgsql.Identifier(role))
                         )
                 cursor.execute(
                     "alter default privileges for role postgres "

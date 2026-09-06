@@ -462,6 +462,55 @@ BEGIN
     RAISE EXCEPTION 'HIST8_EFFECTIVE_ROUTINE_BOUNDARY_UNSATISFIED';
   END IF;
 
+  -- PostgreSQL grants EXECUTE on new routines to PUBLIC by default. Require
+  -- every role that can create in a schema visible to the importer to have a
+  -- non-PUBLIC routine default, so later legacy DDL cannot silently expand the
+  -- long-lived credential. This verifier reports BLOCKED; it does not rewrite
+  -- any unrelated owner's default privileges.
+  IF EXISTS (
+    SELECT 1
+    FROM pg_namespace n
+    JOIN pg_roles creator ON (
+      creator.rolsuper
+      OR creator.oid = n.nspowner
+      OR has_schema_privilege(creator.oid, n.oid, 'CREATE')
+    )
+    LEFT JOIN pg_default_acl global_defaults
+      ON global_defaults.defaclrole = creator.oid
+     AND global_defaults.defaclnamespace = 0
+     AND global_defaults.defaclobjtype = 'f'
+    LEFT JOIN pg_default_acl schema_defaults
+      ON schema_defaults.defaclrole = creator.oid
+     AND schema_defaults.defaclnamespace = n.oid
+     AND schema_defaults.defaclobjtype = 'f'
+    WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+      AND n.nspname NOT LIKE 'pg_toast%'
+      AND n.nspname NOT LIKE 'pg_temp_%'
+      AND has_schema_privilege(
+        'atom_hist8_importer', n.oid, 'USAGE'
+      )
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM aclexplode(COALESCE(
+            global_defaults.defaclacl,
+            acldefault('f', creator.oid)
+          )) acl
+          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM aclexplode(COALESCE(
+            schema_defaults.defaclacl, '{}'::aclitem[]
+          )) acl
+          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+        )
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'HIST8_FUTURE_ROUTINE_DEFAULT_BOUNDARY_UNSATISFIED';
+  END IF;
+
   IF EXISTS (
     SELECT 1
     FROM pg_namespace n
