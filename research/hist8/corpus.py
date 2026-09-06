@@ -500,13 +500,23 @@ def _decode_provider_body(body: bytes, content_encoding: str | None) -> bytes:
     raise Hist8Error(f"unsupported content encoding: {encoding}")
 
 
-def _validate_downloaded_provider_body(
+def _enforce_downloaded_provider_body_limit(
     body: bytes, headers: Mapping[str, str],
 ) -> None:
+    encoding = (headers.get("content-encoding") or "").lower().strip()
+    if encoding == "gzip":
+        wbits = 16 + zlib.MAX_WBITS
+    elif encoding == "deflate":
+        wbits = zlib.MAX_WBITS
+    else:
+        return
     try:
-        _decode_provider_body(body, headers.get("content-encoding"))
-    except (EOFError, OSError, zlib.error) as exc:
-        raise Hist8Error("provider response is not valid decimal JSON") from exc
+        _decompress_provider_body(body, wbits=wbits)
+    except (EOFError, OSError, zlib.error):
+        # A complete HTTP body with malformed compression is still retained as
+        # evidence, then rejected by RawPage.payload(). Only decoded-size
+        # overflow prevents construction and persistence of the page.
+        pass
 
 
 def _http_get(
@@ -528,7 +538,7 @@ def _http_get(
                 body = _read_bounded_provider_body(response)
             except IncompleteRead as exc:
                 raise Hist8Error("provider response body incomplete") from exc
-            _validate_downloaded_provider_body(body, headers)
+            _enforce_downloaded_provider_body_limit(body, headers)
             return int(response.status), headers, body
     except HTTPError as exc:
         with exc:
@@ -542,7 +552,7 @@ def _http_get(
                 raise Hist8Error(
                     "provider response body incomplete"
                 ) from incomplete
-            _validate_downloaded_provider_body(body, headers)
+            _enforce_downloaded_provider_body_limit(body, headers)
             return int(exc.code), headers, body
     except HTTPException as exc:
         raise Hist8Error("provider HTTP protocol failure") from exc

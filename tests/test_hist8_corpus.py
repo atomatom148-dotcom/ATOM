@@ -450,15 +450,18 @@ def test_provider_response_headers_are_case_insensitive() -> None:
 def test_truncated_gzip_is_contained_to_one_provider(monkeypatch) -> None:
     calls = []
     stored = []
-    truncated = replace(
-        _raw_page({}, instruments=corpus.EQUITIES),
-        body=gzip.compress(b'{"bars":{}}')[:-4], content_encoding="gzip",
-    )
+    real_alpaca_pages = corpus.alpaca_pages
+    response = _Response({})
+    response._body = gzip.compress(b'{"bars":{}}')[:-4]
+    response.headers = {
+        "Content-Type": "application/json", "Content-Encoding": "gzip",
+    }
 
     def alpaca(*_args, **_kwargs):
         calls.append("ALPACA")
-        yield truncated
-        truncated.payload()
+        yield from real_alpaca_pages(
+            "key", "secret", opener=lambda *_args, **_kwargs: response,
+        )
 
     def coinbase(*_args, **_kwargs):
         calls.append("COINBASE")
