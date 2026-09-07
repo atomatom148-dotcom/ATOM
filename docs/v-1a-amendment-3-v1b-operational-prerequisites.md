@@ -4,12 +4,12 @@
 **Status:** PROPOSED — no effect before independent final-head review, green required checks, zero material findings, and Owner merge.  
 **Author:** ChatGPT Pro — architecture and freeze authority  
 **Date:** 2026-09-06  
-**Exact-head correction review date:** 2026-09-07
+**Exact-head correction review date:** 2026-09-07\
 **Document state:** Complete replacement for review; not an assertion of implementation or operational acceptance.  
 **Sole documentation-PR path:** `docs/v-1a-amendment-3-v1b-operational-prerequisites.md`  
 **Inspected repository:** `atomatom148-dotcom/ATOM`  
 **Inspected main:** `f0035147a646fc7d4c7002c8a2706f4987f6a10c`  
-**Corrects PR:** #325 at exact reviewed input head `caeae8c1be63a54c5926b56c8aa44eb04be247ff`, including every earlier correction. That input head and every earlier head are superseded by the corrected final head and cannot satisfy its review or merge gate.
+**Corrects PR:** #325 at exact reviewed input head `c25a4517fc46668630476f6748ba80263d334db5`, which superseded `caeae8c1be63a54c5926b56c8aa44eb04be247ff` and every earlier head. That input head and every earlier head are superseded by this corrected final head and cannot satisfy its review or merge gate.\
 **Implementation owner:** Codex; one separate implementation PR and one implementation owner.  
 **Approval, merge, credentials, infrastructure and budget authority:** Owner.
 
@@ -41,7 +41,7 @@ The only additional GitHub metadata/control operations are the explicitly identi
 
 The one in-process routing exception is §5.3’s capacity-only BLOCKED refusal after a count-only scan but before successful seal emission. It expressly replaces V-1A §24 and Amendment 2A §8.6 only for that condition. All other defects observed by the running process after read/seal retain their existing INVALID routes. Section 4 separately defines evidence preservation when a window breach is first knowable only from the mandatory post-terminal history audit: a terminated process cannot fabricate a replacement INVALID receipt. If no valid seal was emitted, no look was consumed and any later invocation remains subject to the existing eligibility/incident law plus a fresh reviewed window; if a valid seal was emitted, the look remains consumed, no replacement look is authorized, and the first complete receipt retains its existing Amendment 2A disposition. There is no change to the contents, hash algorithms or ordinary publication duties of a successful readiness object, run identity, seal or receipt.
 
-In this document, a response-derived identifier is not an operator-selected freeze value. `E` is the exact authenticated execution commit under §4; `B` is the actual build-producing deploy ID under §2.5; `J` is the actual id returned by Render Create job; `M` is one exact §5.2 manifest ID; and `L` is the verified vendor capacity under §5.3. No command sends an unresolved angle-bracket placeholder. A missing source value stops the specified step; it is never invented or silently assigned by implementation.
+In this document, a response-derived identifier is not an operator-selected freeze value. `E` is the exact authenticated execution commit under §4; `B` is the actual build-producing deploy ID under §2.5; `J` is the actual id returned by Render Create job; `M` is one exact §5.2 manifest ID; and `L` is the verified vendor capacity under §5.3. Section 6.3's reader OID, rotation xid8, two timestamp and control-system substitutions come only from the exact retained PostgreSQL response bytes and must pass their stated lexical/database round trips. No command sends an unresolved angle-bracket placeholder. A missing source value stops the specified step; it is never invented or silently assigned by implementation.
 
 ## 2. Invocation-bound runtime identity; version law unchanged
 
@@ -170,7 +170,7 @@ The Owner performs these steps through the existing authenticated Render control
 4. Build the exact approved source `E` with the unchanged `pip install -r requirements.txt` and `PYTHON_VERSION=3.14.3`, with both keys absent. The existing per-invocation `ATOM_V1B_AUTHORIZED_MAIN_SHA`, when set, equals `E`; it is not used to carry provenance. Obtain the actual build-producing deploy object through Render’s service deploy history. `B` is that object’s returned immutable id, with `commit.id = E` and verified successful build completion. In `ATOM-V1B-RUNTIME-PROVENANCE-1`, the term `render_build_id` means this build-producing deploy ID; it is not an undocumented vendor field. `render_deploy_id` is the same `B` for this record. A build-only failure, a requested but unsuccessful deploy, a configuration-only redeploy mistaken for a build, an ambiguous latest artifact or a caller-assigned ID is unusable.
 5. With no intervening build/configuration writer, re-read effective runtime-secret/startup-injection absence and the successful deploy/artifact selection, verify the base is suspended with the exact isolated inert command, then Create job with exactly §2.4’s `startCommand`. Do not claim this pre-job control-plane read inspected `/etc`; the secret-free probe itself supplies that live observation. Create job’s native snapshot must be the latest successful artifact `B` and the now-secret-free, startup-isolated configured environment. There is no assumed per-job environment override parameter. Retain the request, returned `J`, source/deploy observations bracketing creation and complete probe stdout. Resolve uncertain POST outcomes by listing/retrieving jobs, not by sending another POST.
 6. Verify the exact success record, its local-byte/component hashes, job termination and parent suspension. Compare the returned source/service to `B` and `E`; independent acceptance must examine the authenticated build history, reviewed source/blob bindings and complete observation. A process’s own version strings or digests alone do not approve it. The trusted roots for this operational approval are the authenticated Render build/control plane, the authenticated reviewed GitHub source and the independent human/agent acceptance beneath Owner approval. This is not claimed to be remote hardware attestation against a compromised Render control plane or kernel.
-7. Construct the provenance record below from those observed values. Keep its original canonical bytes and SHA-256 in the existing private operational acceptance packet. On initial setup only, after the probe terminates, obtain §3’s PAT scope evidence, §5.3’s authoritative vendor-limit evidence (not the later actual-seal calculation), and §2.4's provider-bound same-artifact/system-layer evidence. Then open and independently accept §4’s no-ref-update window while both runtime secrets remain absent. Only inside that active accepted window perform §6’s temporary `NOLOGIN`, pre-rotation drain/two reader-OID-selected termination passes and full reader/unattributed guards, one actual verified rotation, post-rotation stale-verifier drain, pooler termination-or-containment proof and conforming-URI provisioning; install only the properly scoped dedicated PAT and newly rotated conforming URI using Save only; restore `LOGIN`; and complete every required backend/prepared/settings zero check. Immediately re-read the complete effective environment and configuration: relative to the accepted secret-free state, only those two authorized secret keys may have been added; every startup-injection key remains absent; the isolated inert command, `B` and every other non-secret value remain exact. Bind the still-current accepted `B` system-preload/interpreter baseline without claiming the control plane re-read `/etc` or `/proc`. Record the no-ref-window, URI-update and startup-isolation confirmations, finalize the incident, and only then obtain independent acceptance and issue §2.6’s Owner approval. For a later build/probe, first lawfully close any earlier window and satisfy §2.5 step 1; after the later probe, open and independently accept a new §4 window before restoring the same still-valid PAT and same already-rotated conforming URI retained under step 3. A later probe does not authorize another password rotation, replacement PAT or new incident completion timestamp. Reconfirm scope, incident disposition, current vendor-limit/system-layer evidence, prior backend/pooler-termination-or-containment disposition, the newly accepted window and safe credential reinstallation before issuing that source revision’s separate approval; preserve the original rotation timestamp and finalization digest unless a separately authorized factual incident addendum requires explicit new review. Because a newly created one-off snapshots configured variables and the existing successful artifact, this does not require a new build. Before every evidence-capable new-seal or recovery Create job, revalidate and retain the effective startup-injection absence, accepted `B`/provider-bound system-layer baseline, isolated command and active-window proof; permit no configuration/ref writer between that proof and job creation. This is not a new probe and does not abandon a pending seal. If the platform instead changes the artifact, exposes an injection source, loses the window, refuses the accepted snapshot semantics or requires an unapproved replacement build, no evidence-capable job is accepted.
+7. Construct the provenance record below from those observed values. Keep its original canonical bytes and SHA-256 in the existing private operational acceptance packet. On initial setup only, after the probe terminates, obtain §3’s PAT scope evidence, §5.3’s authoritative vendor-limit evidence (not the later actual-seal calculation), and §2.4's provider-bound same-artifact/system-layer evidence. Then open and independently accept §4’s no-ref-update window while both runtime secrets remain absent. Only inside that active accepted window perform §6’s temporary NOLOGIN fence, two exact visible-reader termination passes, one transaction-proved password rotation, the separately confirmed full Supabase project restart and generation/rotation-row proof, explicit pooler termination-or-containment proof, conforming-URI provisioning and exact LOGIN restoration; install only the properly scoped dedicated PAT and newly rotated conforming URI using Save only; and complete every required backend/prepared/settings zero check. Immediately re-read the complete effective environment and configuration: relative to the accepted secret-free state, only those two authorized secret keys may have been added; every startup-injection key remains absent; the isolated inert command, B and every other non-secret value remain exact. Bind the still-current accepted B system-preload/interpreter baseline without claiming the control plane re-read /etc or /proc. Record the no-ref-window, restart/generation, URI-update and startup-isolation confirmations, finalize the incident, and only then obtain independent acceptance and issue §2.6’s Owner approval. For a later build/probe, first lawfully close any earlier window and satisfy §2.5 step 1; after the later probe, open and independently accept a new §4 window before restoring the same still-valid PAT and same already-rotated conforming URI retained under step 3. A later probe does not authorize another password rotation, project restart, replacement PAT or new incident completion timestamp. Reconfirm scope, incident disposition, current vendor-limit/system-layer evidence, prior backend/restart/pooler disposition, the newly accepted window and safe credential reinstallation before issuing that source revision’s separate approval; preserve the original rotation timestamp and finalization digest unless a separately authorized factual incident addendum requires explicit new review. Because a newly created one-off snapshots configured variables and the existing successful artifact, this does not require a new build. Before every evidence-capable new-seal or recovery Create job, revalidate and retain the effective startup-injection absence, accepted B/provider-bound system-layer baseline, isolated command and active-window proof; permit no configuration/ref writer between that proof and job creation. This is not a new probe and does not abandon a pending seal. If the platform instead changes the artifact, exposes an injection source, loses the window, refuses the accepted snapshot semantics or requires an unapproved replacement build, no evidence-capable job is accepted.
 
 The provenance record has exactly:
 
@@ -312,7 +312,7 @@ Require exactly one `CURRENT` approval and zero other active/current V-1B window
 
 No zero-current fallback, multiple-current choice, “latest” choice, caller-selected comment/ruleset ID, local metadata cache or URL extracted from a comment is accepted. Historical immutable approvals are retained for audit but can never be reused as current authority; their lawful deletion/closure does not permanently prevent a later sequential window. Fixed references in `A` are evidence locators for the external reviewer, not runtime fetch instructions. The runtime derives `B` from authenticated `P`, not from an invented environment field. The Owner’s bracketing Render evidence proves the actual job’s artifact selection; the runtime separately proves exact approved bytes/source. Do not describe the latter as a direct Render API attestation inside the process.
 
-Fetch/revalidate the identical current approval and review body hashes, repeat the complete current/historical classification, and reject any newly active duplicate at the pre-seal and final repository checks and during recovery. Verify the current approval predates the invocation’s evidence read; the external launcher does not create the job until approval exists. The underlying private scope/incident/limit/window-closure evidence and same-build selection must still be valid at action time. Any discovered change stops the action rather than silently updating `A`. Approvals remain retained after PAT removal. Current-approval loss, ambiguous lifecycle state, multiple current approvals or post-seal mismatch uses §2.3 failure routing.
+Fetch/revalidate the identical current approval and review body hashes, repeat the complete current/historical classification, and reject any newly active duplicate at the pre-seal and final repository checks and during recovery. Verify the current approval predates the invocation’s evidence read; the external launcher does not create the job until approval exists. The underlying private scope/incident/limit/window-closure evidence and same-build selection must still be valid at action time. Any discovered change stops the action rather than silently updating `A`. Approvals remain retained after PAT removal. Current-approval loss, ambiguous lifecycle state, multiple current approvals or post-seal mismatch use §2.3 failure routing.
 
 The public-repository status remains mandatory. GitHub documents public issue-comment reads without additional optional repository permissions, but live acceptance must prove that these exact authenticated reads work with the restricted PAT. A refusal does not authorize Issues/Pull requests permissions, an unauthenticated retry or another source. No approval-comment read is made by the secret-free probe.
 
@@ -516,7 +516,7 @@ command_bytes + 4096 <= L
 
 Equality in the second line passes. One byte over fails. A complete would-be seal is only an in-memory candidate until this gate and every unchanged seal prerequisite pass. Do not emit it, write it to a file, create the recovery job, perform protected computation or claim a consumed identity merely to measure its size. On PASS, freeze these exact bytes; the next emitted consuming seal must be byte-identical `S`. Any later change requires rebuilding/rechecking the unconsumed candidate before emission, not emitting different bytes under the measured capacity. Emitting and successfully capturing that original canonical seal is still the consumption event; no human is inserted between seal and results.
 
-If the limit/proof is unavailable, stale under a known vendor change or incompatible, if exact byte measurement of an otherwise schema-valid candidate cannot establish usable capacity, or if either equation fails, return BLOCKED before seal emission and require documentation-first recovery redesign. This narrow capacity-only refusal uses the existing Amendment 2A-amended V-1A §14.1 BLOCKED negative schema, its existing singleton reason code and existing official negative filename rules, with all three seal/readiness fields null; no key/status/schema is invented. `stage` retains its frozen literal. This expressly permits that one non-consuming authority refusal after the count-only scan, notwithstanding the ordinary after-read INVALID rule. Close/roll back the read-only snapshot. The complete canonical negative is written/retained by the same existing negative-receipt path; stdout contains only that complete negative plus LF, stderr is empty, and the command exits 1. No candidate seal, counts, partial results or ad-hoc debug record is emitted. A malformed/unencodable or otherwise schema-invalid seal and any separate, already established protocol/identity/causality/proof defect are not relabeled as capacity failure and retains the earlier applicable INVALID route.
+If the limit/proof is unavailable, stale under a known vendor change or incompatible, if exact byte measurement of an otherwise schema-valid candidate cannot establish usable capacity, or if either equation fails, return BLOCKED before seal emission and require documentation-first recovery redesign. This narrow capacity-only refusal uses the existing Amendment 2A-amended V-1A §14.1 BLOCKED negative schema, its existing singleton reason code and existing official negative filename rules, with all three seal/readiness fields null; no key/status/schema is invented. `stage` retains its frozen literal. This expressly permits that one non-consuming authority refusal after the count-only scan, notwithstanding the ordinary after-read INVALID rule. Close/roll back the read-only snapshot. The complete canonical negative is written/retained by the same existing negative-receipt path; stdout contains only that complete negative plus LF, stderr is empty, and the command exits 1. No candidate seal, counts, partial results or ad-hoc debug record is emitted. A malformed/unencodable or otherwise schema-invalid seal and any separate, already established protocol/identity/causality/proof defect are not relabeled as capacity failure and retain the earlier applicable INVALID route.
 
 HOLD, WAIT_FIRST_MANIFEST and usage-error behavior is unchanged and constructs no seal-size fixture. A later separately authorized new-seal retry scans the same anchored candidate sequence and must still select the earliest qualifying boundary; a smaller later boundary or shortened lineage is forbidden. A capacity refusal consumes no look but is not permission to invent a workaround.
 
@@ -563,17 +563,17 @@ Include the verified exposure vector; first-known and discovery timestamps; earl
 
 PENDING with a null completion timestamp is the required valid initial state, not a contradictory missing-finalization defect. It permits the separately authorized protective/rotation work but never evidence-capable V-1B activation. A failed or uncertain rotation leaves it PENDING with the observed failure/uncertainty appended; it cannot be marked completed from an intention, a submitted request or a job-start timestamp.
 
-Mandatory post-rotation finalization. After the one actual successful password change, append the actual confirmation source and its measured UTC timestamp. Set `rotation_status = "COMPLETED"` and `rotation_completion_timestamp` to that actual confirmed-completion timestamp, not a placeholder, anticipated value, earliest exposure time or document date. The exact timestamp source is the secure control plane’s successful password-change completion event; when the exact psql route in §6.3 is used, it is the server-clock observation returned immediately after acknowledged COMMIT. That latter timestamp is explicitly an observed completion upper bound, not a claim to know an unavailable internal commit instant. Preserve that distinction in the private timeline.
+Mandatory post-rotation finalization. After the one actual successful password change, append the actual confirmation source and its measured UTC timestamp. Set `rotation_status = "COMPLETED"` and `rotation_completion_timestamp` to that actual confirmed-completion timestamp, not a placeholder, anticipated value, earliest exposure time or document date. This amendment has one rotation route and one accepted completion source: §6.3's exact canonical server-clock output returned immediately after acknowledged password COMMIT. That timestamp is explicitly an observed completion upper bound, not a claim to know an unavailable internal commit instant. Preserve that distinction in the private timeline; absent acknowledgement or output remains PENDING/OPEN under §6.3.
 
-Password replacement prevents later authentication with the old password but does not terminate an already authenticated PostgreSQL session; an ordinary role may also replace its own password or persist per-role/per-database session defaults from such a surviving session. This amendment therefore selects an exact temporary `NOLOGIN` fence plus complete backend termination, not an administrative notation or discretionary containment alternative. Section 6.3 first sets the existing reader role `NOLOGIN`, drains two consecutive possible PostgreSQL 17 `authentication_timeout` maxima plus one second under the exact pre-timer settings, runs two administrator-authorized termination passes selecting every client backend by the immutable reader OID, and proves repeated reader/unattributed/prepared-transaction zeros plus absence of global or database-specific reader settings before the one password replacement. It keeps `NOLOGIN` active and the URI absent through the post-rotation drain and accepted pooler-containment observation, provisions the URI while still fenced, and restores `LOGIN` only afterward. Before the new URI is installed or `record_status = "FINALIZED"`, it must prove that every PostgreSQL process authenticated as `atom_e1_scorecard_reader` before the fence—and every reader or not-yet-attributed client process appearing during the bounded authentication drains—has ended or cannot carry the old credential past the atomic final guard. `backend_start` is retained as process-incarnation evidence but is not treated as authentication-completion time and never excludes a row from termination. An active, idle, idle-in-transaction, waiting or different-database backend is not implicitly contained. If complete termination or clean pre-auth/prepared/role-setting state cannot be proved, the role remains `NOLOGIN`, all benchmark/V-1B jobs remain terminal, the parent remains suspended/inert, the reader URI remains absent, the incident remains OPEN and evidence-capable activation is prohibited. No `ALTER ROLE ... RESET`, prepared-transaction action, catalog edit, new role grant or guessed baseline is authorized. That contained stopped state does not permit incident finalization.
+Password replacement prevents later authentication with the old password but does not terminate an already authenticated PostgreSQL session, and an ordinary role may change its own password from a surviving session. Section 6.3 therefore sets the immutable reader role NOLOGIN, performs two exact OID-selected termination passes for every visible reader client backend, proves visible reader/prepared/settings zeros, performs the one password replacement with an in-transaction pg_authid row-version proof, and then requires a provider-confirmed full restart of the exact Supabase project while NOLOGIN remains active and the URI remains absent. Stock PostgreSQL 17 does not publish every startup child in pg_stat_activity before authentication/LOGIN processing; no NULL usesysid scan or fixed timeout is treated as complete. Finalization instead requires the provider’s completed termination semantics, a strictly newer postmaster generation on the same control-system identity, exact persistence of the committed rotation row, and authenticated proof that the project has one primary and zero replicas/secondary instances before and after. Any mismatch in those pre-LOGIN restart/generation/persistence gates leaves the URI absent, incident OPEN and V-1B blocked; retain NOLOGIN only when an exact readback proves it, otherwise preserve/report the observed or unknown role state under §6.3. No setting reset, prepared-transaction action, catalog edit, new grant, guessed baseline or unlisted restart is authorized.
 
 The direct-only/no-pooler rule constrains the legitimate scorecard, not an attacker. Supabase Shared Pooler session/transaction endpoints, and any enabled Dedicated Pooler or legacy PgBouncer endpoint, are therefore part of the incident boundary. A pooler frontend socket is not a PostgreSQL backend and may be absent from `pg_stat_activity` while idle; the document does not relabel it as terminated. It is accepted as explicitly contained only after all of the following are independently established while `NOLOGIN` remains active: every server-side backend/lease for the reader is included in the exact PostgreSQL zero proofs; the one password replacement is confirmed; no pre-rotation reader backend or prepared transaction survives; and current authoritative Supabase documentation or Owner-control-plane/support evidence establishes that a frontend or cached old verifier cannot create a database session using the invalidated password after `LOGIN` is restored. The private incident packet must inventory every available Shared/Dedicated/legacy pooler plane, retain role/project-scoped frontend/cache/server-lease observations and their coverage limits, and state which frontends were terminated versus contained. If any frontend retains a usable server lease, the vendor semantics/evidence are unavailable, or stale cached authentication could regain database access after restoration, keep `NOLOGIN`, remove/keep absent the URI and require a documentation-first, vendor-supported drain/purge decision. This amendment does not invent or authorize an undocumented pooler administration endpoint, connect the scorecard through a pooler, or infer safety from `pg_stat_activity` alone.
 
-Record the conforming Render URI update confirmation separately; it is not the password-change or backend-termination time. The finalized incident version retains the preflight and pre-fence inventory; the immutable reader OID; exact `NOLOGIN`/`LOGIN` transaction acknowledgements and server-clock bounds; the verified PostgreSQL 17 authentication/pre-timer settings and `preauth_activity_fully_visible` proof; both reader-OID-selected termination-transaction outputs; every false/exception; every prepared-transaction and global/database role-setting observation; all pre-rotation reader/unattributed zero observations; the post-rotation 601-second drain and all reader/unattributed guard observations before provisioning and atomically before `LOGIN`; the post-`LOGIN` and pre-finalization reader-only zero observations and server-clock times; the pooler-plane inventory/termination-or-containment evidence; the retained successful `\password`/`ALTER ROLE` status; and proof that the parent stayed suspended/inert with the URI absent through rotation, the post-rotation drain and accepted pooler-containment observation. Thereafter it records the one authorized fenced URI-provisioning event while `NOLOGIN` remained true, the parent remained suspended/inert and no job existed. No password, URI, verifier, query body containing a secret or unrestricted activity text is retained.
+Record the conforming Render URI update separately from the password-change, visible-backend termination and provider-restart times. The finalized incident version retains the preflight/inventory; immutable reader OID; NOLOGIN/LOGIN acknowledgements and canonical completion bounds; both OID-selected termination outputs and every false/exception; prepared-transaction and role-setting observations; pre-password retained rotation lower bound/xid, password-change precondition/postcondition booleans, commit status and post-COMMIT bound; exact one-primary/zero-replica observations; action-time outage confirmation and server-clock restart lower bound; exact full-project action/completion evidence; pre/post postmaster times and stable control-system identifier; exact persisted-rotation-row proof; post-restart reader zeros; pooler-plane termination-or-containment evidence; and proof that the parent stayed suspended/inert and the URI stayed absent through rotation, restart and accepted pooler disposition. It then records the one fenced URI-provisioning event while NOLOGIN remained true, the parent remained suspended/inert and no job existed. No password, URI, verifier, verifier digest, secret-bearing query body or unrestricted activity text is retained.
 
-Complete the artifact dispositions and the bounded investigation below, recording retained-artifact access controls/retention reasons and any telemetry gaps. Append the final record version with `record_status = "FINALIZED"`, actual independent reviewer/Owner disposition and non-secret evidence references. PENDING initial records remain retained. The direct-PostgreSQL old-password new-backend exposure ends when the `NOLOGIN` commit is confirmed; already-started authentication and existing PostgreSQL sessions remain in the surviving-session window until the full drain/termination/zero proof completes. Pooler-frontend authentication is a separate interval and does not inherit that cutoff; close it only at the confirmed rotation plus accepted pooler containment observation above. The final password replacement after zero invalidates any password an earlier surviving reader session may have selected. The role remains `NOLOGIN` through secure URI provisioning and is restored to its frozen `LOGIN` state only by the later, separately acknowledged §6.3 transaction. Record the fence, drain, rotation, pooler-containment and restoration bounds separately; none erases already disclosed data.
+Complete the artifact dispositions and bounded investigation, then append the FINALIZED version only after §6.3 succeeds. PENDING versions remain retained. The NOLOGIN commit blocks completion of a new login but does not end authentication already underway or a surviving session. The direct PostgreSQL surviving-process window therefore closes only when the exact provider restart is confirmed complete, the sole primary reports a newer postmaster generation, and the committed rotation row remains exact. Pooler frontend/cache exposure closes separately only through the accepted pooler disposition. The role stays NOLOGIN through restart, URI provisioning and every guard, and returns to frozen LOGIN only by the acknowledged §6.3 transaction. Record fence, rotation, restart, pooler and restoration bounds separately; none erases prior disclosure or proves historical non-use.
 
-Evidence-capable activation requires the real finalized version, COMPLETED/non-null actual rotation timestamp, exact §6.3 pre- and post-rotation authentication drains/termination with all required backend/prepared-transaction zero observations, explicit pooler termination-or-containment proof, the updated conforming URI, and independent acceptance of the documented incident disposition. §2.6 exposes only the opaque incident ID/finalization digest/completion timestamp and approval, never private incident contents. Missing finalization, uncertain invalidation, incomplete termination/visibility/pooler containment or an unresolved wider-privilege/active-abuse finding blocks activation. Limited historical telemetry may be recorded and explicitly dispositioned by the Owner; it cannot support an assertion that no abuse occurred.
+Evidence-capable activation requires the real finalized version, COMPLETED/non-null actual rotation timestamp, both exact visible-reader termination passes, all required reader/prepared/settings zeros, the completed full-project restart and new-generation/unchanged-rotation-row proof, authenticated one-primary/zero-replica proof, explicit pooler termination-or-containment proof, the updated conforming URI and independent acceptance of the incident disposition. §2.6 exposes only the opaque incident ID/finalization digest/completion timestamp and approval, never private incident contents. Missing finalization, uncertain invalidation/restart, changed rotation row, incomplete termination/project/pooler coverage or an unresolved wider-privilege/active-abuse finding blocks activation. Limited historical telemetry may be recorded and dispositioned; it cannot prove that no abuse occurred.
 
 Privilege finding preserved precisely. The frozen/catalog-verified steady state remains LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS, with no reader memberships, no database/non-system-schema CREATE and no durable-table INSERT/UPDATE/DELETE/TRUNCATE path under the V-1A checks. The only role-attribute exception is §6.3's temporary `NOLOGIN` fence and exact restoration of `LOGIN`; no other attribute may change. Preserve the established no-durable-table-mutation/no-BYPASSRLS finding for the verified state; do not expand a point-in-time check into an unverified claim about every instant of the exposure window.
 
@@ -621,35 +621,40 @@ The pinned CA remains exactly 1,367 bytes with SHA-256:
 
 Preserve all original raw-query, duplicate, exactly-once decoding, dual-parser, `PQconninfo`, explicit URI-password, no-ambient/no-file/no-argument, certificate, SCRAM, GSS and no-pooler rules. The rotated password is percent-encoded only as necessary for URI userinfo; no other URI identity or security value is substituted.
 
-The exposed password may never be restored, reused, retained as a fallback, installed in another environment or included in a rollback. If the new password or Render update fails, keep the worker suspended and correct provisioning of that same new credential without reverting the database password. A second password replacement is not authorized by this one-rotation grant. An uncertain rotation outcome must be resolved through the secure control plane, not by guessing, repeating the rotation or trying the exposed password.
+The exposed password may never be restored, reused, retained as a fallback, installed in another environment or included in a rollback. If the new password or Render update fails, keep the worker suspended and correct provisioning of that same new credential without reverting the database password. A second password replacement is not authorized by this one-rotation grant. An uncertain rotation outcome follows §6.3's exact fail-closed route: keep PENDING/OPEN, keep the URI absent and parent suspended, do not start the project restart, reconnect, repeat the rotation or try the exposed password, and require documentation-first incident disposition.
 
-Complete §6.3's `NOLOGIN` fence, pre-rotation authentication drain, exact reader-OID-selected termination and repeated reader/unattributed/prepared-transaction zero verification before the one password rotation. Keep `NOLOGIN` and the URI absent through the exact post-rotation stale-verifier drain, conservative unattributed-client guard and pooler containment proof, then provision the conforming URI, repeat the full pre-`LOGIN` guard, restore `LOGIN` atomically with its final guard, prove the specified post-`LOGIN` reader-only backend/prepared/settings zeros, and complete mandatory §6.1 finalization with the actual fence/termination/rotation/containment/restoration evidence before activation. Later connection/authority acceptance uses only the new credential and the frozen direct-host TLS/reader checks before evidence access. This amendment phase itself performs none of those connections or checks.
+Complete §6.3's NOLOGIN fence, both exact reader-OID-selected visible-backend termination passes, repeated reader/prepared/settings zero checks and the transaction-bound password-change proof. Keep NOLOGIN and the URI absent through the separately confirmed full-project restart, exact newer-generation/unchanged-rotation-row/zero-replica proof and pooler containment proof; only then provision the conforming URI, restore LOGIN under the final guards, prove the specified post-LOGIN reader/prepared/settings zeros, and complete §6.1 finalization. Later connection/authority acceptance uses only the new credential and frozen direct-host TLS/reader checks before evidence access. This documentation phase performs none of those connections or actions.
 
-### 6.3 Exact secure administrative action; no runtime administrator
+### 6.3 Exact secure administrative action and complete server-generation barrier
 
-This subsection closes the previously generic “administrative channel” for the one rotation. It authorizes only the Owner’s existing direct PostgreSQL administrative credential, supplied through a private interactive prompt on the Owner’s administrative terminal. It does not provision a new administrative credential, put it in Render, use the V-1B PAT for PostgreSQL, or allow a pooler. The terminal is not the scorecard/probe process. Its recorded working directory is the verified implementation repository root containing the exact pinned CA; no `.pgpass`, service file, `.psqlrc`, PG/SSL target override or client-certificate fallback is used.
+This subsection closes the administrative path for the one rotation and the disposition of every PostgreSQL backend that could have authenticated as the reader before rotation. It expressly rejects an activity-view-only completeness proof. In stock PostgreSQL 17, a server child can authenticate before pgstat_bestart() publishes its PID and role in pg_stat_activity; therefore a NULL usesysid count, elevated statistics visibility, a fixed authentication_timeout wait or repeated pg_stat_activity scans cannot prove that every pre-rotation process ended. Visible-reader termination remains mandatory immediate containment, but the complete proof is the post-rotation Supabase restart barrier and unchanged-rotation-row proof below.
+
+The PostgreSQL administrator is the Owner’s existing direct credential, supplied through a private interactive prompt on the Owner’s administrative terminal. It is never provisioned to Render or the scorecard, and no pooler is used. The terminal is outside the probe/scorecard, starts in the verified implementation repository root containing the pinned CA, and uses no .pgpass, service file, .psqlrc, PG/SSL target override or client-certificate fallback.
 
 Exact command, containing no password:
 
-```text
+~~~text
 psql -X -W -v ON_ERROR_STOP=1 --dbname='postgresql://postgres@db.afyiydxbjgzaiswnbcyj.supabase.co:5432/postgres?sslmode=verify-full&sslrootcert=certs/supabase-prod-ca-2021.crt&sslcertmode=disable&require_auth=scram-sha-256&gssencmode=disable'
-```
+~~~
 
-Only for this separately authorized administrative rotation connection, the password is taken from psql’s forced private prompt rather than URI userinfo. This is an explicit administration-only exception to the incorporated URI-password-source requirement; V-1B and conditional migration 033 keep their existing credential-source rules unchanged. All target, CA, certificate-chain/hostname, SCRAM and GSS values remain exact. No client incapable of enforcing this tuple may be substituted. The Owner must already control a client/administrative channel that protects cleartext and password verifiers from session recording, history, exceptions and SQL/audit-log disclosure; no logging-policy change or new administrator is authorized to manufacture that capability.
+Only this administration connection takes its password from psql’s forced private prompt. V-1B and conditional migration 033 retain their existing credential-source rules. The Owner must already have a terminal/control path that excludes cleartext and password verifiers from history, recording, errors and audit output. No new administrator, logging-policy change or alternate client is authorized.
 
-The initial private incident record must be PENDING/null. After connecting, the Owner verifies `session_user = current_user = postgres`, `current_database() = postgres`, the direct endpoint and active certificate-verified TLS. The exact non-secret SQL identity query is:
+Before connection, require all benchmark/V-1B jobs terminal, the Render parent suspended with its isolated inert command, the reader URI absent from every effective Render source, the incident PENDING/OPEN, and the §4 no-ref-update window active. Open an exclusive reader-role and Supabase-project infrastructure window that lasts through incident finalization: no other actor or automation may create, drop, rename, alter, grant to/from, change settings for or authenticate an administrative writer as the target role; add/remove a read replica; fail over, resize, pause, restore or otherwise replace the project database; or issue another restart. Discovery of a concurrent or unknown writer stops the sequence.
 
-```sql
+Through the authenticated Supabase dashboard’s Infrastructure Settings for exact project afyiydxbjgzaiswnbcyj, retain a non-secret observation proving that the project has exactly one Primary database and zero Read Replicas or other PostgreSQL serving instances. Repeat that observation immediately before restart and after restart completion. This zero-replica condition is mandatory because Supabase documents that a primary may return to service before its read replicas restart. If any replica/secondary exists, the inventory is ambiguous, or the interface cannot prove zero, do not remove it or infer coverage: keep the role fenced and require a documentation-first all-instance drain design.
+
+After connecting, require exactly session_user = current_user = postgres, current_database() = postgres and active TLS:
+
+~~~sql
 SELECT session_user, current_user, current_database(),
-       (SELECT ssl FROM pg_catalog.pg_stat_ssl
+       (SELECT ssl
+        FROM pg_catalog.pg_stat_ssl
         WHERE pid = pg_catalog.pg_backend_pid()) AS tls_active;
-```
+~~~
 
-Any mismatch stops before containment or password mutation. At this point every benchmark/V-1B job must be terminal, the parent must be suspended with the isolated inert command, and `ATOM_E1_SCORECARD_READONLY_DATABASE_URL` must be absent from every effective Render source. The new password remains only in the Owner's private generator/prompt path until the fenced termination checks below pass.
+Any mismatch stops before mutation. Run the exact preflight:
 
-Before sending the preflight query, establish the exclusive role-administration window defined below; it begins before this preflight and remains uninterrupted through final verification. Then run this exact capability/version/limit preflight:
-
-```sql
+~~~sql
 WITH reader AS (
   SELECT oid, rolcanlogin, rolinherit, rolsuper, rolcreatedb, rolcreaterole,
          rolreplication, rolbypassrls, rolconfig
@@ -661,10 +666,9 @@ caller AS (
   FROM pg_catalog.pg_roles
   WHERE rolname = current_user
 ),
-auth_limit AS (
-  SELECT setting, unit, min_val, max_val, context
-  FROM pg_catalog.pg_settings
-  WHERE name = 'authentication_timeout'
+control AS (
+  SELECT system_identifier
+  FROM pg_catalog.pg_control_system()
 )
 SELECT reader.oid AS reader_role_oid,
        reader.rolcanlogin AS reader_can_login,
@@ -688,80 +692,60 @@ SELECT reader.oid AS reader_role_oid,
          caller.rolsuper
          OR pg_catalog.pg_has_role(current_user, 'pg_signal_backend', 'USAGE')
        ) AS termination_authorized,
-       (
-         caller.rolsuper
-         OR pg_catalog.pg_has_role(current_user, 'pg_read_all_stats', 'USAGE')
-         OR pg_catalog.pg_has_role(current_user, reader.oid, 'USAGE')
-       ) AS activity_fully_visible,
-       (
-         caller.rolsuper
-         OR pg_catalog.pg_has_role(current_user, 'pg_read_all_stats', 'USAGE')
-       ) AS preauth_activity_fully_visible,
+       pg_catalog.has_table_privilege(
+         current_user, 'pg_catalog.pg_authid', 'SELECT'
+       ) AS authid_select_authorized,
        current_setting('server_version_num')::integer AS server_version_num,
-       current_setting('pre_auth_delay') AS pre_auth_delay,
-       current_setting('log_hostname') AS log_hostname,
-       auth_limit.setting AS authentication_timeout,
-       auth_limit.unit AS authentication_timeout_unit,
-       auth_limit.min_val AS authentication_timeout_min,
-       auth_limit.max_val AS authentication_timeout_max,
-       auth_limit.context AS authentication_timeout_context
+       pg_catalog.pg_postmaster_start_time() AS pre_restart_postmaster_started_at,
+       control.system_identifier AS control_system_identifier
 FROM reader
 CROSS JOIN caller
-CROSS JOIN auth_limit;
-```
+CROSS JOIN control;
+~~~
 
-Require exactly one row and retain its `reader_role_oid` as immutable for the complete fence/rotation/restoration sequence; every later role observation and role cast must resolve to that same OID. Immediately capture that observed value into the psql variable used below, and retain the displayed source row separately:
+Require one row; frozen reader values true, false, false, false, false, false, false in the order LOGIN, INHERIT, SUPERUSER, CREATEDB, CREATEROLE, REPLICATION, BYPASSRLS; rolconfig NULL; all three authorization booleans true; and 170000 <= server_version_num < 180000. Retain reader_role_oid, pre_restart_postmaster_started_at and control_system_identifier as immutable non-secret observations. A privilege failure authorizes no grant or fallback.
 
-```text
-SELECT oid::text AS reader_role_oid
-FROM pg_catalog.pg_roles
-WHERE rolname = 'atom_e1_scorecard_reader'
-\gset atom_v1b_
-```
+Capture the immutable reader OID, pre-restart generation time and control-system identifier into psql variables, then display and retain the exact non-secret source tuple:
 
-The value stored by `\gset` must equal the displayed preflight `reader_role_oid`; any mismatch or failed/non-single-row `\gset` stops before mutation. No caller may set, unset, recapture or replace `atom_v1b_reader_role_oid` except for the exact reconnect rehydration below. The exclusive role-administration window already opened before the preflight remains in force through final incident verification: no other session, automation or operator may create, drop, rename, alter, grant to/from or change settings for this role. If that exclusion cannot be established or a concurrent/unknown role action appears, stop without further mutation and require documentation-first disposition.
-
-If an expressly authorized reconnect below creates a fresh psql client, it does not establish a new baseline. In that fresh client, query only a candidate variable:
-
-```text
-SELECT r.oid::text AS candidate_reader_role_oid
+~~~text
+SELECT r.oid::text AS reader_role_oid,
+       to_char(pg_catalog.pg_postmaster_start_time() AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+         AS pre_restart_postmaster_started_at,
+       c.system_identifier::text AS control_system_identifier
 FROM pg_catalog.pg_roles AS r
+CROSS JOIN pg_catalog.pg_control_system() AS c
 WHERE r.rolname = 'atom_e1_scorecard_reader'
-\gset atom_v1b_reconnect_
-```
+\gset atom_v1b_
+SELECT :'atom_v1b_reader_role_oid' AS reader_role_oid,
+       :'atom_v1b_pre_restart_postmaster_started_at'
+         AS pre_restart_postmaster_started_at,
+       :'atom_v1b_control_system_identifier' AS control_system_identifier;
+~~~
 
-Display that candidate and require exact equality to the originally retained immutable OID under the still-active exclusive role-administration window. Only after that comparison may the Owner execute exactly `\set atom_v1b_reader_role_oid :atom_v1b_reconnect_candidate_reader_role_oid` followed immediately by `\unset atom_v1b_reconnect_candidate_reader_role_oid`, then rerun the identity guard below. A missing/multiple row, unavailable original record or mismatch stops; no mutation or replacement baseline follows. This is the sole OID-variable rehydration exception. A disconnect after the password COMMIT but before acknowledged `LOGIN` restoration remains a blocking incident unless the later explicit lost-ack read-only route is used; no post-rotation sleep or mutation is silently resumed in a new client.
+Require exactly one captured row and exact equality to the preflight observations. The OID is its canonical unsigned decimal text with no leading zero; the timestamp is exactly `YYYY-MM-DDTHH:MM:SS.ffffffZ`; the system identifier is canonical signed-`bigint` decimal text. Retain those exact bytes. Before every name-based target-role mutation and reader-OID-selected termination, and at every checkpoint, run this identity guard and require the sole result true:
 
-Before every name-based `ALTER ROLE` or `\password` below, before each reader-OID-selected termination statement, and at every repeated role/backend/prepared/settings checkpoint, run this exact identity guard in the same psql session and require the sole result `reader_identity_exact = true` before sending the next statement:
-
-```sql
+~~~sql
 SELECT count(*) = 1
-       AND COALESCE(
-             bool_and(
-               r.oid = :'atom_v1b_reader_role_oid'::oid
-               AND r.rolname = 'atom_e1_scorecard_reader'
-             ),
-             false
-           ) AS reader_identity_exact
+       AND COALESCE(bool_and(
+             r.oid = :'atom_v1b_reader_role_oid'::oid
+             AND r.rolname = 'atom_e1_scorecard_reader'
+           ), false) AS reader_identity_exact
 FROM pg_catalog.pg_roles AS r
 WHERE r.oid = :'atom_v1b_reader_role_oid'::oid
    OR r.rolname = 'atom_e1_scorecard_reader';
-```
+~~~
 
-The `OR` intentionally detects rename-plus-recreate as two/nonmatching rows. A false, NULL, missing-variable, parse or query result stops before the guarded statement; do not recapture an OID or retarget the action. Because PostgreSQL's role-mutation syntax is name-based, this immediate guard plus the exclusive role-administration window—not the spelling alone—is the frozen name-to-OID binding.
+The OR detects rename-plus-recreate. After the one authorized reconnect, the five psql variables may be rehydrated only from their retained canonical bytes under the exact §6.3 template and round trips, followed immediately by this identity guard before any other dependent query. They may not create a new baseline.
 
-Require the exact frozen reader booleans `true, false, false, false, false, false, false` in the order `rolcanlogin, rolinherit, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls`; `reader_global_settings IS NULL`; all four authorization/visibility predicates true, including the stricter `preauth_activity_fully_visible`; `170000 <= server_version_num < 180000`; `pre_auth_delay = '0'`; `log_hostname = 'off'`; and `authentication_timeout_unit = 's'`, `authentication_timeout_min = '1'`, `authentication_timeout_max = '600'`, `authentication_timeout_context = 'sighup'`. The two termination statements use only the already held administrator or `pg_signal_backend` capability proved here; this amendment authorizes no role membership, `SET ROLE` privilege or grant. Reader-role visibility alone cannot reveal unattributed pre-authentication rows. This amendment authorizes no `GRANT pg_read_all_stats`; a false stricter predicate blocks before `NOLOGIN`. Also run the exact query below and require zero rows. Migration 030 created no role-level setting and no later controlling law authorizes one; a row/value is a material incident, not authority to reset or adopt it.
+Require zero global/database role settings and zero reader-owned prepared transactions before the fence and at every later checkpoint:
 
-```sql
+~~~sql
 SELECT s.setdatabase, s.setrole, s.setconfig
 FROM pg_catalog.pg_db_role_setting AS s
 WHERE s.setrole = :'atom_v1b_reader_role_oid'::oid
 ORDER BY s.setdatabase, s.setrole;
-```
 
-Run this exact cluster-wide prepared-transaction count before the fence and retain it separately from backend counts:
-
-```sql
 SELECT count(*) AS reader_prepared_transactions
 FROM pg_catalog.pg_prepared_xacts AS p
 WHERE p.owner = (
@@ -770,24 +754,22 @@ WHERE p.owner = (
   WHERE r.oid = :'atom_v1b_reader_role_oid'::oid
     AND r.rolname = 'atom_e1_scorecard_reader'
 );
-```
+~~~
 
-It must equal zero. A prepared transaction has no live backend to terminate and can retain locks after its originating backend ends; it is therefore neither a terminated backend nor acceptable containment. A nonzero pre-fence result permits only the exact `NOLOGIN` and two backend-termination passes below as protective containment, then requires the role to remain `NOLOGIN`, the URI to remain absent and a separate documentation-first disposition; it forbids password rotation, `LOGIN` restoration and incident finalization. No `COMMIT PREPARED`, `ROLLBACK PREPARED`, GID selection or prepared-transaction mutation is authorized here. Repeat this identical count after the second termination pass, with each later repeated zero-backend checkpoint, immediately after the password transaction, after Render URI provisioning while fenced, with each post-`LOGIN` checkpoint and at final verification; every result must be zero.
+A setting row or prepared transaction is a material incident. No RESET, COMMIT PREPARED, ROLLBACK PREPARED or other mutation is authorized. Retain this pre-fence inventory without query text or credentials:
 
-The current authentication setting is recorded but never used to shorten the drain. A failure authorizes no grant, membership, setting reset, alternative administrator or broader mutation predicate. Privately retain the preflight, the zero-row role-setting result and this complete pre-fence inventory across all databases/states:
-
-```sql
+~~~sql
 SELECT pg_catalog.clock_timestamp() AS inventory_observed_at,
        a.pid, a.backend_start, a.datname, a.application_name,
        a.client_addr, a.client_port, a.state, a.wait_event_type, a.wait_event
 FROM pg_catalog.pg_stat_activity AS a
 WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid
 ORDER BY a.backend_start, a.pid;
-```
+~~~
 
-Select the termination-only route under a temporary login fence; no surviving backend is accepted as “contained.” In the same private session execute exactly:
+Set the exact temporary fence:
 
-```text
+~~~text
 \set AUTOCOMMIT on
 BEGIN;
 ALTER ROLE atom_e1_scorecard_reader NOLOGIN;
@@ -799,11 +781,11 @@ SELECT to_char(
            AT TIME ZONE 'UTC',
          'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
        ) AS nologin_completion_upper_bound_utc;
-```
+~~~
 
-Require the exact identity guard immediately before `ALTER ROLE`, again after its COMMIT, and a fresh `pg_roles` observation for `oid = :'atom_v1b_reader_role_oid'::oid` with exactly one row, exact name and `rolcanlogin = false`. Immediately rerun the guard before this first fresh termination transaction:
+Require acknowledged COMMIT, the identity guard, exact original attributes with rolcanlogin = false, and URI absence. Then execute exactly two fresh visible-reader termination transactions. Each transaction is exactly:
 
-```sql
+~~~sql
 BEGIN;
 WITH targets AS MATERIALIZED (
   SELECT a.pid, a.backend_start, a.datname, a.application_name,
@@ -819,161 +801,207 @@ SELECT t.pid, t.backend_start, t.datname, t.application_name,
 FROM targets AS t
 ORDER BY t.backend_start, t.pid;
 COMMIT;
-```
+~~~
 
-The preflight must prove that the existing administrative session is a superuser or already has `pg_signal_backend`; no new membership or grant is authorized. Each exact statement materializes only current `client backend` rows whose `usesysid` equals the immutable reader OID and supplies only those PIDs to `pg_terminate_backend`. PostgreSQL 17's stock `pg_terminate_backend(pid, timeout)` nevertheless has no `(pid, backend_start)` identity overload: after selection and before the operating-system signal, the selected process can exit and the numeric PID can be recycled. With the existing administrator/`pg_signal_backend` authority, that residual interval could signal a different non-superuser backend. This amendment accepts that narrowly bounded residual only for these two exact, fresh, OID-selected termination passes because PostgreSQL supplies no stock identity-bound signaling primitive; it does not claim cross-role signaling is impossible. Any observed or suspected collateral termination is a material operational incident and stops V-1B. The transaction must return every selected `(pid, backend_start)` and complete with acknowledged `COMMIT`; a signal permission error, statement error or uncertain transaction outcome fails the pass. The transaction grants no durable membership, setting or new capability.
+After the first acknowledged transaction, execute exactly `SELECT pg_catalog.pg_sleep(1.0::double precision);`, clear the statistics snapshot, rerun the identity/fence checks, and execute the identical second transaction. PostgreSQL guarantees that this sleep finishes no sooner than its argument and permits it to run longer; the actual separation is therefore at least one second, not exactly one second. These are two fixed passes, not a loop or proof of hidden-process absence. Each target PID is selected inside the same statement solely by immutable reader OID and client-backend type. Retain every selected (pid, backend_start), boolean, exception and both COMMIT acknowledgements. PostgreSQL has no PID-plus-incarnation signaling primitive; possible PID reuse/collateral termination is a material incident and stops V-1B. No saved PID, state/database narrowing, pg_cancel_backend, other-role selection, grant or extra pass is authorized.
 
-The active `NOLOGIN` fence blocks a new completed login but does not prove every authentication exchange already underway has ended. PostgreSQL 17 can apply `AuthenticationTimeout` once while collecting the startup/SSL packet and then reset and apply it again during `InitPostgres` authentication; `PerformAuthentication()` precedes the `rolcanlogin` enforcement. PostgreSQL can also delay before starting those timers or perform reverse DNS outside them, so the preflight's exact `pre_auth_delay = '0'` and `log_hostname = 'off'` are mandatory and must remain unchanged throughout the fence. With those two pre-timer paths disabled, a hostile old-password connection can occupy nearly twice the 600-second maximum before the fence rejects it. After the first termination pass, wait exactly twice the verified maximum plus one second—1201 seconds—which is conservatively more than 1201 seconds after the already-confirmed `NOLOGIN` commit. Never substitute the observed current setting, a single 601-second interval or wall-clock subtraction:
+Every “reader-only observation” below is the following exact autocommit checkpoint; run the clear-snapshot statement before the count and require both returned counts to be zero:
 
-```sql
-SELECT pg_catalog.pg_sleep(1201.0::double precision);
-```
-
-An interrupted sleep proves no drain; after reconnecting with the exact administrative command and revalidating identity, `NOLOGIN`, PostgreSQL 17, the 600-second maximum, `pre_auth_delay = '0'` and `log_hostname = 'off'`, start a fresh complete 1201-second sleep. No SIGHUP, database configuration change or Owner/control-plane setting mutation is permitted during the fence. After an uninterrupted sleep, revalidate those facts and execute the exact complete `BEGIN`/OID-selected termination/`COMMIT` transaction above a second time against a fresh scan. These are two mandated passes, not an output-based retry loop. Reconcile every pre-fence inventory `(pid, backend_start)` with a true termination result or a fresh proof that that exact incarnation ended naturally; retain every false result/exception. No row is excluded by database, state, age or application.
-
-In fresh autocommit statements, run this exact count, wait exactly one second, and run the identical count again:
-
-```sql
+~~~sql
 SELECT pg_catalog.pg_stat_clear_snapshot();
-
-SELECT count(*) FILTER (
-         WHERE a.backend_type = 'client backend'
-           AND a.usesysid = :'atom_v1b_reader_role_oid'::oid
-       ) AS reader_client_backends,
-       count(*) FILTER (
-         WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid
-       ) AS all_reader_processes,
-       count(*) FILTER (
-         WHERE a.backend_type = 'client backend'
-           AND a.usesysid IS NULL
-       ) AS unattributed_client_backends
+SELECT count(*) FILTER (WHERE a.backend_type = 'client backend')
+         AS reader_client_backends,
+       count(*) AS all_reader_processes
 FROM pg_catalog.pg_stat_activity AS a
-WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid
-   OR (a.backend_type = 'client backend' AND a.usesysid IS NULL);
+WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid;
+~~~
 
-SELECT pg_catalog.pg_sleep(1.0::double precision);
+After the second pass, run two such checkpoints with exactly `SELECT pg_catalog.pg_sleep(1.0::double precision);` between them, so the actual separation is at least one second and may be longer; repeat the identity, NOLOGIN, prepared-transaction and role-setting checks. These observations prove visible containment only. They never assert that a pre-pgstat_bestart server child is visible or gone.
 
-SELECT pg_catalog.pg_stat_clear_snapshot();
+Perform the one password replacement in a fresh transaction. The only pg_authid mutation in this transaction is the password change: no savepoint, subtransaction or unrelated ALTER ROLE is permitted.
 
-SELECT count(*) FILTER (
-         WHERE a.backend_type = 'client backend'
-           AND a.usesysid = :'atom_v1b_reader_role_oid'::oid
-       ) AS reader_client_backends,
-       count(*) FILTER (
-         WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid
-       ) AS all_reader_processes,
-       count(*) FILTER (
-         WHERE a.backend_type = 'client backend'
-           AND a.usesysid IS NULL
-       ) AS unattributed_client_backends
-FROM pg_catalog.pg_stat_activity AS a
-WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid
-   OR (a.backend_type = 'client backend' AND a.usesysid IS NULL);
-```
-
-All three columns in both observations and every accompanying prepared-transaction count must equal zero, and `rolcanlogin` must remain false. These pre-rotation NULL guards close the untimed post-authentication/pre-`rolcanlogin` interval for every process that could have cached the old `LOGIN` state before the fence; the already proved `preauth_activity_fully_visible` is mandatory. Rerun the exact global `rolconfig` and `pg_db_role_setting` checks and again require NULL/zero rows. Only then perform the one password replacement while the role remains fenced:
-
-```text
-SELECT pg_catalog.clock_timestamp() AS rotation_lower_bound
+~~~text
+SELECT to_char(pg_catalog.clock_timestamp() AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+         AS rotation_lower_bound
 \gset atom_v1b_
-SELECT to_char(
-         :'atom_v1b_rotation_lower_bound'::timestamptz
-           AT TIME ZONE 'UTC',
-         'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
-       ) AS rotation_lower_bound_utc;
 BEGIN;
 SET LOCAL password_encryption = 'scram-sha-256';
+SELECT pg_catalog.pg_current_xact_id()::text AS rotation_xid8
+\gset atom_v1b_
+SELECT :'atom_v1b_rotation_lower_bound' AS rotation_lower_bound_utc,
+       :'atom_v1b_rotation_xid8' AS rotation_xid8,
+       (:'atom_v1b_rotation_xid8'::xid8)::text
+         = :'atom_v1b_rotation_xid8' AS rotation_xid8_canonical;
+SELECT count(*) = 1
+       AND COALESCE(bool_and(
+         r.oid = :'atom_v1b_reader_role_oid'::oid
+         AND r.rolname = 'atom_e1_scorecard_reader'
+         AND NOT r.rolcanlogin
+         AND r.xmin <> pg_catalog.pg_current_xact_id()::xid
+       ), false) AS password_change_precondition
+FROM pg_catalog.pg_authid AS r
+WHERE r.oid = :'atom_v1b_reader_role_oid'::oid
+   OR r.rolname = 'atom_e1_scorecard_reader';
 \password atom_e1_scorecard_reader
+SELECT count(*) = 1
+       AND COALESCE(bool_and(
+         r.oid = :'atom_v1b_reader_role_oid'::oid
+         AND r.rolname = 'atom_e1_scorecard_reader'
+         AND NOT r.rolcanlogin
+         AND r.rolpassword IS NOT NULL
+         AND r.rolpassword LIKE 'SCRAM-SHA-256$%'
+         AND r.xmin = pg_catalog.pg_current_xact_id()::xid
+       ), false) AS password_change_observed
+FROM pg_catalog.pg_authid AS r
+WHERE r.oid = :'atom_v1b_reader_role_oid'::oid
+   OR r.rolname = 'atom_e1_scorecard_reader';
 COMMIT;
 SELECT pg_catalog.clock_timestamp() AS rotation_completion_upper_bound
 \gset atom_v1b_
-SELECT to_char(
-         :'atom_v1b_rotation_lower_bound'::timestamptz
-           AT TIME ZONE 'UTC',
+SELECT :'atom_v1b_rotation_xid8' AS rotation_xid8,
+       (:'atom_v1b_rotation_xid8'::xid8)::text
+         = :'atom_v1b_rotation_xid8' AS rotation_xid8_canonical,
+       to_char(
+         :'atom_v1b_rotation_lower_bound'::timestamptz AT TIME ZONE 'UTC',
          'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
        ) AS rotation_lower_bound_utc,
        to_char(
          :'atom_v1b_rotation_completion_upper_bound'::timestamptz
            AT TIME ZONE 'UTC',
          'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
-       ) AS rotation_completion_upper_bound_utc;
-```
+       ) AS rotation_completion_upper_bound_utc,
+       pg_catalog.pg_xact_status(
+         :'atom_v1b_rotation_xid8'::xid8
+       ) = 'committed' AS rotation_transaction_committed;
+~~~
 
-The `\password` inputs are the same fresh high-entropy password twice in its private prompts; never the exposed password. PostgreSQL documents that `\password` encrypts the value before submitting `ALTER ROLE` and avoids cleartext in command history/server logs. That is not a promise that every external session recorder or audit configuration suppresses sensitive verifiers; the preceding secure-channel requirement remains mandatory. No returned/printed password or verifier is acceptance evidence.
+Before entering `\password`, require the pre-password lower-bound/xid output fully captured in the private packet and `rotation_xid8_canonical = true`; this preserves the exact transaction identifier even if the later connection outcome is lost. Then require the precondition and postcondition sole booleans true before entering COMMIT, acknowledged COMMIT, and the post-COMMIT `rotation_xid8_canonical = true` and `rotation_transaction_committed = true`. The precondition prevents a cancelled/no-op password command from inheriting an already matching 32-bit xmin. The postcondition proves that this transaction created the exact fenced target role’s current SCRAM row version; the secure double prompt proves which fresh password was supplied. PostgreSQL 17 psql does not print an ALTER ROLE command tag for \password, so no such tag is required or claimed. Retain only the non-secret canonical unsigned-decimal `rotation_xid8`, booleans, transaction acknowledgement and immediate UTC lower/upper bounds—never rolpassword, a verifier digest, generated SQL, prompt bytes or an exception containing them. If the pre-password output or either password-row boolean is not exactly accepted, do not COMMIT; ROLLBACK if the connection remains usable, otherwise prove disconnection rolled the transaction back. Do not repeat \password under this grant. A lost or uncertain COMMIT acknowledgement/output has no in-document continuation: keep the incident PENDING/OPEN, do not start the project restart, retain the pre-password xid/lower-bound evidence for separate incident disposition, and do not reconnect or repeat the password action under this amendment.
 
-`COMMIT` may be entered only after `\password` itself completes without cancellation, EOF, prompt mismatch, client/meta-command error or server error and psql reports the successful non-secret server command tag exactly `ALTER ROLE`. Retain a redacted private action record proving that exact `\password` completion and command tag without prompt input, verifier, generated SQL or secret-bearing terminal bytes. If that success is not observed, do not issue `COMMIT`: if the session remains usable issue `ROLLBACK;` and `\q`; if psql has exited, prove the administrative connection ended so PostgreSQL discarded its open transaction. Leave the incident PENDING and do not repeat `\password` under this grant. Only the conjunction of (1) that retained successful `\password`/`ALTER ROLE` status, (2) acknowledged `COMMIT`, and (3) the subsequent server-clock upper bound establishes the one rotation; a successful no-op `COMMIT` cannot substitute for item 1. Preserve both time bounds. Require `rolcanlogin = false`, a fresh all-reader-process count of zero and the prepared-transaction count of zero again.
+Keep NOLOGIN, URI absence, parent suspension/inertness and zero jobs. Immediately before the restart, require a fully loaded, unfiltered and error-free authenticated Infrastructure view for exact project `afyiydxbjgzaiswnbcyj` to show exactly one Primary and zero Read Replicas/secondary PostgreSQL instances, then obtain a separate affirmative Owner confirmation for this exact disruptive action. A loading, stale, filtered, partial or failed view is not a zero-replica observation; project metadata or service health alone is not replica inventory. The action-time record must show the exact project, that the operation restarts the project database and terminates ongoing workloads, every known direct/pooler/PostgREST/quote/Level-II/import or other affected client, expected interruption, current health, and the zero-replica finding. This document authorizes no remembered or blanket outage approval.
 
-Starting only after that acknowledged rotation-completion upper bound, keep `NOLOGIN` unchanged, the reader URI absent and the parent suspended/inert, and execute this exact uninterrupted post-rotation stale-verifier drain:
+In the still-verified administrative session and immediately before the Owner confirms the dashboard action, capture the server-clock lower bound and recheck the original postmaster start time without replacing its baseline:
 
-```sql
-SELECT pg_catalog.pg_sleep(601.0::double precision);
-```
+~~~text
+SELECT to_char(pg_catalog.clock_timestamp() AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+         AS restart_action_lower_bound,
+       to_char(pg_catalog.pg_postmaster_start_time() AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+         AS restart_pre_restart_postmaster_started_at
+\gset atom_v1b_
+SELECT :'atom_v1b_restart_action_lower_bound'
+         AS restart_action_lower_bound,
+       :'atom_v1b_restart_pre_restart_postmaster_started_at'
+         = :'atom_v1b_pre_restart_postmaster_started_at'
+         AS pre_restart_generation_unchanged;
+~~~
 
-This 601 seconds is not a bound on a fresh socket's startup/DNS path. It exhausts the single at-most-600-second `AuthenticationTimeout` around `ClientAuthentication()` for an exchange that had acquired the old verifier before rotation. It does not bound PostgreSQL's later, untimed interval between successful authentication and `InitializeSessionUserId()`'s `rolcanlogin` check; during that interval `pg_stat_activity.usesysid` remains NULL. A connection reaching verifier acquisition only after rotation sees the new verifier, while `NOLOGIN` still prevents a completed login. An interrupted sleep proves no drain.
+Require the sole boolean true and retain the exact canonical 27-byte `restart_action_lower_bound`. Only after that observation and the separate Owner confirmation, use the authenticated Supabase General Settings page at:
 
-After the uninterrupted sleep, revalidate the same immutable role OID, `rolcanlogin = false`, PostgreSQL 17, the 600-second maximum and unchanged `pre_auth_delay = '0'`/`log_hostname = 'off'`. Then, in fresh autocommit statements, execute this exact post-rotation guard, wait exactly one second and execute the entire guard again:
+~~~text
+https://supabase.com/dashboard/project/afyiydxbjgzaiswnbcyj/settings/general
+~~~
 
-```sql
-SELECT pg_catalog.pg_stat_clear_snapshot();
+Select only the top-level **Restart project** control and its **Restart project** confirmation exactly once. **Fast database reboot**, **Restart database**, a service-only restart, or an unavailable/disabled full-project control is not equivalent and stops the sequence. No Management API endpoint, CLI command, pause/restore, replica deletion, compute resize or retry is inferred. If submission outcome is uncertain, inspect the exact project status/event and obtain Supabase support confirmation as needed; do not click again.
 
-SELECT count(*) FILTER (
-         WHERE a.backend_type = 'client backend'
-           AND a.usesysid = :'atom_v1b_reader_role_oid'::oid
-       ) AS reader_client_backends,
-       count(*) FILTER (
-         WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid
-       ) AS all_reader_processes,
-       count(*) FILTER (
-         WHERE a.backend_type = 'client backend'
-           AND a.usesysid IS NULL
-       ) AS unattributed_client_backends
-FROM pg_catalog.pg_stat_activity AS a
-WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid
-   OR (a.backend_type = 'client backend' AND a.usesysid IS NULL);
+A request success, HTTP `200 {}`, toast, redirect, `RESTARTING` status, transient disconnection or later `ACTIVE_HEALTHY` status alone is not completion proof. Accept the barrier only from the complete conjunction of: (1) the fully loaded/error-free exact-project Infrastructure view showing exactly one Primary and zero Read Replicas immediately before and after; (2) retained evidence that the exact full-project action entered `RESTARTING`, subsequently completed without a reported failure and returned the exact project healthy; (3) the fresh direct administrative connection below proving the same control-system identifier and `post_restart_postmaster_started_at > restart_action_lower_bound`; and (4) retained current Supabase documentation establishing that a full project restart terminates ongoing workloads and restarts every project database. If the dashboard cannot supply an independently reviewable complete inventory or completion state, require Supabase support confirmation tied to the exact project, action and time window; otherwise keep NOLOGIN, keep the URI absent, leave the incident OPEN and block V-1B.
 
-SELECT pg_catalog.pg_sleep(1.0::double precision);
+No control-plane artifact is claimed to enumerate PostgreSQL backend PIDs. The conclusion that every old primary backend ended follows only from that complete conjunction: documented full-restart semantics, exact completed action, zero replicas and a strictly newer postmaster generation. Pooler frontends remain subject to the separate containment proof.
 
-SELECT pg_catalog.pg_stat_clear_snapshot();
+The restart necessarily closes the administrative psql session. One post-restart reconnect with the exact command above is expressly authorized. First reprove the exact project/database/TLS/admin identity without using any retained variable. Before any later query references them, restore the five retained non-secret observations through this exact psql template:
 
-SELECT count(*) FILTER (
-         WHERE a.backend_type = 'client backend'
-           AND a.usesysid = :'atom_v1b_reader_role_oid'::oid
-       ) AS reader_client_backends,
-       count(*) FILTER (
-         WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid
-       ) AS all_reader_processes,
-       count(*) FILTER (
-         WHERE a.backend_type = 'client backend'
-           AND a.usesysid IS NULL
-       ) AS unattributed_client_backends
-FROM pg_catalog.pg_stat_activity AS a
-WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid
-   OR (a.backend_type = 'client backend' AND a.usesysid IS NULL);
-```
+~~~text
+\set atom_v1b_reader_role_oid '<retained_reader_role_oid>'
+\set atom_v1b_rotation_xid8 '<retained_rotation_xid8>'
+\set atom_v1b_pre_restart_postmaster_started_at '<retained_pre_restart_postmaster_started_at>'
+\set atom_v1b_control_system_identifier '<retained_control_system_identifier>'
+\set atom_v1b_restart_action_lower_bound '<retained_restart_action_lower_bound>'
+SELECT (:'atom_v1b_reader_role_oid'::oid)::text
+         = :'atom_v1b_reader_role_oid' AS reader_oid_input_canonical,
+       (:'atom_v1b_rotation_xid8'::xid8)::text
+         = :'atom_v1b_rotation_xid8' AS rotation_xid8_input_canonical,
+       to_char(
+         :'atom_v1b_pre_restart_postmaster_started_at'::timestamptz
+           AT TIME ZONE 'UTC',
+         'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+       ) = :'atom_v1b_pre_restart_postmaster_started_at'
+         AS pre_restart_time_input_canonical,
+       (:'atom_v1b_control_system_identifier'::bigint)::text
+         = :'atom_v1b_control_system_identifier'
+         AS control_system_id_input_canonical,
+       to_char(
+         :'atom_v1b_restart_action_lower_bound'::timestamptz
+           AT TIME ZONE 'UTC',
+         'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+       ) = :'atom_v1b_restart_action_lower_bound'
+         AS restart_lower_bound_input_canonical;
+~~~
 
-All three columns in both observations must equal zero. The NULL count is intentionally cluster-wide and conservative: it contains every visible client process not yet attributed to a role, including any old-verifier exchange paused in the untimed post-authentication/pre-`rolcanlogin` interval. It is never used as authority to signal an unattributed or other-role process. The all-reader count preserves the wider process invariant in the same observation. Repeat the prepared-transaction count at both checkpoints and the global/database role-setting checks. No third termination pass is authorized. Any row, changed OID/setting/version, incomplete visibility or failed observation keeps the URI absent, role fenced and incident OPEN for separate remediation; it never permits `LOGIN` or finalization.
+Before substituting, require the exact retained source bytes: positive canonical decimal OID and xid8 with no sign or leading zero; both exact 27-byte UTC timestamps `YYYY-MM-DDTHH:MM:SS.ffffffZ`; and canonical signed-`bigint` decimal control-system identifier. Replace each angle-bracket token once with only that matching retained value; no unresolved token, whitespace, quote, psql metacharacter or recaptured value may be sent. Require all five round-trip booleans true. Then run the existing identity guard to prove the fresh OID/name candidate exactly equals the retained OID under the still-active exclusive window. Repeat the authenticated fully loaded/error-free zero-replica/one-primary control-plane observation. None of the five values may be recaptured as a replacement baseline.
 
-Before provisioning the URI or restoring `LOGIN`, the Owner and independent incident reviewer use only the existing authenticated Supabase project audit/support control plane to retain one non-secret `ATOM-V1B-READER-POOLER-CONTAINMENT-1` observation with exactly: project ref `afyiydxbjgzaiswnbcyj`; database role `atom_e1_scorecard_reader`; observation time; inventory of Shared Supavisor session and transaction modes plus any enabled Dedicated Pooler or legacy PgBouncer plane; the vendor/control-plane evidence reference and digest; observed or explicitly unavailable frontend/cache/server-lease coverage; confirmation that every server-side reader lease is represented by the repeated zero `pg_stat_activity` proof; and the vendor-grounded conclusion that no pre-rotation frontend or cached old verifier can obtain a PostgreSQL backend after the confirmed password replacement. This is a read-only observation/support confirmation, not a connection attempt or pooler mutation. It must classify each discovered frontend as vendor-confirmed terminated or explicitly contained by zero live server lease, active `NOLOGIN`, completed rotation and inability of the invalidated credential to create a later backend. An unknown plane, usable lease, unsupported conclusion or evidence limited to the legitimate direct URI blocks finalization and requires a separate documentation-first vendor drain/purge decision; never test the exposed password.
+In one fresh autocommit statement run this exact post-restart proof, which emits booleans and non-secret generation identifiers but no verifier:
 
-While `NOLOGIN` remains verified, install that same confirmed new credential in the exact Render URI using Save only, keep the parent suspended, create no job, and read back the permitted non-secret configuration plus secret provisioning state. Then recheck `rolcanlogin = false`; repeat the complete two-observation post-rotation guard above, including all three zero columns and the one-second interval; and require the prepared-transaction count zero, `rolconfig IS NULL` and zero `pg_db_role_setting` rows at both checkpoints. Only after that provisioning is accepted, rerun the exact OID guard, begin one transaction, call `pg_stat_clear_snapshot()` and run one further complete post-rotation guard query. Require all three counts zero before sending the name-based `ALTER ROLE`; if any is nonzero, issue `ROLLBACK` and take the failure route. Only the all-zero branch executes:
+~~~sql
+WITH now_xid AS (
+  SELECT pg_catalog.pg_current_xact_id() AS value
+),
+control AS (
+  SELECT system_identifier
+  FROM pg_catalog.pg_control_system()
+),
+role_state AS (
+  SELECT count(*) = 1
+         AND COALESCE(bool_and(
+           r.oid = :'atom_v1b_reader_role_oid'::oid
+           AND r.rolname = 'atom_e1_scorecard_reader'
+           AND NOT r.rolcanlogin
+           AND r.rolpassword IS NOT NULL
+           AND r.rolpassword LIKE 'SCRAM-SHA-256$%'
+           AND r.xmin = :'atom_v1b_rotation_xid8'::xid8::xid
+         ), false) AS exact_rotation_row_persisted
+  FROM pg_catalog.pg_authid AS r
+  WHERE r.oid = :'atom_v1b_reader_role_oid'::oid
+     OR r.rolname = 'atom_e1_scorecard_reader'
+)
+SELECT pg_catalog.pg_postmaster_start_time()
+         AS post_restart_postmaster_started_at,
+       control.system_identifier
+         AS post_restart_control_system_identifier,
+       pg_catalog.pg_postmaster_start_time()
+         > :'atom_v1b_restart_action_lower_bound'::timestamptz
+         AS newer_postmaster_generation,
+       control.system_identifier
+         = :'atom_v1b_control_system_identifier'::bigint
+         AS same_control_system,
+       pg_catalog.pg_xact_status(
+         :'atom_v1b_rotation_xid8'::xid8
+       ) = 'committed' AS rotation_transaction_committed,
+       (
+         now_xid.value::text::numeric
+           - :'atom_v1b_rotation_xid8'::numeric
+       ) BETWEEN 1 AND 2147483647 AS rotation_xid_unambiguous,
+       role_state.exact_rotation_row_persisted
+FROM now_xid
+CROSS JOIN control
+CROSS JOIN role_state;
+~~~
 
-```text
+Retain both observed identifiers and require all five booleans true. The full xid8 commit status and strictly sub-half-range distance make the 32-bit xmin comparison unambiguous. Exact xmin equality proves no later committed target-role update—including a password change from a pre-restart surviving reader session—replaced the rotation row before the restart. A frozen or changed xmin, unavailable commit status, equal/older postmaster timestamp, changed cluster identifier, role/OID/NOLOGIN/SCRAM mismatch, nonzero replica count, uncertain restart completion or any second serving instance blocks finalization. The newer postmaster time corroborates the provider’s complete-shutdown evidence; it does not substitute for it.
+
+Repeat the two reader-only observations, prepared-transaction zero and global/database role-setting zero checks. They corroborate the new generation but are not the completeness root. The full restart terminates PostgreSQL backends; it may not end logical pooler frontends or cached frontend authentication. Therefore retain the existing ATOM-V1B-READER-POOLER-CONTAINMENT-1 evidence for every Shared Supavisor session/transaction plane and any Dedicated/legacy pooler. Each frontend must be vendor-confirmed terminated or independently proven unable to obtain a server lease using the invalidated password after the restart and later LOGIN. Unknown coverage, a usable lease or unsupported cache semantics keeps NOLOGIN and URI absence and requires a documentation-first vendor drain/purge decision. No pooler mutation or old-password test is authorized.
+
+Only after the restart/rotation-row/pooler proofs pass, install the same new credential in the exact Render reader URI using Save only while NOLOGIN remains true, keep the parent suspended/inert and create no job. Revalidate the exact role identity and attributes, exact persisted rotation row, newer generation, prepared/settings zeros, URI provisioning state and no intervening role/project writer. Then restore LOGIN in one guarded transaction:
+
+~~~text
 BEGIN;
 SELECT pg_catalog.pg_stat_clear_snapshot();
 SELECT count(*) FILTER (
          WHERE a.backend_type = 'client backend'
-           AND a.usesysid = :'atom_v1b_reader_role_oid'::oid
        ) AS reader_client_backends,
-       count(*) FILTER (
-         WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid
-       ) AS all_reader_processes,
-       count(*) FILTER (
-         WHERE a.backend_type = 'client backend'
-           AND a.usesysid IS NULL
-       ) AS unattributed_client_backends
+       count(*) AS all_reader_processes
 FROM pg_catalog.pg_stat_activity AS a
-WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid
-   OR (a.backend_type = 'client backend' AND a.usesysid IS NULL);
+WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid;
 ALTER ROLE atom_e1_scorecard_reader LOGIN;
 COMMIT;
 SELECT pg_catalog.clock_timestamp() AS login_restore_completion_upper_bound
@@ -983,47 +1011,15 @@ SELECT to_char(
            AT TIME ZONE 'UTC',
          'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
        ) AS login_restore_completion_upper_bound_utc;
-```
+~~~
 
-An old-verifier process capable of reaching that untimed interval already has an initial backend-status slot before authentication and is therefore included by the immediate NULL-or-target guard. A process not yet represented there has not acquired the old verifier; any authentication it begins after this point uses the rotated verifier. The query/`ALTER ROLE` transaction is the final fence transition; no external connection or administrative action may intervene.
+Enter ALTER ROLE only when both counts are zero and every preceding guard remains true. Require acknowledged COMMIT, exact frozen role attributes with rolcanlogin = true, and complete retention of the exact canonical 27-byte `login_restore_completion_upper_bound_utc`. Run two exact reader-only checkpoints with exactly `SELECT pg_catalog.pg_sleep(1.0::double precision);` between them, so their actual separation is at least one second and may be longer, plus a final checkpoint immediately before incident finalization. Each must show zero reader client backends and zero all-reader processes and also repeats zero prepared transactions and NULL/zero role settings. A process beginning after the completed restart can authenticate only against the retained rotated verifier; this is not an assertion that such a process is visible before pgstat_bestart.
 
-Require the complete original frozen role-attribute values with `rolcanlogin = true`, `rolconfig IS NULL` and zero `pg_db_role_setting` rows. Then run this exact reader-only two-observation query with its one-second interval, plus the exact prepared-transaction count at each checkpoint:
+The only new PostgreSQL mutations are temporary NOLOGIN, the two exact OID-selected visible-reader termination passes, the one \password row update and exact LOGIN restoration. The only new provider mutation is the one confirmed project restart. No extra password replacement, saved-PID action, unattributed/other-role signal, generic cleanup, prepared-transaction mutation, setting reset, grant, pooler action, resize or replica change is authorized.
 
-```sql
-SELECT pg_catalog.pg_stat_clear_snapshot();
+The finalized private incident record retains: exact project/zero-replica observations before and after; action-time outage confirmation and exact restart-action server-clock lower bound; full-project control/confirmation and independently reviewable completion evidence; pre/post postmaster times and stable system identifier; immutable role OID; NOLOGIN/LOGIN acknowledgements and canonical completion bounds; both termination-pass outputs and visible zero checks; every prepared/settings observation; pre-password retained rotation lower bound/xid, pre/post password-row booleans, commit status and post-COMMIT bound; all five post-reconnect input round trips; exact persisted-row proof; pooler disposition; URI provisioning; and final reader zeros. It retains no password, URI, verifier or verifier digest.
 
-SELECT count(*) FILTER (WHERE a.backend_type = 'client backend')
-         AS reader_client_backends,
-       count(*) AS all_reader_processes
-FROM pg_catalog.pg_stat_activity AS a
-WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid;
-
-SELECT pg_catalog.pg_sleep(1.0::double precision);
-
-SELECT pg_catalog.pg_stat_clear_snapshot();
-
-SELECT count(*) FILTER (WHERE a.backend_type = 'client backend')
-         AS reader_client_backends,
-       count(*) AS all_reader_processes
-FROM pg_catalog.pg_stat_activity AS a
-WHERE a.usesysid = :'atom_v1b_reader_role_oid'::oid;
-```
-
-Both columns at both observations must be zero. The cluster-wide unattributed-client guard has already served its narrowly defined purpose inside the atomic pre-`LOGIN` fence transition; after `LOGIN`, a newly arriving unattributed client would authenticate only against the rotated verifier and is not evidence of a surviving old-password session. Any reader process, prepared transaction or role-setting row before an authorized scorecard job is nevertheless a material incident. Immediately before finalization clear the statistics snapshot and execute one further copy of the exact reader-only count, require both columns zero, repeat the prepared-transaction zero count and NULL/zero role-setting observations, and record:
-
-```text
-SELECT to_char(
-         pg_catalog.clock_timestamp() AT TIME ZONE 'UTC',
-         'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
-       ) AS reader_backend_termination_verified_at_utc;
-\q
-```
-
-Each non-secret bound is emitted immediately after its server-clock observation: the `NOLOGIN` upper bound, both rotation bounds and the `LOGIN` upper bound. That immediate emission remains retainable even if the one expressly authorized pre-rotation reconnect loses psql variables. This final non-secret row must also be captured completely before `\q`. A missing earlier bound, cast/format failure, truncated row or lost output leaves the incident OPEN and is not reconstructed from client time.
-
-`ALTER ROLE ... NOLOGIN`, the one `\password`, `ALTER ROLE ... LOGIN`, and the two administrator-authorized, reader-OID-selected termination passes are the only new database mutations. Each pass supplies to `pg_terminate_backend` only PIDs selected directly inside that fresh statement by the exact reader-role OID and `backend_type = 'client backend'`; it relies only on the preflight-proved existing administrator/`pg_signal_backend` capability and does not grant or assume `SET ROLE`. This selection boundary does not erase the explicitly accepted post-selection PID-reuse interval above. A stored/operator-supplied PID, another role selected by query predicate, broad idle-session cleanup, scheduled cleanup, `pg_cancel_backend`, prepared-transaction mutation, grant, membership or other attribute change is forbidden.
-
-Any remaining backend or prepared-transaction row, incomplete visibility, wrong/changed version or maximum, false result without a reconciled ended incarnation, permission failure, SQL/client/meta-command error or missing observation leaves the incident OPEN and V-1B blocked. On a failure before URI provisioning, keep the URI absent. On a failure after fenced URI provisioning but before acknowledged `LOGIN` restoration, remove the URI and keep/verify `NOLOGIN`; this is the failure route, not a requirement to remove the URI during the uninterrupted successful provisioning-to-restoration sequence. In either case keep the parent suspended. An uncertain password COMMIT is resolved through the secure administrative channel while `NOLOGIN` remains in force and is never repeated; a known failed/cancelled `\password` follows the explicit rollback path above and also is not repeated. If the `LOGIN` COMMIT acknowledgement is lost, reconnect with the exact administrative command and read the complete target-role attributes before any further mutation or activation. A verified `rolcanlogin = false` is a safely fenced failure: remove the URI and remain blocked. A verified exact restored `LOGIN` state resolves the role outcome only if the two mandated post-restoration zero backend/prepared-transaction observations and the final zero backend/prepared-transaction observation pass; record the readback and its server-clock upper bound instead of inventing the lost commit time. An ambiguous role state, any reader backend/prepared transaction or any evidence that the new password escaped is a separate material incident requiring immediate protective stop and documentation-first remediation; this amendment authorizes no automatic reassertion, extra termination pass, prepared-transaction mutation or second password replacement. The role may not remain `NOLOGIN` for activation or be marked finalized merely because it is safely contained.
+Any failed/uncertain rotation, restart, reconnect, generation, row-persistence, pooler, URI or LOGIN proof leaves the incident OPEN and V-1B blocked. Before URI provisioning keep it absent. If it has been provisioned, remove it, prove effective absence and keep the parent suspended/inert regardless of the last observed role state. Retain and describe NOLOGIN containment only when an exact readback already proves NOLOGIN. If LOGIN committed or the role state is unknown, preserve and report that exact observed or unknown state; do not call it fenced, do not silently reassert NOLOGIN or LOGIN, and obtain separate protective/remediation authority. A lost/uncertain password COMMIT stops before restart under the exact rule above; no reconnect/status probe is implied. An uncertain restart is resolved through the same project control plane/support without issuing another restart. A lost/uncertain LOGIN acknowledgement has no additional reconnect/readback route under this amendment: remove the URI, record role state unknown, and require documentation-first remediation. Safe containment is not incident finalization, and no deadline permits a second rotation or restart.
 
 ### 6.4 Bounded incident inspection path
 
@@ -1050,7 +1046,7 @@ ORDER BY c.oid;
 SELECT transaction, prepared, owner, database
 FROM pg_catalog.pg_prepared_xacts
 WHERE owner = 'atom_e1_scorecard_reader'
-ORDER BY prepared, transaction;
+ORDER BY prepared, transaction::text::bigint;
 
 SELECT datname, numbackends, temp_files, temp_bytes, deadlocks, stats_reset
 FROM pg_catalog.pg_stat_database
@@ -1081,11 +1077,11 @@ Rollback is exactly:
 1. Cancel and verify termination of any running V-1B one-off job; suspend and verify the named base service. Preserve every seal, complete receipt and required log. Classify a crossed seal only through existing Amendment 2A rules and §4's post-terminal evidence-preservation procedure; a valid-seal look remains consumed and nonreplaceable, and its first complete receipt retains the unchanged publication duty. Keep its exact build and retained seal available until recovery produces the first complete terminal receipt or the consuming-negative/incident obligation is lawfully closed; cancellation alone does not erase a pending look. Protective cancellation/revocation may occur immediately, but does not authorize replacing that build or claiming recovery eligibility was restored.
 2. Restore the action-time non-secret configuration only while the base service remains suspended. The base command remains exactly `python -I -S -B -X pycache_prefix=/dev/null/atom-v1b-no-pyc -c "raise SystemExit(0)"`. Do not restore the historical E-1 command even as a suspended configuration value during V-1B rollback; any later return to E-1 is outside this amendment. Restore the previous `PYTHON_VERSION`/authorized-SHA presence and value if those fields were changed, without launching the reverted runtime. Never restore a §2.4 startup-injection key. Leave all untouched settings untouched.
 3. Remove the newly added `ATOM_V1B_GITHUB_TOKEN` from this service and revoke that dedicated PAT through the Owner’s secure control plane. Do not install another token or credential fallback. This is the rollback path for the same cleanup independently required on normal completion by §5.4.
-4. Never restore the exposed password or obsolete TLS configuration, including through a platform environment rollback. Keep the new password and conforming reader URI only if every §6.3 containment, rotation, `LOGIN` restoration, backend/prepared-transaction zero and final verification passed and the incident was independently finalized; if safe URI retention later becomes impossible, remove the URI and remain suspended. On any incomplete, failed or uncertain path, remove/keep absent the URI, suspend the parent and preserve the reader role's exactly observed state. If that observed state is `NOLOGIN`, leave it fenced. If it is `LOGIN`, ambiguous or otherwise unsafe, this rollback supplies no silent second fence: obtain separate explicit protective/remediation authority. Rollback does not authorize reasserting `NOLOGIN`, `LOGIN`, an extra termination pass, prepared-transaction mutation, a second password replacement or incident finalization.
+4. Never restore the exposed password or obsolete TLS configuration, including through a platform environment rollback. Keep the new password and conforming reader URI only if every §6.3 visible-backend, password-row, full-project restart/new-generation, zero-replica, pooler, LOGIN, prepared/settings and final verification passed and the incident was independently finalized; otherwise remove/keep absent the URI, suspend the parent and preserve the exact observed role state. Leave verified NOLOGIN fenced. If state is LOGIN, ambiguous or otherwise unsafe, rollback supplies no silent second fence: obtain separate protective/remediation authority. Rollback authorizes neither reasserting NOLOGIN/LOGIN, an extra termination pass, another project restart, prepared-transaction mutation, a second password replacement nor incident finalization.
 5. Repository rollback may begin only after §4's window is lawfully closed—therefore only after no valid seal remains without its first complete terminal receipt or other lawful consuming-negative/incident discharge—and then follows Amendment 2A §10.3 exactly: a separately reviewed revert of only the verified V-1B implementation merge’s first-parent diff on then-current `main`. No repository revert or rollback merge is permitted while the no-ref-update window is active. Never reset history or revert a later per-invocation head containing receipts. Preserve all freezes, this amendment, the eight evidence files, seals and receipts. A non-clean revert requires a reviewed rollback plan; no unrelated refactor or ad-hoc privilege rollback.
 6. Do not automatically disable an IPv4 add-on already relied on by other direct clients. Disabling the newly enabled project-wide add-on requires a separate Owner instruction after connection-impact and billing confirmation. It is not a means to restore an old password or erase a consumed look.
 
-A Render rollback that would replay the old command, restore an exposed secret, lose retained evidence or start an unauthorized runtime must not be invoked. The safe rollback state is a suspended service with the isolated inert command, §4's window retained for any undischarged seal, and the role/URI in the exact completed or fenced state required above. Rollback never restores research eligibility.
+A Render rollback that would replay the old command, restore an exposed secret, lose retained evidence or start an unauthorized runtime must not be invoked. The safe rollback state is a suspended service with the isolated inert command, §4's window retained for any undischarged seal, the URI retained or absent exactly as step 4 permits, and the role's exact observed NOLOGIN, LOGIN or unknown state truthfully preserved. Rollback never restores research eligibility.
 
 ## 9. Implementation, review and acceptance requirements
 
@@ -1107,12 +1103,12 @@ Retain every applicable V-1A/TLS/2A test. Within the existing test module add fo
 3. Exact §2.6 comment schemas and canonical hashes, Owner envelope identity, prior independent-review binding, fixed metadata source and all five exact deadline literals. Test monotonic boundaries one nanosecond before, exactly at and after expiration; the secret-free isolated resolver child, bounded/canonical address output, private one-byte acknowledgement, pidfd identity, two equal child-map reads, exact-interpreter/parent-candidate native subset proof, extra/racing/unreadable mapping rejection, hard kill plus synchronous reap, no leaked child/thread/future and no token/URI in its environment/arguments/pipe/output; stalled DNS/address/TCP/TLS/request-write/status/header/framing/body; read-idle slow drip; multi-page pagination and multi-endpoint checkpoint totals; no deadline reset; incomplete responses; every `3xx`/`Location` rejection with no Authorization retransmission; connection close; no retry/`Retry-After`/cache/background fallback; immediate failure on a changed/mixed ref with no movement reread; and exact stage routing. Retain duplicate/missing/edited approval rejection, no acceptance fallback on API refusal/private repository, and exact provenance/readiness/run/receipt and sealed CPU/artifact routing.
 4. The inert parent, probe, all nine exact manifest commands, recovery outer process and recovery child carry exact `-I -S -B -X pycache_prefix=/dev/null/atom-v1b-no-pyc`; normal/recovery use the same direct synthetic-parent runner and only the original CLI options. Render/parse actual complete synthetic seals including their final LF with the corrected longer recovery template; prove hexadecimal doubling and every wrapper/escaping/child-source/child-argv byte is counted. Test `command_bytes + 4096 == L` passes, one byte more fails, and missing/unverified limit fails before emission. Test long legal lineage/cohort fields without caps, no truncation/later-boundary substitution, unchanged successful seal bytes, the narrow new-seal capacity BLOCKED exception and consuming recovery failure. Do not assert a finite maximum seal size or reuse an earlier template measurement.
 5. Retained PAT scope proof, missing/extra permissions, secret-redaction behavior and normal-completion removal/revocation, not just rollback. URI/password changes preserve the exact target/TLS tuple and never restore the exposed password.
-6. Initial incident PENDING/null state permits containment/rotation but blocks activation; uncertain rotation cannot finalize; immutable reader OID; exact frozen `NOINHERIT`; temporary `NOLOGIN`; PostgreSQL 17, zero pre-auth delay/hostname lookup, fixed 600-second maximum and `preauth_activity_fully_visible` proof; the uninterrupted pre-rotation 1201-second drain; both exact administrator-authorized, reader-OID-selected termination transactions; full reader plus cluster-wide unattributed-client zeros before rotation; immediate retained emission of every server-clock bound; successful `\password`/`ALTER ROLE` status before COMMIT; the exact post-rotation 601-second stale-verifier drain with no third kill; reader plus cluster-wide unattributed-client zeros after that drain, after URI provisioning and in the same transaction immediately before `LOGIN`; post-`LOGIN` reader-only zeros; all mandated prepared-transaction zeros; NULL global `rolconfig` and zero per-database role-setting rows at every specified checkpoint; explicit direct/Shared/Dedicated/legacy pooler termination-or-containment proof; one password replacement while fenced; URI provisioning while fenced; and exact `LOGIN` restoration are mandatory. Test startup-packet and authentication timers separately and straddled; the untimed post-authentication/pre-`rolcanlogin` interval represented by a NULL `usesysid` before and after rotation; active, idle, idle-in-transaction, waiting and other-database target sessions; an authentication caching the old `LOGIN` state before the fence; an authentication acquiring the old verifier immediately before rotation; an authentication reaching it after rotation; another-role and cluster-wide unattributed client activity; post-selection PID reuse by another role and collateral-termination incident handling; false return followed by a proved-ended incarnation versus a remaining PID; an owned prepared transaction; a cancelled/mismatched/no-op `\password`; a pooler frontend/cache with no visible backend; a post-restoration reader backend as material; a surviving reader's global/per-database `ALTER ROLE ... SET`; incomplete stats/pre-auth/pooler visibility/termination/role authority; wrong version/maximum/OID; saved PID, narrowed state/database predicate, another role selected by the SQL predicate, `pg_cancel_backend`, prepared-transaction/pooler mutation, new grant/`SET ROLE`, setting reset/adoption, automatic retry and second password rotation rejection. PUBLIC TEMPORARY remains acknowledged; any incomplete path preserves the observed role state, removes the URI, leaves the incident OPEN and requires separate authority for a second fence; rollback keeps the base isolated/inert and preserves every seal/receipt/incident version.
+6. Initial incident PENDING/null state permits containment/rotation but blocks activation; immutable reader OID; frozen NOINHERIT and temporary NOLOGIN; exactly two administrator-authorized reader-OID-selected visible-backend termination transactions; visible reader/prepared/settings zeros; one-primary/zero-replica Supabase inventory before and after; separate action-time Owner confirmation of every project-wide outage impact; exact one-shot top-level Restart project submission with uncertain-outcome resolution; provider-confirmed termination of all ongoing workloads on the sole PostgreSQL instance; strictly newer pg_postmaster_start_time than the captured action lower bound with unchanged control-system identity; and exact rotation-row persistence are mandatory. Test the password transaction’s pre-xmin mismatch and post-xmin match, full rotation xid8, committed status, sub-half-range unambiguous xid distance, SCRAM/NOLOGIN/OID predicates, cancelled/mismatched/no-op password paths, and the fact that psql emits no required ALTER ROLE tag. Test pre-password external capture of the canonical rotation lower bound/xid, exact capture/retention/post-restart rehydration and canonical round trips for the OID, xid8, pre-restart time, control-system identifier and restart-action lower bound, and exact canonical LOGIN-completion output retention. A lost/uncertain password COMMIT must stop before restart with no reconnect or repeat; a lost/uncertain LOGIN acknowledgement must remove the URI and preserve unknown role state with no extra reconnect/readback. Test a hidden pre-pgstat_bestart old-verifier process, a surviving role self-password change before restart, changed/frozen xmin, unavailable commit status, old/equal postmaster time, changed cluster, ambiguous/failed/duplicated restart, the adjacent Fast database reboot/Restart database control, request success/RESTARTING/ACTIVE_HEALTHY without the complete conjunction, primary availability before replica restart, a discovered replica/secondary, missing outage approval and loss of post-restart reconnect evidence. Preserve both exact visible termination passes, PID-reuse/collateral-termination incident handling, prepared transactions, role settings, explicit Shared/Dedicated/legacy pooler frontend/cache/server-lease disposition, fenced URI provisioning, guarded LOGIN restoration, post-LOGIN reader zeros, PUBLIC TEMPORARY acknowledgement and fail-closed OPEN/URI-absent handling that retains NOLOGIN only when proved and otherwise preserves/reports the observed LOGIN or unknown role state. Test the exact `pg_sleep(1.0::double precision)` statements as at-least-one-second separations, not exact elapsed-time claims; test every post-LOGIN final-proof failure without a silent NOLOGIN/LOGIN reassertion. Test that pg_stat_activity NULL usesysid scans and fixed authentication-timeout sleeps are rejected as completeness proof; no saved PID, third termination pass, second password rotation/restart, pooler mutation, grant, setting reset, replica deletion or automatic retry is permitted.
 7. The no-ref-update-window contract requires an exact active no-bypass ruleset and `refs/heads/main == E` before either runtime secret is installed, at every runtime checkpoint and through terminal discharge of any seal. Test exact `W` schema/hash and manifest binding; repository-wide complete `CURRENT`/`HISTORICAL_CLOSED` approval classification; a lawfully closed immutable older approval followed by one fresh current window; zero and multiple current windows including overlaps across different `E` or `M`; the fixed read-only ruleset GETs under the checkpoint deadline; omitted versus returned empty `bypass_actors`; both ruleset/ref observations; final ruleset/ref check immediately before receipt construction; pending writers and the exclusive writer gate through post-delete readback; missing/implicit bypass; unavailable/incomplete history or version evidence; persistent default-branch/ruleset/ref mismatch observable by the process; transient rule edit/reversion producing changed history, delete/recreate producing fixed-ID loss, and the invariant that no accepted `main` update is possible while the exact unchanged no-bypass rule is active; rejected versus effective bypass attempts; mixed observations; zero ref-movement rereads; one-manifest/single-look scope; window retention through recovery; exact closure evidence; prohibition on receipt/unrelated merges while active; runtime stage-correct failure routing; and the distinct post-terminal incident branches: no valid seal means no consumed look and no retry beyond existing law plus a fresh reviewed window, while a valid seal remains consumed/nonreplaceable and its first complete receipt keeps the unchanged Amendment 2A disposition. A provably rejected request with no state change is audit-only and non-consuming; no descendant or “unrelated change” acceptance exists inside the window.
 
 A local test command is `python -m pytest -q tests/test_volatility_scorecard.py` in the already authorized development/test environment with synthetic credentials/evidence only. The repository’s actual required CI checks and their existing commands remain mandatory; no check workflow or dependency is altered to make them green. These tests do not constitute a live provenance probe or operational acceptance.
 
-Before an evidence-capable job is created, independent operational acceptance must have the successful credential-free isolated probe; authenticated exact-build/source/launcher and startup-injection proof; approved §2.6 record including `W`; authoritative vendor capacity; PAT scope evidence; finalized incident with exact backend/prepared-transaction termination-or-zero and pooler containment; securely configured exact URI; and any separately approved IPv4 action. Launching that closed command is not acceptance of a database connection or authority to read evidence. During its ordinary initial repository phase, that invocation proves every required authenticated read—including the fixed ruleset projection—within §2.6's exact deadlines using the restricted PAT; it then passes the exact URI/TLS and one-snapshot database-authority checks before evidence reading. No circular requirement demands a prior unlisted token/connection-test job; no trial protected evaluation is a connectivity test. Setup data may contain catalog/authority/session facts but no research-population counts or statistics.
+Before an evidence-capable job is created, independent operational acceptance must have the successful credential-free isolated probe; authenticated exact-build/source/launcher and startup-injection proof; approved §2.6 record including W; authoritative vendor capacity; PAT scope evidence; finalized incident with exact visible-backend termination, provider-confirmed full restart/new-generation/unchanged-rotation-row and one-primary/zero-replica proof, prepared/settings zeros and pooler containment; securely configured exact URI; and any separately approved IPv4 action. Launching that closed command is not acceptance of a database connection or authority to read evidence. During its ordinary initial repository phase, that invocation proves every required authenticated read—including the fixed ruleset projection—within §2.6's exact deadlines using the restricted PAT; it then passes the exact URI/TLS and one-snapshot database-authority checks before evidence reading. No circular requirement demands a prior unlisted token/connection-test job; no trial protected evaluation is a connectivity test. Setup data may contain catalog/authority/session facts but no research-population counts or statistics.
 
 No separate unlisted “preflight CLI” is assumed. The non-consuming probe is §2.4. The evidence-capable CLI is §5.2 and its frozen ordering is the authority/connectivity gate before evidence reads. Owner-controlled external checks use only the explicit control-plane paths in Appendix A. A runtime failure of those pre-read gates yields the existing BLOCKED negative without a consuming seal.
 
@@ -1138,8 +1134,8 @@ this one-file documentation amendment
 → independent build/launcher/startup-isolation acceptance and verified vendor capacity
 → action-time IPv4 confirmation when needed and retained scoped-PAT evidence
 → Owner opens and independent review accepts the exact no-ref-update window while both runtime secrets remain absent
-→ temporary NOLOGIN + fixed 1201-second bounded authentication drain + exact reader-OID-selected termination + full pre-rotation reader/unattributed/prepared zero verification
-→ one actual password rotation while fenced + exact 601-second stale-verifier drain + explicit pooler termination-or-containment proof + secure Save-only URI/PAT provisioning + exact LOGIN restoration + finalized incident
+→ temporary NOLOGIN + two exact reader-OID-selected visible-backend termination passes + reader/prepared/settings zero checks
+→ one transaction-proved password rotation while fenced + separately confirmed full-project restart + newer-generation/unchanged-rotation-row/zero-replica proof + pooler termination-or-containment + secure Save-only URI/PAT provisioning + exact LOGIN restoration + finalized incident
 → independent operational review and Owner approval metadata
 → exact isolated one-off invocation; unchanged readiness, exact E-held window and exact actual-seal capacity gate
 → original successful seal and unchanged protected calculations
@@ -1156,7 +1152,7 @@ Appendix A closes the operational action/input/output paths; Appendix B specifie
 
 ### A.1 Control-plane catalogue
 
-All network actions in this catalogue are Owner-controlled operations outside the probe and scorecard, except the exact read-only GitHub operations expressly assigned to the scorecard. They use the Owner’s existing authenticated vendor/connector session or already-held administrative capability. No new Render/Supabase control-plane API key, runtime environment alias or credential-bearing shell command is authorized. A connector must actually support the stated action; an unavailable action is not implemented by an imagined tool or a broader credential. The Owner may use the corresponding existing authenticated vendor interface. The exact HTTP method/path/body below define the operation independently of a client’s UI spelling. No credential value or Authorization header belongs in the retained action record.
+All network actions in this catalogue are Owner-controlled operations outside the probe and scorecard, except the exact read-only GitHub operations assigned to the scorecard. They use an existing authenticated vendor/connector session or already-held administrative capability. No new Render/Supabase control-plane API key, runtime environment alias or credential-bearing shell command is authorized. A connector must actually support the stated action; unavailable behavior is not implemented by an imagined tool or broader credential. The exact UI action or HTTP method/path/body stated below defines each operation. No credential value or Authorization header belongs in the retained action record.
 
 `SVC = srv-daa7thgae00c73a2lmn0`; the Render workspace is always `tea-d9g2b1m7r5hc73e7ufk0`. Only the following Render operations are authorized for this workflow:
 
@@ -1176,6 +1172,14 @@ All network actions in this catalogue are Owner-controlled operations outside th
 
 The allowed GitHub operational writes are the exact §2.6 review/approval comments, the already authorized documentation/implementation/receipt PR workflow outside an active window, and §4's temporary ruleset lifecycle, all performed through the Owner/reviewer’s own connection. For one window, the exact operations are: read the repository/default-ref and all matching rulesets; create one repository ruleset whose name, target, conditions, active enforcement, three rules and empty bypass list equal §4; read back that returned ruleset ID and ref; with the same Owner control plane, fully paginate `GET /repos/atomatom148-dotcom/ATOM/rulesets/{id}/history?per_page=100&page=1` and retrieve every returned version with `GET /repos/atomatom148-dotcom/ATOM/rulesets/{id}/history/{version_id}` at opening and after each job; and, only after §4's clean-closure predicates or its reviewed incident-closure predicates pass, delete that same ID and read back the restored matching-ruleset/ref state. The complete authenticated response bodies/envelopes and pagination are retained; the history/version operations require the same Owner-side Administration: write permission used for creation/deletion and are never made with the runtime PAT. No update, replace, bypass or second concurrent/overlapping ruleset operation is authorized. A later sequential lifecycle is permitted only after the earlier window's lawful closure/deletion, with a fresh `W`, independent review and Owner approval. If the earlier incident closure proved no valid seal/look, a fresh window also requires the express retry authorization in §4; an incident involving a valid consumed seal never permits a replacement look. At most one current active V-1B window may exist repository-wide, regardless of `E` or `M`. The exclusive ref/settings-writer gate begins before opening and ends only after deletion plus restored-state/`H = E` readback. Any API/UI representation must be independently shown to encode exactly §4; an unavailable or ambiguous mapping blocks the window. The read-only runtime PAT cannot perform a write. Runtime reads are the original authenticated repository/PR/commit/blob/receipt history, the fixed §2.6 PR #325 comment collection and every fixed `W.ruleset_id` endpoint needed for §2.6 current/historical classification at each checkpoint. No URL in a record becomes a runtime fetch target; each ruleset path is constructed only from a validated positive integer in an approval's `W`.
 
+The sole Supabase database-restart operation is §6.3's Owner-confirmed dashboard action for exact project `afyiydxbjgzaiswnbcyj`. Immediately before and after it, the Owner retains a fully loaded, unfiltered, error-free authenticated Infrastructure view proving exactly one Primary and zero Read Replicas/secondary PostgreSQL instances. Immediately before submission, the Owner also records the exact project, current health, all known direct/pooler/PostgREST/quote/Level-II/import and other affected clients, expected interruption, explicit action-time approval and the exact server-clock lower bound. The only submission is the top-level **Restart project** control plus its same-named confirmation exactly once at:
+
+~~~text
+https://supabase.com/dashboard/project/afyiydxbjgzaiswnbcyj/settings/general
+~~~
+
+**Fast database reboot**, **Restart database**, a service-only restart or an unavailable/disabled full-project control is rejected. An uncertain outcome is resolved by reading the same project state/event and, if needed, obtaining Supabase support confirmation tied to the exact project/action/time window; it is never resubmitted automatically. Request success, HTTP `200 {}`, toast, redirect, `RESTARTING`, transient disconnection or later `ACTIVE_HEALTHY` alone is not acceptance. The complete conjunction in §6.3 must prove the exact action completed without reported failure, the exact project returned healthy, the before/after sole-instance inventory, a postmaster start strictly later than the action lower bound on the same system identifier, and current documented full-project termination/restart semantics. No PID enumeration is claimed. No management endpoint, CLI, pause, restore, resize, failover, replica change or second restart is inferred. This project-wide action is credential-incident containment, not evidence access or research execution.
+
 The allowed Supabase IPv4 operation is through the existing Owner-authenticated project Add-ons interface, or the equivalent verified management endpoint:
 
 ```text
@@ -1186,7 +1190,7 @@ body = {"addon_variant":"ipv4_default","addon_type":"ipv4"}
 
 The PATCH is permitted only after §7’s separately recorded affirmative action-time cost/impact confirmation and only when the add-on is absent. An already-enabled add-on requires no purchase. No `SUPABASE_ACCESS_TOKEN` or other administrative variable is created in Render, and no management call is made by the scorecard. Existing direct DNS resolution/TLS verification uses the original hostname, never an IP substitution. The corresponding HIST8 project action is explicitly not authorized. Disabling IPv4 is not in this sequence without §8’s separate Owner instruction.
 
-The only additional database mutations in this correction are §6.3's exact temporary `ALTER ROLE atom_e1_scorecard_reader NOLOGIN`, two Owner-run `pg_terminate_backend(pid, 10000::bigint)` passes, the already-authorized one password replacement while fenced, and exact `ALTER ROLE atom_e1_scorecard_reader LOGIN` restoration. Each termination statement selects only the exact reader-role OID and `backend_type = 'client backend'` inside the same fresh SQL statement and uses only the preflight-proved existing administrator/`pg_signal_backend` capability; no membership or `SET ROLE` path is added. The new credential remains unprovisioned through both passes, rotation, the post-rotation drain and pooler-containment observation, and the role remains `NOLOGIN` through the later authorized URI provisioning. The associated waits/verification are the fixed uninterrupted 1201-second two-timeout pre-rotation drain; exact 601-second post-rotation stale-verifier drain; proven visibility of pre-authentication rows; full reader and conservative cluster-wide unattributed-client guards both before rotation and again before provisioning/atomically before `LOGIN`; post-`LOGIN` reader-only guards; exact one-second confirmation intervals; role/process/prepared-transaction queries; NULL/zero global/database role-setting checks; and read-only pooler-plane termination-or-containment evidence in §6.3. A setting row is never reset under this amendment. No scorecard/runtime administrator, stored PID, unattributed process, other role selected by the SQL predicate, new privilege, role-attribute change other than that exact temporary `NOLOGIN`/`LOGIN` fence, cancel, generic session cleanup or loop is authorized.
+The only additional PostgreSQL mutations in this correction are §6.3's temporary ALTER ROLE atom_e1_scorecard_reader NOLOGIN, two Owner-run pg_terminate_backend(pid, 10000::bigint) passes, the already-authorized one password replacement while fenced, and exact ALTER ROLE atom_e1_scorecard_reader LOGIN restoration. Each termination statement selects only the immutable reader-role OID and client-backend type inside the same fresh statement and uses only the preflight-proved administrator/pg_signal_backend capability; no membership or SET ROLE path is added. The reader URI remains absent and NOLOGIN remains true through both passes, rotation, the one separately confirmed full-project restart, post-restart rotation-row/generation/zero-replica proof and pooler disposition. The exact `pg_sleep(1.0::double precision)` at-least-one-second separations, role/process/prepared/settings queries, password-transaction xmin/xid8 proof, provider restart evidence, postmaster/control-system readback and pooler evidence are verification, not further database mutations. A setting row is never reset. No scorecard/runtime administrator, saved PID, unattributed/other-role signal, new privilege, extra role-attribute change, generic cleanup, pooler mutation, replica change, second password rotation/restart or loop is authorized.
 
 ### A.2 Sequence ledger: inputs, authority, environment, output, failure and lifetime
 
@@ -1203,7 +1207,7 @@ The entries below cover each new prerequisite and its place in the existing prog
 | **A6 — Provenance/startup approval preparation**: build `P` and the §2.4 startup baseline from observation and authenticated `B` | Complete successful probe, independent build/source review, original canonical hashes and current provider same-artifact/system-layer evidence | Existing private acceptance packet; public mirror contains only defined non-secret fields/digests | Approved artifact/startup candidate; no process can approve its own hashes and no control-plane `/etc` read is fabricated. No dispatch baseline. Wrong/absent evidence → BLOCKED, not a new runtime baseline. |
 | **A7 — Vendor capacity and IPv4 cost gates**: obtain authoritative `L`; A.1 Add-ons action only after §7 confirmation | Current authoritative Render limit evidence, exact positive byte `L`; separate Supabase project-specific quote/impact approval | Owner/vendor control plane only; no runtime API credential or website fetch | Retained evidence and `C`; absent/ambiguous `L` blocks evidence-capable activation. Cost not confirmed → no purchase. Neither supplies an evaluation boundary. |
 | **A8 — Freeze main and scope PAT evidence**: create/read back §4's exact temporary no-ref-update ruleset while both runtime secrets remain absent; inspect §3 fine-grained-token scope without installing it | Exact `E`, `M`, zero pending writers, pre-window ruleset state, existing Owner GitHub control plane, independent reviewer, scoped token metadata | GitHub control plane/private packet only; parent remains suspended/inert and URI/PAT absent from Render | Active no-bypass window record with `main == E`, interval-evidence capability and independent acceptance; non-secret PAT-scope record. Any ambiguity/bypass/pending writer blocks installation and invocation. |
-| **A9 — Fence, terminate, rotate, contain, provision and finalize**: exact §6.3 private psql `NOLOGIN`, pre-rotation 1201-second bounded drain, two administrator-authorized reader-OID-selected termination transactions, full pre-rotation reader/unattributed/prepared/role-setting checks, one verified `\password`, post-rotation 601-second stale-verifier drain, repeated reader/unattributed guards, read-only pooler containment proof, Save-only URI/PAT, atomic final guard/`LOGIN`, reader-only final checks and incident finalization | Accepted §4 window; existing Owner accounts/admin or `pg_signal_backend` capability; PENDING incident; fresh password; exact CA/target; immutable reader OID; verified PostgreSQL 17/600-second maximum, zero pre-auth delay/hostname lookup, `preauth_activity_fully_visible` and authority | Reader URI absent through termination, rotation, post-rotation drain and pooler proof; it is installed only at the later authorized fenced provisioning step while `NOLOGIN`, parent suspension/inertness and no-job state persist. PAT is installed only inside the accepted window; admin/new DB password uses only secure prompts/control plane. | Every target PostgreSQL backend ended, every prepared count zero, the conservative unattributed-client guard is zero before rotation and before the atomic `LOGIN` transition, pooler frontends are terminated or explicitly contained, and one password replacement is confirmed. Failure removes the URI, preserves the exactly observed role state, leaves incident OPEN/service suspended and authorizes no silent second fence. Never repeat/test old password. |
+| **A9 — Fence, terminate, rotate, restart, contain, provision and finalize**: exact §6.3 private psql NOLOGIN, two reader-OID-selected visible termination transactions, reader/prepared/settings checks, one xmin/xid8-proved password change, action-time-confirmed top-level Supabase Restart project, new-generation/unchanged-rotation-row/zero-replica proof, pooler disposition, Save-only URI/PAT, guarded LOGIN, final checks and incident finalization | Accepted §4 window; existing Owner admin/pg_signal_backend capability; PENDING incident; fresh password; exact CA/target/OID; authid SELECT; retained canonical OID/xid8/pre-restart time/control-system/restart-lower-bound tuple; authenticated one-primary/zero-replica inventory; explicit Owner outage approval | Reader URI absent and NOLOGIN active through termination, rotation, full restart, row/generation proof and pooler disposition; URI/PAT installed only after those proofs while parent stays suspended/inert and no job exists | The complete §6.3 conjunction proves the full-project action completed and every old primary backend ended; persisted rotation xmin proves no surviving session replaced the new password before restart, and pooler frontends are terminated or explicitly contained. Any missing/mismatched/uncertain proof leaves the incident OPEN, removes/keeps the URI absent, blocks activation and authorizes no retry, second rotation or restart; retain NOLOGIN only when proved, otherwise preserve/report the observed LOGIN or unknown role state. |
 | **A10 — Publish operational approval**: exact §2.6 reviewer comment then Owner comment | Completed `A`, canonical digest, actual independent review ID/author and source `E` | Existing authenticated GitHub PR #325 metadata; runtime later uses only read-only PAT | Unique immutable Owner approval/review binding; comment IDs from actual responses. No main commit/rebuild required, no new repository file. Missing/edited/duplicate → failure route in §2.3. |
 | **A11 — Normal manifest launch**: one exact isolated §5.2 command in Create job | Actual Owner invocation authorization, window-bound `M`, `H = E`, same approved `B`, accepted `A`, exact startup/window proof | One new job’s native snapshot; URI/PAT only exact Render variables; no startup hook or parent daemon | Startup guard, arguments and authenticated history/provenance/byte/token reads within exact §2.6 deadlines first. Deferred no-first-receipt → exact WAIT/no DB. Other pre-read failures → existing BLOCKED. No retry/fallback or ref-movement reread. |
 | **A12 — Connect and count-only scan**: existing normal CLI, no extra preflight command | Exact URI/CA; initial authority; original one-snapshot population/lineage rules | One read-only REPEATABLE READ connection. Its first DB operation obtains original `scan_started_at`; full authority proof precedes evidence-table reads | Earliest READY candidate or exact HOLD. No protected metrics/bootstraps. Normal after-read defects → PRE-CELL INVALID. No separate connectivity snapshot or latest-state substitute. |
@@ -1212,7 +1216,7 @@ The entries below cover each new prerequisite and its place in the existing prog
 | **A15 — Crash/recovery**: corrected isolated §5.2 recovery template, no new mode | Original canonical seal/LF and identity; same `B`/source/startup state; same active window, exact `H = E` and prior-look proof | Isolated outer inline hex → private `/tmp/atom-v1b-seals/<hash>.json` → isolated child/original recovery option; no network seal retrieval | Validate input before resource access. Window/ref or prerequisite mismatch → consuming INVALID/incident route. Invalid file/prelude does not erase pending seal. No replacement look or automatic POST/GitHub retry. |
 | **A16 — Stop, audit, cleanly close or incident-hold the window, publish or rollback**: resolve any Create result; cancel/status + suspend/readback where a job exists; §4 control/history audit and closure; immutable receipt PR; §8 reversal | Actual job IDs/statuses or proof no Create was accepted, first complete receipts, retained seals, complete ruleset history/version and ref/default-branch brackets, Owner closure/incident/revert decision | Existing logs/private packet/GitHub receipt paths; no recreated evidence | Base suspended/inert; any job terminal. Keep `main == E` and ruleset active while recovery/outcome is pending. §4's exact zero-job, terminal-no-seal or terminal-receipt branch plus a clean audit permits exact-rule deletion under the writer gate and only then publication/unrelated work. For a breach first found post-terminal: with no valid seal, no look was consumed and any later window remains subject to existing law; with a valid seal, the first receipt keeps its unchanged publication duty, the look remains consumed and no replacement is permitted. Remove/revoke PAT only when allowed; retain rotated URI/records/history. Reviewed Owner-merged revert only. |
 
-The mutation authority in A8/A9 is credential administration, not evidence mutation. A12/A14 alone are the official scorecard snapshot/evaluation. A2/A6/A7/A9/A10 are operational evidence, not new study receipts or a READY publication. A0/A1 do not execute any later step.
+The mutations in A8/A9 are the expressly bounded repository-control, credential-administration, session-containment and one-project-restart operations; none is evidence mutation. A12/A14 alone are the official scorecard snapshot/evaluation. A2/A6/A7/A9/A10 are operational evidence, not new study receipts or a READY publication. A0/A1 do not execute any later step.
 
 ## Appendix B. Adversarial walk-through and executable document-model audit
 
@@ -1257,18 +1261,22 @@ The following cases were walked through against the normative clauses; implement
 | Candidate seal is changed after its command size passes | Recalculate before emission; only measured byte-identical `S` may become consuming. No changed seal is emitted under old arithmetic. |
 | Complete sealed recovery no longer fits a verified current vendor limit | Original identity is already consumed. §5.3/Amendment 2A consuming-negative/incident rules apply; no new BLOCKED look or truncated payload. |
 | Incident initial record lacks a completed timestamp because rotation has not occurred | Correct initial PENDING/null state. It authorizes the scoped rotation step but blocks activation; §6.1. |
-| Password-change request was sent but its outcome is unknown | Remain PENDING; use actual secure confirmation, never the planned time or an automatic second rotation; §§6.1/6.3. |
+| Password COMMIT acknowledgement/output is lost after the canonical xid/lower bound was retained | Remain PENDING/OPEN and stop before project restart. The retained xid is incident evidence, not authority for an unlisted reconnect/status probe, a planned completion time or a repeated password action; §§6.1/6.3. |
 | Rotation succeeds but Render update or private finalization is missing | No activation or approval payload; §§6.1/2.6. Newly rotated password remains in force; old value never restored. |
-| Operator treats password rotation as terminating existing authenticated sessions | Not established. §6.1 keeps surviving-session exposure separate from new-authentication invalidation and requires investigation/containment evidence. |
-| Active, idle, idle-in-transaction, waiting or other-database reader backends exist at rotation | Every reader-OID client backend is included regardless of state/database. The new URI remains absent through the authentication drain, both termination passes and the full reader/unattributed zero guards; §§6.1/6.3. |
-| An old-password connection stalls through startup-packet handling and then authentication | The fixed uninterrupted 1201-second two-timeout drain outlasts both PostgreSQL 17 maxima before the second fresh pass. A 601-second drain is rejected as insufficient; any unreconciled backend or post-restoration backend is material. |
-| An authentication acquired the old verifier immediately before the password COMMIT and finishes later | `NOLOGIN` remains active and the exact 601-second post-rotation authentication-phase drain expires that verifier exchange before URI provisioning or `LOGIN`; no third termination pass or shortened wait. |
-| `pre_auth_delay` is nonzero, `log_hostname` is on, or either changes during the fence | The 1201-second proof is unavailable. No setting mutation is authorized; preserve/obtain protective state and block for documentation-first resolution. |
+| The restart disconnects psql and a retained OID/xid8/time/system value is missing, reformatted, recaptured or inserted with an unresolved token | Post-restart proof does not run. All five exact canonical values must be restored from the retained source tuple and pass their database round trips plus the immediate identity guard; §6.3. |
+| `pg_sleep(1.0)` returns later than one second | This is conforming; the exact statement guarantees an at-least-one-second separation, not exact elapsed time. The next exact clear-snapshot/count checkpoint still runs once; §6.3. |
+| Operator selects Fast database reboot/Restart database, or accepts HTTP 200, a toast, `RESTARTING` or `ACTIVE_HEALTHY` alone | No accepted full-project barrier. Require the top-level same-named Restart project control and the complete exact-action/sole-instance/completion/current-doc/same-cluster/postmaster-after-action-bound conjunction; §6.3. |
+| Operator treats password rotation or visible pg_stat_activity zeros as terminating every existing authentication/backend | Not established. Stock PostgreSQL 17 can leave a pre-pgstat_bestart child invisible. Finalization requires the completed sole-instance project restart, newer postmaster generation, unchanged committed rotation row and separate pooler proof; §§6.1/6.3. |
+| Active, idle, idle-in-transaction, waiting or other-database reader backends exist at the fence | Both exact OID-selected passes include every visible reader client backend regardless of state/database. The later provider-confirmed full restart terminates the complete old primary generation, including processes not visible to the activity view; §§6.1/6.3. |
+| An old-password connection stalls before pgstat_bestart and never appears in pg_stat_activity | Fixed sleeps/NULL-role scans are not completeness proof. NOLOGIN and URI absence remain, the one password rotation is proven, and the completed sole-instance project restart must terminate the old postmaster generation before URI provisioning/LOGIN; §6.3. |
+| An authentication acquired the old verifier immediately before password COMMIT and finishes later | It is killed by the confirmed full restart before URI provisioning/LOGIN. If a surviving session changed the password after the Owner’s COMMIT, the post-restart xmin/full-xid proof fails and the incident remains OPEN/NOLOGIN; §6.3. |
+| Supabase shows a Read Replica, secondary instance or ambiguous inventory | A primary may become available before replicas restart. Do not delete a replica or accept the primary timestamp alone; keep NOLOGIN/URI absence and require a documentation-first all-instance drain design; §6.3. |
 | A materialized reader PID exits and is reused by another role before the signal | PostgreSQL has no stock `(pid, backend_start)` signaling primitive. The exact fresh OID-selected statement minimizes but cannot eliminate that residual under the existing administrator/`pg_signal_backend` capability; any observed or suspected collateral termination is a material incident and stops V-1B; §6.3. |
 | The checked backend exits and its PID is recycled in PostgreSQL's residual interval between the internal role check and OS signal | Do not claim identity-bound signaling. This narrow source-documented residual is accepted only for the two exact passes; any observed/suspected collateral termination is a material incident and stops V-1B. No broader identity or extra pass is authorized. |
-| `pg_terminate_backend` returns false, activity is not fully visible, a target remains, or the final post-provisioning count is nonzero | A false race is acceptable only with all later fresh zero observations. Otherwise remove/keep absent the URI, keep the incident OPEN and parent suspended; no second rotation or broader kill. |
+| pg_terminate_backend returns false, a visible target remains, or a post-restart reader count is nonzero | A false race is acceptable only when the second fixed pass, provider-complete restart and every later pre-LOGIN check prove termination. Otherwise keep/remove the URI, retain proved NOLOGIN/OPEN state and stop; if a failure is discovered after LOGIN restoration, use §6.3's exact observed-state rule. No broader kill, second rotation or restart. |
+| LOGIN COMMIT acknowledgement or its canonical completion output is lost | Remove/prove absence of the URI, leave the incident OPEN, record role state unknown and obtain documentation-first remediation. This amendment authorizes no extra reconnect/readback or silent NOLOGIN/LOGIN reassertion; §6.3. |
 | A reader-owned prepared transaction exists after its backend ends | It is neither terminated nor contained by a zero activity count. Keep/establish the authorized fence, leave the URI absent and require a separate disposition; no prepared-transaction mutation is authorized. |
-| `\password` is cancelled, mismatched or errors, followed by a successful no-op COMMIT | Not a rotation. COMMIT is forbidden without the retained successful `\password`/`ALTER ROLE` tag; rollback, remain PENDING and do not repeat under this grant. |
+| \password is cancelled, mismatched or errors, followed by a successful no-op COMMIT | Not a rotation. The same-transaction pre-xmin mismatch and post-xmin/current-xid match must both be exactly true before COMMIT. No ALTER ROLE command tag is expected from PostgreSQL 17 psql; false/missing proof requires rollback and no repeat; §6.3. |
 | A Shared/Dedicated/legacy pooler frontend authenticated with the old password is absent from `pg_stat_activity` | It is not called terminated. Finalization requires the exact plane inventory and vendor-grounded proof that it has no live server lease and cannot regain a backend after rotation; otherwise remain fenced and require a separate drain/purge decision. |
 | A global `rolconfig` value or `pg_db_role_setting` row exists for the reader before restoration | Keep `NOLOGIN`, URI absent and incident OPEN. Do not reset/adopt it under this amendment; it is a material persisted-state finding requiring documentation-first disposition. |
 | Analyst says NOINHERIT/no memberships means no TEMPORARY privilege | Incorrect; §6.1 preserves effective PUBLIC TEMPORARY and requires temporary-object/storage/connection/resource investigation. |
@@ -1277,14 +1285,14 @@ The following cases were walked through against the normative clauses; implement
 | Creation request times out after Render may have accepted it | Resolve the actual job by control-plane listing/retrieval before any new POST; no autonomous duplicate invocation. |
 | First complete result is unfavorable or an INVALID receipt, including when later control evidence creates a §4 incident | Retain and submit it unchanged under original Amendment 2A receipt/one-look/nonselective-continuation law. No favorable-result replacement or suppression is authorized; later control evidence is retained separately and never selected by result content. |
 | Normal-success path ends with the dedicated PAT still installed | Incomplete cleanup. §5.4 requires removal plus GitHub revocation once all authorized invocations are closed and no valid recovery remains pending. |
-| Rollback proposes restoring old E-1 command, exposed password or obsolete trust setting | Forbidden even on a suspended base during V-1B rollback; §8 retains the inert command, rotated URI and pinned TLS. |
+| Rollback proposes restoring old E-1 command, exposed password or obsolete trust setting | Forbidden even on a suspended base during V-1B rollback; §8 retains the inert command and pinned TLS, and retains the rotated URI only after every listed proof/finalization passes—otherwise the URI is absent and the actual role state is preserved. |
 | Rollback would reset current main or erase an earlier receipt/evidence artifact | Forbidden; §8 permits only the reviewed implementation first-parent diff revert on then-current main. |
 | HIST8’s similar IPv4 issue is added while fixing V-1B | Outside PR #325. §7 retains `pjbjpgnmniwcajqkuhge` exclusion and requires its own follow-on amendment. |
 | Earlier PR-head checks/review are green but the replacement has not been reviewed | No merge. §9 requires fresh exact-final-head independent review, green actual checks, zero material findings and Owner-only merge. |
 
 ### B.2 What was actually tested during document authoring
 
-The prior 125-assertion/27-transport-fixture authoring run applies only to the superseded input text at `caeae8c1be63a54c5926b56c8aa44eb04be247ff`. It did not test this correction's isolated runner, longer recovery command, resolver/deadline behavior, no-ref-update window or authentication-drain/termination lifecycle and is not evidence for the corrected final head. This correction claims no replacement assertion count or successful execution.
+The prior 125-assertion/27-transport-fixture authoring run applies only to the superseded input text at `caeae8c1be63a54c5926b56c8aa44eb04be247ff`. It did not test this correction's isolated runner, longer recovery command, resolver/deadline behavior, no-ref-update window or restart/rotation/session-containment lifecycle and is not evidence for the corrected final head. This correction claims no replacement assertion count or successful execution.
 
 Before final-head approval, the document model and later implementation tests must add every case in §9 and B.1, render and parse the exact corrected commands, and record the actual command/test count and results without editing a result to fit an earlier claim. Synthetic fixtures remain non-production and do not constitute a Render job, GitHub/PAT acceptance, PostgreSQL termination, real incident finalization, protected statistic, independent review or operational acceptance.
 
@@ -1316,7 +1324,14 @@ Before final-head approval, the document model and later implementation tests mu
 | Startup permits `PYTHONPATH`, site/user customization, shell functions or native preload hooks to execute before runtime-secret access | Exact-head P1 | §§2.4–2.5, 5.2–5.4, 8, 9; A.1–A.2 | Every Python path uses `-I -S -B` and the direct no-site bootstrap; prelaunch evidence excludes shell/native injection, system preload and launcher drift before either secret-bearing process can start. |
 | GitHub transport has no exact connect/read/request/pagination deadline | Exact-head P2 | §§2.3, 2.6; §9 test 3 | Five immutable monotonic deadlines cover connect, read-idle, request total, pagination total and checkpoint total; the bounded resolver/nonblocking transport forbid reset/retry/fallback and route failure by the existing evidence/seal stage. |
 | Unrelated `main` movement can make a sealed execution fail final `E == H` | Exact-head P1 | §§2.6, 4; §9 test 7 | Owner-enforced no-ref-update window holds exact `main == E` from before either runtime secret is installed through terminal discharge. Runtime checkpoints detect persistent state loss; the mandatory post-terminal history audit detects transient edit/revert/delete/recreate. Authorized unrelated merges are deferred. A post-terminal breach with no valid seal consumed no look and any later window remains governed by existing eligibility/incident law; a breach after a valid seal leaves the first receipt's disposition unchanged, holds the consumed look and never permits a replacement identity. Lawfully closed sequential windows do not deadlock on their retained immutable approvals. |
-| Password rotation leaves pre-rotation authenticated reader backends alive | Exact-head P1 | §§6.1–6.4; §9 test 6; A.1–A.2 | Temporary `NOLOGIN`, immutable OID/pre-timer/pre-auth-visibility proof, 1201-second pre-rotation drain and two administrator-authorized reader-OID-selected termination transactions precede rotation. Exact reader-process, prepared/settings and cluster-wide unattributed-client guards run before rotation, after the 601-second stale-auth drain, after URI provisioning and atomically before `LOGIN`; reader-only guards continue afterward. Pooler frontends must be terminated or explicitly proven unable to regain a backend. No new `SET ROLE` grant, discretionary containment or silent repair permits finalization. |
+| Password rotation leaves pre-rotation authenticated reader backends alive | Exact-head P1 | §§6.1–6.4; §9 test 6; A.1–A.2 | Temporary NOLOGIN, immutable OID, two exact reader-OID-selected visible termination passes and reader/prepared/settings zeros precede rotation. Because stock PostgreSQL 17 can hide a pre-pgstat_bestart child, finalization instead roots completeness in a separately confirmed full restart of the exact sole-instance Supabase project, a newer postmaster generation on the same control system, exact persistence of the committed rotation row and separate pooler disposition. Any replica, restart/row ambiguity or stale lease keeps the URI absent and blocks activation; NOLOGIN is retained only when exact readback proves it, otherwise the observed/unknown role state is preserved. |
+| pg_stat_activity NULL-role scans were claimed to prove hidden startup-process absence | Superseding exact-head P1 found after c25a4517 | §§6.1, 6.3; §9 test 6; A.1–A.2; B.1 | PostgreSQL 17 source shows pgstat_bestart publishes activity only after authentication and LOGIN processing. All timeout/NULL-use completeness claims are removed. Provider-confirmed full sole-instance restart plus newer generation is the termination root; activity zeros are corroboration only. |
+| psql password was required to print an ALTER ROLE command tag it does not emit | Superseding exact-head P2 found after c25a4517 | §6.3; §9 test 6; B.1 | The nonexistent tag is removed. A fresh transaction requires a pre-change xmin mismatch and post-password current-xid/SCRAM/NOLOGIN/OID match, acknowledged COMMIT, full xid8 committed status and post-restart unchanged-row proof without exposing the verifier. |
+| Post-restart SQL referenced process-local psql variables without freezing their cross-session transport | Prepublication P1 caught in source audit | §§1.1, 6.3; §9 test 6; A.2 A9 | OID, xid8, pre-restart postmaster time, control-system ID and restart-action lower bound are captured as canonical non-secret response bytes; the one reconnect has an exact five-substitution template, database round trips and immediate OID/name guard with no rebaseline. |
+| Rotation xid/lower bound and LOGIN completion bound could remain process-local, while lost COMMIT acknowledgements implied unlisted reconnect/readback continuations | Prepublication P1 caught in source audit | §§6.1, 6.3; §9 test 6; B.1 | The canonical rotation xid/lower bound is externally retained before `\password`; successful completion and LOGIN bounds are explicitly printed/retained. Lost/uncertain password COMMIT stops before restart, and lost/uncertain LOGIN removes the URI and preserves unknown role state; neither branch invents another reconnect, probe or mutation. |
+| Fixed `pg_sleep(1.0)` calls were described as exactly one elapsed second and reader-zero observations were unnamed | Prepublication P2 caught in source audit | §6.3; §9 test 6; A.1; B.1 | The exact statement remains frozen, but its documented guarantee is at least one second and possibly longer. Every reader-only checkpoint now has exact clear-snapshot/count SQL and autocommit semantics. |
+| Supabase request success or project health could be mistaken for a completed all-database restart | Prepublication P2 caught in provider audit | §§6.1, 6.3; §9 test 6; A.1–A.2; B.1 | Only the top-level Restart project control is allowed; adjacent database-only controls are rejected. Acceptance requires the complete exact-action/sole-instance/provider-status/current-doc/same-cluster/postmaster-after-server-clock-bound conjunction or exact-project support confirmation. |
+| Incident inspection ordered the PostgreSQL `xid` field with an unavailable comparison operator | Prepublication P2 caught in final source audit | §6.4 | Preserve the selected incident fields and deterministic timestamp ordering, but cast the canonical decimal `xid` text to `bigint` for the tie-breaker so the PostgreSQL 17 query is executable. |
 
 ### C.2 Cross-contract contradiction scan
 
@@ -1328,19 +1343,19 @@ Before final-head approval, the document model and later implementation tests mu
 | Amendment 2A §§5–10 | Nine manifests, earliest boundary from original `T_amend`, six minima, initial snapshot timestamp, same-process seal/results, prior-look guards, sealed recovery and byte/source binding | Preserved. §4 temporarily holds the authenticated default ref exactly at `E` across one manifest's new-seal/recovery lifecycle; no descendant, current head or ref event moves a boundary, identity, result or look. |
 | `AGENTS.md` and merged TLS §5 | Governance domain, SIM-5 pointer and narrow parallel V-1B exception, distinct documentation/implementation/operations, Owner merge | No pointer, role-governance or SIM/HIST8 scope change. Codex implementation remains separate; fresh exact-head review/Owner merge mandatory. |
 | Render one-off/CPython startup behavior | Build/configuration snapshot, command shell/loader/Python startup, no inherited parent local disk, `startCommand` override, parent suspension not terminating a job | Secret-free launcher is bound; configurable shell/native hooks are absent before secret installation; probe/parent/normal/recovery use exact isolated commands; recovery staging and child are both covered. |
-| PostgreSQL 17/Supabase connection planes | PUBLIC TEMPORARY, TLS/SCRAM/password rotation, both startup/authentication timers and pre-timer paths, stale-verifier lifetime, activity/prepared visibility, reader-OID-selected administrative signaling, direct and pooler frontend/server leases | No PUBLIC TEMPORARY/RLS change. Exact `NOLOGIN`/`LOGIN`, zero pre-auth delay/hostname lookup, two reader-OID-selected termination passes, pre/post-rotation unattributed-client guards, post-rotation stale-auth drain, backend/prepared zeros and explicit pooler termination-or-containment proof precede finalization; no new role grant or invented pooler mutation endpoint. |
+| PostgreSQL 17/Supabase connection planes | PUBLIC TEMPORARY, TLS/SCRAM/password rotation, pgstat publication timing, role self-password authority, xid/xmin semantics, reader-OID signaling, provider restart semantics, replicas and pooler frontends/leases | No PUBLIC TEMPORARY/RLS change. Visible termination is not completeness proof. Exact NOLOGIN/LOGIN, transaction-bound SCRAM row proof, full sole-instance restart/new generation, unchanged committed rotation row, prepared/settings zeros and explicit pooler disposition precede finalization; no new grant, replica mutation or invented pooler/restart endpoint. |
 | Secret lifecycle / sources | One runtime PAT, one existing reader URI, no probe secrets, retained scope/startup/session evidence, normal closure plus rollback | Exact sources/absence/reinstallation/cleanup paths specified. New URI stays absent until termination proof; private evidence never becomes runtime input. |
 | Complete command/data dependency scan | All new operands have fixed literals or exact authenticated response/record sources; command bytes use the corrected runner; head facts remain exact under one accepted window | No unresolved timeout, startup path, descendant baseline, termination target, seal limit, approval file, build-ID environment variable, alternate credential or arbitrary fetch URL remains in the authored path. |
 
 Internal scan conclusion: zero newly introduced internal contract contradictions were found in the defined paths and modeled cases after the corrections recorded above. This is an author’s bounded adversarial check, not a claim of mathematical completeness, a substitute for independent review, or a statement that operational blockers are zero.
 
-Operational acceptance is not asserted. In particular, no authoritative numeric Render `startCommand` capacity was established by the official references inspected for this document. `L` must be obtained through §5.3’s explicit vendor evidence path; until then evidence-capable activation is BLOCKED. The same-build isolated probe, effective startup-injection/system-preload absence, exact launcher, actual one-off identity/inheritance, secure administrative rotation, authentication drain/termination/zero proof, real private incident finalization, token scope/deadlined reads, direct-host TLS reachability and action-time IPv4 cost confirmation also require their actual prescribed acceptance evidence. Those are retained fail-closed gates, not facts inferred from document text, synthetic tests or green CI. If vendor behavior cannot satisfy one frozen mechanism, redesign remains documentation-first; this document does not claim it has already succeeded.
+Operational acceptance is not asserted. In particular, no authoritative numeric Render startCommand capacity was established by the official references inspected for this document. L must be obtained through §5.3; until then evidence-capable activation is BLOCKED. The same-build isolated probe, effective startup-injection/system-preload absence, exact launcher, actual one-off identity/inheritance, secure transaction-proved password rotation, authenticated one-primary/zero-replica inventory, separately approved and provider-confirmed project restart, newer-generation/unchanged-rotation-row proof, real private incident finalization, pooler disposition, token scope/deadlined reads, direct-host TLS reachability and action-time IPv4 cost confirmation also require actual acceptance evidence. Those are fail-closed gates, not facts inferred from document text, synthetic tests or green CI. If vendor behavior cannot satisfy one frozen mechanism, redesign remains documentation-first.
 
 ---
 
 ## Source record and verification boundary
 
-Authenticated read-only GitHub inspection on 2026-09-07 confirmed PR #325 open and unmerged, with base `f0035147a646fc7d4c7002c8a2706f4987f6a10c`, exact input head `caeae8c1be63a54c5926b56c8aa44eb04be247ff`, and exactly one changed path: `docs/v-1a-amendment-3-v1b-operational-prerequisites.md`, Git blob `da088882e5398cb4834c839aebde1101e1c00638`. This narrow correction was authored against those exact input bytes. It changes only the four exact-head findings identified in Appendix C and their necessary command, test, lifecycle and appendix consumers. The corrected final head/blob/hash do not exist until Codex applies this text; none is predicted here, and the reviewed input head cannot satisfy the new final-head gate.
+Authenticated read-only GitHub inspection on 2026-09-07 confirmed PR #325 open and unmerged, with base f0035147a646fc7d4c7002c8a2706f4987f6a10c, exact superseded input head c25a4517fc46668630476f6748ba80263d334db5, and exactly one changed path: docs/v-1a-amendment-3-v1b-operational-prerequisites.md, Git blob 2894fe91823e199a8fbbb5759924ffa3b8a4abc4. That head had incorporated the four originally requested exact-head corrections but is superseded because independent review found the additional PostgreSQL activity-publication P1 and psql command-tag P2 recorded in Appendix C. This replacement also closes the reconnect-variable, in-flight psql-capture/continuation, sleep-semantics and provider-completion precision findings caught before publication; all changes and necessary cross-references remain within the same Amendment 3 operational surface. Its final head/blob/hash do not exist until Codex applies it, and no earlier review satisfies the new gate.
 
 The inspected current main remained `f0035147a646fc7d4c7002c8a2706f4987f6a10c`; GitHub reported it unprotected. V-1A source blob was `4bafc8e1d0d52e05b2832f1355b903d544e953ec`; Amendment 2A source blob was `e95dbbe3780629366cd77f8d9d8c2c6f26086450`; `AGENTS.md` source blob at the correction head was `26f12b78098429bad77450c742ed58c66434e30e`. The exact inherited source documents, not a summary of prior chats, govern unchanged mathematics and receipts:
 
@@ -1349,7 +1364,7 @@ The inspected current main remained `f0035147a646fc7d4c7002c8a2706f4987f6a10c`; 
 - Amendment 2A: `docs/v-1a-amendment-2a-tiered-readiness-boundaries.md`, especially §§5–11.
 - `AGENTS.md`: governance/technical-domain separation, Owner operational instructions, phase separation, final-head review, active-pointer boundary.
 
-Read-only Render service/deploy metadata on 2026-09-06 still showed the named parent suspended, one 4c-8g instance, auto-deploy off and the stale E-1/sleep command. The observed existing latest deploy was not a V-1B acceptance build. This document did not replace that command, fetch environment secret values, create a build/job, rotate a password, access database evidence, publish an operational approval or purchase IPv4.
+Read-only Render service/deploy metadata on 2026-09-06 still showed the named parent suspended, one 4c-8g instance, auto-deploy off and the stale E-1/sleep command. The observed latest deploy was not a V-1B acceptance build. This document did not replace that command, fetch a secret, create a build/job, change a role, terminate a backend, restart a Supabase project, access database evidence, publish an operational approval or purchase IPv4.
 
 Official vendor references from the input document and the 2026-09-07 exact-head correction review:
 
@@ -1370,7 +1385,11 @@ Official vendor references from the input document and the 2026-09-07 exact-head
 15. PostgreSQL 17 connection settings and Supabase role limits — https://www.postgresql.org/docs/17/runtime-config-connection.html and https://supabase.com/docs/guides/database/postgres/roles-superuser — `authentication_timeout` and hosted administrative-role constraints.
 16. GitHub rulesets — https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets, https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets and https://docs.github.com/en/rest/repos/rules — branch targeting, restrict-update/delete/force-push behavior, bypass lists, Metadata-read fixed-ID ruleset GETs (whose read-only response may omit `bypass_actors`) and authenticated ruleset lifecycle; actual plan/effective-state/history capability remains an operational gate.
 17. CPython socket, SSL, subprocess and selectors — https://docs.python.org/3.14/library/socket.html, https://docs.python.org/3.14/library/ssl.html, https://docs.python.org/3.14/library/subprocess.html and https://docs.python.org/3.14/library/selectors.html — isolated resolver-process, nonblocking connection/handshake/I/O and synchronous child cleanup mechanics used to make the frozen monotonic deadlines enforceable.
-18. PostgreSQL 17 backend startup/source and server-signaling behavior — https://doxygen.postgresql.org/backend__startup_8c_source.html, https://doxygen.postgresql.org/postinit_8c_source.html and https://www.postgresql.org/docs/17/functions-admin.html — the startup-packet and authentication timers, pre-timer delay/hostname paths, authentication-before-`LOGIN` order, the intervening not-yet-role-attributed backend state and `pg_terminate_backend` capability/timeout behavior; these ground the 1201-second pre-rotation drain, two reader-OID-selected termination passes, 601-second post-rotation stale-auth drain and conservative NULL-`usesysid` guards before rotation and `LOGIN`.
+18. PostgreSQL 17 backend startup and psql source — https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/utils/init/postinit.c, https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/utils/activity/backend_status.c and https://github.com/postgres/postgres/blob/REL_17_STABLE/src/bin/psql/command.c — authentication/LOGIN precede pgstat_bestart publication, and psql's password command does not print the formerly required ALTER ROLE tag. These primary sources are why activity-only hidden-process proof and that tag gate are removed.
 19. Supabase database connection methods and Supavisor behavior — https://supabase.com/docs/guides/database/connecting-to-postgres and https://supabase.com/docs/guides/troubleshooting/supavisor-faq-YyP5tI — Shared/Dedicated pooler planes and frontend/server-connection separation considered by the explicit termination-or-containment record; no legitimate pooler route or undocumented administrative operation is authorized.
+20. PostgreSQL 17 transaction identifiers, system columns and ALTER ROLE — https://www.postgresql.org/docs/17/functions-info.html, https://www.postgresql.org/docs/17/ddl-system-columns.html and https://www.postgresql.org/docs/17/sql-alterrole.html — pg_current_xact_id/pg_xact_status, 64-bit xid8 versus wrapping 32-bit xmin, row-version identity and an ordinary role's authority to change its own password ground the exact rotation-row proof.
+21. Supabase project restart and Read Replica behavior — https://supabase.com/docs/guides/troubleshooting/http-api-issues and https://supabase.com/docs/guides/platform/read-replicas/getting-started — project restart terminates ongoing workloads and restarts all databases, while a primary can become available before replicas restart; therefore exact one-primary/zero-replica proof, provider completion evidence and a newer primary generation are all required.
+22. PostgreSQL 17 delay and psql-variable behavior — https://www.postgresql.org/docs/17/functions-admin.html and https://www.postgresql.org/docs/17/app-psql.html — `pg_sleep(1.0)` guarantees no less than the requested delay but may run longer, and psql variables are process-local textual values; the corrected checkpoints and explicit canonical reconnect transport follow those limits.
+23. Supabase restart API and Studio action flow — https://supabase.com/docs/reference/api/v1-restart-a-project, https://github.com/supabase/supabase/blob/master/apps/studio/components/interfaces/Settings/General/Infrastructure/RestartServerButton.tsx and https://github.com/supabase/supabase/blob/master/apps/studio/data/projects/project-restart-mutation.ts — request success initiates a restart but supplies no public end-to-end completion receipt; the exact full-project control, server-clock bracket and composite completion proof prevent request/status-only acceptance.
 
 These references explain supported mechanics, not fulfilled gates. Vendor changes do not silently amend this freeze. No numeric limit, private incident fact, future merge/build/job ID, actual review conclusion or successful deployment is fabricated by this complete document.
