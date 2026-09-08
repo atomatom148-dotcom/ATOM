@@ -5,9 +5,13 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import ModuleType
+from unittest import SkipTest
 from unittest.mock import Mock
 
 
@@ -93,3 +97,36 @@ def test_dependency_is_isolated_and_exact() -> None:
     assert (ROOT / "workflows" / "requirements.txt").read_text(encoding="utf-8") == (
         "render>=1.0.1\n"
     )
+
+
+def test_real_sdk_installs_and_exposes_required_workflow_api() -> None:
+    """Prove the isolated dependency exposes the frozen Render Workflows API in CI."""
+    if os.environ.get("CI") != "true":
+        raise SkipTest("real Render SDK installation proof runs only in CI")
+
+    with tempfile.TemporaryDirectory(prefix="atom-render-sdk-") as directory:
+        subprocess.run([sys.executable, "-m", "venv", directory], check=True)
+        python = Path(directory) / "bin" / "python"
+        subprocess.run(
+            [
+                str(python),
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "-r",
+                str(ROOT / "workflows" / "requirements.txt"),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                str(python),
+                "-c",
+                (
+                    "from render_sdk import TaskContext, Workflows; "
+                    "assert TaskContext is not None; assert Workflows is not None"
+                ),
+            ],
+            check=True,
+        )
