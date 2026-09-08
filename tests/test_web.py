@@ -122,9 +122,12 @@ class WebSurfaceTests(unittest.TestCase):
             for path in ("/", "/api/dashboard", "/api/live"):
                 self.assertEqual(request(app, path)["status"], "200 OK")
 
-    def test_mobile_market_grid_uses_two_non_overlapping_columns(self):
+    def test_mobile_market_grid_uses_readable_responsive_columns(self):
         page = request(create_app(), "/")["body"].decode()
-        self.assertIn(".market{grid-template-columns:repeat(2,minmax(0,1fr))}", page)
+        self.assertIn(
+            ".market{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}",
+            page,
+        )
 
     @patch.dict("os.environ", {"RENDER_GIT_COMMIT": "a" * 40}, clear=False)
     def test_health_reports_process_and_deployed_commit_without_readiness_work(self):
