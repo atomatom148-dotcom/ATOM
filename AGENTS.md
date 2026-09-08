@@ -67,7 +67,7 @@ A current Owner operational instruction controls immediately when it:
 
 - selects or reprioritizes work already allowed by the applicable freezes;
 - chooses among already-authorized implementation or operational options;
-- sets cost or vendor limits;
+- sets or limits cost and vendor use;
 - orders a protective stop, suspension, disablement, rollback, or credential
   revocation;
 - approves or rejects a merge;
@@ -272,11 +272,24 @@ Update this section only by Owner-approved documentation change.
   apply. No new service or project and no change to existing production,
   V1B, SIM, or V9 behavior, and no broker, trading/execution, or
   model-research authority is granted.
+- Owner-approved Render Workflows readiness is separately authorized alongside
+  SIM-5 under `docs/atom-render-workflows-readiness-amendment-1.md`
+  (`ATOM-RENDER-WORKFLOWS-READINESS-AMENDMENT-1`) and does not change, take, or
+  block the SIM-5 active-phase pointer. Its only new infrastructure authority is
+  one Render Workflow service named `atom-workflows` in workspace
+  `tea-d9g2b1m7r5hc73e7ufk0`, sourced from `atomatom148-dotcom/ATOM`, branch
+  `main`, region `oregon`, Auto-Deploy Off, with no readiness secrets and the
+  exact implementation allowlist `workflows/__init__.py`, `workflows/main.py`,
+  `workflows/requirements.txt`, and `tests/test_workflows_readiness.py`. The
+  first service registers only one deterministic no-I/O `readiness_smoke` task.
+  No HIST8 execution, database/provider credential, SIM/V9/production consumer,
+  broker, model-research, or trading authority is granted. Any real workload
+  requires a later documentation-first amendment.
 - Not authorized: E-2, E-3, E-4, SIM-6 or later simulator phases, Level-II
   mathematical use, V9/family changes except the exact L-2 implementation
   surface, new services/roles/credentials/sources except the exact SIM-5W
-  reader role and web-only credential above, broker/account/order authority,
-  or live-capital trading.
+  reader role/web-only credential and the exact `atom-workflows` readiness
+  service above, broker/account/order authority, or live-capital trading.
 
 ## What each document is for
 
