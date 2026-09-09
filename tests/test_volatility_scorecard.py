@@ -8157,6 +8157,12 @@ def test_recovery_seal_reader_accepts_exact_bytes_and_rejects_path_or_content_dr
     with pytest.raises(sc.OrchestrationFailure, match="INVALID_RECOVERY_SEAL"):
         sc.read_recovery_seal(relative)
 
+    missing_path = sc.Invocation(
+        parts.manifest_id, None, sc.InvocationMode.RECOVERY
+    )
+    with pytest.raises(sc.OrchestrationFailure, match="INVALID_RECOVERY_SEAL"):
+        sc.read_recovery_seal(missing_path)
+
     malformed = tmp_path / "malformed.json"
     malformed.write_bytes(parts.seal.canonical_bytes.rstrip(b"\n"))
     with pytest.raises(sc.OrchestrationFailure, match="INVALID_RECOVERY_SEAL"):
