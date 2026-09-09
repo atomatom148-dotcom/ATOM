@@ -1,2 +1,12 @@
 psycopg[binary]==3.3.5
 websocket-client==1.9.0
+
+exchange-calendars==4.13.2
+korean-lunar-calendar==0.3.1
+numpy==2.4.2
+pandas==3.0.0
+pyluach==2.3.0
+python-dateutil==2.9.0.post0
+six==1.17.0
+toolz==1.1.0
+tzdata==2025.3
