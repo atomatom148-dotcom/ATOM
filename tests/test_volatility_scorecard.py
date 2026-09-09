@@ -720,11 +720,12 @@ def test_causal_benchmarks_share_population_and_use_prior_rows_only():
     ]
 
 
-def test_descriptive_metrics_and_level_ratio_zero_behavior():
+@pytest.mark.parametrize("zero", (0.0, -0.0))
+def test_descriptive_metrics_and_level_ratio_zero_behavior(zero):
     population = _population(
         [
-            _window(0, predicted=1.0, realized=0.0),
-            _window(1, predicted=2.0, realized=0.0),
+            _window(0, predicted=1.0, realized=zero),
+            _window(1, predicted=2.0, realized=zero),
         ]
     )
     metrics = sc.descriptive_metrics(population)
@@ -732,6 +733,89 @@ def test_descriptive_metrics_and_level_ratio_zero_behavior():
     assert metrics.level_ratio is None
     assert metrics.coverage_90 == 1.0
     assert metrics.rank_corr is None
+
+
+def test_v9_cohort_trace_accepts_exact_initial_rotation_and_rejects_drift():
+    manifest_id = "v1b-v9-5m"
+    expected_cell = sc.manifest_public_cells(manifest_id)[0]
+    initial_lineage = {
+        "v3_model_version": "v9.1",
+        "symbol": "COIN",
+        "horizon": "5M",
+        "cohort_id": "cohort-a",
+        "cohort_hash": "a" * 64,
+    }
+    final_lineage = {
+        **initial_lineage,
+        "v3_model_version": "v9.2",
+        "cohort_id": "cohort-b",
+        "cohort_hash": "b" * 64,
+    }
+    selected = [{**expected_cell, "lineage_identity": final_lineage}]
+    events = [
+        {
+            "candidate_session": "2026-09-08",
+            **expected_cell,
+            "event_type": "INITIAL",
+            "selected_lineage_identity": initial_lineage,
+        },
+        {
+            "candidate_session": "2026-09-09",
+            **expected_cell,
+            "event_type": "ROTATION",
+            "selected_lineage_identity": final_lineage,
+        },
+    ]
+    sc.validate_cohort_trace(
+        manifest_id,
+        events,
+        first_candidate_session="2026-09-08",
+        boundary_session="2026-09-09",
+        selected_lineages=selected,
+    )
+
+    mutations = (
+        ("array required", None),
+        ("nonmanifest/non-V9", [{**events[0], "cell_order": 0}]),
+        ("wrong V9 cell", [{**events[0], "horizon": "15M"}]),
+        ("outside examined range", [{**events[0], "candidate_session": "2026-09-07"}]),
+        ("bad event type", [{**events[0], "event_type": "UNKNOWN"}]),
+        ("first event must be INITIAL", [{**events[0], "event_type": "ROTATION"}]),
+        (
+            "not strictly candidate/cell ordered",
+            [events[0], events[1], {**events[1], "candidate_session": "2026-09-08"}],
+        ),
+        ("invalid/redundant rotation", [events[0], {**events[1], "selected_lineage_identity": initial_lineage}]),
+        ("missing V9 INITIAL", []),
+    )
+    for message, value in mutations:
+        with pytest.raises(sc.ProtocolDefect, match=message):
+            sc.validate_cohort_trace(
+                manifest_id,
+                value,
+                first_candidate_session="2026-09-08",
+                boundary_session="2026-09-09",
+                selected_lineages=selected,
+            )
+
+    wrong_selected = [{**expected_cell, "lineage_identity": initial_lineage}]
+    with pytest.raises(sc.ProtocolDefect, match="final lineage mismatch"):
+        sc.validate_cohort_trace(
+            manifest_id,
+            events,
+            first_candidate_session="2026-09-08",
+            boundary_session="2026-09-09",
+            selected_lineages=wrong_selected,
+        )
+
+    with pytest.raises(sc.ProtocolDefect, match="FAMILY manifest must be empty"):
+        sc.validate_cohort_trace(
+            "v1b-family-5m",
+            events,
+            first_candidate_session="2026-09-08",
+            boundary_session="2026-09-09",
+            selected_lineages=[],
+        )
 
 
 def test_gate_loss_populations_and_summary_differences_are_exact():
