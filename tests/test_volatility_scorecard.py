@@ -3987,6 +3987,11 @@ def test_chunked_decoder_rejects_every_chunk_extension(size_line):
         sc._decode_chunked(body)
 
 
+def test_chunked_decoder_rejects_nonempty_trailer_section():
+    with pytest.raises(sc.GitHubAuthorityFailure):
+        sc._decode_chunked(b"1\r\nx\r\n0\r\nX-Ignored: yes\r\n\r\n")
+
+
 def test_chunked_decoder_deadline_equality_stops_before_second_work_slice():
     payload = b"x" * (sc.GITHUB_DEADLINE_WORK_CHUNK_BYTES + 1)
     body = f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n0\r\n\r\n"
@@ -4529,6 +4534,52 @@ def _frozen_git_environment():
         "GIT_LITERAL_PATHSPECS": "1",
         "GIT_ALLOW_PROTOCOL": "",
     }
+
+
+def test_local_git_preflight_runs_exact_topology_checks_and_freezes_dirs(
+    tmp_path, monkeypatch
+):
+    git_dir = tmp_path / "git-dir"
+    info = git_dir / "info"
+    info.mkdir(parents=True)
+    outputs = {
+        ("rev-parse", "--show-toplevel"): os.path.realpath(os.getcwd()),
+        ("rev-parse", "--is-inside-work-tree"): "true",
+        ("rev-parse", "--is-bare-repository"): "false",
+        ("rev-parse", "--is-shallow-repository"): "false",
+        ("rev-parse", "--show-object-format"): "sha1",
+        (
+            "rev-parse",
+            "--path-format=absolute",
+            "--absolute-git-dir",
+        ): str(git_dir),
+        (
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ): str(git_dir),
+    }
+    calls = []
+
+    def run(context, clock_ns, *arguments, check):
+        calls.append(arguments)
+        return sc.subprocess.CompletedProcess(
+            arguments, 0, stdout=(outputs[arguments] + "\n").encode("ascii")
+        )
+
+    monkeypatch.setattr(sc, "_FROZEN_GIT_DIRECTORIES", None)
+    monkeypatch.setattr(sc, "_checkpoint_git_run", run)
+    context = sc.GithubDeadlineContext.begin_checkpoint(lambda: 0)
+    assert sc._local_git_preflight(context, lambda: 0) == (
+        str(git_dir),
+        str(git_dir),
+    )
+    assert calls == list(outputs)
+    assert sc._FROZEN_GIT_DIRECTORIES == (str(git_dir), str(git_dir))
+
+    (info / "grafts").write_text("forbidden\n", encoding="ascii")
+    with pytest.raises(sc.OrchestrationFailure, match="LOCAL_GIT_PROOF_FAILED"):
+        sc._local_git_preflight(context, lambda: 0)
 
 
 def test_checkpoint_git_run_uses_exact_remaining_deadline_and_hardened_process(
@@ -5238,6 +5289,7 @@ def _approval_comment(
     created_at: str,
     review_id: int,
     schema_version: str = sc.OPERATIONAL_APPROVAL_SCHEMA_VERSION,
+    component_hex: str = "a",
 ):
     window = _window_approval_projection(
         ruleset_id=ruleset_id,
@@ -5246,7 +5298,12 @@ def _approval_comment(
     )
     payload = {
         "schema_version": schema_version,
-        "provenance": {"execution_source_sha": execution_sha},
+        "provenance": {
+            "execution_source_sha": execution_sha,
+            "runtime_artifact_components": {
+                key: component_hex * 64 for key in sc.RUNTIME_COMPONENT_KEYS
+            },
+        },
         "control_plane_evidence_sha256": "d" * 64,
     }
     approval = sc.ApprovalComment(
@@ -5339,11 +5396,17 @@ def test_comment_item_semantics_use_originating_request_checker():
             immutable_fact_validator=lambda *args: None,
         )
     assert client.page_validator is not None
-    unrelated = {"id": 1, "body": "ordinary unrelated comment"}
+    unrelated = {
+        "id": 1,
+        "user": {"id": 123, "login": "unrelated"},
+        "created_at": "2026-09-09T00:00:00Z",
+        "updated_at": "2026-09-09T00:00:00Z",
+        "body": "ordinary unrelated comment",
+    }
     checks = []
     assert client.page_validator(
         [unrelated], lambda: checks.append(len(checks)) or 0
-    ) == ()
+    ) == (unrelated,)
     assert len(checks) >= 4
 
     request_end = sc.GITHUB_REQUEST_TOTAL_TIMEOUT_NS
@@ -5401,6 +5464,57 @@ def test_cross_page_comment_traversal_uses_pagination_checker():
     with pytest.raises(sc.GitHubAuthorityFailure):
         client.collection_validator((approval, approval), paged)
     assert calls == 2
+
+
+def test_cross_page_review_and_owner_approval_are_resolved_as_one_collection(
+    monkeypatch,
+):
+    clock = _MutableClock(0)
+    client = _CommentPageCaptureClient(clock)
+    with pytest.raises(_CapturedPageValidators):
+        sc.verify_github_checkpoint(
+            client=client,
+            expected_execution_sha="b" * 40,
+            manifest_id="v1b-early-4",
+            artifact_components_validator=lambda value: value,
+            immutable_fact_validator=lambda *args: None,
+        )
+    review = {
+        "id": 19,
+        "user": {"id": 999, "login": "independent-reviewer"},
+        "created_at": "2026-09-09T00:00:00Z",
+        "updated_at": "2026-09-09T00:00:00Z",
+        "body": "review on page one",
+    }
+    approval = {
+        "id": 20,
+        "user": {"id": sc.GITHUB_OWNER_ID, "login": sc.GITHUB_OWNER_LOGIN},
+        "created_at": "2026-09-09T00:01:00Z",
+        "updated_at": "2026-09-09T00:01:00Z",
+        "body": "approval on page two",
+    }
+    page_one = client.page_validator([review], lambda: 0)
+    page_two = client.page_validator([approval], lambda: 0)
+    parsed = (object(),)
+    reviews = {19: object()}
+    selection = object()
+
+    def parse_complete(comments, **kwargs):
+        assert comments == (review, approval)
+        return parsed, reviews
+
+    def classify_complete(**kwargs):
+        assert kwargs["approvals"] is parsed
+        assert kwargs["reviews"] is reviews
+        return selection
+
+    monkeypatch.setattr(sc, "parse_authority_comments", parse_complete)
+    monkeypatch.setattr(sc, "classify_v1b_approvals", classify_complete)
+    paged = sc.GithubDeadlineContext(
+        checkpoint_end_ns=sc.GITHUB_CHECKPOINT_TOTAL_TIMEOUT_NS,
+        pagination_end_ns=sc.GITHUB_PAGINATION_TOTAL_TIMEOUT_NS,
+    )
+    assert client.collection_validator(page_one + page_two, paged) is selection
 
 
 class _AssociatedPRPageCaptureClient:
@@ -5548,6 +5662,47 @@ def test_approval_classification_examines_closed_v1_but_never_selects_it_current
             expected_execution_sha="b" * 40,
             manifest_id="v1b-early-4",
         )
+
+
+def test_approval_classification_compares_artifacts_only_for_current_window():
+    historical, historical_review = _approval_comment(
+        comment_id=10,
+        ruleset_id=500,
+        opened_at="2026-09-07T11:00:00.000000Z",
+        created_at="2026-09-07T11:05:00Z",
+        review_id=9,
+        component_hex="a",
+    )
+    current, current_review = _approval_comment(
+        comment_id=20,
+        ruleset_id=501,
+        opened_at="2026-09-07T12:00:00.000000Z",
+        created_at="2026-09-07T12:05:00Z",
+        review_id=19,
+        component_hex="b",
+    )
+    observed = []
+
+    def validate_current(value):
+        observed.append(value)
+        return value
+
+    selection = sc.classify_v1b_approvals(
+        client=_RulesetClassificationClient(
+            {500: 404, 501: 200},
+            {500: historical.window, 501: current.window},
+        ),
+        context=sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
+        approvals=[historical, current],
+        reviews={9: historical_review, 19: current_review},
+        expected_execution_sha="b" * 40,
+        manifest_id="v1b-early-4",
+        artifact_components_validator=validate_current,
+    )
+    assert selection.current is current
+    assert observed == [
+        {key: "b" * 64 for key in sc.RUNTIME_COMPONENT_KEYS}
+    ]
 
 
 def test_approval_classification_rejects_zero_multiple_or_wrong_e_current_windows():
@@ -10568,7 +10723,7 @@ def test_ready_scan_projection_freezes_population_windows_and_regression():
 
 def test_authority_comment_parser_accepts_linked_payload_v2():
     execution_sha = "b" * 40
-    components = {"synthetic-component": "a" * 64}
+    components = {key: "a" * 64 for key in sc.RUNTIME_COMPONENT_KEYS}
     provenance = {
         "schema_version": "ATOM-V1B-RUNTIME-PROVENANCE-1",
         "render_service_id": sc.RENDER_SERVICE_ID,
@@ -11164,21 +11319,36 @@ def test_github_commit_blob_and_associated_pr_validators_accept_exact_objects():
 def test_commit_diff_paths_decodes_complete_no_rename_change_set(monkeypatch):
     commit_sha = "b" * 40
     parent_sha = "a" * 40
+    reads = []
     monkeypatch.setattr(
         sc,
         "_git_ascii",
         lambda *args: f"{commit_sha} {parent_sha}",
     )
-    monkeypatch.setattr(
-        sc,
-        "_git_read",
-        lambda *args: b"old/name.py\0new/name.py\0",
-    )
+    def git_read(context, clock_ns, *arguments):
+        reads.append(arguments)
+        return b"old/name.py\0new/name.py\0"
+
+    monkeypatch.setattr(sc, "_git_read", git_read)
     assert sc._commit_diff_paths(
         sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
         lambda: 0,
         commit_sha,
     ) == frozenset({"old/name.py", "new/name.py"})
+    assert reads == [
+        (
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "--name-only",
+            "-z",
+            parent_sha,
+            commit_sha,
+            "--",
+        )
+    ]
 
 
 def test_commit_diff_paths_accepts_empty_disjoint_integration(monkeypatch):
@@ -11193,6 +11363,28 @@ def test_commit_diff_paths_accepts_empty_disjoint_integration(monkeypatch):
         lambda: 0,
         commit_sha,
     ) == frozenset()
+
+
+def test_receipt_integration_requires_exactly_one_added_path():
+    receipt = "docs/v-1b-volatility-scorecard-receipt-v1b-early-4-" + "a" * 64 + ".json"
+    assert sc._receipt_addition_path(frozenset({receipt})) == receipt
+    assert sc._receipt_addition_path(frozenset({"README.md"})) is None
+    for changed in (
+        frozenset({receipt, "README.md"}),
+        frozenset(
+            {
+                receipt,
+                "docs/v-1b-volatility-scorecard-negative-v1b-family-5m-"
+                + "b" * 64
+                + ".json",
+            }
+        ),
+    ):
+        with pytest.raises(
+            sc.OrchestrationFailure,
+            match="RECEIPT_INTEGRATION_NOT_ONE_FILE",
+        ):
+            sc._receipt_addition_path(changed)
 
 
 def test_fixed_and_exact_amendment_authentication_accept_matching_bytes(
