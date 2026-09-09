@@ -9206,7 +9206,8 @@ def test_v9_negative_and_zero_variance_have_distinct_receipt_accounting():
     session = _xnys_session(date(2026, 9, 1))
     negative = _v9_kappa_row(1, q0=-1.0)
     zero = _v9_kappa_row(2, q0=0.0)
-    evidence = _kappa_evidence((negative, zero))
+    negative_zero = _v9_kappa_row(3, q0=-0.0)
+    evidence = _kappa_evidence((negative, zero, negative_zero))
     lineage = {
         "v3_model_version": "V9-SYNTHETIC",
         "symbol": "COIN",
@@ -9222,9 +9223,9 @@ def test_v9_negative_and_zero_variance_have_distinct_receipt_accounting():
         {session.session_date: session},
         SimpleNamespace(),
     )
-    assert population.n_input == 2
+    assert population.n_input == 3
     assert population.n_null_or_nonfinite_excluded == 1
-    assert population.n_nonpositive_prediction_excluded == 1
+    assert population.n_nonpositive_prediction_excluded == 2
     assert population.n_kappa_unavailable == 0
     assert population.windows == ()
 
@@ -9232,9 +9233,9 @@ def test_v9_negative_and_zero_variance_have_distinct_receipt_accounting():
     # exclusions and the complete accounting equation.
     cell = sc.evaluate_cell(population)
     assert cell["classification"] == "INSUFFICIENT"
-    assert cell["n_input"] == 2
+    assert cell["n_input"] == 3
     assert cell["n_null_or_nonfinite_excluded"] == 1
-    assert cell["n_nonpositive_prediction_excluded"] == 1
+    assert cell["n_nonpositive_prediction_excluded"] == 2
     assert (
         cell["n_unselected_lineage_rows"]
         + cell["n_inadmissible"]
