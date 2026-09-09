@@ -10162,3 +10162,701 @@ def test_every_durable_v9_row_validates_nonsentinel_lineage_before_filtering():
         sc._select_lineage(
             V9_30S, _kappa_evidence((nonselected,)), as_of
         )
+
+
+def test_population_loader_reconciles_streams_and_closes_every_cursor(monkeypatch):
+    upper = datetime(2026, 9, 8, 19, 59, tzinfo=UTC)
+    scan_start = upper + timedelta(minutes=1)
+
+    class Cursor:
+        def __init__(self, rows):
+            self.rows = list(rows)
+            self.closed = False
+
+        def execute(self, sql, params=None):
+            self.sql = sql
+            self.params = params
+
+        def fetchall(self):
+            rows, self.rows = self.rows, []
+            return rows
+
+        def fetchmany(self, size):
+            assert size == sc.PROOF_BATCH_SIZE
+            if not self.rows:
+                return []
+            return [self.rows.pop(0)]
+
+        def close(self):
+            self.closed = True
+
+    counts = Cursor(((1, 1, 1, 1),))
+    lookup = Cursor(())
+    family_stream = Cursor(((1, None, None, "realized-volatility-v1") + (None,) * 10 + ("22",),))
+    v9_stream = Cursor((("opaque-v9-row",),))
+
+    class Connection:
+        def cursor(self, name=None):
+            if name is None:
+                return lookup
+            return {
+                "v1b_family_stream": family_stream,
+                "v1b_v9_forecast_stream": v9_stream,
+            }[name]
+
+    family = sc.FamilyEvidenceRow(
+        forecast_id=1,
+        forecast_inserting_xid="11",
+        quant_id="q3_volatility",
+        formula_version="realized-volatility-v1",
+        cycle_id="cycle-1",
+        symbol="COIN",
+        horizon="5M",
+        cutoff_epoch=upper.timestamp() - 600,
+        maturity_epoch=upper.timestamp() - 300,
+        cutoff_midpoint=100.0,
+        forecast_volatility_bps=2.0,
+        created_epoch=upper.timestamp() - 599,
+        data_schema_version="synthetic-v1",
+        source_spec_version="synthetic-v1",
+        outcome_inserting_xid="22",
+        maturity_midpoint=101.0,
+        realized_move_bps=1.0,
+        resolved_epoch=upper.timestamp() - 299,
+        forecast_proof=None,
+        outcome_proof=None,
+    )
+    cutoff = upper - timedelta(minutes=1)
+    endpoint = cutoff + timedelta(seconds=30)
+    forecast = SimpleNamespace(
+        persisted_at=cutoff + timedelta(seconds=1),
+        persistence_proof_eligible=True,
+    )
+    outer = {
+        "forecast_record_id": "v9-1",
+        "forecast_record_hash": "a" * 64,
+        "symbol": "COIN",
+        "cutoff_at": cutoff,
+        "target_endpoint": endpoint,
+        "horizon": "30S",
+        "cycle_id": "cycle-v9",
+        "v3_model_version": "V9-SYNTHETIC",
+        "persisted_at": cutoff,
+    }
+    proof = sc.V9ForecastCommitProof(
+        "v9-1",
+        "a" * 64,
+        cutoff + timedelta(seconds=1),
+        endpoint,
+        True,
+        sc.PROOF_METHOD,
+    )
+    monkeypatch.setattr(sc, "_load_legacy_proofs", lambda *args, **kwargs: {})
+    monkeypatch.setattr(sc, "_validate_family_row", lambda *args, **kwargs: family)
+    monkeypatch.setattr(
+        sc, "_load_v9_outcomes", lambda *args, **kwargs: ({"v9-1": ()}, 1)
+    )
+    monkeypatch.setattr(
+        sc, "_validate_v9_forecast", lambda *args, **kwargs: (outer, forecast)
+    )
+    monkeypatch.setattr(
+        sc, "_load_v9_proofs", lambda *args, **kwargs: {"v9-1": proof}
+    )
+
+    population = sc.load_evidence_population(
+        SimpleNamespace(
+            cursor=counts,
+            connection=Connection(),
+            scan_started_at=scan_start,
+        ),
+        upper,
+        deserialize_forecast_record=lambda *args, **kwargs: None,
+        deserialize_outcome_record=lambda *args, **kwargs: None,
+        canonical_target_identity=lambda value: "target-v9-1",
+        apply_forecast_commit_proof=lambda value, proof_row: value,
+        stage_after_first_read=sc.DatabaseFailureStage.SEALED_OR_RECOVERY,
+    )
+
+    assert population.family_rows == (family,)
+    assert population.v9_rows[0].forecast_proof == proof
+    assert population.source_counts == {
+        "public.volatility_forecasts": 1,
+        "public.volatility_forecast_outcomes": 1,
+        "public.atom_v9_v4_forecasts": 1,
+        "public.atom_v9_v4_outcomes": 1,
+    }
+    assert lookup.closed and family_stream.closed and v9_stream.closed
+
+
+def test_ready_scan_projection_freezes_population_windows_and_regression():
+    candidate = _xnys_session(date(2026, 9, 8))
+    population = _population(_ready_windows())
+    counts = sc.readiness_counts(population)
+    lineage = {
+        "cell_order": population.spec.cell_order,
+        "forecaster": population.spec.forecaster,
+        "horizon": population.spec.horizon,
+        "lineage_identity": dict(population.lineage_identity),
+    }
+    scan = sc.ScanResult(
+        first_candidate_session=candidate.session_date,
+        completed_candidates=(candidate,),
+        boundary=sc.CandidateResult(
+            candidate,
+            (lineage,),
+            (),
+            (population,),
+            (counts,),
+        ),
+    )
+
+    projection = sc._ready_scan_projection(scan)
+
+    assert projection["first_candidate_session"] == "2026-09-08"
+    assert projection["boundary_session"] == "2026-09-08"
+    assert projection["selected_lineages"] == [lineage]
+    assert projection["counts"] == [counts.public(require_ready=True)]
+    projected = projection["populations"][0]
+    assert len(projected["windows"]) == len(population.windows)
+    assert len(projected["regression"]) == len(population.regression)
+    assert projected["accounting"]["protocol_defect"] is False
+
+
+def test_authority_comment_parser_accepts_linked_payload_v2():
+    execution_sha = "b" * 40
+    components = {"synthetic-component": "a" * 64}
+    provenance = {
+        "schema_version": "ATOM-V1B-RUNTIME-PROVENANCE-1",
+        "render_service_id": sc.RENDER_SERVICE_ID,
+        "render_build_id": "build-1",
+        "render_deploy_id": "build-1",
+        "repository": sc.GITHUB_REPOSITORY,
+        "execution_source_sha": execution_sha,
+        "build_command": "pip install -r requirements.txt",
+        "python_version": "3.14.3",
+        "runtime_artifact_components": components,
+        "runtime_artifact_sha256": sc.canonical_sha256(components),
+        "probe_generated_at_utc": "2026-09-09T01:00:00.000000Z",
+        "github_tls_trust": {
+            "source": "ssl.get_default_verify_paths().cafile",
+            "reported_cafile_path": "/etc/ssl/certs/ca-certificates.crt",
+            "canonical_cafile_path": "/etc/ssl/certs/ca-certificates.crt",
+            "cafile_size_bytes": 1,
+            "cafile_sha256": "c" * 64,
+        },
+    }
+    window = _window_approval_projection(
+        execution_sha=execution_sha,
+        opened_at="2026-09-09T01:05:00.000000Z",
+    )
+    payload = {
+        "schema_version": sc.OPERATIONAL_APPROVAL_SCHEMA_VERSION,
+        "provenance": provenance,
+        "provenance_sha256": sc.canonical_sha256(provenance),
+        "capacity": {
+            "mechanism": "Render native one-off Create job startCommand",
+            "service_id": sc.RENDER_SERVICE_ID,
+            "recovery_transport_policy": sc.RECOVERY_TRANSPORT_POLICY,
+        },
+        "no_ref_update_window": window,
+        "no_ref_update_window_sha256": sc.canonical_sha256(window),
+        "probe_job_id": "job-probe-1",
+        "probe_observation_sha256": "d" * 64,
+        "control_plane_evidence_sha256": "e" * 64,
+        "pat_scope_evidence_sha256": "f" * 64,
+        "incident_record_id": "ATOM-SEC-INCIDENT-V1B-READER-CREDENTIAL-2026-09-06",
+        "incident_finalization_sha256": "1" * 64,
+        "rotation_status": "COMPLETED",
+        "rotation_completion_timestamp": "2026-09-09T01:04:00.000000Z",
+    }
+    payload_hash = sc.canonical_sha256(payload)
+    review_body = {
+        "schema_version": "ATOM-V1B-OPERATIONAL-REVIEW-1",
+        "approval_payload_sha256": payload_hash,
+        "verdict": "PASS",
+        "material_findings": 0,
+    }
+    approval_body = {
+        "schema_version": "ATOM-V1B-OPERATIONAL-APPROVAL-1",
+        "payload": payload,
+        "approval_payload_sha256": payload_hash,
+        "independent_review_comment_id": 101,
+        "independent_reviewer_user_id": 999,
+        "independent_reviewer_login": "independent-reviewer",
+    }
+
+    def envelope(comment_id, user_id, login, created_at, body):
+        return {
+            "id": comment_id,
+            "user": {"id": user_id, "login": login},
+            "created_at": created_at,
+            "updated_at": created_at,
+            "body": sc.canonical_json(body) + "\n",
+        }
+
+    comments = (
+        envelope(
+            101,
+            999,
+            "independent-reviewer",
+            "2026-09-09T01:06:00Z",
+            review_body,
+        ),
+        envelope(
+            102,
+            sc.GITHUB_OWNER_ID,
+            sc.GITHUB_OWNER_LOGIN,
+            "2026-09-09T01:07:00Z",
+            approval_body,
+        ),
+    )
+    approvals, reviews = sc.parse_authority_comments(
+        comments,
+        artifact_components_validator=lambda value: value,
+    )
+
+    assert len(approvals) == 1
+    assert approvals[0].payload == payload
+    assert approvals[0].review_comment_id == 101
+    assert reviews[101].approval_payload_sha256 == payload_hash
+
+
+def test_tls_connector_retries_address_and_completes_nonblocking_handshake(
+    monkeypatch,
+):
+    class RawSocket:
+        def __init__(self, result, socket_error=0):
+            self.result = result
+            self.socket_error = socket_error
+            self.closed = False
+
+        def setblocking(self, value):
+            assert value is False
+
+        def connect_ex(self, sockaddr):
+            self.sockaddr = sockaddr
+            return self.result
+
+        def getsockopt(self, level, option):
+            assert (level, option) == (sc.socket.SOL_SOCKET, sc.socket.SO_ERROR)
+            return self.socket_error
+
+        def close(self):
+            self.closed = True
+
+    class TLSSocket:
+        def __init__(self):
+            self.handshakes = 0
+            self.closed = False
+
+        def setblocking(self, value):
+            assert value is False
+
+        def do_handshake(self):
+            self.handshakes += 1
+            if self.handshakes == 1:
+                raise sc.ssl.SSLWantReadError()
+            if self.handshakes == 2:
+                raise sc.ssl.SSLWantWriteError()
+
+        def selected_alpn_protocol(self):
+            return "http/1.1"
+
+        def fileno(self):
+            return -1 if self.closed else 7
+
+        def close(self):
+            self.closed = True
+
+    failed = RawSocket(sc.errno.ECONNREFUSED)
+    connected = RawSocket(sc.errno.EINPROGRESS)
+    sockets = iter((failed, connected))
+    tls = TLSSocket()
+
+    class Context:
+        def wrap_socket(self, raw, **kwargs):
+            assert raw is connected
+            assert kwargs == {
+                "server_hostname": sc.GITHUB_API_HOST,
+                "do_handshake_on_connect": False,
+                "suppress_ragged_eofs": False,
+            }
+            return tls
+
+    waits = []
+    monkeypatch.setattr(
+        sc,
+        "_selector_wait",
+        lambda seams, target, event, context, end: waits.append(event),
+    )
+    seams = sc.GithubTransportSeams(
+        monotonic_ns=lambda: 0,
+        socket_factory=lambda *args: next(sockets),
+    )
+    result = sc._connect_tls(
+        seams,
+        Context(),
+        sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
+        sc.GITHUB_CONNECT_TIMEOUT_NS,
+        (
+            ("AF_INET", "192.0.2.1", 443),
+            ("AF_INET", "192.0.2.2", 443),
+        ),
+    )
+
+    assert result is tls
+    assert failed.closed is True
+    assert connected.closed is False
+    assert waits == [
+        sc.selectors.EVENT_WRITE,
+        sc.selectors.EVENT_READ,
+        sc.selectors.EVENT_WRITE,
+    ]
+
+
+def test_receipt_tree_scan_filters_and_byte_sorts_paths(monkeypatch):
+    paths = (
+        b"docs/irrelevant.md",
+        b"docs/v-1b-volatility-scorecard-receipt-v1b-late-1.json",
+        b"docs/v-1b-volatility-scorecard-receipt-v1b-early-4.json",
+    )
+    monkeypatch.setattr(
+        sc,
+        "_git_read",
+        lambda *args, **kwargs: b"\0".join(paths) + b"\0",
+    )
+    result = sc._receipt_paths_at(
+        sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
+        lambda: 0,
+        "b" * 40,
+    )
+    assert result == tuple(
+        sorted(
+            (path.decode("ascii") for path in paths[1:]),
+            key=lambda item: item.encode("utf-8"),
+        )
+    )
+
+
+def test_publication_proof_readers_validate_complete_and_missing_rows():
+    class Cursor:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self, sql, params):
+            self.sql = sql
+            self.params = params
+
+        def fetchall(self):
+            return self.rows
+
+    upper = datetime(2026, 9, 9, 1, 0, tzinfo=UTC)
+    observed = upper - timedelta(seconds=2)
+    legacy_cursor = Cursor(
+        ((sc.FAMILY_FORECAST_KIND, 7, "123", observed, sc.PROOF_METHOD),)
+    )
+    legacy = sc._load_legacy_proofs(
+        legacy_cursor,
+        kind=sc.FAMILY_FORECAST_KIND,
+        record_ids=(7,),
+        upper_as_of=upper,
+    )
+    assert legacy[7].inserting_xid == "123"
+
+    endpoint = upper + timedelta(seconds=30)
+    v9_cursor = Cursor(
+        (
+            (1, "missing", None, None, None, None, None, None),
+            (
+                2,
+                "present",
+                "present",
+                "a" * 64,
+                observed,
+                endpoint,
+                True,
+                sc.PROOF_METHOD,
+            ),
+        )
+    )
+    v9 = sc._load_v9_proofs(
+        v9_cursor,
+        (
+            ("missing", "b" * 64, endpoint),
+            ("present", "a" * 64, endpoint),
+        ),
+    )
+    assert v9["missing"] is None
+    present = v9["present"]
+    assert present is not None
+    assert present.proof_eligible is True
+
+
+def test_local_tree_entry_parses_exact_blob_and_reads_its_bytes(monkeypatch):
+    path = "quant/volatility_scorecard.py"
+    blob = "a" * 40
+    calls = []
+
+    def git_read(context, clock_ns, *arguments):
+        calls.append(arguments)
+        if arguments[0] == "ls-tree":
+            return f"100644 blob {blob}\t{path}\0".encode("ascii")
+        assert arguments == ("cat-file", "blob", blob)
+        return b"reviewed-source"
+
+    monkeypatch.setattr(sc, "_git_read", git_read)
+    result = sc._local_tree_entry(
+        sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
+        lambda: 0,
+        "b" * 40,
+        path,
+    )
+    assert result == ("100644", blob, b"reviewed-source")
+    assert len(calls) == 2
+
+
+def test_repository_facts_authentication_completes_unique_integration(monkeypatch):
+    execution_sha = "e" * 40
+    implementation_sha = "d" * 40
+    implementation_head = "c" * 40
+    tree_sha = "a" * 40
+    merged_at = datetime(2026, 9, 8, 1, 0, tzinfo=UTC)
+    corrective_at = merged_at + timedelta(hours=1)
+
+    def git_ascii(context, clock_ns, *arguments):
+        if arguments == ("rev-parse", "HEAD"):
+            return execution_sha
+        if arguments[:2] == ("rev-parse", f"{execution_sha}^{{tree}}"):
+            return tree_sha
+        if arguments[:2] == ("rev-parse", f"{implementation_sha}^{{tree}}"):
+            return tree_sha
+        if arguments[0:3] == ("rev-list", "--first-parent", "--reverse"):
+            return "\n".join(
+                (sc.CORRECTIVE_AMENDMENT_MERGE_SHA, implementation_sha)
+            )
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(sc, "_git_ascii", git_ascii)
+    monkeypatch.setattr(
+        sc,
+        "_github_commit",
+        lambda *args, **kwargs: {"commit": {"tree": {"sha": tree_sha}}},
+    )
+    fixed_times = iter((merged_at, merged_at, merged_at, merged_at))
+    monkeypatch.setattr(
+        sc,
+        "_authenticate_fixed_merge",
+        lambda *args, **kwargs: next(fixed_times),
+    )
+    exact_times = iter((merged_at, corrective_at))
+    monkeypatch.setattr(
+        sc,
+        "_authenticate_exact_amendment_merge",
+        lambda *args, **kwargs: next(exact_times),
+    )
+    monkeypatch.setattr(sc, "_require_first_parent_ancestor", lambda *args: None)
+    monkeypatch.setattr(
+        sc,
+        "_commit_diff_paths",
+        lambda context, clock_ns, commit: (
+            frozenset({sc.CORRECTIVE_AMENDMENT_PATH})
+            if commit == sc.CORRECTIVE_AMENDMENT_MERGE_SHA
+            else sc.IMPLEMENTATION_PATHS
+        ),
+    )
+    monkeypatch.setattr(
+        sc,
+        "_associated_merged_pr",
+        lambda *args, **kwargs: {
+            "user": {
+                "id": sc.GITHUB_OWNER_ID,
+                "login": sc.GITHUB_OWNER_LOGIN,
+            },
+            "head": {"sha": implementation_head},
+            "created_at": "2026-09-08T03:00:00Z",
+        },
+    )
+    monkeypatch.setattr(sc, "_authenticate_bound_path", lambda *args: None)
+    migration_entry = ("100644", "9" * 40, b"migration")
+    monkeypatch.setattr(
+        sc, "_local_tree_entry_optional", lambda *args: migration_entry
+    )
+    monkeypatch.setattr(sc, "EVIDENCE_ARTIFACTS", ())
+    monkeypatch.setattr(sc, "_receipt_paths_at", lambda *args: ())
+    client = SimpleNamespace(_seams=SimpleNamespace(monotonic_ns=lambda: 0))
+
+    facts = sc.authenticate_immutable_repository_facts(
+        client,
+        sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
+        execution_sha,
+    )
+
+    assert facts.execution_sha == execution_sha
+    assert facts.implementation_merge_sha == implementation_sha
+    assert facts.receipts == ()
+    assert facts.history_sha256 == sc.canonical_sha256([])
+
+
+def test_github_commit_blob_and_associated_pr_validators_accept_exact_objects():
+    commit_sha = "b" * 40
+    blob_sha = "a" * 40
+    blob_bytes = b"exact reviewed bytes"
+    merged_at = "2026-09-09T01:00:00Z"
+
+    class Client:
+        _seams = SimpleNamespace(monotonic_ns=lambda: 0)
+
+        def get_json(self, target, *, context, validator, **kwargs):
+            if target.endswith("/commits/" + commit_sha):
+                value = {
+                    "sha": commit_sha,
+                    "commit": {
+                        "verification": {
+                            "verified": True,
+                            "reason": "valid",
+                            "signature": "signed",
+                            "payload": "payload",
+                        },
+                        "tree": {"sha": "c" * 40},
+                        "committer": {"date": merged_at},
+                    },
+                }
+            elif target.endswith("/git/blobs/" + blob_sha):
+                encoded = sc.base64.b64encode(blob_bytes).decode("ascii")
+                value = {
+                    "sha": blob_sha,
+                    "encoding": "base64",
+                    "size": len(blob_bytes),
+                    "content": encoded,
+                }
+            elif target.endswith("/pulls/333"):
+                value = {
+                    "number": 333,
+                    "merged": True,
+                    "merge_commit_sha": commit_sha,
+                    "base": {
+                        "ref": "main",
+                        "repo": {"full_name": sc.GITHUB_REPOSITORY},
+                    },
+                    "merged_by": {
+                        "id": sc.GITHUB_OWNER_ID,
+                        "login": sc.GITHUB_OWNER_LOGIN,
+                    },
+                    "merged_at": merged_at,
+                }
+            else:
+                raise AssertionError(target)
+            return SimpleNamespace(status=200, headers={}), validator(
+                value, 200, {}, lambda: context.check(self._seams.monotonic_ns)
+            )
+
+        def get_paginated_json(
+            self,
+            target,
+            *,
+            context,
+            page_validator,
+            collection_validator,
+        ):
+            item = {
+                "number": 333,
+                "merge_commit_sha": commit_sha,
+                "merged_at": merged_at,
+            }
+            check = lambda: context.check(self._seams.monotonic_ns)
+            page = page_validator([item], check)
+            return collection_validator(tuple(page), context)
+
+    client = Client()
+    context = sc.GithubDeadlineContext.begin_checkpoint(lambda: 0)
+    assert sc._github_commit(client, context, commit_sha)["sha"] == commit_sha
+    assert sc._github_blob(client, context, blob_sha) == blob_bytes
+    assert sc._associated_merged_pr(
+        client, context, commit_sha, expected_number=333
+    )["number"] == 333
+
+
+def test_commit_diff_paths_decodes_complete_no_rename_change_set(monkeypatch):
+    commit_sha = "b" * 40
+    parent_sha = "a" * 40
+    monkeypatch.setattr(
+        sc,
+        "_git_ascii",
+        lambda *args: f"{commit_sha} {parent_sha}",
+    )
+    monkeypatch.setattr(
+        sc,
+        "_git_read",
+        lambda *args: b"old/name.py\0new/name.py\0",
+    )
+    assert sc._commit_diff_paths(
+        sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
+        lambda: 0,
+        commit_sha,
+    ) == frozenset({"old/name.py", "new/name.py"})
+
+
+def test_fixed_and_exact_amendment_authentication_accept_matching_bytes(
+    monkeypatch,
+):
+    execution_sha = "e" * 40
+    merge_sha = "d" * 40
+    predecessor_sha = "c" * 40
+    path = "docs/corrective.md"
+    decision_id = "CORRECTIVE-1"
+    merged_at = "2026-09-09T01:00:00Z"
+    content = (decision_id + "\n").encode("ascii")
+    blob_sha = "a" * 40
+    client = SimpleNamespace(_seams=SimpleNamespace(monotonic_ns=lambda: 0))
+    context = sc.GithubDeadlineContext.begin_checkpoint(lambda: 0)
+    detail = {
+        "merged_at": merged_at,
+        "user": {
+            "id": sc.GITHUB_OWNER_ID,
+            "login": sc.GITHUB_OWNER_LOGIN,
+        },
+    }
+    monkeypatch.setattr(
+        sc,
+        "_checkpoint_git_run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(
+        sc,
+        "_github_commit",
+        lambda *args: {"commit": {"committer": {"date": merged_at}}},
+    )
+    monkeypatch.setattr(sc, "_associated_merged_pr", lambda *args, **kwargs: detail)
+    monkeypatch.setattr(sc, "_authenticate_path", lambda *args, **kwargs: content)
+
+    assert sc._authenticate_fixed_merge(
+        client,
+        context,
+        execution_sha,
+        merge_sha,
+        332,
+        path,
+        decision_id,
+    ) == datetime(2026, 9, 9, 1, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(sc, "_require_first_parent_ancestor", lambda *args: None)
+    monkeypatch.setattr(
+        sc, "_commit_diff_paths", lambda *args: frozenset({path})
+    )
+    monkeypatch.setattr(
+        sc, "_local_tree_entry", lambda *args: ("100644", blob_sha, content)
+    )
+    monkeypatch.setattr(sc, "_github_blob", lambda *args: content)
+    assert sc._authenticate_exact_amendment_merge(
+        client,
+        context,
+        execution_sha,
+        predecessor_sha=predecessor_sha,
+        merge_sha=merge_sha,
+        pr_number=332,
+        merged_at_text=merged_at,
+        path=path,
+        decision_id=decision_id,
+        git_blob_sha1=blob_sha,
+        raw_sha256=hashlib.sha256(content).hexdigest(),
+    ) == datetime(2026, 9, 9, 1, 0, tzinfo=UTC)

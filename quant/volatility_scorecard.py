@@ -1364,7 +1364,8 @@ def bootstrap_enc_b(
     values: list[float] = []
     attempted = 0
     while len(values) < required and attempted < max_attempts:
-        drawn_sessions = rng.choices(sessions, k=len(sessions))
+        # NOSONAR: frozen deterministic statistical bootstrap, not a security use.
+        drawn_sessions = rng.choices(sessions, k=len(sessions))  # NOSONAR
         attempted += 1
         sampled = [row for session in drawn_sessions for row in grouped[session]]
         fit = encompassing_ols(sampled)
@@ -1413,7 +1414,8 @@ def bootstrap_gate_mean(
     values: list[float] = []
     attempted = 0
     while len(values) < required and attempted < max_attempts:
-        drawn_sessions = rng.choices(sessions, k=len(sessions))
+        # NOSONAR: frozen deterministic statistical bootstrap, not a security use.
+        drawn_sessions = rng.choices(sessions, k=len(sessions))  # NOSONAR
         attempted += 1
         drawn = [value for session in drawn_sessions for value in grouped[session]]
         try:
@@ -2524,7 +2526,8 @@ def validate_startup_observation(
             manifest_id not in MANIFEST_IDS
             or recovery_seal_path is None
             or not re.fullmatch(
-                r"/tmp/atom-v1b-seals/[0-9a-f]{64}\.json",
+                # NOSONAR: exact frozen isolated recovery path, validated below.
+                r"/tmp/atom-v1b-seals/[0-9a-f]{64}\.json",  # NOSONAR
                 recovery_seal_path,
             )
         ):
@@ -4562,7 +4565,8 @@ def _initialize_runtime_for_measurement() -> RuntimeInitialization:
         conninfo_module = sys.modules["psycopg.conninfo"]
     except BaseException:
         raise OrchestrationFailure("RUNTIME_CLOSURE_INITIALIZATION_FAILED") from None
-    if getattr(v4a, "MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS", None) != 5.0:
+    # NOSONAR: exact equality is required for this frozen protocol constant.
+    if getattr(v4a, "MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS", None) != 5.0:  # NOSONAR
         raise OrchestrationFailure("V4A_OVERLAP_CONTRACT_CHANGED")
     return RuntimeInitialization(
         module_names=frozenset(sys.modules),
@@ -13836,6 +13840,9 @@ def _associated_merged_pr(
         base = detail.get("base")
         repository = base.get("repo") if type(base) is dict else None
         merged_by = detail.get("merged_by")
+        repository_full_name = (
+            repository.get("full_name") if type(repository) is dict else None
+        )
         if (
             detail.get("number") != number
             or detail.get("merged") is not True
@@ -13843,7 +13850,7 @@ def _associated_merged_pr(
             or type(base) is not dict
             or base.get("ref") != "main"
             or type(repository) is not dict
-            or repository.get("full_name") != GITHUB_REPOSITORY
+            or repository_full_name != GITHUB_REPOSITORY
             or type(merged_by) is not dict
             or merged_by.get("id") != GITHUB_OWNER_ID
             or merged_by.get("login") != GITHUB_OWNER_LOGIN
@@ -15421,7 +15428,8 @@ def _run_snapshot(
             raise FinalAuthorityRefusal("FINAL_AUTHORITY_FAILED") from None
 
         try:
-            assert seal is not None
+            if seal is None:
+                raise EvaluationConstructionRefusal("SEAL_STATE_MISSING")
             # The generated timestamp is the only observation after the final
             # checkpoint's runtime measurement; receipt construction below is
             # otherwise entirely in memory.
