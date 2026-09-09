@@ -3649,6 +3649,51 @@ def test_github_http_parser_accepts_only_complete_identity_json_framing():
         sc._json_no_duplicates(b'{"x":1,"x":2}')
 
 
+def test_github_request_has_exact_seven_headers_in_frozen_order():
+    request = sc._build_request("/repos/atomatom148-dotcom/ATOM", "token-123")
+    assert bytes(request) == (
+        b"GET /repos/atomatom148-dotcom/ATOM HTTP/1.1\r\n"
+        b"Host: api.github.com\r\n"
+        b"Accept: application/vnd.github+json\r\n"
+        b"X-GitHub-Api-Version: 2022-11-28\r\n"
+        b"User-Agent: ATOM-V1B-READ-ONLY-VOLATILITY-SCORECARD-1\r\n"
+        b"Authorization: Bearer token-123\r\n"
+        b"Connection: close\r\n"
+        b"Accept-Encoding: identity\r\n"
+        b"\r\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    (
+        b"application/json",
+        b"application/json; charset=iso-8859-1",
+        b'application/json; charset="utf-8"',
+        b"application/json; charset=utf-8; profile=x",
+        b"application/problem+json; charset=utf-8",
+        b"application/json, application/json; charset=utf-8",
+        b"application/json; charset=utf-8, application/json",
+        b"application/json; charset=utf-8; charset=utf-8",
+        b"application/json; charset=utf-8\xff",
+    ),
+)
+def test_github_json_content_type_rejects_nonfrozen_grammar(content_type):
+    with pytest.raises(sc.GitHubAuthorityFailure):
+        sc._validate_github_json_content_type(content_type)
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    (
+        b"application/json;charset=utf-8",
+        b" application/vnd.github+json \t; charset = UTF-8\t",
+    ),
+)
+def test_github_json_content_type_accepts_only_frozen_grammar(content_type):
+    sc._validate_github_json_content_type(content_type)
+
+
 class _FakeSelector:
     def __init__(self, clock: _MutableClock, advance_to: int, ready=()):
         self.clock = clock
@@ -3933,6 +3978,13 @@ def test_chunked_decoder_copies_peer_chunk_in_deadline_work_slices():
     assert decoded == payload
     assert trailers == {}
     assert len(checks) >= 7
+
+
+@pytest.mark.parametrize("size_line", (b"1;foo=bar", b"1;", b"0;foo=bar"))
+def test_chunked_decoder_rejects_every_chunk_extension(size_line):
+    body = size_line + (b"\r\nx\r\n0\r\n\r\n" if size_line[:1] == b"1" else b"\r\n\r\n")
+    with pytest.raises(sc.GitHubAuthorityFailure):
+        sc._decode_chunked(body)
 
 
 def test_chunked_decoder_deadline_equality_stops_before_second_work_slice():
@@ -4258,7 +4310,7 @@ def test_request_total_includes_json_semantic_validation(monkeypatch):
         def __init__(self):
             self.chunks = [
                 b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: application/json\r\n"
+                b"Content-Type: application/json; charset=utf-8\r\n"
                 b"Content-Length: 11\r\n\r\n"
                 b'{"ok":true}',
                 b"",
@@ -4388,7 +4440,7 @@ def test_each_paginated_page_receives_a_fresh_subordinate_request_deadline(
     def response(body, link_value=None):
         headers = [
             b"HTTP/1.1 200 OK",
-            b"Content-Type: application/json",
+            b"Content-Type: application/json; charset=utf-8",
             f"Content-Length: {len(body)}".encode("ascii"),
         ]
         if link_value is not None:
@@ -4446,6 +4498,39 @@ def test_each_paginated_page_receives_a_fresh_subordinate_request_deadline(
     assert all(tls.closed for tls in all_tls)
 
 
+def _frozen_git_command(*arguments):
+    return (
+        "git",
+        "--no-pager",
+        "--no-replace-objects",
+        "--no-optional-locks",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "core.commitGraph=false",
+        *arguments,
+    )
+
+
+def _frozen_git_environment():
+    return {
+        "PATH": os.defpath,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_LITERAL_PATHSPECS": "1",
+        "GIT_ALLOW_PROTOCOL": "",
+    }
+
+
 def test_checkpoint_git_run_uses_exact_remaining_deadline_and_hardened_process(
     monkeypatch,
 ):
@@ -4468,7 +4553,7 @@ def test_checkpoint_git_run_uses_exact_remaining_deadline_and_hardened_process(
     assert completed.stdout == b"proof\n"
     assert calls == [
         (
-            ("git", "-c", "credential.helper=", "rev-parse", "HEAD"),
+            _frozen_git_command("rev-parse", "HEAD"),
             {
                 "cwd": os.getcwd(),
                 "stdin": sc.subprocess.DEVNULL,
@@ -4478,7 +4563,7 @@ def test_checkpoint_git_run_uses_exact_remaining_deadline_and_hardened_process(
                 "close_fds": True,
                 "text": False,
                 "timeout": 5.0,
-                "env": {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
+                "env": _frozen_git_environment(),
             },
         )
     ]
@@ -4500,7 +4585,7 @@ def test_checkpoint_git_run_cannot_finish_at_deadline_and_never_retries(
     with pytest.raises(sc.GitHubAuthorityFailure):
         sc._checkpoint_git_run(context, clock, "cat-file", "blob", check=True)
     assert calls == [
-        (("git", "-c", "credential.helper=", "cat-file", "blob"), 1.0)
+        (_frozen_git_command("cat-file", "blob"), 1.0)
     ]
 
 
@@ -4520,13 +4605,7 @@ def test_checkpoint_git_timeout_is_sanitized_and_never_retried(monkeypatch):
     assert caught.value.__cause__ is None
     assert calls == [
         (
-            (
-                "git",
-                "-c",
-                "credential.helper=",
-                "show",
-                "HEAD:requirements.txt",
-            ),
+            _frozen_git_command("show", "HEAD:requirements.txt"),
             2.0,
         )
     ]
@@ -7292,13 +7371,10 @@ def test_snapshot_final_ca_and_local_git_share_final_checkpoint_deadline(
     ]
     assert len(git_calls) == 1
     arguments, kwargs = git_calls[0]
-    assert arguments == (
-        "git",
-        "-c",
-        "credential.helper=",
-        "show",
-        "HEAD:certs/supabase-prod-ca-2021.crt",
+    assert arguments == _frozen_git_command(
+        "show", "HEAD:certs/supabase-prod-ca-2021.crt"
     )
+    assert kwargs["env"] == _frozen_git_environment()
     assert kwargs["timeout"] == 6.0
     assert kwargs["timeout"] > 0.0
     assert terminal_events[-4:] == [
@@ -10651,6 +10727,75 @@ def test_tls_connector_retries_address_and_completes_nonblocking_handshake(
         sc.selectors.EVENT_READ,
         sc.selectors.EVENT_WRITE,
     ]
+
+
+def test_tls_connector_closes_socket_when_final_deadline_check_fails():
+    class Clock:
+        def __init__(self):
+            self.armed = False
+            self.after_alpn_calls = 0
+
+        def __call__(self):
+            if not self.armed:
+                return 0
+            self.after_alpn_calls += 1
+            return 9 if self.after_alpn_calls == 1 else 10
+
+    clock = Clock()
+
+    class RawSocket:
+        def setblocking(self, value):
+            assert value is False
+
+        def connect_ex(self, sockaddr):
+            return 0
+
+        def close(self):
+            raise AssertionError("TLS owns the raw socket")
+
+    raw = RawSocket()
+
+    class TLSSocket:
+        def __init__(self):
+            self.closed = False
+
+        def setblocking(self, value):
+            assert value is False
+
+        def do_handshake(self):
+            return None
+
+        def selected_alpn_protocol(self):
+            clock.armed = True
+            return "http/1.1"
+
+        def fileno(self):
+            return -1 if self.closed else 7
+
+        def close(self):
+            self.closed = True
+
+    tls = TLSSocket()
+
+    class Context:
+        def wrap_socket(self, observed_raw, **kwargs):
+            assert observed_raw is raw
+            return tls
+
+    seams = sc.GithubTransportSeams(
+        monotonic_ns=clock,
+        socket_factory=lambda *args: raw,
+    )
+    context = sc.GithubDeadlineContext(checkpoint_end_ns=10)
+    with pytest.raises(sc.GitHubAuthorityFailure):
+        sc._connect_tls(
+            seams,
+            Context(),
+            context,
+            10,
+            (("AF_INET", "192.0.2.1", 443),),
+        )
+    assert tls.closed is True
 
 
 def test_receipt_tree_scan_filters_and_byte_sorts_paths(monkeypatch):
