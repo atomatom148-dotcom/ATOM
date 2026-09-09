@@ -5026,6 +5026,7 @@ def _approval_comment(
     opened_at: str,
     created_at: str,
     review_id: int,
+    schema_version: str = sc.OPERATIONAL_APPROVAL_SCHEMA_VERSION,
 ):
     window = _window_approval_projection(
         ruleset_id=ruleset_id,
@@ -5033,6 +5034,7 @@ def _approval_comment(
         opened_at=opened_at,
     )
     payload = {
+        "schema_version": schema_version,
         "provenance": {"execution_source_sha": execution_sha},
         "control_plane_evidence_sha256": "d" * 64,
     }
@@ -5298,6 +5300,43 @@ def test_approval_classification_allows_one_current_and_only_older_closed_window
         sc.ApprovalState.HISTORICAL_CLOSED,
         sc.ApprovalState.CURRENT,
     ]
+
+
+def test_approval_classification_examines_closed_v1_but_never_selects_it_current():
+    old, old_review = _approval_comment(
+        comment_id=10,
+        ruleset_id=500,
+        opened_at="2026-09-07T11:00:00.000000Z",
+        created_at="2026-09-07T11:05:00Z",
+        review_id=9,
+        schema_version="ATOM-V1B-OPERATIONAL-APPROVAL-PAYLOAD-1",
+    )
+    current, current_review = _approval_comment(
+        comment_id=20,
+        ruleset_id=501,
+        opened_at="2026-09-07T12:00:00.000000Z",
+        created_at="2026-09-07T12:05:00Z",
+        review_id=19,
+    )
+    windows = {500: old.window, 501: current.window}
+    selection = sc.classify_v1b_approvals(
+        client=_RulesetClassificationClient({500: 404, 501: 200}, windows),
+        context=sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
+        approvals=[old, current],
+        reviews={9: old_review, 19: current_review},
+        expected_execution_sha="b" * 40,
+        manifest_id="v1b-early-4",
+    )
+    assert selection.current is current
+    with pytest.raises(sc.GitHubAuthorityFailure):
+        sc.classify_v1b_approvals(
+            client=_RulesetClassificationClient({500: 200}, {500: old.window}),
+            context=sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
+            approvals=[old],
+            reviews={9: old_review},
+            expected_execution_sha="b" * 40,
+            manifest_id="v1b-early-4",
+        )
 
 
 def test_approval_classification_rejects_zero_multiple_or_wrong_e_current_windows():
@@ -7955,20 +7994,11 @@ def test_production_startup_failure_uses_stage_correct_official_receipt(
     monkeypatch.setattr(sc, "assert_production_startup", startup_failure)
     monkeypatch.setattr(sc, "build_production_dependencies", forbidden)
     assert sc.scorecard_main(tuple(argv)) == 1
-    assert len(output) == 1
-    receipt = json.loads(output[0])
     if recovery:
-        assert receipt["schema_version"] == (
-            "ATOM-V1B-MANIFEST-PRE-CELL-INVALID-RECEIPT-1"
-        )
-        assert receipt["readiness"] == parts.seal.record()["readiness"]
-        assert (
-            receipt["readiness"]["readiness_identity"]
-            == parts.readiness["readiness_identity"]
-        )
-        assert receipt["sealed_run_identity"] == parts.run_identity
-        assert receipt["seal_record_sha256"] == parts.seal.seal_record_sha256
+        assert output == []
     else:
+        assert len(output) == 1
+        receipt = json.loads(output[0])
         assert receipt["schema_version"] == "ATOM-V1B-MANIFEST-BLOCKED-RECEIPT-1"
         assert receipt["readiness"] is None
         assert receipt["sealed_run_identity"] is None
@@ -8379,6 +8409,9 @@ def test_final_authority_event_order_ends_with_runtime_then_receipt(monkeypatch)
             events.append("final_database_authority")
             return parts.authority
 
+        def close_after_final_authority(self):
+            events.append("snapshot_database_close")
+
     snapshot = ObservedSnapshot(
         connection=object(),
         cursor=object(),
@@ -8505,6 +8538,7 @@ def test_final_authority_event_order_ends_with_runtime_then_receipt(monkeypatch)
         "final_github_and_source",
         "final_ruleset_and_ref_reread_complete",
         "final_database_authority",
+        "snapshot_database_close",
         "closing_github_ca_and_zone",
         "final_runtime_remeasurement",
         "final_repository_checkpoint_return",
@@ -8514,6 +8548,7 @@ def test_final_authority_event_order_ends_with_runtime_then_receipt(monkeypatch)
     ]
     closing_index = events.index("final_ruleset_and_ref_reread_complete")
     database_index = events.index("final_database_authority")
+    close_index = events.index("snapshot_database_close")
     ca_zone_index = events.index("closing_github_ca_and_zone")
     runtime_index = events.index("final_runtime_remeasurement")
     checkpoint_return_index = events.index("final_repository_checkpoint_return")
@@ -8523,9 +8558,9 @@ def test_final_authority_event_order_ends_with_runtime_then_receipt(monkeypatch)
         if event == "final_runtime_deadline_check"
     ]
     assert deadline_indexes
-    assert closing_index < database_index < ca_zone_index < runtime_index
+    assert closing_index < database_index < close_index < ca_zone_index < runtime_index
     assert events[database_index - 1] == "final_runtime_deadline_check"
-    assert events[database_index + 1] == "final_runtime_deadline_check"
+    assert events[close_index + 1] == "final_runtime_deadline_check"
     assert events[runtime_index - 1] == "final_runtime_deadline_check"
     assert events[runtime_index + 1] == "final_runtime_deadline_check"
     assert all(

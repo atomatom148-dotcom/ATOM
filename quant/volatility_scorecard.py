@@ -9116,6 +9116,37 @@ def _validate_capacity(
     return capacity
 
 
+def _validate_legacy_capacity(
+    value: object,
+    *,
+    check: Callable[[], int] = _noop_deadline_check,
+) -> dict[str, object]:
+    capacity = _exact_dict(
+        value,
+        frozenset(
+            {
+                "mechanism",
+                "service_id",
+                "accepted_render_startCommand_limit_bytes",
+                "recovery_capacity_margin_bytes",
+                "vendor_evidence_reference",
+                "vendor_evidence_sha256",
+                "vendor_evidence_observed_at_utc",
+            }
+        ),
+        check=check,
+    )
+    _string(capacity["mechanism"], exact="Render native one-off Create job startCommand", check=check)
+    _string(capacity["service_id"], exact=RENDER_SERVICE_ID, check=check)
+    _positive_int(capacity["accepted_render_startCommand_limit_bytes"], check=check)
+    if capacity["recovery_capacity_margin_bytes"] != 4096:
+        _fail()
+    _string(capacity["vendor_evidence_reference"], check=check)
+    _sha256(capacity["vendor_evidence_sha256"], check=check)
+    _timestamp(capacity["vendor_evidence_observed_at_utc"], microseconds=True, check=check)
+    return capacity
+
+
 def _validate_payload(
     value: object,
     artifact_components_validator: Callable[[object], object],
@@ -9145,11 +9176,12 @@ def _validate_payload(
         ),
         check=check,
     )
-    _string(
-        payload["schema_version"],
-        exact=OPERATIONAL_APPROVAL_SCHEMA_VERSION,
-        check=check,
-    )
+    schema_version = _string(payload["schema_version"], check=check)
+    if schema_version not in {
+        "ATOM-V1B-OPERATIONAL-APPROVAL-PAYLOAD-1",
+        OPERATIONAL_APPROVAL_SCHEMA_VERSION,
+    }:
+        _fail()
     provenance = _validate_provenance(
         payload["provenance"],
         artifact_components_validator,
@@ -9159,7 +9191,10 @@ def _validate_payload(
         payload["provenance_sha256"], check=check
     ) != _cooperative_canonical_sha256(provenance, check=check):
         _fail()
-    _validate_capacity(payload["capacity"], check=check)
+    if schema_version == OPERATIONAL_APPROVAL_SCHEMA_VERSION:
+        _validate_capacity(payload["capacity"], check=check)
+    else:
+        _validate_legacy_capacity(payload["capacity"], check=check)
     window = _validate_window(payload["no_ref_update_window"], check=check)
     if _sha256(
         payload["no_ref_update_window_sha256"], check=check
@@ -9606,6 +9641,8 @@ def classify_v1b_approvals(
     if len(current_candidates) != 1:
         _fail()
     current = current_candidates[0]
+    if current.payload["schema_version"] != OPERATIONAL_APPROVAL_SCHEMA_VERSION:
+        _fail()
     current_review = _validate_linked_review(
         current, reviews, check=checkpoint_check
     )
@@ -11007,6 +11044,8 @@ class SnapshotSession:
         ]
         | None
     ) = field(default=None, repr=False)
+    _transaction: object | None = field(default=None, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
 
     def final_authority_check(
         self,
@@ -11045,6 +11084,22 @@ class SnapshotSession:
         if current_ca != self.initial_ca or proof != self.initial_authority_proof:
             _database_fail(stage, DatabaseDefect.AUTHORITY)
         return proof
+
+    def close_after_final_authority(self) -> None:
+        """Commit the read-only transaction and close both database handles."""
+
+        stage = DatabaseFailureStage.FINAL_AUTHORITY_AFTER_TRUTHFUL_CELLS
+        if self._closed or self._transaction is None:
+            _database_fail(stage, DatabaseDefect.SNAPSHOT)
+        try:
+            suppressed = self._transaction.__exit__(None, None, None)
+            if suppressed:
+                raise RuntimeError("transaction exit suppressed")
+            self.cursor.close()
+            self.connection.close()
+        except BaseException:
+            _database_fail(stage, DatabaseDefect.SNAPSHOT)
+        self._closed = True
 
 
 @contextmanager
@@ -11152,6 +11207,7 @@ def open_v1b_snapshot(
                 recovery_started_at=recovery_started_at,
                 _ca_recheck=ca_recheck,
                 _ca_recheck_deadline=ca_recheck_deadline,
+                _transaction=transaction,
             )
             yield session
         except BaseException:
@@ -11168,19 +11224,20 @@ def open_v1b_snapshot(
                 _database_fail(stage, DatabaseDefect.SNAPSHOT)
             raise
         else:
-            try:
-                suppressed = transaction.__exit__(None, None, None)
-            except DatabaseContractError:
-                raise
-            except BaseException:
-                _database_fail(stage, DatabaseDefect.SNAPSHOT)
-            if suppressed:
-                _database_fail(stage, DatabaseDefect.SNAPSHOT)
+            if not session._closed:
+                try:
+                    suppressed = transaction.__exit__(None, None, None)
+                except DatabaseContractError:
+                    raise
+                except BaseException:
+                    _database_fail(stage, DatabaseDefect.SNAPSHOT)
+                if suppressed:
+                    _database_fail(stage, DatabaseDefect.SNAPSHOT)
         finally:
-            if cursor is not None:
+            if cursor is not None and not ("session" in locals() and session._closed):
                 _close_quietly(cursor)
     finally:
-        if connection is not None:
+        if connection is not None and not ("session" in locals() and session._closed):
             _close_quietly(connection)
 
 
@@ -12409,6 +12466,7 @@ class InvocationState:
     snapshot: SnapshotSession | None = None
     seal: SealBundle | None = None
     boundary: "CandidateResult | None" = None
+    terminal_exclusion_verified: bool = False
 
     @property
     def recovery_accepted(self) -> bool:
@@ -13821,7 +13879,7 @@ def _commit_diff_paths(
     raw = _git_read(
         context,
         clock_ns,
-        "diff", "--name-only", "-z", parents[1], commit_sha, "--"
+        "diff", "--no-renames", "--name-only", "-z", parents[1], commit_sha, "--"
     )
     try:
         raw_items = _cooperative_call(checkpoint_check, raw.split, b"\0")
@@ -14342,6 +14400,7 @@ def _select_unique_v1b_implementation(
 ) -> str:
     allowed = IMPLEMENTATION_PATHS | {CONDITIONAL_MIGRATION_PATH}
     after_corrective_amendment = False
+    implementation_seen = False
     candidates: list[str] = []
     for commit_sha in chain:
         if HEX40_RE.fullmatch(commit_sha) is None:
@@ -14349,6 +14408,8 @@ def _select_unique_v1b_implementation(
         if commit_sha == CORRECTIVE_AMENDMENT_MERGE_SHA:
             after_corrective_amendment = True
         changed = changed_paths(commit_sha)
+        if implementation_seen and changed.intersection(REUSED_PRIMITIVE_PATHS):
+            raise OrchestrationFailure("REUSED_SOURCE_CHANGED_AFTER_IMPLEMENTATION")
         if not changed.intersection(allowed):
             continue
         if not after_corrective_amendment:
@@ -14356,6 +14417,7 @@ def _select_unique_v1b_implementation(
         if not IMPLEMENTATION_PATHS.issubset(changed) or not changed <= allowed:
             raise OrchestrationFailure("IMPLEMENTATION_DIFF_INVALID")
         candidates.append(commit_sha)
+        implementation_seen = True
     if not after_corrective_amendment:
         raise OrchestrationFailure("FIRST_PARENT_HISTORY_INVALID")
     if len(candidates) != 1:
@@ -14479,15 +14541,52 @@ def authenticate_immutable_repository_facts(
         client, context, implementation_sha, expected_number=None
     )
     author = detail.get("user")
+    head = detail.get("head")
+    head_sha = head.get("sha") if type(head) is dict else None
     created_at = _parse_github_time(detail.get("created_at"))
     if (
         type(author) is not dict
         or author.get("id") != GITHUB_OWNER_ID
         or author.get("login") != GITHUB_OWNER_LOGIN
+        or type(head_sha) is not str
+        or HEX40_RE.fullmatch(head_sha) is None
         or created_at <= corrective_time
     ):
         raise OrchestrationFailure("IMPLEMENTATION_PR_INVALID")
+    _require_first_parent_ancestor(
+        context,
+        clock_ns,
+        CORRECTIVE_AMENDMENT_MERGE_SHA,
+        head_sha,
+    )
     authenticate_tree(implementation_sha)
+
+    receipt_integrations: dict[str, str] = {}
+    for commit_sha in chain:
+        checkpoint_check()
+        for path in _commit_diff_paths(context, clock_ns, commit_sha):
+            checkpoint_check()
+            if RECEIPT_PATH_RE.fullmatch(path) is None:
+                continue
+            if path in receipt_integrations:
+                raise OrchestrationFailure("RECEIPT_HISTORY_MUTATED")
+            parent_sha = _git_ascii(
+                context, clock_ns, "rev-parse", f"{commit_sha}^1"
+            )
+            if (
+                _local_tree_entry_optional(context, clock_ns, parent_sha, path)
+                is not None
+                or _local_tree_entry_optional(context, clock_ns, commit_sha, path)
+                is None
+            ):
+                raise OrchestrationFailure("RECEIPT_HISTORY_MUTATED")
+            _associated_merged_pr(
+                client, context, commit_sha, expected_number=None
+            )
+            _authenticate_bound_path(
+                client, context, commit_sha, execution_sha, path
+            )
+            receipt_integrations[path] = commit_sha
 
     required_sources = set(IMPLEMENTATION_PATHS | REUSED_PRIMITIVE_PATHS)
     for path in sorted(required_sources, key=lambda item: item.encode("utf-8")):
@@ -15280,6 +15379,7 @@ def _run_snapshot(
                     context=final_context,
                     clock_ns=final_clock_ns,
                 )
+                snapshot.close_after_final_authority()
                 check()
 
                 def finalize_runtime_inside_checkpoint(
@@ -15387,6 +15487,7 @@ def run_scorecard(
             if runtime.frozen.runtime_manifest_sha256 != sealed_digest:
                 raise OrchestrationFailure("RECOVERY_RUNTIME_MISMATCH")
         wait = _authorize_prior_history(invocation, recovery_seal, initial)
+        state.terminal_exclusion_verified = True
         if wait is not None:
             if recovery_seal is not None:
                 raise OrchestrationFailure("RECOVERY_FIRST_MANIFEST_MISSING")
@@ -15414,7 +15515,9 @@ def run_scorecard(
         # uncategorized path that retains POST-EVALUATION authority routing.
         if state.truthful_cells:
             return _emit_post_authority(state, dependencies)
-        if state.recovery_accepted or state.evidence_started:
+        if (
+            state.terminal_exclusion_verified and state.recovery_accepted
+        ) or state.evidence_started:
             return _emit_pre_cell(state, dependencies)
         return _emit_blocked(state, dependencies)
     except BaseException:
@@ -15422,7 +15525,9 @@ def run_scorecard(
         # cells happened to be present in memory; only the explicit final-
         # authority route and late database-context failure above may select
         # the POST-EVALUATION receipt.
-        if state.recovery_accepted or state.evidence_started:
+        if (
+            state.terminal_exclusion_verified and state.recovery_accepted
+        ) or state.evidence_started:
             return _emit_pre_cell(state, dependencies)
         return _emit_blocked(state, dependencies)
 
@@ -16074,9 +16179,10 @@ def scorecard_main(
             dependencies = build_production_dependencies(startup)
         except BaseException:
             if recovery_seal is not None:
-                return _write_uninitialized_recovery_invalid(
-                    invocation, recovery_seal, writer
-                )
+                # Terminal exclusion has not yet been authenticated.  Emitting
+                # another official terminal object could duplicate one already
+                # integrated beyond the sealed execution revision.
+                return 1
             return _write_uninitialized_blocked(invocation, writer)
     return run_scorecard(invocation, recovery_seal, dependencies)
 
