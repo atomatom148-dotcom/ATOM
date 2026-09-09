@@ -10860,3 +10860,227 @@ def test_fixed_and_exact_amendment_authentication_accept_matching_bytes(
         git_blob_sha1=blob_sha,
         raw_sha256=hashlib.sha256(content).hexdigest(),
     ) == datetime(2026, 9, 9, 1, 0, tzinfo=UTC)
+
+
+def test_loaded_specless_runtime_names_are_limited_to_frozen_exceptions(
+    monkeypatch,
+):
+    main_module = sc.ModuleType("__main__")
+    main_module.__file__ = None
+    main_module.__package__ = None
+    main_module.__loader__ = importlib.machinery.BuiltinImporter
+    main_module.__spec__ = None
+
+    DeprecatedType = type("_DeprecatedType", (), {})
+    DeprecatedType.__module__ = "typing"
+    deprecated_io = DeprecatedType()
+    deprecated_io.__module__ = "typing"
+    deprecated_io.__spec__ = None
+    deprecated_re = DeprecatedType()
+    deprecated_re.__module__ = "typing"
+    deprecated_re.__spec__ = None
+
+    cython_runtime = sc.ModuleType("cython_runtime")
+    cython_runtime.__spec__ = None
+    cython_runtime.__file__ = None
+    cython_runtime.__loader__ = None
+    cython_runtime.__package__ = None
+
+    cython_name = "_cython_3_1_0"
+    cython_module = sc.ModuleType(cython_name)
+    cython_module.__spec__ = None
+    cython_module.__file__ = None
+    cython_module.__loader__ = None
+    cython_module.__package__ = None
+    generated_type = type("GeneratedCythonType", (), {})
+    generated_type.__module__ = cython_name
+    cython_module._common_types_metatype = object()
+    cython_module.cython_function_or_method = generated_type
+    cython_module.generator = generated_type
+
+    modules = {
+        "__main__": main_module,
+        "typing.io": deprecated_io,
+        "typing.re": deprecated_re,
+        "cython_runtime": cython_runtime,
+        cython_name: cython_module,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    sc.validate_loaded_module_sources(
+        tuple(modules),
+        covered_source_paths=(),
+        covered_native_paths=(),
+        namespace_roots=(),
+    )
+
+
+def test_runtime_file_walk_and_cooperative_reader_cover_regular_tree(
+    tmp_path,
+):
+    root = tmp_path.resolve()
+    nested = root / "nested"
+    excluded = root / "excluded"
+    nested.mkdir()
+    excluded.mkdir()
+    first = root / "a.py"
+    second = nested / "b.so"
+    ignored_cache = nested / "c.pyc"
+    excluded_file = excluded / "d.py"
+    first.write_bytes(b"alpha")
+    second.write_bytes(b"beta")
+    ignored_cache.write_bytes(b"cache")
+    excluded_file.write_bytes(b"excluded")
+    checks = []
+
+    candidates = sc._walk_regular_candidates(
+        str(root),
+        excluded_roots=(str(excluded.resolve()),),
+        check=lambda: checks.append(True),
+    )
+
+    assert candidates == (
+        sc.FileCandidate(first.as_posix(), str(first.resolve())),
+        sc.FileCandidate(second.as_posix(), str(second.resolve())),
+    )
+    assert sc._cooperative_read_bytes(
+        str(first.resolve()), check=lambda: checks.append(True)
+    ) == b"alpha"
+    assert checks
+
+
+def test_native_candidate_collection_keeps_regular_and_allowed_kernel_maps(
+    tmp_path,
+):
+    library = tmp_path / "libsynthetic.so"
+    library.write_bytes(b"elf")
+    canonical = str(library.resolve())
+    candidates = sc._collect_native_candidates(
+        (
+            sc.ProcMapEntry(1, 2, "rw-p", 0, None),
+            sc.ProcMapEntry(2, 3, "r-xp", 0, "[vdso]"),
+            sc.ProcMapEntry(3, 4, "r-xp", 0, canonical),
+            sc.ProcMapEntry(4, 5, "r-xp", 4096, canonical),
+        )
+    )
+    assert candidates == (sc.FileCandidate(canonical, canonical),)
+
+
+@pytest.mark.parametrize("endpoint_delay", (5, 5.000000000000001))
+def test_runtime_closure_requires_exact_binary64_endpoint_delay(
+    endpoint_delay,
+    monkeypatch,
+    _synthetic_zoneinfo_isolation,
+):
+    state = _synthetic_zoneinfo_isolation
+    monkeypatch.setattr(sc, "_initialize_zoneinfo_isolation", lambda: state)
+
+    def load_closure():
+        _calendar, modules = _synthetic_runtime_closure_modules(
+            monkeypatch, state
+        )
+        modules["quant.v9_v4a_evidence"].MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS = (
+            endpoint_delay
+        )
+        return frozenset(sys.modules)
+
+    monkeypatch.setattr(sc, "_load_complete_runtime_closure", load_closure)
+    with pytest.raises(sc.OrchestrationFailure, match="V4A_OVERLAP_CONTRACT_CHANGED"):
+        sc._initialize_runtime_for_measurement()
+
+
+def test_production_calendar_reader_returns_strict_utc_sessions(monkeypatch):
+    days = (date(2026, 9, 8), date(2026, 9, 9))
+
+    class Label:
+        def __init__(self, value):
+            self.value = value
+
+        def date(self):
+            return self.value
+
+    labels = tuple(Label(day) for day in days)
+
+    class Calendar:
+        name = "XNYS"
+
+        def sessions_in_range(self, start, end):
+            assert (start, end) == ("2026-09-08", "2026-09-09")
+            return labels
+
+        def is_session(self, label):
+            return label in labels
+
+        def session_open(self, label):
+            return datetime.combine(label.date(), datetime.min.time(), UTC) + timedelta(
+                hours=13, minutes=30
+            )
+
+        def session_close(self, label):
+            return datetime.combine(label.date(), datetime.min.time(), UTC) + timedelta(
+                hours=20
+            )
+
+    monkeypatch.setattr(sc, "_ZONEINFO_ISOLATION", object())
+    monkeypatch.setattr(sc, "_validate_zoneinfo_isolation", lambda value: None)
+    read = sc._production_calendar_reader(Calendar())
+    assert read(days[0], days[1]) == tuple(
+        sc.CalendarSession(
+            day,
+            datetime.combine(day, datetime.min.time(), UTC)
+            + timedelta(hours=13, minutes=30),
+            datetime.combine(day, datetime.min.time(), UTC) + timedelta(hours=20),
+        )
+        for day in days
+    )
+
+
+def test_associated_pr_rejects_missing_repository_without_attribute_access():
+    commit_sha = "b" * 40
+
+    class Client:
+        _seams = SimpleNamespace(monotonic_ns=lambda: 0)
+
+        def get_paginated_json(
+            self,
+            target,
+            *,
+            context,
+            page_validator,
+            collection_validator,
+        ):
+            item = {
+                "number": 333,
+                "merge_commit_sha": commit_sha,
+                "merged_at": "2026-09-09T01:00:00Z",
+            }
+            check = lambda: context.check(self._seams.monotonic_ns)
+            return collection_validator(tuple(page_validator([item], check)), context)
+
+        def get_json(self, target, *, context, validator):
+            detail = {
+                "number": 333,
+                "merged": True,
+                "merge_commit_sha": commit_sha,
+                "base": {"ref": "main", "repo": None},
+                "merged_by": {
+                    "id": sc.GITHUB_OWNER_ID,
+                    "login": sc.GITHUB_OWNER_LOGIN,
+                },
+                "merged_at": "2026-09-09T01:00:00Z",
+            }
+            return None, validator(
+                detail,
+                200,
+                {},
+                lambda: context.check(self._seams.monotonic_ns),
+            )
+
+    with pytest.raises(sc.GitHubAuthorityFailure):
+        sc._associated_merged_pr(
+            Client(),
+            sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
+            commit_sha,
+            expected_number=333,
+        )

@@ -4565,8 +4565,8 @@ def _initialize_runtime_for_measurement() -> RuntimeInitialization:
         conninfo_module = sys.modules["psycopg.conninfo"]
     except BaseException:
         raise OrchestrationFailure("RUNTIME_CLOSURE_INITIALIZATION_FAILED") from None
-    # NOSONAR: exact equality is required for this frozen protocol constant.
-    if getattr(v4a, "MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS", None) != 5.0:  # NOSONAR
+    endpoint_delay = getattr(v4a, "MAX_ENDPOINT_OBSERVATION_DELAY_SECONDS", None)
+    if type(endpoint_delay) is not float or endpoint_delay.hex() != "0x1.4000000000000p+2":
         raise OrchestrationFailure("V4A_OVERLAP_CONTRACT_CHANGED")
     return RuntimeInitialization(
         module_names=frozenset(sys.modules),
