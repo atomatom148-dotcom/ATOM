@@ -7807,7 +7807,7 @@ def _connect_tls(
                 network_check,
                 tls.selected_alpn_protocol,
             )
-            if selected_alpn not in (None, "http/1.1"):
+            if selected_alpn != "http/1.1":
                 _fail()
             network_check()
             keep_tls = True
@@ -8444,21 +8444,9 @@ class GithubClient:
             connect_end_ns,
             self._approved_executable,
         )
-        # This is intentionally the first token access in this request.  The
-        # resolver has exited, been reaped, and all of its fds are closed.
-        try:
-            token = _cooperative_call(
-                request_check,
-                self._seams.token_reader,
-            )
-        except GitHubAuthorityFailure:
-            raise
-        except BaseException:
-            _fail()
-        if not isinstance(token, str):
-            _fail()
         tls: ssl.SSLSocket | None = None
         request: bytearray | None = None
+        token = ""
         try:
             tls = _connect_tls(
                 self._seams,
@@ -8468,6 +8456,19 @@ class GithubClient:
                 addresses,
             )
             context.check(self._seams.monotonic_ns, connect_end_ns, request_end_ns)
+            # This is the first token access in this request.  The resolver is
+            # reaped and TLS has authenticated the peer and exact HTTP/1.1 ALPN.
+            try:
+                token = _cooperative_call(
+                    request_check,
+                    self._seams.token_reader,
+                )
+            except GitHubAuthorityFailure:
+                raise
+            except BaseException:
+                _fail()
+            if not isinstance(token, str):
+                _fail()
             request = _build_request(target, token, check=request_check)
             _send_all_nonblocking(
                 tls, request, self._seams, context, request_end_ns
@@ -9345,6 +9346,7 @@ def parse_authority_comments(
     approvals: list[ApprovalComment] = []
     reviews: dict[int, ReviewComment] = {}
     seen_comment_ids: set[int] = set()
+    comments_by_id: dict[int, dict[str, object]] = {}
     for raw_comment in _cooperative_tuple(comments, check=check):
         check()
         if type(raw_comment) is not dict:
@@ -9357,21 +9359,25 @@ def parse_authority_comments(
         if loose_comment_id in seen_comment_ids:
             _fail()
         seen_comment_ids.add(loose_comment_id)
+        comments_by_id[loose_comment_id] = loose_envelope
         loose_body = _cooperative_call(check, loose_envelope.get, "body")
         if type(loose_body) is not str:
             # GitHub issue-comment envelopes must have a string body, even if
             # the comment is unrelated to V-1B authority.
             _fail()
         body = _parse_canonical_comment_body(loose_body, check=check)
+        loose_user = _cooperative_call(check, loose_envelope.get, "user")
+        is_owner = (
+            type(loose_user) is dict
+            and loose_user.get("id") == GITHUB_OWNER_ID
+            and loose_user.get("login") == GITHUB_OWNER_LOGIN
+        )
         if body is None:
-            if "ATOM-V1B-OPERATIONAL-APPROVAL" in loose_body or "ATOM-V1B-OPERATIONAL-REVIEW" in loose_body:
+            if is_owner and "ATOM-V1B-OPERATIONAL-APPROVAL" in loose_body:
                 _fail()
             continue
         schema = _cooperative_call(check, body.get, "schema_version")
-        if schema not in {
-            "ATOM-V1B-OPERATIONAL-REVIEW-1",
-            "ATOM-V1B-OPERATIONAL-APPROVAL-1",
-        }:
+        if schema != "ATOM-V1B-OPERATIONAL-APPROVAL-1" or not is_owner:
             continue
         envelope, user = _comment_envelope(raw_comment, check=check)
         comment_id = _positive_int(envelope["id"], check=check)
@@ -9381,88 +9387,92 @@ def parse_authority_comments(
         if not isinstance(body_text, str):
             _fail()
         canonical_body = _cooperative_call(check, body_text.encode, "utf-8")
-        if schema == "ATOM-V1B-OPERATIONAL-REVIEW-1":
-            review = _exact_dict(
-                body,
-                frozenset(
-                    {
-                        "schema_version",
-                        "approval_payload_sha256",
-                        "verdict",
-                        "material_findings",
-                    }
-                ),
-                check=check,
-            )
-            _sha256(review["approval_payload_sha256"], check=check)
-            _string(review["verdict"], exact="PASS", check=check)
-            if type(review["material_findings"]) is not int or review["material_findings"] != 0:
-                _fail()
-            reviews[comment_id] = ReviewComment(
+        approval = _exact_dict(
+            body,
+            frozenset(
+                {
+                    "schema_version",
+                    "payload",
+                    "approval_payload_sha256",
+                    "independent_review_comment_id",
+                    "independent_reviewer_user_id",
+                    "independent_reviewer_login",
+                }
+            ),
+            check=check,
+        )
+        payload = _validate_payload(
+            approval["payload"], artifact_components_validator, check=check
+        )
+        payload_hash = _cooperative_canonical_sha256(payload, check=check)
+        if _sha256(approval["approval_payload_sha256"], check=check) != payload_hash:
+            _fail()
+        reviewer_id = _positive_int(
+            approval["independent_reviewer_user_id"], check=check
+        )
+        reviewer_login = _string(
+            approval["independent_reviewer_login"], check=check
+        )
+        if reviewer_id == GITHUB_OWNER_ID or reviewer_login == GITHUB_OWNER_LOGIN:
+            _fail()
+        window = payload["no_ref_update_window"]
+        if not isinstance(window, dict):
+            _fail()
+        approvals.append(
+            ApprovalComment(
                 comment_id=comment_id,
-                author_id=_positive_int(user["id"], check=check),
-                author_login=_string(user["login"], check=check),
                 created_at=_string(envelope["created_at"], check=check),
                 canonical_body=canonical_body,
-                approval_payload_sha256=_sha256(
-                    review["approval_payload_sha256"], check=check
+                payload=payload,
+                window=window,
+                review_comment_id=_positive_int(
+                    approval["independent_review_comment_id"], check=check
                 ),
+                reviewer_user_id=reviewer_id,
+                reviewer_login=reviewer_login,
             )
-        elif schema == "ATOM-V1B-OPERATIONAL-APPROVAL-1":
-            # A body by any other user is not authority.  A malformed Owner
-            # body, however, fails closed rather than disappearing.
-            if user["id"] != GITHUB_OWNER_ID or user["login"] != GITHUB_OWNER_LOGIN:
-                continue
-            approval = _exact_dict(
-                body,
-                frozenset(
-                    {
-                        "schema_version",
-                        "payload",
-                        "approval_payload_sha256",
-                        "independent_review_comment_id",
-                        "independent_reviewer_user_id",
-                        "independent_reviewer_login",
-                    }
-                ),
-                check=check,
-            )
-            payload = _validate_payload(
-                approval["payload"],
-                artifact_components_validator,
-                check=check,
-            )
-            payload_hash = _cooperative_canonical_sha256(payload, check=check)
-            if _sha256(
-                approval["approval_payload_sha256"], check=check
-            ) != payload_hash:
-                _fail()
-            reviewer_id = _positive_int(
-                approval["independent_reviewer_user_id"], check=check
-            )
-            reviewer_login = _string(
-                approval["independent_reviewer_login"], check=check
-            )
-            if reviewer_id == GITHUB_OWNER_ID or reviewer_login == GITHUB_OWNER_LOGIN:
-                _fail()
-            window = payload["no_ref_update_window"]
-            if not isinstance(window, dict):
-                _fail()
-            approvals.append(
-                ApprovalComment(
-                    comment_id=comment_id,
-                    created_at=_string(envelope["created_at"], check=check),
-                    canonical_body=canonical_body,
-                    payload=payload,
-                    window=window,
-                    review_comment_id=_positive_int(
-                        approval["independent_review_comment_id"],
-                        check=check,
-                    ),
-                    reviewer_user_id=reviewer_id,
-                    reviewer_login=reviewer_login,
-                )
-            )
+        )
+        check()
+
+    for review_comment_id in _cooperative_tuple(
+        sorted({approval.review_comment_id for approval in approvals}),
+        check=check,
+    ):
+        raw_review = comments_by_id.get(review_comment_id)
+        if raw_review is None:
+            continue
+        envelope, user = _comment_envelope(raw_review, check=check)
+        body_text = envelope["body"]
+        if not isinstance(body_text, str):
+            _fail()
+        body = _parse_canonical_comment_body(body_text, check=check)
+        if body is None or body.get("schema_version") != "ATOM-V1B-OPERATIONAL-REVIEW-1":
+            _fail()
+        review = _exact_dict(
+            body,
+            frozenset(
+                {
+                    "schema_version",
+                    "approval_payload_sha256",
+                    "verdict",
+                    "material_findings",
+                }
+            ),
+            check=check,
+        )
+        _string(review["verdict"], exact="PASS", check=check)
+        if type(review["material_findings"]) is not int or review["material_findings"] != 0:
+            _fail()
+        reviews[review_comment_id] = ReviewComment(
+            comment_id=review_comment_id,
+            author_id=_positive_int(user["id"], check=check),
+            author_login=_string(user["login"], check=check),
+            created_at=_string(envelope["created_at"], check=check),
+            canonical_body=_cooperative_call(check, body_text.encode, "utf-8"),
+            approval_payload_sha256=_sha256(
+                review["approval_payload_sha256"], check=check
+            ),
+        )
         check()
     check()
     return _cooperative_call(check, tuple, approvals), reviews
@@ -13936,7 +13946,7 @@ def _commit_diff_paths(
     except UnicodeError:
         raise OrchestrationFailure("FIRST_PARENT_HISTORY_INVALID") from None
     unique_paths = _cooperative_call(checkpoint_check, set, paths)
-    if not paths or len(paths) != len(unique_paths):
+    if len(paths) != len(unique_paths):
         raise OrchestrationFailure("FIRST_PARENT_HISTORY_INVALID")
     checkpoint_check()
     return _cooperative_call(checkpoint_check, frozenset, paths)
@@ -15076,6 +15086,10 @@ def _wait_line(manifest_id: str) -> bytes:
     )
 
 
+def _recovery_requires_silent_failure(state: InvocationState) -> bool:
+    return state.recovery_accepted and not state.terminal_exclusion_verified
+
+
 def _emit_blocked(state: InvocationState, dependencies: OrchestrationDependencies) -> int:
     checkpoint = state.checkpoint
     snapshot = state.snapshot
@@ -15544,12 +15558,20 @@ def run_scorecard(
     except OutputSinkFailure:
         return 1
     except CapacityRefusal:
+        if _recovery_requires_silent_failure(state):
+            return 1
         return _emit_blocked(state, dependencies)
     except FinalAuthorityRefusal:
+        if _recovery_requires_silent_failure(state):
+            return 1
         return _emit_post_authority(state, dependencies)
     except EvaluationConstructionRefusal:
+        if _recovery_requires_silent_failure(state):
+            return 1
         return _emit_pre_cell(state, dependencies)
     except DatabaseContractError:
+        if _recovery_requires_silent_failure(state):
+            return 1
         # A transaction-context exit can fail after the evaluator has produced
         # every truthful cell.  That database teardown failure is the one late
         # uncategorized path that retains POST-EVALUATION authority routing.
@@ -15561,6 +15583,8 @@ def run_scorecard(
             return _emit_pre_cell(state, dependencies)
         return _emit_blocked(state, dependencies)
     except BaseException:
+        if _recovery_requires_silent_failure(state):
+            return 1
         # Unclassified construction defects remain consuming PRE-CELL even if
         # cells happened to be present in memory; only the explicit final-
         # authority route and late database-context failure above may select
