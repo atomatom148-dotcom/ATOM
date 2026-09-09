@@ -1875,12 +1875,15 @@ def evaluate_cell(
             seasonal_bootstrap=seasonal_bootstrap,
         )
 
-    assert enc_bootstrap.ci_0999 is not None
-    assert enc_bootstrap.ci_095 is not None
-    assert unconditional_bootstrap.ci_0999 is not None
-    assert unconditional_bootstrap.ci_095 is not None
-    assert seasonal_bootstrap.ci_0999 is not None
-    assert seasonal_bootstrap.ci_095 is not None
+    if (
+        enc_bootstrap.ci_0999 is None
+        or enc_bootstrap.ci_095 is None
+        or unconditional_bootstrap.ci_0999 is None
+        or unconditional_bootstrap.ci_095 is None
+        or seasonal_bootstrap.ci_0999 is None
+        or seasonal_bootstrap.ci_095 is None
+    ):
+        raise ProtocolDefect("completed bootstrap interval missing")
     gate_unconditional = (
         "PASS" if unconditional_bootstrap.ci_0999[0] > 0 else "FAIL"
     )
@@ -9377,7 +9380,8 @@ def parse_authority_comments(
         if comment_id != loose_comment_id:
             _fail()
         body_text = envelope["body"]
-        assert isinstance(body_text, str)
+        if not isinstance(body_text, str):
+            _fail()
         canonical_body = _cooperative_call(check, body_text.encode, "utf-8")
         if schema == "ATOM-V1B-OPERATIONAL-REVIEW-1":
             review = _exact_dict(
@@ -9444,7 +9448,8 @@ def parse_authority_comments(
             if reviewer_id == GITHUB_OWNER_ID or reviewer_login == GITHUB_OWNER_LOGIN:
                 _fail()
             window = payload["no_ref_update_window"]
-            assert isinstance(window, dict)
+            if not isinstance(window, dict):
+                _fail()
             approvals.append(
                 ApprovalComment(
                     comment_id=comment_id,
@@ -12619,7 +12624,8 @@ def _read_regular_file_no_symlinks(path: str) -> bytes:
 def read_recovery_seal(invocation: Invocation) -> SealBundle | None:
     if invocation.mode is InvocationMode.NEW_SEAL:
         return None
-    assert invocation.recovery_path is not None
+    if invocation.recovery_path is None:
+        raise OrchestrationFailure("INVALID_RECOVERY_SEAL")
     try:
         raw = _read_regular_file_no_symlinks(invocation.recovery_path)
         record = parse_canonical_line(raw, "recovery seal")
@@ -14310,7 +14316,8 @@ def _authenticate_fixed_merge(
         raise OrchestrationFailure("DECISION_DOCUMENT_INVALID")
     merged_at = _parse_github_time(detail.get("merged_at"))
     commit_data = commit.get("commit")
-    assert isinstance(commit_data, Mapping)
+    if not isinstance(commit_data, Mapping):
+        raise OrchestrationFailure("GITHUB_COMMIT_INVALID")
     committer = commit_data.get("committer")
     if type(committer) is not dict:
         raise OrchestrationFailure("GITHUB_COMMIT_INVALID")
