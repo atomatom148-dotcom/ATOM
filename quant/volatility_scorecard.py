@@ -13847,20 +13847,19 @@ def _associated_merged_pr(
         if status != 200 or type(detail) is not dict:
             _fail()
         base = detail.get("base")
-        repository = base.get("repo") if type(base) is dict else None
         merged_by = detail.get("merged_by")
-        repository_full_name = (
-            repository.get("full_name") if type(repository) is dict else None
-        )
+        if type(base) is not dict or type(merged_by) is not dict:
+            _fail()
+        repository = base.get("repo")
+        if type(repository) is not dict:
+            _fail()
+        repository_full_name = repository.get("full_name")
         if (
             detail.get("number") != number
             or detail.get("merged") is not True
             or detail.get("merge_commit_sha") != commit_sha
-            or type(base) is not dict
             or base.get("ref") != "main"
-            or type(repository) is not dict
             or repository_full_name != GITHUB_REPOSITORY
-            or type(merged_by) is not dict
             or merged_by.get("id") != GITHUB_OWNER_ID
             or merged_by.get("login") != GITHUB_OWNER_LOGIN
         ):
