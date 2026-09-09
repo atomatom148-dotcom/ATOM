@@ -1457,7 +1457,10 @@ def descriptive_metrics(population: CellPopulation) -> DescriptiveMetrics:
         ) / len(windows)
         forecast_median = _median_binary64(forecasts)
         outcome_median = _median_binary64(outcomes)
-        level_ratio = None if outcome_median == 0 else forecast_median / outcome_median
+        # Preserve the frozen exact-zero rule (including negative zero) without
+        # using a floating-point equality comparison.
+        zero_outcome = outcome_median.hex() in {"0x0.0p+0", "-0x0.0p+0"}
+        level_ratio = None if zero_outcome else forecast_median / outcome_median
         coverage = math.fsum(
             1.0 if outcome <= NORMAL_90 * forecast else 0.0
             for forecast, outcome in zip(forecasts, outcomes)
