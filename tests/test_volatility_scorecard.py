@@ -8432,6 +8432,35 @@ def test_public_scorecard_main_reaches_exact_wait_without_opening_snapshot():
     ]
 
 
+@pytest.mark.parametrize(
+    "failure",
+    (
+        sc.CapacityRefusal("capacity"),
+        sc.DatabaseContractError(
+            sc.DatabaseFailureStage.NEW_BEFORE_EVIDENCE,
+            sc.DatabaseDefect.SNAPSHOT,
+        ),
+        RuntimeError("generic startup failure"),
+    ),
+)
+def test_recovery_failure_before_terminal_exclusion_is_silent(failure):
+    parts = _ready_schema_parts()
+    runtime = _orchestration_runtime_state()
+    checkpoint = _orchestration_checkpoint(runtime, parts.manifest_id)
+    output = []
+    dependencies = replace(
+        _routing_dependencies(runtime, checkpoint, output),
+        validate_startup=lambda invocation: (_ for _ in ()).throw(failure),
+    )
+    invocation = sc.Invocation(
+        parts.manifest_id,
+        f"/tmp/atom-v1b-seals/{parts.seal.seal_record_sha256}.json",
+        sc.InvocationMode.RECOVERY,
+    )
+    assert sc.run_scorecard(invocation, parts.seal, dependencies) == 1
+    assert output == []
+
+
 @pytest.mark.parametrize("failure_point", ("partial_write", "flush"))
 def test_wait_output_sink_failure_is_one_attempt_without_fallback(failure_point):
     runtime = _orchestration_runtime_state()
@@ -10610,6 +10639,13 @@ def test_authority_comment_parser_accepts_linked_payload_v2():
         }
 
     comments = (
+        {
+            "id": 100,
+            "user": {"id": 555, "login": "unrelated-user"},
+            "created_at": "2026-09-09T01:05:00Z",
+            "updated_at": "2026-09-09T01:05:00Z",
+            "body": "malformed ATOM-V1B-OPERATIONAL-APPROVAL text",
+        },
         envelope(
             101,
             999,
@@ -10634,6 +10670,7 @@ def test_authority_comment_parser_accepts_linked_payload_v2():
     assert approvals[0].payload == payload
     assert approvals[0].review_comment_id == 101
     assert reviews[101].approval_payload_sha256 == payload_hash
+    assert 100 not in reviews
 
 
 def test_tls_connector_retries_address_and_completes_nonblocking_handshake(
@@ -10796,6 +10833,70 @@ def test_tls_connector_closes_socket_when_final_deadline_check_fails():
             (("AF_INET", "192.0.2.1", 443),),
         )
     assert tls.closed is True
+
+
+def test_tls_connector_rejects_missing_alpn_and_closes_before_token_use(
+    monkeypatch,
+):
+    class RawSocket:
+        def setblocking(self, value):
+            assert value is False
+
+        def connect_ex(self, sockaddr):
+            return 0
+
+        def close(self):
+            raise AssertionError("TLS owns the raw socket")
+
+    raw = RawSocket()
+
+    class TLSSocket:
+        def __init__(self):
+            self.closed = False
+
+        def setblocking(self, value):
+            assert value is False
+
+        def do_handshake(self):
+            return None
+
+        def selected_alpn_protocol(self):
+            return None
+
+        def fileno(self):
+            return -1 if self.closed else 7
+
+        def close(self):
+            self.closed = True
+
+    tls = TLSSocket()
+
+    class Context:
+        def wrap_socket(self, observed_raw, **kwargs):
+            assert observed_raw is raw
+            return tls
+
+    token_reads = []
+    seams = sc.GithubTransportSeams(
+        monotonic_ns=lambda: 0,
+        socket_factory=lambda *args: raw,
+        token_reader=lambda: token_reads.append(True) or "secret-token",
+    )
+    monkeypatch.setattr(
+        sc,
+        "_resolve_api_github_addresses",
+        lambda *args: (("AF_INET", "192.0.2.1", 443),),
+    )
+    client = sc.GithubClient(
+        approved_executable="/runtime/python", seams=seams, ssl_context=Context()
+    )
+    with pytest.raises(sc.GitHubAuthorityFailure):
+        client.get_json(
+            sc.GITHUB_REPOSITORY_PATH,
+            context=sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
+        )
+    assert tls.closed is True
+    assert token_reads == []
 
 
 def test_receipt_tree_scan_filters_and_byte_sorts_paths(monkeypatch):
@@ -11078,6 +11179,20 @@ def test_commit_diff_paths_decodes_complete_no_rename_change_set(monkeypatch):
         lambda: 0,
         commit_sha,
     ) == frozenset({"old/name.py", "new/name.py"})
+
+
+def test_commit_diff_paths_accepts_empty_disjoint_integration(monkeypatch):
+    commit_sha = "b" * 40
+    parent_sha = "a" * 40
+    monkeypatch.setattr(
+        sc, "_git_ascii", lambda *args: f"{commit_sha} {parent_sha}"
+    )
+    monkeypatch.setattr(sc, "_git_read", lambda *args: b"")
+    assert sc._commit_diff_paths(
+        sc.GithubDeadlineContext.begin_checkpoint(lambda: 0),
+        lambda: 0,
+        commit_sha,
+    ) == frozenset()
 
 
 def test_fixed_and_exact_amendment_authentication_accept_matching_bytes(
