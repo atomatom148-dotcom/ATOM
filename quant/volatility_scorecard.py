@@ -7809,8 +7809,8 @@ def _connect_tls(
             )
             if selected_alpn not in (None, "http/1.1"):
                 _fail()
-            keep_tls = True
             network_check()
+            keep_tls = True
             return tls
         except GitHubAuthorityFailure:
             raise
@@ -7887,7 +7887,8 @@ def _build_request(
         b"User-Agent: ATOM-V1B-READ-ONLY-VOLATILITY-SCORECARD-1\r\n",
         b"Authorization: Bearer ",
         token_bytes,
-        b"\r\nConnection: close\r\n\r\n",
+        b"\r\nConnection: close\r\n",
+        b"Accept-Encoding: identity\r\n\r\n",
     ):
         _cooperative_call(check, request.extend, part)
     _cooperative_check(check)
@@ -8102,19 +8103,14 @@ def _decode_chunked(
             line.partition,
             b";",
         )
+        if separator or extension:
+            _fail()
         if _cooperative_call(
             check,
             re.fullmatch,
             rb"[0-9A-Fa-f]+",
             size_token,
         ) is None:
-            _fail()
-        extension_invalid = separator and _cooperative_call(
-            check,
-            lambda value: any(byte < 0x20 or byte > 0x7E for byte in value),
-            extension,
-        )
-        if extension_invalid:
             _fail()
         size = _cooperative_call(check, int, size_token, 16)
         if size == 0:
@@ -8179,6 +8175,27 @@ def _decode_chunked(
     if b"location" in trailers:
         _fail()
     return _cooperative_call(check, bytes, decoded), trailers
+
+
+def _validate_github_json_content_type(
+    value: bytes,
+    *,
+    check: Callable[[], int] = _noop_deadline_check,
+) -> None:
+    try:
+        content_type = _cooperative_call(check, value.strip, b" \t")
+        content_type_match = _cooperative_call(
+            check,
+            re.fullmatch,
+            rb"(?:application/json|application/vnd\.github\+json)"
+            rb"[ \t]*;[ \t]*charset[ \t]*=[ \t]*utf-8",
+            content_type,
+            re.IGNORECASE,
+        )
+    except BaseException:
+        _fail()
+    if content_type_match is None:
+        _fail()
 
 
 @dataclass(frozen=True, slots=True)
@@ -8473,28 +8490,9 @@ class GithubClient:
             )
             if len(content_types) != 1:
                 _fail()
-            try:
-                media_parts = _cooperative_call(
-                    request_check,
-                    content_types[0].split,
-                    b";",
-                    1,
-                )
-                media_type = _cooperative_call(
-                    request_check,
-                    _cooperative_call(
-                        request_check,
-                        media_parts[0].strip,
-                    ).lower,
-                )
-            except BaseException:
-                _fail()
-            if not (
-                media_type == b"application/json"
-                or media_type == b"application/vnd.github+json"
-                or media_type.endswith(b"+json")
-            ):
-                _fail()
+            _validate_github_json_content_type(
+                content_types[0], check=request_check
+            )
             value = _json_no_duplicates(response.body, check=request_check)
             if validator is not None:
                 value = _cooperative_call(
@@ -13422,7 +13420,19 @@ def _checkpoint_git_run(
     timeout_seconds = context.remaining_seconds(clock_ns)
     try:
         completed = subprocess.run(
-            ("git", "-c", "credential.helper=", *arguments),
+            (
+                "git",
+                "--no-pager",
+                "--no-replace-objects",
+                "--no-optional-locks",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "core.commitGraph=false",
+                *arguments,
+            ),
             cwd=os.getcwd(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -13431,7 +13441,20 @@ def _checkpoint_git_run(
             close_fds=True,
             text=False,
             timeout=timeout_seconds,
-            env={"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
+            env={
+                "PATH": os.defpath,
+                "LANG": "C",
+                "LC_ALL": "C",
+                "GIT_NO_LAZY_FETCH": "1",
+                "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_GRAFT_FILE": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_LITERAL_PATHSPECS": "1",
+                "GIT_ALLOW_PROTOCOL": "",
+            },
         )
     except (OSError, subprocess.SubprocessError):
         raise OrchestrationFailure("LOCAL_GIT_PROOF_FAILED") from None
