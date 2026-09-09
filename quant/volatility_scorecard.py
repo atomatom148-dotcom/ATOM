@@ -13265,7 +13265,7 @@ def _v9_population(
             # sqrt(q0) is undefined over the frozen real-valued formula.
             n_null += 1
             continue
-        if variance == 0:
+        if variance.hex() in {"0x0.0p+0", "-0x0.0p+0"}:
             n_nonpositive += 1
             continue
         kappa = _causal_kappa(row, evidence, primitives)
