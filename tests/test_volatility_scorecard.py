@@ -818,6 +818,54 @@ def test_v9_cohort_trace_accepts_exact_initial_rotation_and_rejects_drift():
         )
 
 
+def test_xnys_candidate_enumeration_filters_exact_full_sessions_and_targets():
+    first_day = date(2026, 9, 8)
+    second_day = date(2026, 9, 9)
+    first = sc.CalendarSession(
+        first_day,
+        datetime(2026, 9, 8, 13, 30, tzinfo=UTC),
+        datetime(2026, 9, 8, 20, 0, tzinfo=UTC),
+    )
+    shortened = sc.CalendarSession(
+        second_day,
+        datetime(2026, 9, 9, 13, 30, tzinfo=UTC),
+        datetime(2026, 9, 9, 17, 0, tzinfo=UTC),
+    )
+    candidates = sc.enumerate_xnys_candidates(
+        (first, shortened),
+        amendment_merged_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
+        scan_started_at=datetime(2026, 9, 10, 0, 0, tzinfo=UTC),
+    )
+    assert candidates == (first,)
+    assert sc.qualifying_full_xnys_sessions((first, shortened)) == (first,)
+
+    sessions = {first_day: first}
+    assert sc._session_for_target(
+        datetime(2026, 9, 8, 13, 31, tzinfo=UTC),
+        datetime(2026, 9, 8, 13, 36, tzinfo=UTC),
+        sessions,
+    ) == first_day
+    assert sc._session_for_target(
+        datetime(2026, 9, 8, 13, 31, tzinfo=UTC),
+        datetime(2026, 9, 8, 20, 1, tzinfo=UTC),
+        sessions,
+    ) is None
+    assert sc._session_for_target(
+        datetime(2026, 9, 8, 13, 31, tzinfo=UTC),
+        datetime(2026, 9, 8, 13, 31, tzinfo=UTC),
+        sessions,
+    ) is None
+
+    with pytest.raises(sc.ProtocolDefect, match="calendar row type"):
+        sc.enumerate_xnys_candidates(
+            (object(),),
+            amendment_merged_at=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
+            scan_started_at=datetime(2026, 9, 10, 0, 0, tzinfo=UTC),
+        )
+    with pytest.raises(sc.ProtocolDefect, match="not strictly ordered"):
+        sc.qualifying_full_xnys_sessions((shortened, first))
+
+
 def test_gate_loss_populations_and_summary_differences_are_exact():
     base = _window(0, predicted=2.0, realized=4.0)
     row = sc.RegressionWindow(base, persist_1=1.0, persist_20=1.5, unconditional=3.0, seasonal=3.0)
