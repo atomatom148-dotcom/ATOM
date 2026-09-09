@@ -11162,6 +11162,14 @@ def test_repository_facts_authentication_completes_unique_integration(monkeypatc
     tree_sha = "a" * 40
     merged_at = datetime(2026, 9, 8, 1, 0, tzinfo=UTC)
     corrective_at = merged_at + timedelta(hours=1)
+    preflight_calls = []
+
+    monkeypatch.setattr(
+        sc,
+        "_local_git_preflight",
+        lambda context, clock_ns: preflight_calls.append((context, clock_ns))
+        or ("/repo/.git", "/repo/.git"),
+    )
 
     def git_ascii(context, clock_ns, *arguments):
         if arguments == ("rev-parse", "HEAD"):
@@ -11232,6 +11240,7 @@ def test_repository_facts_authentication_completes_unique_integration(monkeypatc
     )
 
     assert facts.execution_sha == execution_sha
+    assert len(preflight_calls) == 1
     assert facts.implementation_merge_sha == implementation_sha
     assert facts.receipts == ()
     assert facts.history_sha256 == sc.canonical_sha256([])
