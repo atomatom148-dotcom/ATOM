@@ -4594,6 +4594,7 @@ def _production_source_identity() -> SourceIdentity:
         raise ContractError("PROBE_SOURCE_IDENTITY_INVALID")
     try:
         context = GithubDeadlineContext.begin_checkpoint(time.monotonic_ns)
+        _local_git_preflight(context, time.monotonic_ns)
         completed = _checkpoint_git_run(
             context,
             time.monotonic_ns,
@@ -8140,7 +8141,7 @@ def _decode_chunked(
                 trailer_end,
             )
             if trailer_block:
-                trailers = _parse_headers(trailer_block, check=check)
+                _fail()
             position = trailer_end + 4
             break
         if len(body) - position < size + 2:
@@ -9022,7 +9023,6 @@ def _validate_github_tls_trust(
 
 def _validate_provenance(
     value: object,
-    artifact_components_validator: Callable[[object], object],
     *,
     check: Callable[[], int] = _noop_deadline_check,
 ) -> dict[str, object]:
@@ -9068,13 +9068,13 @@ def _validate_provenance(
         check=check,
     )
     _string(provenance["python_version"], exact="3.14.3", check=check)
-    components = _cooperative_call(
-        check,
-        artifact_components_validator,
+    components = _exact_dict(
         provenance["runtime_artifact_components"],
+        frozenset(RUNTIME_COMPONENT_KEYS),
+        check=check,
     )
-    if components != provenance["runtime_artifact_components"]:
-        _fail()
+    for key in RUNTIME_COMPONENT_KEYS:
+        _sha256(components[key], check=check)
     if _sha256(
         provenance["runtime_artifact_sha256"], check=check
     ) != _cooperative_canonical_sha256(components, check=check):
@@ -9158,7 +9158,6 @@ def _validate_legacy_capacity(
 
 def _validate_payload(
     value: object,
-    artifact_components_validator: Callable[[object], object],
     *,
     check: Callable[[], int] = _noop_deadline_check,
 ) -> dict[str, object]:
@@ -9193,7 +9192,6 @@ def _validate_payload(
         _fail()
     provenance = _validate_provenance(
         payload["provenance"],
-        artifact_components_validator,
         check=check,
     )
     if _sha256(
@@ -9401,9 +9399,7 @@ def parse_authority_comments(
             ),
             check=check,
         )
-        payload = _validate_payload(
-            approval["payload"], artifact_components_validator, check=check
-        )
+        payload = _validate_payload(approval["payload"], check=check)
         payload_hash = _cooperative_canonical_sha256(payload, check=check)
         if _sha256(approval["approval_payload_sha256"], check=check) != payload_hash:
             _fail()
@@ -9605,6 +9601,7 @@ def classify_v1b_approvals(
     reviews: Mapping[int, ReviewComment],
     expected_execution_sha: str,
     manifest_id: str,
+    artifact_components_validator: Callable[[object], object] = lambda value: value,
     initial_selection: ApprovalSelection | None = None,
 ) -> ApprovalSelection:
     """Query every approval's fixed ID before selecting exactly one CURRENT."""
@@ -9662,6 +9659,17 @@ def classify_v1b_approvals(
         _fail()
     current = current_candidates[0]
     if current.payload["schema_version"] != OPERATIONAL_APPROVAL_SCHEMA_VERSION:
+        _fail()
+    current_provenance = current.payload["provenance"]
+    if type(current_provenance) is not dict:
+        _fail()
+    current_components = current_provenance["runtime_artifact_components"]
+    validated_components = _cooperative_call(
+        checkpoint_check,
+        artifact_components_validator,
+        current_components,
+    )
+    if validated_components != current_components:
         _fail()
     current_review = _validate_linked_review(
         current, reviews, check=checkpoint_check
@@ -9891,35 +9899,26 @@ def verify_github_checkpoint(
         request_check()
         if type(comments) is not list:
             _fail()
-        approvals, reviews = parse_authority_comments(
-            comments,
-            artifact_components_validator=artifact_components_validator,
-            check=request_check,
-        )
+        retained: list[object] = []
+        for comment in _cooperative_tuple(comments, check=request_check):
+            request_check()
+            if type(comment) is not dict:
+                _fail()
+            _comment_envelope(comment, check=request_check)
+            _cooperative_call(request_check, retained.append, comment)
         request_check()
-        return (*approvals, *reviews.values())
+        return _cooperative_call(request_check, tuple, retained)
 
     def validate_comment_collection(
         parsed_comments: tuple[object, ...],
         paged: GithubDeadlineContext,
     ) -> object:
         paged_check = paged.checker(client._seams.monotonic_ns)
-        approvals: list[ApprovalComment] = []
-        reviews: dict[int, ReviewComment] = {}
-        seen_comment_ids: set[int] = set()
-        for parsed in parsed_comments:
-            paged_check()
-            if isinstance(parsed, ApprovalComment):
-                comment_id = parsed.comment_id
-                approvals.append(parsed)
-            elif isinstance(parsed, ReviewComment):
-                comment_id = parsed.comment_id
-                reviews[comment_id] = parsed
-            else:
-                _fail()
-            if comment_id in seen_comment_ids:
-                _fail()
-            seen_comment_ids.add(comment_id)
+        approvals, reviews = parse_authority_comments(
+            parsed_comments,
+            artifact_components_validator=artifact_components_validator,
+            check=paged_check,
+        )
         paged_check()
         return classify_v1b_approvals(
             client=client,
@@ -9928,6 +9927,7 @@ def verify_github_checkpoint(
             reviews=reviews,
             expected_execution_sha=sha,
             manifest_id=manifest_id,
+            artifact_components_validator=artifact_components_validator,
             initial_selection=initial_selection,
         )
 
@@ -13421,6 +13421,9 @@ def scan_manifest_candidates(
 # ---------------------------------------------------------------------------
 
 
+_FROZEN_GIT_DIRECTORIES: tuple[str, str] | None = None
+
+
 def _checkpoint_git_run(
     context: GithubDeadlineContext,
     clock_ns: Callable[[], int],
@@ -13470,6 +13473,104 @@ def _checkpoint_git_run(
         raise OrchestrationFailure("LOCAL_GIT_PROOF_FAILED") from None
     context.check(clock_ns)
     return completed
+
+
+def _local_git_preflight(
+    context: GithubDeadlineContext,
+    clock_ns: Callable[[], int],
+) -> tuple[str, str]:
+    global _FROZEN_GIT_DIRECTORIES
+
+    check = context.checker(clock_ns)
+    try:
+        check()
+        null_stat = os.lstat("/dev/null")
+        check()
+        if (
+            os.path.realpath("/dev/null") != "/dev/null"
+            or not stat.S_ISCHR(null_stat.st_mode)
+        ):
+            raise OSError
+
+        def read_predicate(*arguments: str) -> str:
+            completed = _checkpoint_git_run(
+                context, clock_ns, *arguments, check=True
+            )
+            raw = completed.stdout
+            if type(raw) is not bytes:
+                raise OSError
+            text = raw.decode("ascii", "strict")
+            match = re.fullmatch(r"([^\r\n]+)\n?", text)
+            if match is None:
+                raise OSError
+            check()
+            return match.group(1)
+
+        root = read_predicate("rev-parse", "--show-toplevel")
+        inside = read_predicate("rev-parse", "--is-inside-work-tree")
+        bare = read_predicate("rev-parse", "--is-bare-repository")
+        shallow = read_predicate("rev-parse", "--is-shallow-repository")
+        object_format = read_predicate("rev-parse", "--show-object-format")
+        git_dir = read_predicate(
+            "rev-parse", "--path-format=absolute", "--absolute-git-dir"
+        )
+        common_dir = read_predicate(
+            "rev-parse", "--path-format=absolute", "--git-common-dir"
+        )
+        expected_root = os.path.realpath(os.getcwd())
+        if (
+            root != expected_root
+            or inside != "true"
+            or bare != "false"
+            or shallow != "false"
+            or object_format != "sha1"
+        ):
+            raise OSError
+        for directory in (git_dir, common_dir):
+            check()
+            observed = os.lstat(directory)
+            check()
+            if (
+                not os.path.isabs(directory)
+                or os.path.normpath(directory) != directory
+                or os.path.realpath(directory) != directory
+                or stat.S_ISLNK(observed.st_mode)
+                or not stat.S_ISDIR(observed.st_mode)
+            ):
+                raise OSError
+        directories = (git_dir, common_dir)
+        if _FROZEN_GIT_DIRECTORIES is None:
+            _FROZEN_GIT_DIRECTORIES = directories
+        elif _FROZEN_GIT_DIRECTORIES != directories:
+            raise OSError
+
+        info = os.path.join(common_dir, "info")
+        grafts = os.path.join(info, "grafts")
+        check()
+        try:
+            info_stat = os.lstat(info)
+        except FileNotFoundError:
+            info_stat = None
+        check()
+        if info_stat is not None and (
+            os.path.realpath(info) != info
+            or stat.S_ISLNK(info_stat.st_mode)
+            or not stat.S_ISDIR(info_stat.st_mode)
+        ):
+            raise OSError
+        check()
+        try:
+            os.lstat(grafts)
+        except FileNotFoundError:
+            pass
+        else:
+            raise OSError
+        check()
+        return directories
+    except GitHubAuthorityFailure:
+        raise
+    except BaseException:
+        raise OrchestrationFailure("LOCAL_GIT_PROOF_FAILED") from None
 
 
 def _git_read(
@@ -13927,7 +14028,16 @@ def _commit_diff_paths(
     raw = _git_read(
         context,
         clock_ns,
-        "diff", "--no-renames", "--name-only", "-z", parents[1], commit_sha, "--"
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "--name-only",
+        "-z",
+        parents[1],
+        commit_sha,
+        "--",
     )
     try:
         raw_items = _cooperative_call(checkpoint_check, raw.split, b"\0")
@@ -13950,6 +14060,17 @@ def _commit_diff_paths(
         raise OrchestrationFailure("FIRST_PARENT_HISTORY_INVALID")
     checkpoint_check()
     return _cooperative_call(checkpoint_check, frozenset, paths)
+
+
+def _receipt_addition_path(changed_paths: frozenset[str]) -> str | None:
+    receipt_paths = tuple(
+        path for path in changed_paths if RECEIPT_PATH_RE.fullmatch(path)
+    )
+    if not receipt_paths:
+        return None
+    if len(receipt_paths) != 1 or changed_paths != frozenset(receipt_paths):
+        raise OrchestrationFailure("RECEIPT_INTEGRATION_NOT_ONE_FILE")
+    return receipt_paths[0]
 
 
 def _parse_github_time(
@@ -14483,6 +14604,7 @@ def authenticate_immutable_repository_facts(
 
     clock_ns = client._seams.monotonic_ns
     checkpoint_check = context.checker(clock_ns)
+    _local_git_preflight(context, clock_ns)
     if _git_ascii(context, clock_ns, "rev-parse", "HEAD") != execution_sha:
         raise OrchestrationFailure("LOCAL_HEAD_MISMATCH")
     def authenticate_tree(commit_sha: str) -> None:
@@ -14613,10 +14735,10 @@ def authenticate_immutable_repository_facts(
     receipt_integrations: dict[str, str] = {}
     for commit_sha in chain:
         checkpoint_check()
-        for path in _commit_diff_paths(context, clock_ns, commit_sha):
+        changed_paths = _commit_diff_paths(context, clock_ns, commit_sha)
+        receipt_path = _receipt_addition_path(changed_paths)
+        for path in (() if receipt_path is None else (receipt_path,)):
             checkpoint_check()
-            if RECEIPT_PATH_RE.fullmatch(path) is None:
-                continue
             if path in receipt_integrations:
                 raise OrchestrationFailure("RECEIPT_HISTORY_MUTATED")
             parent_sha = _git_ascii(
@@ -16041,6 +16163,7 @@ def build_production_dependencies(
             if context is None
             else context
         )
+        _local_git_preflight(local_context, clock_ns)
         mode, blob, content = _local_tree_entry(
             local_context, clock_ns, "HEAD", path
         )
