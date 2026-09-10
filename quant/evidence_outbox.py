@@ -1590,8 +1590,20 @@ class EvidenceLedgerWorker:
             rows, invalid_metric="evidence_handoff.invalid_anchor")
         if len(records) != 1 or records[0].cutoff_midpoint is None:
             return None
-        return MidpointObservation(
-            records[0].cutoff_at.timestamp(), records[0].cutoff_midpoint)
+        record = records[0]
+        try:
+            # The cycle identity retains the provider epoch; cutoff_at rounds
+            # to microseconds and cannot safely fence sub-microsecond overlap.
+            event_epoch = float(record.cycle_id.removeprefix("COIN:"))
+            if (record.symbol != "COIN" or not math.isfinite(event_epoch) or
+                    record.cycle_id != f"COIN:{event_epoch:.9f}" or
+                    datetime.fromtimestamp(event_epoch, timezone.utc) !=
+                    record.cutoff_at):
+                raise ValueError("inconsistent handoff event identity")
+        except (ValueError, OverflowError, OSError):
+            self.metrics.increment("evidence_handoff.invalid_anchor")
+            raise ValueError("invalid handoff event identity") from None
+        return MidpointObservation(event_epoch, record.cutoff_midpoint)
 
     def _release_runtime_ownership(self) -> None:
         cursor = self._connection.cursor()

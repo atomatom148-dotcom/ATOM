@@ -1,7 +1,9 @@
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
+from queue import Empty
 from types import SimpleNamespace
 import json
+import math
 import threading
 import time
 
@@ -844,10 +846,25 @@ def test_handoff_anchor_uses_authoritative_commit_proofs_not_stored_json(
     assert cursor.params[-2:] == (256, len(HORIZONS))
 
 
+@pytest.mark.parametrize("event_epoch,invalid_cycle_id", (
+    (1789055000.1234562, None),
+    (1789055000.1234567, None),
+    (1789055000.123456, None),
+    (1789055000.1234562, "cycle-1"),
+    (1789055000.1234562, "QQQ:1789055000.123456240"),
+    (1789055000.1234562, "COIN:1789055000.12345624"),
+    (1789055000.1234562, "COIN:1789055001.123456240"),
+    (1789055000.1234562, "COIN:nan"),
+    (1789055000.1234562, "COIN:inf"),
+    (1789055000.1234562, f"COIN:{1e100:.9f}"),
+))
 def test_handoff_anchor_rehydrates_false_stored_json_from_authoritative_proof(
-        monkeypatch):
+        monkeypatch, event_epoch, invalid_cycle_id):
     monkeypatch.setattr(EvidenceLedgerWorker, "_load_pending", lambda _self: [])
     v1, v2 = _inputs()
+    cutoff = datetime.fromtimestamp(event_epoch, timezone.utc)
+    v1.cutoff_at = cutoff
+    v1.cycle_id = invalid_cycle_id or f"COIN:{event_epoch:.9f}"
     calculated = V4DCoordinator(
         capture_v1=lambda: v1,
         capture_v2=lambda _captured: v2,
@@ -884,7 +901,7 @@ def test_handoff_anchor_rehydrates_false_stored_json_from_authoritative_proof(
             return (
                 forecast.forecast_record_id,
                 forecast.forecast_record_hash,
-                NOW,
+                cutoff,
                 forecast.target_endpoint,
                 True,
                 "POST_COMMIT_DB_OBSERVATION_V1",
@@ -909,10 +926,42 @@ def test_handoff_anchor_rehydrates_false_stored_json_from_authoritative_proof(
         connection=Connection(False),
     )
 
-    assert proven._load_handoff_anchor() == MidpointObservation(
-        forecast.cutoff_at.timestamp(), 100.0,
-    )
     assert unproven._load_handoff_anchor() is None
+    if invalid_cycle_id is not None:
+        released = []
+        monkeypatch.setattr(proven, "_try_acquire_runtime_ownership", lambda: True)
+        monkeypatch.setattr(proven, "_release_runtime_ownership",
+                            lambda: released.append(True))
+        with pytest.raises(ValueError):
+            proven._acquire_runtime_ownership()
+        assert released == [True]
+        assert proven.is_runtime_owner() is False
+        assert dict(proven.metrics.snapshot().statuses)[
+            "evidence_runtime_owner_status"] == "ERROR"
+        assert dict(proven.metrics.snapshot().counters)[
+            "evidence_handoff.invalid_anchor"] == 1
+        return
+
+    anchor = proven._load_handoff_anchor()
+    assert anchor == MidpointObservation(event_epoch, 100.0)
+    ready = [False]
+    outbox = EvidenceOutbox()
+    state = LiveMarketState(
+        clock=lambda: event_epoch + 1,
+        evidence_outbox=outbox,
+        evidence_acceptance_ready=lambda: ready[0],
+        evidence_handoff_anchor=lambda: anchor if ready[0] else None,
+    )
+    assert state.accept_quote(bid=99.0, ask=101.0, event_epoch=event_epoch)
+    next_epoch = math.nextafter(event_epoch, math.inf)
+    ready[0] = True
+    assert state.accept_quote(bid=100.0, ask=102.0, event_epoch=next_epoch)
+    item = outbox.get(timeout=0)
+    assert item.previous_observation == anchor
+    assert item.current_observation == MidpointObservation(next_epoch, 101.0)
+    assert item.cycle_id == f"COIN:{next_epoch:.9f}"
+    with pytest.raises(Empty):
+        outbox.get(timeout=0)
 
 
 @pytest.mark.parametrize("database_url", (
