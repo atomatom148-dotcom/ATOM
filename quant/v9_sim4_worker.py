@@ -2045,7 +2045,7 @@ class SimulationEntryWorker:
         finally:
             self._events.task_done()
 
-    def _drain_through(self, watermark: int) -> None:
+    def _drain_through(self, watermark: int, *, allow_safe_eviction: bool = False) -> None:
         while self._last_drained_sequence < watermark:
             try:
                 envelope = self._events.get(timeout=SIM4_BOUNDARY_RECHECK_SECONDS)
@@ -2054,7 +2054,7 @@ class SimulationEntryWorker:
             try:
                 if envelope.admission_sequence > watermark:
                     raise Sim4GenerationFailed("quote FIFO crossed its deadline watermark")
-                self._retain_admitted_quote(envelope, allow_safe_eviction=False)
+                self._retain_admitted_quote(envelope, allow_safe_eviction=allow_safe_eviction)
             finally:
                 self._events.task_done()
 
@@ -2433,8 +2433,14 @@ class SimulationEntryWorker:
             if self._sim5_enabled and self._pending_resolutions and self._anchor is not None:
                 due_resolution = self._due_resolution_deadline()
                 if due_resolution is not None:
-                    resolution_now_ns = self._anchor.derived_epoch_ns(self._monotonic_ns())
-                    if resolution_now_ns >= due_resolution:
+                    greater, _, watermark = self._deadline_sample(due_resolution)
+                    if greater:
+                        # The closed window includes an admission at equality.
+                        # Drain the fixed accepted set before choosing its exit;
+                        # later arrivals cannot extend this bounded drain.
+                        self._drain_through(watermark, allow_safe_eviction=True)
+                        if self._stop_requested.is_set() or self._generation_failed:
+                            return
                         self._terminalize_due_resolutions(due_resolution)
                         continue
             boundary_recheck = False
