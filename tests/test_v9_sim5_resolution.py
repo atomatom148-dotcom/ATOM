@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 from quant.v9_sim1_contract import build_simulation_trade_intent
@@ -51,7 +52,9 @@ from quant.v9_sim5_resolution import (
     validate_resolution_matches_entry,
 )
 from quant.v9_sim4_worker import (
+    AdmissionEnvelope,
     MonotonicUTCAnchor,
+    ParsedSIPQuote,
     PaperTradingCredentials,
     PendingResolution,
     SimulationEntryWorker,
@@ -186,6 +189,260 @@ class FakeConnection:
 
 def authority(pid=4321):
     return [(SIM_ENTRY_RUNTIME_ROLE, SIM_ENTRY_RUNTIME_ROLE, pid)]
+
+
+
+class SimulationResolutionDeadlineTests(unittest.TestCase):
+    def worker(self, *, at_deadline=False, coverage=True):
+        entry = build_entry()
+        target, deadline = target_and_deadline(entry)
+        deadline_ns = datetime_to_epoch_nanoseconds(deadline)
+        origin_ns = datetime_to_epoch_nanoseconds(T0)
+        samples = {"now": deadline_ns - origin_ns + (0 if at_deadline else 1)}
+        worker = SimulationEntryWorker(
+            lambda: self.fail("deadline selection must not open a connection"),
+            "abcdefghijklmnopqrst", PaperTradingCredentials("key", "secret"),
+            monotonic_ns=lambda: samples["now"],
+            monotonic=lambda: samples["now"] / 1_000_000_000,
+            sim5_enabled=True,
+        )
+        worker._anchor = MonotonicUTCAnchor(0, origin_ns // 1000)
+        worker._admission_enabled = True
+        worker._sip_streak_start_ns = 0 if coverage else None
+        worker._register_pending_resolution(entry)
+        worker._new_target = lambda *_args: None
+        records = []
+
+        def terminalize(entry, *, exit_quote=None, unresolved_status=None):
+            records.append(build_simulation_resolution_record(
+                entry=entry, exit_quote=exit_quote,
+                unresolved_status=unresolved_status,
+            ))
+            worker._stop_requested.set()
+
+        worker._terminalize_resolution = terminalize
+        return worker, entry, target, deadline, samples, records
+
+    @staticmethod
+    def enqueue(worker, quote):
+        sequence = worker._next_admission_sequence
+        worker._events.put_nowait(AdmissionEnvelope(sequence, quote))
+        worker._next_admission_sequence = sequence + 1
+
+    def test_deadline_drains_queued_exits_and_selects_first_frozen_tuple(self):
+        for coverage in (True, False):
+            with self.subTest(continuous_coverage=coverage):
+                worker, entry, target, _deadline, _samples, records = self.worker(
+                    coverage=coverage,
+                )
+                accepted = target + timedelta(seconds=1)
+                first = build_quote(
+                    provider_event_ns=datetime_to_epoch_nanoseconds(accepted) - 2,
+                    accepted_at=accepted, bid=100.5, ask=100.75,
+                )
+                later = build_quote(
+                    provider_event_ns=datetime_to_epoch_nanoseconds(accepted) - 1,
+                    accepted_at=accepted, bid=101.0, ask=101.25,
+                )
+                # The FIFO order does not substitute for the frozen full tuple.
+                self.enqueue(worker, later)
+                self.enqueue(worker, first)
+                worker._ready_loop(None, 0)
+                self.assertEqual(records, [build_simulation_resolution_record(
+                    entry=entry, exit_quote=first,
+                )])
+                self.assertEqual(worker._last_drained_sequence, 2)
+                self.assertTrue(worker._events.empty())
+
+    def test_exact_deadline_remains_open_for_an_endpoint_admission(self):
+        worker, entry, _target, deadline, samples, records = self.worker(
+            at_deadline=True,
+        )
+        endpoint = ParsedSIPQuote(
+            datetime_to_epoch_nanoseconds(deadline), 100.5, 100.75, 2.0, 3.0,
+        )
+        admitted = []
+
+        def ordinary_boundary():
+            if not admitted:
+                admitted.append(worker.admit_parsed_quote(endpoint))
+                samples["now"] += 1
+            return None
+
+        worker._next_uncaptured_deadline = ordinary_boundary
+        worker._ready_loop(None, 0)
+        self.assertEqual(admitted, [True])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].resolution_status, "RESOLVED")
+        self.assertEqual(records[0].exit_quote.accepted_at, deadline)
+        self.assertEqual(records[0].exit_quote.provider_event_ns,
+                         endpoint.provider_event_ns)
+
+    def test_fixed_watermark_does_not_chase_later_admissions(self):
+        worker, _entry, target, deadline, _samples, records = self.worker()
+        accepted = target + timedelta(seconds=1)
+        first = build_quote(
+            provider_event_ns=datetime_to_epoch_nanoseconds(accepted),
+            accepted_at=accepted,
+        )
+        self.enqueue(worker, first)
+        original_sample = worker._deadline_sample
+        samples = []
+
+        def capture_then_receive(deadline_ns):
+            result = original_sample(deadline_ns)
+            samples.append(result[2])
+            self.assertTrue(worker.admit_parsed_quote(ParsedSIPQuote(
+                datetime_to_epoch_nanoseconds(deadline) + 1,
+                101.0, 101.25, 2.0, 3.0,
+            )))
+            return result
+
+        worker._deadline_sample = capture_then_receive
+        worker._ready_loop(None, 0)
+        self.assertEqual(samples, [1])
+        self.assertEqual(records[0].exit_quote, first)
+        self.assertEqual(worker._last_drained_sequence, 1)
+        self.assertEqual(worker._events.qsize(), 1)
+
+    def test_resolution_drain_preserves_quotes_for_pending_sim4_deadlines(self):
+        for deadline_offset in (500_000_000, 0, -500_000_000):
+            with self.subTest(sim4_deadline_offset_ns=deadline_offset):
+                worker, entry, target, deadline, _samples, records = self.worker()
+                old_quotes = []
+                for index in range(256):
+                    accepted = target - timedelta(seconds=2) + timedelta(
+                        microseconds=index,
+                    )
+                    old_quotes.append(AdmissionEnvelope(index + 1, build_quote(
+                        provider_event_ns=datetime_to_epoch_nanoseconds(accepted),
+                        accepted_at=accepted,
+                    )))
+                worker._quotes.extend(old_quotes)
+                worker._last_drained_sequence = 256
+                worker._next_admission_sequence = 257
+                worker._pending["sim4-intent"] = SimpleNamespace(
+                    deadline_epoch_ns=(datetime_to_epoch_nanoseconds(deadline)
+                                       + deadline_offset),
+                )
+                accepted = target + timedelta(seconds=1)
+                quote = build_quote(
+                    provider_event_ns=datetime_to_epoch_nanoseconds(accepted),
+                    accepted_at=accepted,
+                )
+                self.enqueue(worker, quote)
+                worker._ready_loop(None, 0)
+                self.assertEqual(records, [build_simulation_resolution_record(
+                    entry=entry, exit_quote=quote,
+                )])
+                self.assertEqual(worker._last_drained_sequence, 257)
+                if deadline_offset > 0:
+                    # Expired retained quotes must not displace a new quote
+                    # that may still serve the future SIM-4 entry window.
+                    self.assertEqual(list(worker._quotes), [AdmissionEnvelope(257, quote)])
+                    self.assertEqual(worker.telemetry.snapshot()["quote_buffer_full"], 0)
+                else:
+                    # Due SIM-4 boundaries retain their original candidate set.
+                    # The incoming quote still reached SIM-5 before overflow.
+                    self.assertEqual(list(worker._quotes), old_quotes)
+                    self.assertEqual(worker.telemetry.snapshot()["quote_buffer_full"], 1)
+
+    def test_existing_deadline_drain_keeps_its_no_eviction_default(self):
+        worker, _entry, target, _deadline, _samples, _records = self.worker()
+        old = build_quote(
+            provider_event_ns=datetime_to_epoch_nanoseconds(target) - 2_000_000_000,
+            accepted_at=target - timedelta(seconds=2),
+        )
+        worker._quotes.append(AdmissionEnvelope(1, old))
+        worker._last_drained_sequence = 1
+        worker._next_admission_sequence = 2
+        incoming = build_quote(
+            provider_event_ns=datetime_to_epoch_nanoseconds(target),
+            accepted_at=target,
+        )
+        self.enqueue(worker, incoming)
+        worker._drain_through(2)
+        self.assertEqual(list(worker._quotes), [
+            AdmissionEnvelope(1, old), AdmissionEnvelope(2, incoming),
+        ])
+
+    def test_one_drain_resolves_all_six_horizons_at_the_same_deadline(self):
+        worker, _entry, target, _deadline, _samples, records = self.worker()
+        worker._pending_resolutions.clear()
+        entries = [build_entry(
+            horizon=horizon, horizon_seconds=seconds,
+            cutoff_at=target - timedelta(seconds=seconds),
+            eligible_at=T0, source_cycle_id="cycle-" + horizon,
+            final_bps=1.25 if index % 2 == 0 else -1.25,
+        ) for index, (horizon, seconds) in enumerate((
+            ("30S", 30), ("1M", 60), ("5M", 300),
+            ("15M", 900), ("30M", 1800), ("1H", 3600),
+        ))]
+        for entry in entries:
+            worker._register_pending_resolution(entry)
+        quote = build_quote(
+            provider_event_ns=datetime_to_epoch_nanoseconds(target),
+            accepted_at=target, bid=100.5, ask=100.75,
+        )
+        self.enqueue(worker, quote)
+
+        def terminalize(entry, *, exit_quote=None, unresolved_status=None):
+            records.append(build_simulation_resolution_record(
+                entry=entry, exit_quote=exit_quote,
+                unresolved_status=unresolved_status,
+            ))
+            if len(records) == 6:
+                worker._stop_requested.set()
+
+        worker._terminalize_resolution = terminalize
+        worker._ready_loop(None, 0)
+        self.assertCountEqual(records, [build_simulation_resolution_record(
+            entry=entry, exit_quote=quote,
+        ) for entry in entries])
+        self.assertEqual(worker._last_drained_sequence, 1)
+        self.assertEqual(worker._pending_resolutions, {})
+
+    def test_stop_or_generation_failure_during_drain_does_not_terminalize(self):
+        for failure in ("stop", "generation"):
+            with self.subTest(failure=failure):
+                worker, entry, target, _deadline, _samples, records = self.worker()
+                quote = build_quote(
+                    provider_event_ns=datetime_to_epoch_nanoseconds(target),
+                    accepted_at=target,
+                )
+                self.enqueue(worker, quote)
+                original_retain = worker._retain_admitted_quote
+
+                def retain_then_stop(envelope, *, allow_safe_eviction):
+                    original_retain(envelope, allow_safe_eviction=allow_safe_eviction)
+                    if failure == "stop":
+                        worker._stop_requested.set()
+                    else:
+                        worker._generation_failed = True
+
+                worker._retain_admitted_quote = retain_then_stop
+                worker._ready_loop(None, 0)
+                self.assertEqual(records, [])
+                self.assertIn(entry.entry_id, worker._pending_resolutions)
+
+    def test_disconnect_during_drain_preserves_the_accepted_exit(self):
+        worker, entry, target, _deadline, _samples, records = self.worker()
+        quote = build_quote(
+            provider_event_ns=datetime_to_epoch_nanoseconds(target),
+            accepted_at=target,
+        )
+        self.enqueue(worker, quote)
+        original_retain = worker._retain_admitted_quote
+
+        def retain_then_disconnect(envelope, *, allow_safe_eviction):
+            original_retain(envelope, allow_safe_eviction=allow_safe_eviction)
+            worker._on_sip_observation(False)
+
+        worker._retain_admitted_quote = retain_then_disconnect
+        worker._ready_loop(None, 0)
+        self.assertEqual(records, [build_simulation_resolution_record(
+            entry=entry, exit_quote=quote,
+        )])
 
 
 class SimulationResolutionContractTests(unittest.TestCase):
