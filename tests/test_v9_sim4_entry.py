@@ -126,6 +126,21 @@ def entry_row(entry):
     )
 
 
+def recovery_page_rows(entries=(), *, count=None, tail=None):
+    entries = tuple(entries)
+    if count is None:
+        count = len(entries)
+    if tail is None and entries:
+        tail = max((entry.horizon, entry.publication_at, entry.entry_id)
+                   for entry in entries)
+    marker = [None] * len(sim4_entry_module._ENTRY_COLUMNS)
+    if tail is not None:
+        for name, value in zip(("horizon", "publication_at", "entry_id"), tail):
+            marker[sim4_entry_module._ENTRY_COLUMNS.index(name)] = value
+    return [("OPEN", None, *entry_row(entry)) for entry in entries] + [
+        ("PAGE", count, *marker)]
+
+
 def intent_row(intent):
     return (
         intent.intent_id,
@@ -672,17 +687,16 @@ class SimulationEntryStoreTests(unittest.TestCase):
         entry2 = build_simulation_entry_record(
             intent=intent2, entry_status="ENTERED", quote=build_quote())
         cursor = ScriptedCursor([
-            ("entry_status = 'ENTERED'", [entry_row(entry1), entry_row(entry2)]),
+            ("entry_status = 'ENTERED'", recovery_page_rows((entry1, entry2))),
         ])
         store = SimulationEntryStore(FakeConnection(cursor), project_ref=PROJECT_REF)
         with self.assertRaises(SimulationEntryStateError):
             store.load_open_occupancy_on_cursor(cursor)
         sql, parameters = cursor.executed[0]
         self.assertIn("WHERE symbol = %s", sql)
-        self.assertIn("horizon IN (%s, %s, %s, %s, %s, %s)", sql)
+        self.assertIn("horizon = %s", sql)
         self.assertIn("ORDER BY horizon, publication_at, entry_id", sql)
-        self.assertEqual(parameters, ("COIN", "30S", "1M", "5M", "15M",
-                                      "30M", "1H"))
+        self.assertEqual(parameters, ("COIN", "30S"))
 
     def test_horizon_release_queries_exclude_durably_resolved_entries(self):
         # SIM-5 freeze (docs/sim-4a-exact-sim5-resolution-freeze.md,
@@ -773,21 +787,22 @@ class SimulationEntryStoreTests(unittest.TestCase):
         entry1 = build_simulation_entry_record(
             intent=build_intent(), entry_status="ENTERED", quote=build_quote())
         cursor = ScriptedCursor([
-            ("entry_status = 'ENTERED'", []),
+            ("recovery_candidates", recovery_page_rows()) for _ in sim4_entry_module.HORIZONS
         ])
         store = SimulationEntryStore(FakeConnection(cursor), project_ref=PROJECT_REF)
         occupancy = store.load_open_occupancy_on_cursor(cursor)
         self.assertEqual(occupancy, {})
         sql, parameters = cursor.executed[0]
         self.assertIn(
-            "NOT EXISTS (SELECT 1 FROM public.atom_v9_sim_resolutions AS r "
-            "WHERE r.entry_id = e.entry_id AND ", sql)
+            sim4_entry_module._VALID_TERMINAL_RESOLUTION_CLAUSE, sql)
         self.assertIn("ORDER BY horizon, publication_at, entry_id", sql)
-        self.assertEqual(parameters, ("COIN", "30S", "1M", "5M", "15M", "30M", "1H"))
+        self.assertEqual(parameters, ("COIN", "30S"))
+        self.assertEqual([parameters[1] for _, parameters in cursor.executed],
+                         list(sim4_entry_module.HORIZONS))
 
         cursor_keep = ScriptedCursor([
-            ("entry_status = 'ENTERED'", [entry_row(entry1)]),
-        ])
+            ("recovery_candidates", recovery_page_rows((entry1,))),
+        ] + [("recovery_candidates", recovery_page_rows()) for _ in range(5)])
         store_keep = SimulationEntryStore(FakeConnection(cursor_keep), project_ref=PROJECT_REF)
         occupancy_keep = store_keep.load_open_occupancy_on_cursor(cursor_keep)
         self.assertEqual(occupancy_keep, {"30S": entry1})
@@ -805,6 +820,217 @@ class SimulationEntryStoreTests(unittest.TestCase):
         self.assertIn("ORDER BY publication_at, entry_id", sql2)
         self.assertEqual(parameters2, ("COIN", "30S"))
         del entry1  # constructed only to prove ENTERED entries build cleanly
+
+    def test_recovery_advances_through_closed_pages_without_a_history_cap(self):
+        entry = build_simulation_entry_record(
+            intent=build_intent(), entry_status="ENTERED", quote=build_quote())
+        tail1 = ("30S", T0 - timedelta(seconds=2), "v9simentry:" + "a" * 64)
+        tail2 = ("30S", T0 - timedelta(seconds=1), "v9simentry:" + "b" * 64)
+        cursor = ScriptedCursor([
+            ("recovery_candidates", recovery_page_rows(count=128, tail=tail1)),
+            ("recovery_candidates", recovery_page_rows(count=128, tail=tail2)),
+            ("recovery_candidates", recovery_page_rows((entry,))),
+        ] + [("recovery_candidates", recovery_page_rows()) for _ in range(5)])
+        connection = FakeConnection(cursor)
+        store = SimulationEntryStore(connection, project_ref=PROJECT_REF)
+        self.assertEqual(store.load_open_occupancy_on_cursor(cursor), {"30S": entry})
+        self.assertEqual(len(cursor.executed), 8)
+        self.assertEqual(cursor.executed[1][1], ("COIN", *tail1))
+        self.assertEqual(cursor.executed[2][1], ("COIN", *tail2))
+        for sql, _ in cursor.executed:
+            self.assertIn("ORDER BY horizon, publication_at, entry_id LIMIT 128", sql)
+            self.assertIn(sim4_entry_module._VALID_TERMINAL_RESOLUTION_CLAUSE, sql)
+            self.assertIn("WHERE symbol = %s AND horizon = %s AND entry_status = 'ENTERED'", sql)
+        self.assertNotIn("(publication_at, entry_id) >", cursor.executed[0][0])
+        self.assertIn("(publication_at, entry_id) > (%s, %s)",
+                      cursor.executed[1][0])
+        self.assertNotIn("(publication_at, entry_id) >", cursor.executed[3][0])
+        self.assertEqual(cursor.executed[3][1], ("COIN", "1M"))
+        self.assertEqual((connection.commit_calls, connection.rollback_calls,
+                          connection.close_calls), (0, 0, 0))
+        self.assertEqual(sim4_entry_module.SIM4_RECONCILIATION_PAGE_SIZE, 16)
+
+    def test_recovery_detects_duplicate_horizons_across_pages(self):
+        first = build_simulation_entry_record(
+            intent=build_intent(), entry_status="ENTERED", quote=build_quote())
+        second_intent = build_intent(source_cycle_id="later",
+                                     eligible_at=T0 + timedelta(seconds=3))
+        second = build_simulation_entry_record(
+            intent=second_intent, entry_status="ENTERED", quote=build_quote(
+                provider_event_ns=datetime_to_epoch_nanoseconds(T0) + 3_000_000_001,
+                accepted_at=T0 + timedelta(seconds=3, microseconds=1)))
+        tail = ("30S", T0 + timedelta(seconds=1), "v9simentry:" + "f" * 64)
+        cursor = ScriptedCursor([
+            ("recovery_candidates", recovery_page_rows((first,), count=128, tail=tail)),
+            ("recovery_candidates", recovery_page_rows((second,))),
+        ])
+        store = SimulationEntryStore(FakeConnection(cursor), project_ref=PROJECT_REF)
+        with self.assertRaises(SimulationEntryStateError):
+            store.load_open_occupancy_on_cursor(cursor)
+
+    def test_recovery_rejects_malformed_page_metadata(self):
+        tail = ("30S", T0, "v9simentry:" + "a" * 64)
+        valid = recovery_page_rows(count=1, tail=tail)[0]
+        malformed = [[], [valid, valid], [("UNKNOWN", *valid[1:])],
+                     [("PAGE", True, *valid[2:])], [("PAGE", -1, *valid[2:])],
+                     [("PAGE", 129, *valid[2:])], [("PAGE", 0, *valid[2:])],
+                     [("PAGE", 1, *([None] * len(sim4_entry_module._ENTRY_COLUMNS)))],
+                     [valid[:-1]]]
+        extra_payload = list(valid)
+        extra_payload[2 + sim4_entry_module._ENTRY_COLUMNS.index("record_json")] = {}
+        malformed.append([tuple(extra_payload)])
+        for rows in malformed:
+            with self.subTest(rows=rows):
+                cursor = ScriptedCursor([("recovery_candidates", rows)])
+                store = SimulationEntryStore(FakeConnection(cursor), project_ref=PROJECT_REF)
+                with self.assertRaises(SimulationEntryRowInvalidError):
+                    store.load_open_occupancy_on_cursor(cursor)
+
+    def test_recovery_rejects_nonadvancing_cursor_and_out_of_page_entry(self):
+        entry = build_simulation_entry_record(
+            intent=build_intent(), entry_status="ENTERED", quote=build_quote())
+        tail = ("30S", T0 + timedelta(seconds=1), "v9simentry:" + "a" * 64)
+        for second_page in (recovery_page_rows(count=1, tail=tail),
+                            recovery_page_rows((entry,), count=1,
+                                tail=("30S", T0 + timedelta(seconds=2), tail[2]))):
+            cursor = ScriptedCursor([
+                ("recovery_candidates", recovery_page_rows(count=128, tail=tail)),
+                ("recovery_candidates", second_page),
+            ])
+            store = SimulationEntryStore(FakeConnection(cursor), project_ref=PROJECT_REF)
+            with self.assertRaises(SimulationEntryRowInvalidError):
+                store.load_open_occupancy_on_cursor(cursor)
+
+    def test_recovery_later_page_failure_never_returns_partial_occupancy(self):
+        entry = build_simulation_entry_record(
+            intent=build_intent(), entry_status="ENTERED", quote=build_quote())
+        rows = recovery_page_rows((entry,), count=128,
+                                  tail=("30S", T0, "v9simentry:" + "f" * 64))
+        cursor = ScriptedCursor([("recovery_candidates", rows)])
+        original_execute = cursor.execute
+        def execute(sql, parameters=None):
+            if cursor.executed:
+                raise TimeoutError("synthetic later-page timeout")
+            original_execute(sql, parameters)
+        cursor.execute = execute
+        connection = FakeConnection(cursor)
+        store = SimulationEntryStore(connection, project_ref=PROJECT_REF)
+        with self.assertRaises(TimeoutError):
+            store.load_open_occupancy_on_cursor(cursor)
+        self.assertEqual((connection.commit_calls, connection.rollback_calls,
+                          connection.close_calls), (0, 0, 0))
+
+    def test_recovery_paging_preserves_closure_checks_in_postgres(self):
+        import os
+        from urllib.parse import urlsplit
+
+        database_url = os.environ.get("H2C_TEST_DATABASE_URL")
+        if not database_url or os.environ.get("CI") != "true":
+            self.skipTest("explicit CI PostgreSQL required")
+        import psycopg
+        from psycopg.types.json import Jsonb
+        from quant.v9_sim5_resolution import (
+            _RESOLUTION_COLUMNS, build_simulation_resolution_record)
+        from tests.test_v9_sim5_resolution import resolution_row
+
+        parsed = urlsplit(database_url)
+        if (parsed.scheme not in {"postgres", "postgresql"} or
+                parsed.hostname not in {"localhost", "127.0.0.1", "::1"} or
+                parsed.port != 5432 or parsed.username != "postgres" or
+                parsed.path != "/postgres" or parsed.query or parsed.fragment):
+            self.fail("recovery integration requires the local CI Postgres DSN")
+
+        # These temporary tables preserve native production column types but
+        # permit deliberately corrupt closures. Only table names are redirected;
+        # the actual store query, decoder and complete traversal run unchanged.
+        types = {"record_json": "jsonb"}
+        for name in ("publication_at", "entry_deadline_at", "quote_accepted_at",
+                     "cutoff_at", "resolution_target_at", "resolution_deadline_at",
+                     "exit_quote_accepted_at"):
+            types[name] = "timestamptz"
+        for name in ("horizon_seconds", "quantity_shares", "quote_event_ns",
+                     "exit_quote_event_ns"):
+            types[name] = "bigint"
+        for name in ("entry_price", "exit_price", "return_bps"):
+            types[name] = "double precision"
+
+        class RecoveryCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+                self.pages = []
+
+            def execute(self, query, parameters):
+                query = query.replace("public.atom_v9_sim_entries", "pg_temp.recovery_entries")
+                query = query.replace("public.atom_v9_sim_resolutions", "pg_temp.recovery_resolutions")
+                self.cursor.execute(query, parameters)
+
+            def fetchall(self):
+                rows = self.cursor.fetchall()
+                marker = next(row for row in rows if row[0] == "PAGE")
+                self.pages.append((marker[1], sum(row[0] == "OPEN" for row in rows)))
+                return rows
+
+        with psycopg.connect(database_url) as connection:
+            with connection.cursor() as cursor:
+                for table, columns in (("recovery_entries", sim4_entry_module._ENTRY_COLUMNS),
+                                       ("recovery_resolutions", _RESOLUTION_COLUMNS)):
+                    declarations = ", ".join(name + " " + types.get(name, "text")
+                                             for name in columns)
+                    cursor.execute("CREATE TEMP TABLE " + table + " (" + declarations +
+                                   ") ON COMMIT DROP")
+                cursor.execute("CREATE INDEX ON recovery_entries "
+                               "(symbol, horizon, entry_status, publication_at, entry_id)")
+                cursor.execute("CREATE UNIQUE INDEX ON recovery_resolutions (entry_id)")
+                entries = []
+                resolutions = []
+                for index in range(257):
+                    entry = build_simulation_entry_record(
+                        intent=build_intent(source_cycle_id=f"paging-{index}"),
+                        entry_status="ENTERED", quote=build_quote())
+                    entries.append(entry)
+                    target = entry.cutoff_at + timedelta(seconds=entry.horizon_seconds)
+                    if index % 2:
+                        resolution = build_simulation_resolution_record(
+                            entry=entry, exit_quote=build_quote(
+                                provider_event_ns=datetime_to_epoch_nanoseconds(target) + 1,
+                                accepted_at=target + timedelta(microseconds=1),
+                                bid=101.0, ask=101.25))
+                    else:
+                        resolution = build_simulation_resolution_record(
+                            entry=entry, unresolved_status="UNRESOLVED_OBSERVATION_GAP")
+                    resolutions.append(resolution)
+                for table, columns, rows in (
+                        ("recovery_entries", sim4_entry_module._ENTRY_COLUMNS,
+                         [entry_row(entry) for entry in entries]),
+                        ("recovery_resolutions", _RESOLUTION_COLUMNS,
+                         [resolution_row(resolution) for resolution in resolutions])):
+                    cursor.executemany(
+                        "INSERT INTO " + table + " (" + ", ".join(columns) +
+                        ") VALUES (" + ", ".join(["%s"] * len(columns)) + ")",
+                        [(*row[:-1], Jsonb(row[-1])) for row in rows])
+                cursor.execute("ANALYZE recovery_entries")
+                cursor.execute("ANALYZE recovery_resolutions")
+                store = SimulationEntryStore(connection, project_ref=PROJECT_REF)
+                recovery = RecoveryCursor(cursor)
+                self.assertEqual(store.load_open_occupancy_on_cursor(recovery), {})
+                self.assertEqual(recovery.pages, [(128, 0), (128, 0), (1, 0)] + [(0, 0)] * 5)
+
+                # Every publication timestamp ties: the entry ID must advance
+                # across closed pages to discover the final unclosed entry.
+                first, last = min(entries, key=lambda e: e.entry_id), max(entries, key=lambda e: e.entry_id)
+                cursor.execute("DELETE FROM recovery_resolutions WHERE entry_id = %s", (last.entry_id,))
+                recovery = RecoveryCursor(cursor)
+                self.assertEqual(store.load_open_occupancy_on_cursor(recovery), {"30S": last})
+                self.assertEqual(recovery.pages[:3], [(128, 0), (128, 0), (1, 1)])
+
+                # A resolution row with inconsistent canonical identity must
+                # leave the older entry open and expose the cross-page conflict.
+                cursor.execute("UPDATE recovery_resolutions SET entry_hash = %s WHERE entry_id = %s",
+                               ("f" * 64, first.entry_id))
+                recovery = RecoveryCursor(cursor)
+                with self.assertRaises(SimulationEntryStateError):
+                    store.load_open_occupancy_on_cursor(recovery)
+                self.assertEqual(recovery.pages, [(128, 1), (128, 0), (1, 1)])
 
     def test_canonical_entry_price_token_matches_float8_in_postgres(self):
         import os

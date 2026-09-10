@@ -924,16 +924,65 @@ _VALID_TERMINAL_RESOLUTION_CLAUSE = (
 # A durably resolved entry no longer occupies its horizon (SIM-5 freeze,
 # docs/sim-4a-exact-sim5-resolution-freeze.md section 10: "minimum
 # query/locking change needed so a durably resolved entry no longer blocks
-# its horizon").  This also bounds worker startup/recovery to unresolved
-# ENTERED rows without any separate query (freeze section 9), since
-# load_open_occupancy_on_cursor is exactly the method the worker calls at
-# startup.  atom_v9_sim_resolutions does not exist before migration 031 is
+# its horizon"). Startup/recovery below uses the same closure predicate and
+# returns unresolved ENTERED records plus cursor metadata, never closed
+# entry payloads. atom_v9_sim_resolutions does not exist before migration 031 is
 # applied and SIM-5 is activated only behind ATOM_V9_SIM5_ENABLED=true; this
 # anti-join is unconditional so it must be present the moment 031 lands.
 _ENTRY_NOT_RESOLVED_CLAUSE = (
     " AND NOT EXISTS (SELECT 1 FROM public.atom_v9_sim_resolutions AS r "
     "WHERE r.entry_id = e.entry_id AND " + _VALID_TERMINAL_RESOLUTION_CLAUSE + ")"
 )
+# Recovery must exhaust ENTERED history under the existing owner/activation
+# transaction without spending the 100 ms statement budget on the whole table.
+# Fix every equality prefix of the existing entry lookup index before seeking
+# (publication_at, entry_id); a cross-horizon keyset does not seek efficiently.
+_RECOVERY_CANDIDATE_PAGE_SIZE = 128
+_RECOVERY_ENTRY_PROJECTION = ", ".join(
+    "record_json #> '{}'::text[] AS record_json" if name == "record_json" else name
+    for name in _ENTRY_COLUMNS
+)
+# Keep this projection local: the resolution module imports this module. The
+# identity JSON projection detoasts once before repeated canonical comparisons.
+_RECOVERY_RESOLUTION_PROJECTION = (
+    "resolution_id, resolution_hash, contract_version, canonicalization_version, "
+    "simulator_version, mode, symbol, instrument, entry_id, entry_hash, "
+    "source_cycle_id, cutoff_at, horizon, horizon_seconds, decision, "
+    "entry_quote_id, entry_quote_hash, entry_price, resolution_target_at, "
+    "resolution_deadline_at, resolution_status, exit_quote_id, exit_quote_hash, "
+    "exit_quote_source_spec, exit_quote_event_ns, exit_quote_accepted_at, "
+    "exit_price, return_bps, record_json #> '{}'::text[] AS record_json"
+)
+_RECOVERY_MARKER_COLUMNS = frozenset(("entry_id", "horizon", "publication_at"))
+_RECOVERY_PAGE_RESULT = (
+    "(SELECT 'OPEN'::text AS recovery_row_kind, "
+    "NULL::bigint AS recovery_page_count, " + ", ".join(_ENTRY_COLUMNS) +
+    " FROM recovery_candidates AS e WHERE NOT EXISTS (SELECT 1 FROM "
+    "(SELECT " + _RECOVERY_RESOLUTION_PROJECTION +
+    " FROM public.atom_v9_sim_resolutions WHERE entry_id = e.entry_id OFFSET 0) "
+    "AS r WHERE r.entry_id = e.entry_id AND " + _VALID_TERMINAL_RESOLUTION_CLAUSE +
+    ") ORDER BY horizon, publication_at, entry_id) UNION ALL "
+    "(SELECT 'PAGE'::text, stats.page_count, " + ", ".join(
+        "tail." + name if name in _RECOVERY_MARKER_COLUMNS else "NULL"
+        for name in _ENTRY_COLUMNS
+    ) +
+    " FROM (SELECT count(*)::bigint AS page_count FROM recovery_candidates) AS stats "
+    "LEFT JOIN LATERAL (SELECT entry_id, horizon, publication_at FROM recovery_candidates "
+    "ORDER BY horizon DESC, publication_at DESC, entry_id DESC LIMIT 1) AS tail ON true)"
+)
+
+
+def _recovery_page_query(*, after: bool) -> str:
+    return (
+        "WITH recovery_candidates AS MATERIALIZED (SELECT " +
+        _RECOVERY_ENTRY_PROJECTION + " FROM " + SIM_ENTRY_TABLE +
+        " WHERE symbol = %s AND horizon = %s AND entry_status = 'ENTERED'" +
+        (" AND (publication_at, entry_id) > (%s, %s)" if after else "") +
+        " ORDER BY horizon, publication_at, entry_id LIMIT " +
+        str(_RECOVERY_CANDIDATE_PAGE_SIZE) + ") " + _RECOVERY_PAGE_RESULT
+    )
+
+
 _INTENT_COLUMNS = (
     "intent_id", "intent_hash", "contract_version", "canonicalization_version",
     "simulator_version", "symbol", "horizon", "horizon_seconds", "cutoff_at",
@@ -1113,21 +1162,79 @@ class SimulationEntryStore:
 
     def load_open_occupancy_on_cursor(
             self, cursor) -> Mapping[str, SimulationEntryRecord]:
-        cursor.execute(_ENTRY_SELECT +
-                       " WHERE symbol = %s "
-                       "AND horizon IN (%s, %s, %s, %s, %s, %s) "
-                       "AND entry_status = 'ENTERED'" +
-                       _ENTRY_NOT_RESOLVED_CLAUSE +
-                       " ORDER BY horizon, publication_at, entry_id",
-                       (SYMBOL, *HORIZONS))
+        # The caller retains its sole-writer session and exclusive activation
+        # transaction throughout this traversal. No partial occupancy escapes
+        # if any page fails. Closed payloads stay in PostgreSQL; PAGE advances
+        # from the last scanned candidate even when every candidate is closed.
         occupancy: dict[str, SimulationEntryRecord] = {}
-        for row in self._fetchall(cursor):
-            entry = self._decode_entry_row(row)
-            if entry.horizon in occupancy:
-                raise SimulationEntryStateError(
-                    "more than one durable open entry exists for a horizon")
-            occupancy[entry.horizon] = entry
-        return MappingProxyType(occupancy)
+        for horizon in HORIZONS:
+            after: tuple[datetime, str] | None = None
+            while True:
+                cursor.execute(_recovery_page_query(after=after is not None),
+                               (SYMBOL, horizon, *(after or ())))
+                entries, count, tail = self._decode_recovery_page(
+                    self._fetchall(cursor), horizon=horizon, after=after)
+                for entry in entries:
+                    if entry.horizon in occupancy:
+                        raise SimulationEntryStateError(
+                            "more than one durable open entry exists for a horizon")
+                    occupancy[entry.horizon] = entry
+                if count < _RECOVERY_CANDIDATE_PAGE_SIZE:
+                    break
+                after = tail
+        return MappingProxyType(dict(sorted(occupancy.items())))
+
+    @classmethod
+    def _decode_recovery_page(cls, rows, *, horizon: str,
+            after: tuple[datetime, str] | None
+            ) -> tuple[tuple[SimulationEntryRecord, ...], int,
+                       tuple[datetime, str] | None]:
+        try:
+            markers, open_rows = [], []
+            for row in rows:
+                if not isinstance(row, (tuple, list)) or len(row) != len(_ENTRY_COLUMNS) + 2:
+                    raise ValueError("recovery row shape")
+                if row[0] == "PAGE":
+                    markers.append(row)
+                elif row[0] == "OPEN" and row[1] is None:
+                    open_rows.append(row[2:])
+                else:
+                    raise ValueError("recovery row kind")
+            if len(markers) != 1:
+                raise ValueError("recovery page marker count")
+            marker = markers[0]
+            count = _integer("recovery candidate count", marker[1],
+                             maximum=_RECOVERY_CANDIDATE_PAGE_SIZE)
+            values = dict(zip(_ENTRY_COLUMNS, marker[2:]))
+            if any(value is not None for name, value in values.items()
+                   if name not in _RECOVERY_MARKER_COLUMNS):
+                raise ValueError("recovery marker contains entry payload")
+            if len(open_rows) > count:
+                raise ValueError("recovery open count exceeds candidate count")
+            tail = None
+            if count == 0:
+                if any(value is not None for value in values.values()):
+                    raise ValueError("empty recovery page has a cursor")
+            else:
+                entry_id = values["entry_id"]
+                if (values["horizon"] != horizon or not isinstance(entry_id, str)
+                        or _ENTRY_ID_RE.fullmatch(entry_id) is None):
+                    raise ValueError("recovery page cursor identity")
+                tail = (_aware_datetime("recovery publication_at",
+                                        values["publication_at"]).astimezone(timezone.utc),
+                        entry_id)
+                if after is not None and tail <= after:
+                    raise ValueError("recovery cursor did not advance")
+            entries = tuple(cls._decode_entry_row(row) for row in open_rows)
+            for entry in entries:
+                key = (entry.publication_at, entry.entry_id)
+                if (entry.symbol != SYMBOL or entry.horizon != horizon or
+                        entry.entry_status != "ENTERED" or tail is None or
+                        key > tail or (after is not None and key <= after)):
+                    raise ValueError("open entry is outside recovery page")
+            return entries, count, tail
+        except (TypeError, ValueError) as error:
+            raise SimulationEntryRowInvalidError("recovery page is invalid") from error
 
     def load_checkpoint_on_cursor(self, cursor) -> ReconciliationCheckpoint:
         cursor.execute(
