@@ -54,7 +54,7 @@ render>=1.0.1
 The implementation must use the current Render Python SDK contract:
 
 ```python
-from render_sdk import TaskContext, Workflows
+from render import TaskContext, Workflows
 
 app = Workflows()
 ```
@@ -86,7 +86,7 @@ Codex is the preferred implementation owner. One implementation owner owns the P
 Before implementation merge, prove on the exact final head:
 
 - the changed-file set is exactly the four authorized files;
-- `render>=1.0.1` installs and exposes `render_sdk.Workflows` and `render_sdk.TaskContext` in a clean Python environment;
+- `render>=1.0.1` installs and exposes `render.Workflows` and `render.TaskContext` in a clean Python environment;
 - module import registers only the readiness task and does not call `app.start()`;
 - `readiness_smoke` is deterministic and side-effect free;
 - no HIST8, SIM, V9, production worker, database, provider, broker, or secret path is imported or invoked;
