@@ -927,13 +927,22 @@ def test_handoff_anchor_rehydrates_false_stored_json_from_authoritative_proof(
     )
 
     assert unproven._load_handoff_anchor() is None
-    anchor = proven._load_handoff_anchor()
     if invalid_cycle_id is not None:
-        assert anchor is None
+        released = []
+        monkeypatch.setattr(proven, "_try_acquire_runtime_ownership", lambda: True)
+        monkeypatch.setattr(proven, "_release_runtime_ownership",
+                            lambda: released.append(True))
+        with pytest.raises(ValueError):
+            proven._acquire_runtime_ownership()
+        assert released == [True]
+        assert proven.is_runtime_owner() is False
+        assert dict(proven.metrics.snapshot().statuses)[
+            "evidence_runtime_owner_status"] == "ERROR"
         assert dict(proven.metrics.snapshot().counters)[
             "evidence_handoff.invalid_anchor"] == 1
         return
 
+    anchor = proven._load_handoff_anchor()
     assert anchor == MidpointObservation(event_epoch, 100.0)
     ready = [False]
     outbox = EvidenceOutbox()
