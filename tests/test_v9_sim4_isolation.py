@@ -1808,16 +1808,18 @@ def test_existing_terminal_is_read_and_validated_only_after_horizon_lock():
     assert cursor.executions[2][1] == (intent.intent_id,)
 
 
+@pytest.mark.parametrize("prestart", (True, False))
 @pytest.mark.parametrize("case", (
     "new", "existing_skip", "existing_entered", "invalid_existing",
     "occupied", "valid_closure", "corrupt_closure", "invalid_occupant", "commit_failure",
 ))
-def test_expired_prestart_fast_path_preserves_store_precedence_and_reduces_transactions(
-        monkeypatch, case):
+def test_expired_publication_fast_path_preserves_store_precedence_and_reduces_transactions(
+        monkeypatch, case, prestart):
     intent = build_worker_intent(140)
     deadline_ns = datetime_to_epoch_nanoseconds(WORKER_T0) + 2_000_000_000
     publication = worker.PublicationRecord(
         140, WORKER_T0, WORKER_T0, 1, intent, deadline_ns + 1)
+    expired_status = "SKIPPED_RESTART_GAP" if prestart else "SKIPPED_WINDOW_EXPIRED"
     existing = None
     if case in {"existing_skip", "invalid_existing"}:
         existing = build_simulation_entry_record(
@@ -1876,7 +1878,7 @@ def test_expired_prestart_fast_path_preserves_store_precedence_and_reduces_trans
 
         connection = Connection()
         runtime = make_authoritative_worker(connection)
-        runtime._runtime_started_at = WORKER_T0 + timedelta(seconds=10)
+        runtime._runtime_started_at = WORKER_T0 + timedelta(seconds=10 if prestart else -10)
         runtime._runtime_started_epoch_ns = datetime_to_epoch_nanoseconds(runtime._runtime_started_at)
         runtime._sim5_enabled = True
         monkeypatch.setattr(runtime, "_register_pending_resolution",
@@ -1890,11 +1892,11 @@ def test_expired_prestart_fast_path_preserves_store_precedence_and_reduces_trans
             if use_fast_path:
                 assert runtime._classify_publication(store, publication)
             else:
-                # Exact pre-change expired-prestart path: a separate existing
+                # Exact pre-change expired path: a separate existing
                 # probe, then terminalization only when the probe found none.
                 prior = runtime._existing_entry(store, intent)
                 if prior is None:
-                    runtime._terminalize(store, publication, "SKIPPED_RESTART_GAP")
+                    runtime._terminalize(store, publication, expired_status)
                 else:
                     runtime._pending.pop(intent.intent_id, None)
         except RuntimeError as error:
@@ -1928,7 +1930,7 @@ def test_expired_prestart_fast_path_preserves_store_precedence_and_reduces_trans
         assert len(original_sql) - len(repaired_sql) == 4
         result = repaired_inserts[0]
         assert result.entry_status == (
-            "SKIPPED_POSITION_OPEN" if occupied_rows else "SKIPPED_RESTART_GAP")
+            "SKIPPED_POSITION_OPEN" if occupied_rows else expired_status)
         assert result.blocking_entry_id == (blocker.entry_id if occupied_rows else None)
     if occupied_rows:
         original_occupancy = [sql for sql, _ in original_sql if "AND entry_status = 'ENTERED'" in sql]
@@ -1937,10 +1939,10 @@ def test_expired_prestart_fast_path_preserves_store_precedence_and_reduces_trans
 
 
 @pytest.mark.parametrize("case", (
-    "deadline_equality", "poststart", "missing_runtime_at", "missing_runtime_ns",
+    "deadline_equality", "poststart_with_closure", "missing_runtime_at", "missing_runtime_ns",
     "no_trade", "unavailable",
 ))
-def test_expired_prestart_fast_path_leaves_other_classification_paths_unchanged(monkeypatch, case):
+def test_expired_publication_fast_path_leaves_other_classification_paths_unchanged(monkeypatch, case):
     intent = build_worker_intent(150, final_bps=0.0 if case == "no_trade" else
                                  None if case == "unavailable" else 1.25,
                                  source_v3_status="UNAVAILABLE" if case == "unavailable" else "AVAILABLE")
@@ -1950,9 +1952,10 @@ def test_expired_prestart_fast_path_leaves_other_classification_paths_unchanged(
     runtime = make_authoritative_worker(WorkerTransactionConnection())
     runtime._runtime_started_at = WORKER_T0 + timedelta(seconds=10)
     runtime._runtime_started_epoch_ns = datetime_to_epoch_nanoseconds(runtime._runtime_started_at)
-    if case == "poststart":
+    if case == "poststart_with_closure":
         runtime._runtime_started_at = WORKER_T0 - timedelta(seconds=10)
         runtime._runtime_started_epoch_ns = datetime_to_epoch_nanoseconds(runtime._runtime_started_at)
+        runtime._deadline_closures[deadline_ns] = worker.DeadlineClosure(deadline_ns, 0, {}, None)
     elif case == "missing_runtime_at":
         runtime._runtime_started_at = None
     elif case == "missing_runtime_ns":
@@ -1971,9 +1974,58 @@ def test_expired_prestart_fast_path_leaves_other_classification_paths_unchanged(
         assert runtime._pending[intent.intent_id].forced_status_after_deadline == "SKIPPED_RESTART_GAP"
     else:
         assert runtime._classify_publication(object(), publication)
-        expected = {"poststart": "SKIPPED_WINDOW_EXPIRED", "no_trade": "SKIPPED_NO_TRADE",
+        expected = {"poststart_with_closure": "SKIPPED_WINDOW_EXPIRED", "no_trade": "SKIPPED_NO_TRADE",
                     "unavailable": "SKIPPED_UNAVAILABLE"}[case]
         assert events == ["existing", expected]
+
+
+@pytest.mark.parametrize("discovery_offset_ns", (-1, 0))
+def test_expired_fast_path_uses_immutable_discovery_not_later_processing_clock(
+        monkeypatch, discovery_offset_ns):
+    intent = build_worker_intent(160)
+    deadline_ns = datetime_to_epoch_nanoseconds(WORKER_T0) + 2_000_000_000
+    publication = worker.PublicationRecord(
+        160, WORKER_T0, WORKER_T0, 1, intent, deadline_ns + discovery_offset_ns)
+    runtime = make_authoritative_worker(WorkerTransactionConnection())
+    runtime._runtime_started_at = WORKER_T0 - timedelta(seconds=10)
+    runtime._runtime_started_epoch_ns = datetime_to_epoch_nanoseconds(runtime._runtime_started_at)
+    monkeypatch.setattr(runtime, "_monotonic_ns", lambda: deadline_ns + 300_000_000_000)
+    probes = []
+    monkeypatch.setattr(runtime, "_existing_entry", lambda *_args: probes.append(intent.intent_id))
+    monkeypatch.setattr(runtime, "_terminalize", lambda *_args: pytest.fail("timely discovery must wait"))
+    assert runtime._classify_publication(object(), publication) is False
+    assert probes == [intent.intent_id]
+    assert runtime._pending[intent.intent_id].publication.discovered_epoch_ns == (
+        deadline_ns + discovery_offset_ns)
+    assert runtime._pending[intent.intent_id].forced_status_after_deadline is None
+
+
+def test_expired_fast_path_preserves_captured_poststart_quote_candidate(monkeypatch):
+    intent = build_worker_intent(170)
+    deadline_ns = datetime_to_epoch_nanoseconds(WORKER_T0) + 2_000_000_000
+    publication = worker.PublicationRecord(170, WORKER_T0, WORKER_T0, 1, intent, deadline_ns + 1)
+    runtime = make_authoritative_worker(WorkerTransactionConnection())
+    runtime._runtime_started_at = WORKER_T0 - timedelta(seconds=10)
+    runtime._runtime_started_epoch_ns = datetime_to_epoch_nanoseconds(runtime._runtime_started_at)
+    runtime._sim5_enabled = True
+    quote = build_worker_quote()
+    runtime._deadline_closures[deadline_ns] = worker.DeadlineClosure(
+        deadline_ns, 7, {intent.intent_id: quote}, 170)
+    events = []
+    registered = []
+    monkeypatch.setattr(runtime, "_existing_entry", lambda *_args: events.append("existing"))
+
+    def terminalize(_store, _publication, status, selected_quote=None):
+        events.append((status, selected_quote))
+        return build_simulation_entry_record(intent=intent, entry_status=status, quote=selected_quote)
+
+    monkeypatch.setattr(runtime, "_terminalize", terminalize)
+    monkeypatch.setattr(runtime, "_register_pending_resolution", registered.append)
+    assert runtime._classify_publication(object(), publication)
+    assert events == ["existing", ("ENTERED", quote)]
+    assert len(registered) == 1
+    assert registered[0].entry_status == "ENTERED"
+    assert registered[0].quote == quote
 
 
 def test_worker_retries_flapping_sip_readiness_on_same_receiver():
