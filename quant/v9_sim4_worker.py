@@ -1869,6 +1869,22 @@ class SimulationEntryWorker:
         publication: PublicationRecord,
     ) -> bool:
         intent = publication.intent
+        if (
+            intent.status == "ACTIONABLE"
+            and self._runtime_started_at is not None
+            and self._runtime_started_epoch_ns is not None
+            and publication.publication_at <= self._runtime_started_at
+            and publication.discovered_epoch_ns > (
+                _datetime_to_epoch_nanoseconds(publication.publication_at)
+                + 2_000_000_000
+            )
+        ):
+            # This already-expired prestart request needs no quote inspection.
+            # The terminal transaction itself validates existing-entry and
+            # durable-open-position precedence under the same horizon lock.
+            self._terminalize(store, publication, "SKIPPED_RESTART_GAP")
+            self._pending.pop(intent.intent_id, None)
+            return True
         existing = self._existing_entry(store, intent)
         if existing is not None:
             self._pending.pop(intent.intent_id, None)

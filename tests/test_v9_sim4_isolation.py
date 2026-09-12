@@ -34,11 +34,13 @@ from quant.v9_sim4_entry import (
     SimulationEntryBackendError,
     SimulationEntryInstallationError,
     SimulationEntryRoleError,
+    SimulationEntryRowInvalidError,
     SimulationEntryStateError,
     SimulationEntryStore,
     build_simulation_entry_record,
     build_simulation_executable_quote,
     datetime_to_epoch_nanoseconds,
+    deserialize_simulation_entry_record,
     discover_supabase_project_ref,
     horizon_advisory_lock_key,
     serialize_simulation_entry_record,
@@ -1804,6 +1806,174 @@ def test_existing_terminal_is_read_and_validated_only_after_horizon_lock():
     )
     assert "WHERE intent_id = %s" in cursor.executions[2][0]
     assert cursor.executions[2][1] == (intent.intent_id,)
+
+
+@pytest.mark.parametrize("case", (
+    "new", "existing_skip", "existing_entered", "invalid_existing",
+    "occupied", "valid_closure", "corrupt_closure", "invalid_occupant", "commit_failure",
+))
+def test_expired_prestart_fast_path_preserves_store_precedence_and_reduces_transactions(
+        monkeypatch, case):
+    intent = build_worker_intent(140)
+    deadline_ns = datetime_to_epoch_nanoseconds(WORKER_T0) + 2_000_000_000
+    publication = worker.PublicationRecord(
+        140, WORKER_T0, WORKER_T0, 1, intent, deadline_ns + 1)
+    existing = None
+    if case in {"existing_skip", "invalid_existing"}:
+        existing = build_simulation_entry_record(
+            intent=intent, entry_status="SKIPPED_WINDOW_EXPIRED")
+    elif case == "existing_entered":
+        existing = build_simulation_entry_record(
+            intent=intent, entry_status="ENTERED", quote=build_worker_quote())
+    existing_row = None if existing is None else entry_database_row(existing)
+    if case == "invalid_existing":
+        existing_row = (*existing_row[:1], "f" * 64, *existing_row[2:])
+
+    blocker = build_simulation_entry_record(
+        intent=build_worker_intent(141), entry_status="ENTERED", quote=build_worker_quote())
+    # These are the unchanged occupancy query's results. The PostgreSQL
+    # closure regression exercises the valid/corrupt JSON filtering itself;
+    # here both paths must retain its blocker and choose the same terminal row.
+    occupied_rows = ([entry_database_row(blocker)] if case in {
+        "occupied", "corrupt_closure", "invalid_occupant"} else [])
+    if case == "invalid_occupant":
+        row = occupied_rows[0]
+        occupied_rows = [(*row[:1], "f" * 64, *row[2:])]
+
+    def execute(use_fast_path):
+        cursors = []
+
+        def transaction(terminal):
+            cursors.append(ScriptedCursor(one=((4321,),)))
+            rows = [(SIM_ENTRY_RUNTIME_ROLE, SIM_ENTRY_RUNTIME_ROLE, 4321),
+                    (None,), existing_row]
+            if terminal and existing_row is None:
+                rows.append(("inserted",))
+            cursors.append(ScriptedCursor(one=rows, all_rows=(occupied_rows,)))
+
+        if use_fast_path:
+            transaction(True)
+        else:
+            transaction(False)
+            if existing_row is None:
+                transaction(True)
+
+        class Connection(WorkerTransactionConnection):
+            def __init__(self):
+                super().__init__()
+                self.remaining = deque(cursors)
+
+            def cursor(self):
+                cursor = self.remaining.popleft()
+                self.cursors.append(cursor)
+                return cursor
+
+            def commit(self):
+                super().commit()
+                if case == "commit_failure" and any(
+                        sql.startswith("INSERT INTO") for sql, _ in self.cursors[-1].executions):
+                    raise RuntimeError("injected terminal commit failure")
+
+        connection = Connection()
+        runtime = make_authoritative_worker(connection)
+        runtime._runtime_started_at = WORKER_T0 + timedelta(seconds=10)
+        runtime._runtime_started_epoch_ns = datetime_to_epoch_nanoseconds(runtime._runtime_started_at)
+        runtime._sim5_enabled = True
+        monkeypatch.setattr(runtime, "_register_pending_resolution",
+                            lambda _entry: pytest.fail("existing entry must not be registered again"))
+        if existing_row is not None or case == "commit_failure":
+            runtime._pending[intent.intent_id] = worker.PendingIntent(publication, deadline_ns)
+        store = SimulationEntryStore(connection, project_ref=SIM_PROJECT_REF,
+                                     expected_backend_pid=4321)
+        error_type = None
+        try:
+            if use_fast_path:
+                assert runtime._classify_publication(store, publication)
+            else:
+                # Exact pre-change expired-prestart path: a separate existing
+                # probe, then terminalization only when the probe found none.
+                prior = runtime._existing_entry(store, intent)
+                if prior is None:
+                    runtime._terminalize(store, publication, "SKIPPED_RESTART_GAP")
+                else:
+                    runtime._pending.pop(intent.intent_id, None)
+        except RuntimeError as error:
+            error_type = type(error)
+        statements = [item for cursor in connection.cursors for item in cursor.executions]
+        inserts = [deserialize_simulation_entry_record(parameters[-1])
+                   for sql, parameters in statements if sql.startswith("INSERT INTO")]
+        if error_type is None:
+            assert intent.intent_id not in runtime._pending
+        elif existing_row is not None or case == "commit_failure":
+            assert intent.intent_id in runtime._pending
+        assert not connection.remaining
+        assert connection.autocommit is True
+        return connection, statements, inserts, error_type
+
+    original, original_sql, original_inserts, original_error = execute(False)
+    repaired, repaired_sql, repaired_inserts, repaired_error = execute(True)
+    assert repaired_inserts == original_inserts
+    assert repaired_error is original_error
+    if case == "commit_failure":
+        assert repaired_error is RuntimeError
+        assert (original.commits, repaired.commits) == (2, 1)
+    elif case in {"invalid_existing", "invalid_occupant"}:
+        assert repaired_error is SimulationEntryRowInvalidError
+        assert repaired.rollbacks == original.rollbacks == 1
+    elif existing is not None:
+        assert repaired.commits == original.commits == 1
+        assert not repaired_inserts
+    else:
+        assert (original.commits, repaired.commits) == (2, 1)
+        assert len(original_sql) - len(repaired_sql) == 4
+        result = repaired_inserts[0]
+        assert result.entry_status == (
+            "SKIPPED_POSITION_OPEN" if occupied_rows else "SKIPPED_RESTART_GAP")
+        assert result.blocking_entry_id == (blocker.entry_id if occupied_rows else None)
+    if occupied_rows:
+        original_occupancy = [sql for sql, _ in original_sql if "AND entry_status = 'ENTERED'" in sql]
+        repaired_occupancy = [sql for sql, _ in repaired_sql if "AND entry_status = 'ENTERED'" in sql]
+        assert repaired_occupancy == original_occupancy
+
+
+@pytest.mark.parametrize("case", (
+    "deadline_equality", "poststart", "missing_runtime_at", "missing_runtime_ns",
+    "no_trade", "unavailable",
+))
+def test_expired_prestart_fast_path_leaves_other_classification_paths_unchanged(monkeypatch, case):
+    intent = build_worker_intent(150, final_bps=0.0 if case == "no_trade" else
+                                 None if case == "unavailable" else 1.25,
+                                 source_v3_status="UNAVAILABLE" if case == "unavailable" else "AVAILABLE")
+    deadline_ns = datetime_to_epoch_nanoseconds(WORKER_T0) + 2_000_000_000
+    discovered = deadline_ns if case == "deadline_equality" else deadline_ns + 1
+    publication = worker.PublicationRecord(150, WORKER_T0, WORKER_T0, 1, intent, discovered)
+    runtime = make_authoritative_worker(WorkerTransactionConnection())
+    runtime._runtime_started_at = WORKER_T0 + timedelta(seconds=10)
+    runtime._runtime_started_epoch_ns = datetime_to_epoch_nanoseconds(runtime._runtime_started_at)
+    if case == "poststart":
+        runtime._runtime_started_at = WORKER_T0 - timedelta(seconds=10)
+        runtime._runtime_started_epoch_ns = datetime_to_epoch_nanoseconds(runtime._runtime_started_at)
+    elif case == "missing_runtime_at":
+        runtime._runtime_started_at = None
+    elif case == "missing_runtime_ns":
+        runtime._runtime_started_epoch_ns = None
+    events = []
+    monkeypatch.setattr(runtime, "_existing_entry", lambda *_args: events.append("existing"))
+    monkeypatch.setattr(runtime, "_terminalize", lambda _store, _publication, status:
+                        events.append(status))
+    if case.startswith("missing_runtime"):
+        with pytest.raises(worker.Sim4GenerationFailed):
+            runtime._classify_publication(object(), publication)
+        assert events == ["existing"]
+    elif case == "deadline_equality":
+        assert runtime._classify_publication(object(), publication) is False
+        assert events == ["existing"]
+        assert runtime._pending[intent.intent_id].forced_status_after_deadline == "SKIPPED_RESTART_GAP"
+    else:
+        assert runtime._classify_publication(object(), publication)
+        expected = {"poststart": "SKIPPED_WINDOW_EXPIRED", "no_trade": "SKIPPED_NO_TRADE",
+                    "unavailable": "SKIPPED_UNAVAILABLE"}[case]
+        assert events == ["existing", expected]
 
 
 def test_worker_retries_flapping_sip_readiness_on_same_receiver():
