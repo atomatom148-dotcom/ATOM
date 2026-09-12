@@ -1474,15 +1474,30 @@ class SimulationEntryWorker:
         with self._admission_lock:
             if connected:
                 if self._sip_streak_start_ns is None:
-                    self._sip_streak_start_ns = self._monotonic_ns()
+                    streak_start_ns = self._monotonic_ns()
+                    if self._anchor is not None:
+                        # Only the initial callback may legitimately predate
+                        # the anchor.  A later backward/invalid sample must not
+                        # be mistaken for that startup ordering.
+                        self._anchor.derived_epoch_ns(streak_start_ns)
+                    self._sip_streak_start_ns = streak_start_ns
             else:
-                if (
-                    self._sip_streak_start_ns is not None
-                    and self._anchor is not None
-                    and self._sip_streak_start_ns >= self._anchor.monotonic_ns
-                ):
+                streak_start_ns = self._sip_streak_start_ns
+                # Disconnect is authoritative even if a clock conversion below
+                # fails and the receiver contains that callback exception.
+                self._sip_streak_start_ns = None
+                if streak_start_ns is not None and self._anchor is not None:
+                    if (
+                        isinstance(streak_start_ns, int)
+                        and not isinstance(streak_start_ns, bool)
+                        and streak_start_ns < self._anchor.monotonic_ns
+                    ):
+                        # An already-open streak proves coverage strictly
+                        # after anchor capture, never at or before it.  This
+                        # integer lower bound does not rewrite its real start.
+                        streak_start_ns = self._anchor.monotonic_ns + 1
                     streak_start_epoch_ns = self._anchor.derived_epoch_ns(
-                        self._sip_streak_start_ns,
+                        streak_start_ns,
                     )
                     streak_end_epoch_ns = self._anchor.derived_epoch_ns(
                         self._monotonic_ns(),
@@ -1494,7 +1509,6 @@ class SimulationEntryWorker:
                             and streak_end_epoch_ns >= pending.deadline_epoch_ns
                         ):
                             pending.observed_through_deadline = True
-                self._sip_streak_start_ns = None
 
     def _sip_observed_continuously(
         self,
@@ -1512,12 +1526,16 @@ class SimulationEntryWorker:
         with self._admission_lock:
             streak_start_ns = self._sip_streak_start_ns
             anchor = self._anchor
-        if (
-            streak_start_ns is None
-            or anchor is None
-            or streak_start_ns < anchor.monotonic_ns
-        ):
+        if streak_start_ns is None or anchor is None:
             return False
+        if (
+            isinstance(streak_start_ns, int)
+            and not isinstance(streak_start_ns, bool)
+            and streak_start_ns < anchor.monotonic_ns
+        ):
+            # Match disconnect latching: pre-anchor coverage remains unknown,
+            # while an unbroken streak can prove a strictly later window.
+            streak_start_ns = anchor.monotonic_ns + 1
         return (
             anchor.derived_epoch_ns(streak_start_ns) <= since_epoch_ns
             and anchor.derived_epoch_ns(self._monotonic_ns()) >= through_epoch_ns
