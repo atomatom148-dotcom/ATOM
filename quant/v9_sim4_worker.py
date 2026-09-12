@@ -1474,7 +1474,13 @@ class SimulationEntryWorker:
         with self._admission_lock:
             if connected:
                 if self._sip_streak_start_ns is None:
-                    self._sip_streak_start_ns = self._monotonic_ns()
+                    streak_start_ns = self._monotonic_ns()
+                    if self._anchor is not None:
+                        # Only the initial callback may legitimately predate
+                        # the anchor.  A later backward/invalid sample must not
+                        # be mistaken for that startup ordering.
+                        self._anchor.derived_epoch_ns(streak_start_ns)
+                    self._sip_streak_start_ns = streak_start_ns
             else:
                 streak_start_ns = self._sip_streak_start_ns
                 # Disconnect is authoritative even if a clock conversion below

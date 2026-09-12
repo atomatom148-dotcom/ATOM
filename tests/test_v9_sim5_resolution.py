@@ -446,11 +446,12 @@ class SimulationResolutionDeadlineTests(unittest.TestCase):
 
 
 class SimulationResolutionObservationCoverageTests(unittest.TestCase):
-    def worker(self, *, observation_before_anchor=True, target_offset_us=1_000_000):
+    def worker(self, *, observation_before_anchor=True, target_offset_us=1_000_000,
+               initial_observation_ns=99):
         entry = build_entry()
         target, deadline = target_and_deadline(entry)
         anchor_at = target - timedelta(microseconds=target_offset_us)
-        samples = {"now": 99 if observation_before_anchor else 100}
+        samples = {"now": initial_observation_ns if observation_before_anchor else 100}
         worker = SimulationEntryWorker(
             lambda: self.fail("observation classification must not open a connection"),
             "abcdefghijklmnopqrst", PaperTradingCredentials("key", "secret"),
@@ -469,7 +470,7 @@ class SimulationResolutionObservationCoverageTests(unittest.TestCase):
             samples["now"] = 101
             worker._on_sip_observation(True)
         self.assertEqual(worker._sip_streak_start_ns,
-                         99 if observation_before_anchor else 101)
+                         initial_observation_ns if observation_before_anchor else 101)
         worker._register_pending_resolution(entry)
         records = []
         worker._terminalize_resolution = (
@@ -600,10 +601,7 @@ class SimulationResolutionObservationCoverageTests(unittest.TestCase):
         for invalid_start in (True, 99.0):
             for disconnect in (False, True):
                 with self.subTest(invalid_start=invalid_start, disconnect=disconnect):
-                    f = self.worker()
-                    f.worker._on_sip_observation(False)
-                    f.samples["now"] = invalid_start
-                    f.worker._on_sip_observation(True)
+                    f = self.worker(initial_observation_ns=invalid_start)
                     self.advance(f, f.deadline_ns + 1)
                     with self.assertRaises(ValueError):
                         if disconnect:
@@ -632,6 +630,31 @@ class SimulationResolutionObservationCoverageTests(unittest.TestCase):
                     self.advance(f, f.deadline_ns + 1)
                     self.assertEqual(self.terminal_status(f),
                                      "UNRESOLVED_OBSERVATION_GAP")
+
+    def test_invalid_post_anchor_connect_cannot_certify_until_valid_reconnect(self):
+        for invalid_now in (99, True, 99.0, "101"):
+            for valid_reconnect in (False, True):
+                for disconnect in (False, True):
+                    with self.subTest(invalid_now=invalid_now,
+                                      valid_reconnect=valid_reconnect,
+                                      disconnect=disconnect):
+                        f = self.worker()
+                        receiver = f.worker._receiver_factory(f.worker.admit_parsed_quote)
+                        f.samples["now"] = 200
+                        receiver._notify_observation(False)
+                        f.samples["now"] = invalid_now
+                        receiver._notify_observation(True)
+                        self.assertIsNone(f.worker._sip_streak_start_ns)
+                        if valid_reconnect:
+                            f.samples["now"] = 201
+                            receiver._notify_observation(True)
+                            self.assertEqual(f.worker._sip_streak_start_ns, 201)
+                        self.advance(f, f.deadline_ns + 1)
+                        if disconnect:
+                            receiver._notify_observation(False)
+                        expected = ("UNRESOLVED_WINDOW_EXPIRED" if valid_reconnect
+                                    else "UNRESOLVED_OBSERVATION_GAP")
+                        self.assertEqual(self.terminal_status(f), expected)
 
     def test_sim5_disabled_receiver_does_not_track_observation(self):
         worker = SimulationEntryWorker(
