@@ -1351,11 +1351,19 @@ class SimulationEntryStore:
 
     def _load_horizon_occupancy_on_cursor(
             self, cursor, horizon: str) -> SimulationEntryRecord | None:
-        cursor.execute(_ENTRY_SELECT +
+        # Detoast each canonical payload once and probe resolutions by entry
+        # identity, while retaining every historical candidate and closure check.
+        cursor.execute("WITH occupancy_candidates AS MATERIALIZED (SELECT " +
+                       _RECOVERY_ENTRY_PROJECTION + " FROM " + SIM_ENTRY_TABLE +
                        " WHERE symbol = %s AND horizon = %s "
-                       "AND entry_status = 'ENTERED'" +
-                       _ENTRY_NOT_RESOLVED_CLAUSE +
-                       " ORDER BY publication_at, entry_id",
+                       "AND entry_status = 'ENTERED') SELECT " +
+                       ", ".join(_ENTRY_COLUMNS) +
+                       " FROM occupancy_candidates AS e WHERE NOT EXISTS (SELECT 1 FROM "
+                       "(SELECT " + _RECOVERY_RESOLUTION_PROJECTION +
+                       " FROM public.atom_v9_sim_resolutions WHERE entry_id = e.entry_id OFFSET 0) "
+                       "AS r WHERE r.entry_id = e.entry_id AND " +
+                       _VALID_TERMINAL_RESOLUTION_CLAUSE +
+                       ") ORDER BY publication_at, entry_id",
                        (SYMBOL, horizon))
         rows = self._fetchall(cursor)
         if len(rows) > 1:
