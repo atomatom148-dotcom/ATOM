@@ -815,8 +815,8 @@ class SimulationEntryStoreTests(unittest.TestCase):
         self.assertIsNone(blocker)
         sql2, parameters2 = cursor2.executed[0]
         self.assertIn(
-            "NOT EXISTS (SELECT 1 FROM public.atom_v9_sim_resolutions AS r "
-            "WHERE r.entry_id = e.entry_id AND ", sql2)
+            "AS r WHERE r.entry_id = e.entry_id AND ", sql2)
+        self.assertIn(sim4_entry_module._VALID_TERMINAL_RESOLUTION_CLAUSE, sql2)
         self.assertIn("ORDER BY publication_at, entry_id", sql2)
         self.assertEqual(parameters2, ("COIN", "30S"))
         del entry1  # constructed only to prove ENTERED entries build cleanly
@@ -920,7 +920,7 @@ class SimulationEntryStoreTests(unittest.TestCase):
         self.assertEqual((connection.commit_calls, connection.rollback_calls,
                           connection.close_calls), (0, 0, 0))
 
-    def test_recovery_paging_preserves_closure_checks_in_postgres(self):
+    def test_occupancy_queries_preserve_closure_checks_in_postgres(self):
         import os
         from urllib.parse import urlsplit
 
@@ -958,6 +958,7 @@ class SimulationEntryStoreTests(unittest.TestCase):
             def __init__(self, cursor):
                 self.cursor = cursor
                 self.pages = []
+                self.last_rows = []
 
             def execute(self, query, parameters):
                 query = query.replace("public.atom_v9_sim_entries", "pg_temp.recovery_entries")
@@ -966,8 +967,10 @@ class SimulationEntryStoreTests(unittest.TestCase):
 
             def fetchall(self):
                 rows = self.cursor.fetchall()
-                marker = next(row for row in rows if row[0] == "PAGE")
-                self.pages.append((marker[1], sum(row[0] == "OPEN" for row in rows)))
+                self.last_rows = rows
+                markers = [row for row in rows if row[0] == "PAGE"]
+                if markers:
+                    self.pages.append((markers[0][1], sum(row[0] == "OPEN" for row in rows)))
                 return rows
 
         with psycopg.connect(database_url) as connection:
@@ -989,7 +992,7 @@ class SimulationEntryStoreTests(unittest.TestCase):
                         entry_status="ENTERED", quote=build_quote())
                     entries.append(entry)
                     target = entry.cutoff_at + timedelta(seconds=entry.horizon_seconds)
-                    if index % 2:
+                    if index % 3 == 0:
                         resolution = build_simulation_resolution_record(
                             entry=entry, exit_quote=build_quote(
                                 provider_event_ns=datetime_to_epoch_nanoseconds(target) + 1,
@@ -997,7 +1000,8 @@ class SimulationEntryStoreTests(unittest.TestCase):
                                 bid=101.0, ask=101.25))
                     else:
                         resolution = build_simulation_resolution_record(
-                            entry=entry, unresolved_status="UNRESOLVED_OBSERVATION_GAP")
+                            entry=entry, unresolved_status=("UNRESOLVED_OBSERVATION_GAP"
+                                if index % 3 == 1 else "UNRESOLVED_WINDOW_EXPIRED"))
                     resolutions.append(resolution)
                 for table, columns, rows in (
                         ("recovery_entries", sim4_entry_module._ENTRY_COLUMNS,
@@ -1011,6 +1015,27 @@ class SimulationEntryStoreTests(unittest.TestCase):
                 cursor.execute("ANALYZE recovery_entries")
                 cursor.execute("ANALYZE recovery_resolutions")
                 store = SimulationEntryStore(connection, project_ref=PROJECT_REF)
+
+                def assert_horizon(expected, error=None):
+                    # Compare the actual new SQL's complete rows with the prior
+                    # unpaged anti-join, then exercise the unchanged decoder.
+                    horizon_cursor = RecoveryCursor(cursor)
+                    horizon_cursor.execute(sim4_entry_module._ENTRY_SELECT +
+                        " WHERE symbol = %s AND horizon = %s AND entry_status = 'ENTERED'" +
+                        sim4_entry_module._ENTRY_NOT_RESOLVED_CLAUSE +
+                        " ORDER BY publication_at, entry_id", ("COIN", "30S"))
+                    baseline_rows = horizon_cursor.fetchall()
+                    self.assertEqual([row[0] for row in baseline_rows],
+                                     sorted(entry.entry_id for entry in expected))
+                    if error is None:
+                        self.assertEqual(store._load_horizon_occupancy_on_cursor(
+                            horizon_cursor, "30S"), expected[0] if expected else None)
+                    else:
+                        with self.assertRaises(error):
+                            store._load_horizon_occupancy_on_cursor(horizon_cursor, "30S")
+                    self.assertEqual(horizon_cursor.last_rows, baseline_rows)
+
+                assert_horizon(())
                 recovery = RecoveryCursor(cursor)
                 self.assertEqual(store.load_open_occupancy_on_cursor(recovery), {})
                 self.assertEqual(recovery.pages, [(128, 0), (128, 0), (1, 0)] + [(0, 0)] * 5)
@@ -1022,6 +1047,7 @@ class SimulationEntryStoreTests(unittest.TestCase):
                 recovery = RecoveryCursor(cursor)
                 self.assertEqual(store.load_open_occupancy_on_cursor(recovery), {"30S": last})
                 self.assertEqual(recovery.pages[:3], [(128, 0), (128, 0), (1, 1)])
+                assert_horizon((last,))
 
                 # A resolution row with inconsistent canonical identity must
                 # leave the older entry open and expose the cross-page conflict.
@@ -1031,6 +1057,38 @@ class SimulationEntryStoreTests(unittest.TestCase):
                 with self.assertRaises(SimulationEntryStateError):
                     store.load_open_occupancy_on_cursor(recovery)
                 self.assertEqual(recovery.pages, [(128, 1), (128, 0), (1, 1)])
+                assert_horizon((first, last), SimulationEntryStateError)
+
+                # Restore the temporary fixture, then corrupt one closure or
+                # entry at a time. Invalid closures stay open; invalid entries
+                # reach canonical decoding and fail closed.
+                cursor.execute("UPDATE recovery_resolutions SET entry_hash = %s WHERE entry_id = %s",
+                               (first.entry_hash, first.entry_id))
+                last_resolution = next(r for r in resolutions if r.entry_id == last.entry_id)
+                row = resolution_row(last_resolution)
+                cursor.execute("INSERT INTO recovery_resolutions (" + ", ".join(_RESOLUTION_COLUMNS) +
+                    ") VALUES (" + ", ".join(["%s"] * len(_RESOLUTION_COLUMNS)) + ")",
+                    (*row[:-1], Jsonb(row[-1])))
+                cases = [
+                    ("recovery_resolutions", "resolution_hash", "f" * 64, None),
+                    ("recovery_resolutions", "source_cycle_id", "wrong-cycle", None),
+                    ("recovery_resolutions", "resolution_target_at", T0, None),
+                    ("recovery_entries", "entry_hash", "f" * 64, SimulationEntryRowInvalidError),
+                ]
+                for payload in ({}, [], "invalid", None):
+                    cases.extend([
+                        ("recovery_resolutions", "record_json", Jsonb(payload), None),
+                        ("recovery_entries", "record_json", Jsonb(payload), SimulationEntryRowInvalidError),
+                    ])
+                for table, column, value, error in cases:
+                    with self.subTest(table=table, column=column, value=value):
+                        cursor.execute("SAVEPOINT occupancy_corruption")
+                        cursor.execute("UPDATE " + table + " SET " + column +
+                                       " = %s WHERE entry_id = %s", (value, first.entry_id))
+                        assert_horizon((first,), error)
+                        cursor.execute("ROLLBACK TO SAVEPOINT occupancy_corruption")
+                        cursor.execute("RELEASE SAVEPOINT occupancy_corruption")
+                assert_horizon(())
 
     def test_canonical_entry_price_token_matches_float8_in_postgres(self):
         import os
