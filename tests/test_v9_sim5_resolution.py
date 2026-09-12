@@ -445,6 +445,208 @@ class SimulationResolutionDeadlineTests(unittest.TestCase):
         )])
 
 
+class SimulationResolutionObservationCoverageTests(unittest.TestCase):
+    def worker(self, *, observation_before_anchor=True, target_offset_us=1_000_000):
+        entry = build_entry()
+        target, deadline = target_and_deadline(entry)
+        anchor_at = target - timedelta(microseconds=target_offset_us)
+        samples = {"now": 99 if observation_before_anchor else 100}
+        worker = SimulationEntryWorker(
+            lambda: self.fail("observation classification must not open a connection"),
+            "abcdefghijklmnopqrst", PaperTradingCredentials("key", "secret"),
+            utc_clock=lambda: anchor_at,
+            monotonic_ns=lambda: samples["now"],
+            sim5_enabled=True,
+        )
+        worker._receiver = SimpleNamespace(
+            ready_event=SimpleNamespace(is_set=lambda: True),
+        )
+        if observation_before_anchor:
+            worker._on_sip_observation(True)
+        samples["now"] = 100
+        worker._enable_admission_with_anchor()
+        if not observation_before_anchor:
+            samples["now"] = 101
+            worker._on_sip_observation(True)
+        self.assertEqual(worker._sip_streak_start_ns,
+                         99 if observation_before_anchor else 101)
+        worker._register_pending_resolution(entry)
+        records = []
+        worker._terminalize_resolution = (
+            lambda entry, exit_quote=None, unresolved_status=None:
+            records.append(build_simulation_resolution_record(
+                entry=entry, exit_quote=exit_quote,
+                unresolved_status=unresolved_status,
+            ))
+        )
+        return SimpleNamespace(
+            worker=worker, samples=samples, entry=entry, records=records,
+            target_ns=datetime_to_epoch_nanoseconds(target),
+            deadline_ns=datetime_to_epoch_nanoseconds(deadline),
+            anchor_epoch_ns=datetime_to_epoch_nanoseconds(anchor_at),
+        )
+
+    @staticmethod
+    def advance(fixture, epoch_ns):
+        fixture.samples["now"] = 100 + epoch_ns - fixture.anchor_epoch_ns
+
+    def terminal_status(self, fixture):
+        fixture.worker._terminalize_due_resolutions(fixture.deadline_ns)
+        self.assertEqual(len(fixture.records), 1)
+        self.assertEqual(fixture.worker._pending_resolutions, {})
+        return fixture.records[0].resolution_status
+
+    def test_future_window_is_covered_under_either_startup_callback_order(self):
+        for before_anchor in (True, False):
+            for disconnect_offset in (None, 0, 1):
+                with self.subTest(before_anchor=before_anchor,
+                                  disconnect_offset_ns=disconnect_offset):
+                    f = self.worker(observation_before_anchor=before_anchor)
+                    self.advance(f, f.deadline_ns + (disconnect_offset or 0))
+                    if disconnect_offset is not None:
+                        f.worker._on_sip_observation(False)
+                        self.assertTrue(f.worker._pending_resolutions[
+                            f.entry.entry_id].observed_through_deadline)
+                    self.advance(f, f.deadline_ns + 1)
+                    self.assertEqual(self.terminal_status(f),
+                                     "UNRESOLVED_WINDOW_EXPIRED")
+
+    def test_pre_anchor_streak_proof_starts_strictly_after_anchor(self):
+        for target_offset_us in (-1, 0, 1):
+            for disconnect in (False, True):
+                with self.subTest(target_offset_us=target_offset_us,
+                                  disconnect=disconnect):
+                    f = self.worker(target_offset_us=target_offset_us)
+                    self.advance(f, f.deadline_ns + 1)
+                    if disconnect:
+                        f.worker._on_sip_observation(False)
+                    expected = ("UNRESOLVED_WINDOW_EXPIRED" if target_offset_us > 0
+                                else "UNRESOLVED_OBSERVATION_GAP")
+                    self.assertEqual(self.terminal_status(f), expected)
+
+    def test_pre_anchor_streak_keeps_its_real_start_and_integer_proof_boundary(self):
+        f = self.worker()
+        self.advance(f, f.deadline_ns + 1)
+        f.worker._on_sip_observation(True)
+        self.assertEqual(f.worker._sip_streak_start_ns, 99)
+        self.assertFalse(f.worker._sip_observed_continuously(
+            f.anchor_epoch_ns, f.deadline_ns,
+        ))
+        self.assertTrue(f.worker._sip_observed_continuously(
+            f.anchor_epoch_ns + 1, f.deadline_ns,
+        ))
+
+    def test_disconnect_or_late_reconnect_cannot_join_coverage_across_a_gap(self):
+        for disconnect_offset, reconnect_offset in ((-1, 1), (1, 2), (1, None)):
+            with self.subTest(disconnect_offset_ns=disconnect_offset,
+                              reconnect_offset_ns=reconnect_offset):
+                f = self.worker()
+                self.advance(f, f.target_ns + disconnect_offset)
+                f.worker._on_sip_observation(False)
+                if reconnect_offset is not None:
+                    self.advance(f, f.target_ns + reconnect_offset)
+                    f.worker._on_sip_observation(True)
+                self.advance(f, f.deadline_ns + 1)
+                self.assertEqual(self.terminal_status(f),
+                                 "UNRESOLVED_OBSERVATION_GAP")
+
+    def test_missing_anchor_or_streak_cannot_certify_coverage(self):
+        for missing in ("_anchor", "_sip_streak_start_ns"):
+            with self.subTest(missing=missing):
+                f = self.worker()
+                self.advance(f, f.deadline_ns + 1)
+                setattr(f.worker, missing, None)
+                self.assertFalse(f.worker._sip_observed_continuously(
+                    f.target_ns, f.deadline_ns,
+                ))
+                f.worker._on_sip_observation(False)
+                self.assertEqual(self.terminal_status(f),
+                                 "UNRESOLVED_OBSERVATION_GAP")
+
+    def test_invalid_monotonic_sample_cannot_certify_or_latch_coverage(self):
+        for now in (99, True, "101"):
+            for disconnect in (False, True):
+                with self.subTest(now=now, disconnect=disconnect):
+                    f = self.worker()
+                    f.samples["now"] = now
+                    with self.assertRaises(ValueError):
+                        if disconnect:
+                            f.worker._on_sip_observation(False)
+                        else:
+                            f.worker._sip_observed_continuously(
+                                f.target_ns, f.deadline_ns,
+                            )
+                    self.assertFalse(f.worker._pending_resolutions[
+                        f.entry.entry_id].observed_through_deadline)
+                    self.assertEqual(f.records, [])
+
+    def test_selected_quote_precedes_both_expiry_and_gap_classification(self):
+        for disconnect_offset in (1, RESOLUTION_WINDOW_SECONDS * 1_000_000_000):
+            with self.subTest(disconnect_offset_ns=disconnect_offset):
+                f = self.worker()
+                target, _deadline = target_and_deadline(f.entry)
+                quote = build_quote(
+                    accepted_at=target, provider_event_ns=f.target_ns,
+                    bid=101.0, ask=101.25,
+                )
+                f.worker._offer_quote_to_pending_resolutions(quote)
+                self.advance(f, f.target_ns + disconnect_offset)
+                f.worker._on_sip_observation(False)
+                self.advance(f, f.deadline_ns + 1)
+                self.assertEqual(self.terminal_status(f), "RESOLVED")
+                self.assertEqual(f.records[0].exit_quote, quote)
+
+    def test_invalid_streak_start_is_not_repaired_by_the_anchor_floor(self):
+        for invalid_start in (True, 99.0):
+            for disconnect in (False, True):
+                with self.subTest(invalid_start=invalid_start, disconnect=disconnect):
+                    f = self.worker()
+                    f.worker._on_sip_observation(False)
+                    f.samples["now"] = invalid_start
+                    f.worker._on_sip_observation(True)
+                    self.advance(f, f.deadline_ns + 1)
+                    with self.assertRaises(ValueError):
+                        if disconnect:
+                            f.worker._on_sip_observation(False)
+                        else:
+                            f.worker._sip_observed_continuously(
+                                f.target_ns, f.deadline_ns,
+                            )
+                    self.assertFalse(f.worker._pending_resolutions[
+                        f.entry.entry_id].observed_through_deadline)
+                    self.assertEqual(f.records, [])
+
+    def test_disconnect_clock_error_cannot_leave_a_stale_connected_streak(self):
+        for before_anchor in (True, False):
+            for invalid_now in (99, True, "101"):
+                with self.subTest(before_anchor=before_anchor, invalid_now=invalid_now):
+                    f = self.worker(observation_before_anchor=before_anchor)
+                    receiver = f.worker._receiver_factory(f.worker.admit_parsed_quote)
+                    f.samples["now"] = invalid_now
+                    # The actual receiver contains callback exceptions.  A later
+                    # valid clock must not turn that disconnect into continuity.
+                    receiver._notify_observation(False)
+                    self.assertIsNone(f.worker._sip_streak_start_ns)
+                    self.assertFalse(f.worker._pending_resolutions[
+                        f.entry.entry_id].observed_through_deadline)
+                    self.advance(f, f.deadline_ns + 1)
+                    self.assertEqual(self.terminal_status(f),
+                                     "UNRESOLVED_OBSERVATION_GAP")
+
+    def test_sim5_disabled_receiver_does_not_track_observation(self):
+        worker = SimulationEntryWorker(
+            lambda: self.fail("disabled observation must not open a connection"),
+            "abcdefghijklmnopqrst", PaperTradingCredentials("key", "secret"),
+            sim5_enabled=False,
+        )
+        receiver = worker._receiver_factory(worker.admit_parsed_quote)
+        receiver._notify_observation(True)
+        self.assertIsNone(worker._sip_streak_start_ns)
+        self.assertFalse(worker._sip_observed_continuously(0, 1))
+        receiver._notify_observation(False)
+        self.assertEqual(worker._pending_resolutions, {})
+
+
 class SimulationResolutionContractTests(unittest.TestCase):
     def test_exact_constants_field_order_and_frozen_slotted_shape(self):
         self.assertEqual(SIM_RESOLUTION_CONTRACT_VERSION, "ATOM_TRUE_V9_SIM5_RESOLUTION_1")
