@@ -321,6 +321,7 @@ def dashboard_data(
     for horizon in PHASE_E_HORIZONS:
         item = accuracy_by_horizon.get(horizon)
         available = item is not None and item.directional_accuracy is not None
+        state_as_of = getattr(item, "state_as_of", None)
         v9_accuracy.append({
             "horizon": horizon,
             "directional_wins": item.directional_wins if available else None,
@@ -328,6 +329,10 @@ def dashboard_data(
             "directional_accuracy": item.directional_accuracy if available else None,
             "directional_effective_n": item.directional_effective_n if available else None,
             "status": item.status if available else "UNAVAILABLE",
+            "state_as_of": (
+                state_as_of.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                if state_as_of is not None else None
+            ),
         })
     v1_output = getattr(v9_output, "v1", None)
     forecast_cutoff = (v1_output.cutoff_at.timestamp()
@@ -480,6 +485,7 @@ def dashboard_page(data: dict[str, object]) -> bytes:
             for item in v9_accuracy
         ]),
         ("STATUS", [item["status"] for item in v9_accuracy]),
+        ("AS OF (UTC)", [item.get("state_as_of") or "—" for item in v9_accuracy]),
     )
     phase_e_headers = (
         "FAMILY/HORIZON", "PROOF N≤64", "N≥20", "DIR ACC",
@@ -606,7 +612,8 @@ def dashboard_page(data: dict[str, object]) -> bytes:
         (item.directional_accuracy * 100).toFixed(1) + "%"),
       "EFFECTIVE N": data.v9_accuracy.map(item => item.directional_effective_n == null ? "—" :
         Number(item.directional_effective_n).toFixed(2)),
-      "STATUS": data.v9_accuracy.map(item => item.status)
+      "STATUS": data.v9_accuracy.map(item => item.status),
+      "AS OF (UTC)": data.v9_accuracy.map(item => item.state_as_of ?? "—")
     }};
     Object.entries(accuracyRows).forEach(([name, values]) =>
       values.forEach((value, index) => set(`v9_accuracy.${{name}}.${{index}}`, value)));

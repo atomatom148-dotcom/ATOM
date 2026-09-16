@@ -385,6 +385,7 @@ class WebSurfaceTests(unittest.TestCase):
             "horizon": "30S", "directional_wins": 400,
             "directional_losses": 20, "directional_accuracy": 400 / 420,
             "directional_effective_n": 399.25, "status": "MATURE",
+            "state_as_of": None,
         })
         self.assertEqual(data["v9_accuracy"][1]["status"], "PROVISIONAL")
         self.assertEqual(data["v9_accuracy"][2]["status"], "UNAVAILABLE")
@@ -402,6 +403,86 @@ class WebSurfaceTests(unittest.TestCase):
                       for index in range(6)],
         })
         self.assertIn("V9 DIRECTIONAL ACCURACY", rendered)
+
+    def test_accuracy_timestamp_uses_published_state_not_current_market_time(self):
+        as_of = datetime(2026, 9, 15, 12, 7, 30, tzinfo=timezone.utc)
+        current = datetime(2026, 9, 16, 14, 7, 30, tzinfo=timezone.utc)
+        accuracy = SimpleNamespace(
+            horizon="30S", state_as_of=as_of, directional_wins=400,
+            directional_losses=20, directional_accuracy=400 / 420,
+            directional_effective_n=399.25, status="MATURE",
+        )
+        output = SimpleNamespace(
+            final_numbers=(), accuracy=(accuracy,),
+            v1=SimpleNamespace(cutoff_at=current),
+        )
+        state = LiveMarketState()
+        state.update_market_display(
+            coin_midpoint=100.0, coin_event_epoch=current.timestamp(),
+        )
+        publication = replace(state.publication(), v9_output=output)
+        with patch.object(state, "publication", return_value=publication):
+            app = create_app(state=state, clock=current.timestamp)
+            payload = json.loads(request(app, "/api/live")["body"])
+            page = request(app, "/")["body"].decode()
+
+        self.assertEqual(payload["market"]["data_age"], 0.0)
+        self.assertEqual(payload["v9"]["forecast_age"], 0.0)
+        self.assertEqual(payload["v9_accuracy"][0], {
+            "horizon": "30S", "directional_wins": 400,
+            "directional_losses": 20, "directional_accuracy": 400 / 420,
+            "directional_effective_n": 399.25, "status": "MATURE",
+            "state_as_of": "2026-09-15T12:07:30Z",
+        })
+        self.assertIsNone(payload["v9_accuracy"][1]["state_as_of"])
+        self.assertIn(
+            'data-dashboard-field="v9_accuracy.AS OF (UTC).0">'
+            '2026-09-15T12:07:30Z</td>', page)
+        self.assertIn(
+            'data-dashboard-field="v9_accuracy.AS OF (UTC).1">—</td>', page)
+        self.assertIs(accuracy.state_as_of, as_of)
+
+    def test_live_browser_updates_accuracy_timestamp_and_clears_missing_metadata(self):
+        page = request(create_app(), "/")["body"].decode()
+        script = page.split("<script>", 1)[1].split("</script>", 1)[0]
+        payload = dashboard_data()
+        payload["v9_accuracy"][0]["state_as_of"] = "2026-09-15T12:07:30Z"
+        harness = f"""
+const source = {json.dumps(script)};
+const payload = {json.dumps(payload)};
+const cell = {{dataset: {{dashboardField: "v9_accuracy.AS OF (UTC).0"}}, textContent: ""}};
+const timers = [];
+global.setTimeout = fn => {{ timers.push(fn); return timers.length; }};
+global.clearTimeout = () => {{}};
+global.document = {{
+  querySelectorAll: () => [cell],
+  getElementById: () => ({{replaceChildren: () => {{}}}}),
+  createElement: () => ({{textContent: "", replaceChildren: () => {{}}}}),
+}};
+global.fetch = async () => ({{ok: true, json: async () => payload}});
+(async () => {{
+  eval(source);
+  const refreshLive = timers[0];
+  await refreshLive();
+  if (cell.textContent !== "2026-09-15T12:07:30Z")
+    throw new Error("published accuracy timestamp was not rendered");
+  payload.v9_accuracy[0].state_as_of = "2026-09-16T14:07:30Z";
+  await refreshLive();
+  if (cell.textContent !== "2026-09-16T14:07:30Z")
+    throw new Error("new accuracy timestamp did not replace the old generation");
+  payload.v9_accuracy[0].state_as_of = null;
+  await refreshLive();
+  if (cell.textContent !== "—")
+    throw new Error("missing timestamp retained a prior generation");
+  delete payload.v9_accuracy[0].state_as_of;
+  await refreshLive();
+  if (cell.textContent !== "—")
+    throw new Error("absent timestamp did not remain unknown");
+}})().catch(error => {{ console.error(error); process.exitCode = 1; }});
+"""
+        result = subprocess.run(
+            ["node", "-"], input=harness, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_v9_accuracy_request_path_only_reads_published_live_output(self):
         class Store:
