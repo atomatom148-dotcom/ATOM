@@ -120,6 +120,7 @@ def run(*, database_url: str, stop_event: threading.Event,
                 connect=connect,
                 database_url=database_url,
                 metrics=metrics,
+                on_stopped=reader.close,
             )
             worker.start()
             started = True
@@ -134,16 +135,19 @@ def run(*, database_url: str, stop_event: threading.Event,
             elif not stop_event.is_set():
                 raise
         finally:
-            try:
-                if worker is not None:
-                    worker.close()
-                elif state_connection is not None:
-                    state_connection.close()
-            finally:
-                if reader is not None:
-                    reader.close()
-                elif lease_connection is not None:
-                    lease_connection.close()
+            if worker is not None:
+                # A bounded close may return while a slow build still runs.
+                # The worker retains the lease until its own final cleanup.
+                worker.close()
+            else:
+                try:
+                    if state_connection is not None:
+                        state_connection.close()
+                finally:
+                    if reader is not None:
+                        reader.close()
+                    elif lease_connection is not None:
+                        lease_connection.close()
 
 
 def main() -> None:
