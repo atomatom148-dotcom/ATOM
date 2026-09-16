@@ -29,7 +29,7 @@ from quant.evidence_outbox import (
     EvidenceLedgerWorker, EvidenceOutbox, QuoteEvidenceWork, TerminalDeliveryError,
     PostgresV4BStateBuilder, PostgresV4CStateBuilder, PostgresV4StateBuilder,
     V4StateBuildWorker, V4StateCacheRefresher, _decode_v4_state_row,
-    _iter_v4_state_pages,
+    _iter_v4_state_pages, _iter_v4_state_row_batches,
     _prepare_v4_state_evidence, _prepare_v4_state_evidence_sets,
 )
 from quant.history import MidpointObservation
@@ -1859,6 +1859,77 @@ def test_offline_builder_cooldown_starts_after_slow_build_finishes():
     assert calls == [0.0, 100.0]
 
 
+class _StateHistoryConnection(_WorkerConnection):
+    """Database boundary double; the PostgreSQL regression verifies real SQL."""
+
+    def __init__(self, rows, *, row_key=lambda row: (row[0], row[1], row[6]),
+                 extra_keys=()):
+        self.rows = tuple(rows)
+        self.row_key = row_key
+        self.keys = sorted(set(map(row_key, rows)) | set(extra_keys))
+        self.evidence_params = []
+        self.pages = []
+        self.cursors = []
+        self.commits = 0
+        self.rollbacks = 0
+
+    def cursor(self, *args, **kwargs):
+        connection = self
+
+        class Cursor:
+            closed = False
+
+            def execute(self, sql, params=()):
+                self.index = 0
+                if sql.startswith("SET TRANSACTION"):
+                    self.rows = ()
+                elif "unnest" in sql:
+                    self.rows = tuple((h,) for h in sorted(params[0]))
+                elif "SELECT f.cutoff_at, f.forecast_record_id" in sql:
+                    assert "record_json" not in sql
+                    horizon, as_of, limit = params[1], params[2], params[-1]
+                    after = tuple(params[4:6]) if len(params) > 4 else None
+                    self.rows = tuple((cutoff, record_id)
+                                      for h, cutoff, record_id in connection.keys
+                                      if h == horizon and cutoff <= as_of and
+                                      (after is None or (cutoff, record_id) > after))[:limit]
+                    connection.pages.append(self.rows)
+                else:
+                    assert "read_forecast_commit_proof" in sql
+                    assert "o.created_at<=%s" in sql
+                    assert "o.record_json->>'proof_eligible'='true'" in sql
+                    assert "f.record_json->>'cohort_id'=%s" in sql
+                    assert "f.record_json->>'cohort_hash'=%s" in sql
+                    assert "ORDER BY f.horizon, f.cutoff_at, f.forecast_record_id" in sql
+                    assert "o.created_at, o.outcome_record_id" in sql
+                    assert "LIMIT" not in sql
+                    connection.evidence_params.append(params)
+                    ids = set(params[-1])
+                    self.rows = tuple(row for row in connection.rows
+                                      if connection.row_key(row)[2] in ids)
+
+            def fetchall(self):
+                return self.rows
+
+            def fetchmany(self, size):
+                start = self.index
+                self.index += size
+                return self.rows[start:self.index]
+
+            def close(self):
+                self.closed = True
+
+        cursor = Cursor()
+        self.cursors.append(cursor)
+        return cursor
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
 def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkeypatch):
     v1, v2 = _inputs()
     calculated = V4DCoordinator(
@@ -1887,24 +1958,6 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
         "POST_COMMIT_DB_OBSERVATION_V1",
     )
 
-    class Cursor:
-        def execute(self, sql, params):
-            assert "atom_v9_v4_forecasts" in sql and "atom_v9_v4_outcomes" in sql
-            assert "o.created_at<=%s" in sql
-            proof_filter = "o.record_json->>'proof_eligible'='true'"
-            assert proof_filter in sql
-            assert "f.record_json->>'cohort_id'=%s" in sql
-            assert "f.record_json->>'cohort_hash'=%s" in sql
-            assert "read_forecast_commit_proof" in sql and "LIMIT" not in sql
-            assert "ORDER BY f.horizon, f.cutoff_at" in sql
-            self.params = params
-        def fetchall(self):
-            return (row,)
-        def close(self): pass
-    class Connection(_WorkerConnection):
-        def __init__(self): self.cursor_value = Cursor()
-        def cursor(self): return self.cursor_value
-
     captured = {}
     state = SimpleNamespace(state_id="state")
     def frozen_build(**kwargs):
@@ -1913,7 +1966,7 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
     monkeypatch.setattr("quant.evidence_outbox.build_accuracy_state", frozen_build)
     store = SimpleNamespace(
         calls=[], insert=lambda candidate, created: store.calls.append((candidate, created)) or "INSERT")
-    connection = Connection()
+    connection = _StateHistoryConnection((row,))
     builder = PostgresV4BStateBuilder(connection, state_store=store,
                                       wall_clock=lambda: NOW + timedelta(minutes=2))
     cohorts = {item.forecast.horizon:
@@ -1936,10 +1989,11 @@ def test_postgres_v4b_builder_reads_governed_v4a_and_invokes_frozen_build(monkey
         selection.raw_resolved_n == 0
         for horizon, selection in selections.items()
         if horizon != forecast.horizon)
-    assert connection.cursor_value.params == (
+    assert connection.evidence_params == [(
         "COIN", as_of, as_of,
         *(value for horizon in HORIZONS for value in (horizon, *cohorts[horizon])),
-    )
+        [forecast.forecast_record_id],
+    )]
     assert store.calls == [(state, NOW + timedelta(minutes=2))]
     with pytest.raises(
             RuntimeError, match="V4_STATE_EVIDENCE_RELATIONAL_MISMATCH"):
@@ -1972,7 +2026,8 @@ def test_v4_state_pages_continue_past_former_total_evidence_bound(monkeypatch):
 
     monkeypatch.setattr("quant.evidence_outbox._decode_v4_state_row", decode)
     cursor = Cursor()
-    page_sizes = tuple(len(page) for page in _iter_v4_state_pages(cursor))
+    batches = iter(lambda: cursor.fetchmany(V4_STATE_BUILD_QUERY_CHUNK), ())
+    page_sizes = tuple(len(page) for page in _iter_v4_state_pages(batches))
 
     assert sum(page_sizes) == total
     assert max(page_sizes) <= V4_STATE_BUILD_QUERY_CHUNK
@@ -2023,29 +2078,6 @@ def test_streamed_overlap_selection_matches_frozen_whole_history(
         )
         pairs.append((forecast, outcome))
 
-    class Cursor:
-        def __init__(self):
-            self.index = 0
-
-        def execute(self, _sql, _params):
-            pass
-
-        def fetchmany(self, size):
-            assert size == page_size
-            start = self.index
-            self.index = min(len(pairs), start + size)
-            return tuple(pairs[start:self.index])
-
-        def close(self):
-            pass
-
-    class Connection(_WorkerConnection):
-        def __init__(self):
-            self.cursor_value = Cursor()
-
-        def cursor(self, *args, **kwargs):
-            return self.cursor_value
-
     monkeypatch.setattr(
         "quant.evidence_outbox.V4_STATE_BUILD_QUERY_CHUNK", page_size)
     decoded = []
@@ -2060,7 +2092,10 @@ def test_streamed_overlap_selection_matches_frozen_whole_history(
     }
 
     prepared_sets = _prepare_v4_state_evidence_sets(
-        Connection(), symbol="COIN", state_as_of=NOW + timedelta(hours=1),
+        _StateHistoryConnection(
+            pairs, row_key=lambda row: (
+                row[0].horizon, row[0].cutoff_at, row[0].forecast_record_id)),
+        symbol="COIN", state_as_of=NOW + timedelta(hours=1),
         cohorts=cohorts,
         governed_sets={
             "all": lambda **kwargs: tuple(kwargs["pairs"]),
@@ -2139,28 +2174,6 @@ def test_streaming_preserves_conflicting_pairs_across_fetch_boundaries(
         (later, make_outcome(later, 4.0)),
     )
 
-    class Cursor:
-        def __init__(self):
-            self.index = 0
-
-        def execute(self, _sql, _params):
-            pass
-
-        def fetchmany(self, size):
-            assert size == 1
-            if self.index == len(pairs):
-                return ()
-            pair = pairs[self.index]
-            self.index += 1
-            return (pair,)
-
-        def close(self):
-            pass
-
-    class Connection(_WorkerConnection):
-        def cursor(self, *args, **kwargs):
-            return Cursor()
-
     monkeypatch.setattr("quant.evidence_outbox.V4_STATE_BUILD_QUERY_CHUNK", 1)
     monkeypatch.setattr(
         "quant.evidence_outbox._decode_v4_state_row", lambda row: row)
@@ -2169,7 +2182,10 @@ def test_streaming_preserves_conflicting_pairs_across_fetch_boundaries(
         for horizon in HORIZONS
     }
     prepared = _prepare_v4_state_evidence(
-        Connection(), symbol="COIN", state_as_of=NOW + timedelta(hours=1),
+        _StateHistoryConnection(
+            pairs, row_key=lambda row: (
+                row[0].horizon, row[0].cutoff_at, row[0].forecast_record_id)),
+        symbol="COIN", state_as_of=NOW + timedelta(hours=1),
         cohorts=cohorts,
         governed=lambda **kwargs: tuple(kwargs["pairs"]),
     )
@@ -2198,29 +2214,13 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
         endpoint_observation_at=forecast.target_endpoint,
         target_resolved_at=forecast.target_endpoint, actual_return_bps=2.0)
 
-    class Cursor:
-        def execute(self, sql, params):
-            assert "atom_v9_v4_forecasts" in sql and "atom_v9_v4_outcomes" in sql
-            assert "o.created_at<=%s" in sql
-            proof_filter = "o.record_json->>'proof_eligible'='true'"
-            assert proof_filter in sql
-            assert "f.record_json->>'cohort_id'=%s" in sql
-            assert "f.record_json->>'cohort_hash'=%s" in sql
-            assert "read_forecast_commit_proof" in sql and "LIMIT" not in sql
-            assert "ORDER BY f.horizon, f.cutoff_at" in sql
-            self.params = params
-        def fetchall(self):
-            return ((forecast.horizon, forecast.cutoff_at,
-                     forecast.forecast_record_hash,
-                     json.dumps(_canonical(asdict(forecast))),
-                     outcome.outcome_record_hash, json.dumps(_canonical(asdict(outcome))),
-                     forecast.forecast_record_id, forecast.forecast_record_hash,
-                     NOW, forecast.target_endpoint, True,
-                     "POST_COMMIT_DB_OBSERVATION_V1"),)
-        def close(self): pass
-    class Connection(_WorkerConnection):
-        def __init__(self): self.cursor_value = Cursor()
-        def cursor(self): return self.cursor_value
+    row = (forecast.horizon, forecast.cutoff_at,
+           forecast.forecast_record_hash,
+           json.dumps(_canonical(asdict(forecast))),
+           outcome.outcome_record_hash, json.dumps(_canonical(asdict(outcome))),
+           forecast.forecast_record_id, forecast.forecast_record_hash,
+           NOW, forecast.target_endpoint, True,
+           "POST_COMMIT_DB_OBSERVATION_V1")
 
     import quant.evidence_outbox as module
     calls = {"threshold": 0, "scale": 0, "range": 0, "state": 0}
@@ -2235,7 +2235,7 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
 
     store = SimpleNamespace(calls=[])
     store.insert = lambda state, created: store.calls.append((state, created)) or "INSERT"
-    connection = Connection()
+    connection = _StateHistoryConnection((row,))
     builder = PostgresV4CStateBuilder(connection, state_store=store,
                                       wall_clock=lambda: NOW + timedelta(minutes=2))
     cohorts = {item.forecast.horizon:
@@ -2250,10 +2250,11 @@ def test_postgres_v4c_builder_runs_frozen_components_and_persists_combined_state
     assert state.state_version == PROBABILITY_STATE_VERSION
     assert state.cohort_id == "v9v4statecohort:" + module.canonical_sha256(
         tuple(cohorts[horizon] for horizon in HORIZONS))
-    assert connection.cursor_value.params == (
+    assert connection.evidence_params == [(
         "COIN", as_of, as_of,
         *(value for horizon in HORIZONS for value in (horizon, *cohorts[horizon])),
-    )
+        [forecast.forecast_record_id],
+    )]
     assert state.horizons[0].range_status == "UNAVAILABLE"
     assert all(item.range_status == "UNAVAILABLE" for item in state.horizons)
     assert store.calls[0][1] == NOW + timedelta(minutes=2)
@@ -2631,3 +2632,267 @@ def test_unexpected_v3_horizon_status_is_rejected(monkeypatch):
     with pytest.raises(RuntimeError, match="UNEXPECTED_V3_HORIZON_STATUS"):
         coordinator.run_cycle()
     assert not any(key.startswith("horizon.") for key, _ in metrics.snapshot().counters)
+
+
+def test_v4_history_key_pages_continue_after_empty_evidence_without_total_cap():
+    total = 65_537
+    keys = tuple(("30S", NOW + timedelta(microseconds=i), f"f-{i}")
+                 for i in range(total))
+    connection = _StateHistoryConnection((), extra_keys=keys)
+    rows = tuple(_iter_v4_state_row_batches(
+        connection, symbol="COIN", state_as_of=NOW + timedelta(hours=1),
+        cohort_scope="f.record_json->>'cohort_id'=%s AND "
+                     "f.record_json->>'cohort_hash'=%s",
+        cohort_params=("c", "h")))
+    assert rows == ()
+    requested = tuple(record_id for params in connection.evidence_params
+                      for record_id in params[-1])
+    assert requested == tuple(key[2] for key in keys)
+    assert max(map(len, connection.pages)) <= V4_STATE_BUILD_QUERY_CHUNK
+    assert all(cursor.closed for cursor in connection.cursors)
+
+
+def test_v4_history_failure_closes_cursors_and_rolls_back(monkeypatch):
+    connection = _StateHistoryConnection(
+        (), extra_keys=(("30S", NOW, "first"), ("30S", NOW, "second")))
+    original_cursor = connection.cursor
+
+    def cursor(*args, **kwargs):
+        result = original_cursor(*args, **kwargs)
+        if kwargs.get("name"):
+            def fail(_size):
+                raise OSError("page fetch failed")
+            result.fetchmany = fail
+        return result
+
+    connection.cursor = cursor
+    with pytest.raises(OSError, match="page fetch failed"):
+        _prepare_v4_state_evidence_sets(
+            connection, symbol="COIN", state_as_of=NOW,
+            cohorts={h: ("c", "h") for h in HORIZONS},
+            governed_sets={"all": lambda **kwargs: kwargs["pairs"]})
+    assert connection.commits == 0 and connection.rollbacks == 1
+    assert all(cursor.closed for cursor in connection.cursors)
+
+
+def test_v4_history_refuses_autocommit_before_reading():
+    connection = _StateHistoryConnection(())
+    connection.autocommit = True
+    with pytest.raises(RuntimeError, match="requires one transaction"):
+        tuple(_iter_v4_state_row_batches(
+            connection, symbol="COIN", state_as_of=NOW,
+            cohort_scope="true", cohort_params=()))
+    assert not connection.cursors
+
+
+@pytest.fixture
+def v4_history_postgres():
+    """Exercise the reader in an isolated disposable database, never production."""
+    import os
+    from urllib.parse import urlsplit, urlunsplit
+    from uuid import uuid4
+
+    url = os.environ.get("H2C_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("H2C_TEST_DATABASE_URL disposable PostgreSQL required")
+    parsed = urlsplit(url)
+    if (parsed.scheme not in {"postgres", "postgresql"} or
+            parsed.hostname not in {"localhost", "127.0.0.1", "::1"} or
+            parsed.port != 5432 or parsed.username != "postgres" or
+            parsed.path != "/postgres" or parsed.query or parsed.fragment):
+        pytest.fail("V4 history integration requires the local CI postgres DSN")
+    psycopg = pytest.importorskip("psycopg")
+    from psycopg import sql
+
+    name = "atom_v4_history_" + uuid4().hex[:12]
+    isolated_url = urlunsplit((parsed.scheme, parsed.netloc, "/" + name, "", ""))
+    admin = psycopg.connect(url, autocommit=True)
+    database_created = False
+    reader = writer = None
+    try:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+        database_created = True
+        writer = psycopg.connect(isolated_url)
+        writer.execute("""
+            CREATE TABLE public.atom_v9_v4_forecasts (
+                forecast_record_id text PRIMARY KEY,
+                forecast_record_hash text NOT NULL, symbol text NOT NULL,
+                horizon text NOT NULL, cutoff_at timestamptz NOT NULL,
+                record_json jsonb NOT NULL);
+            CREATE INDEX ON public.atom_v9_v4_forecasts (symbol, cutoff_at, horizon);
+            CREATE TABLE public.atom_v9_v4_outcomes (
+                outcome_record_id text PRIMARY KEY,
+                forecast_record_id text NOT NULL, outcome_record_hash text NOT NULL,
+                created_at timestamptz NOT NULL, record_json jsonb NOT NULL);
+            CREATE INDEX ON public.atom_v9_v4_outcomes (forecast_record_id);
+            CREATE TABLE public.proofs (
+                forecast_record_id text PRIMARY KEY,
+                forecast_record_hash text, commit_observed_at timestamptz,
+                target_endpoint timestamptz, proof_eligible boolean,
+                proof_method text);
+            CREATE SCHEMA atom_v9_internal;
+            CREATE FUNCTION atom_v9_internal.read_forecast_commit_proof(text)
+                RETURNS SETOF public.proofs LANGUAGE SQL STABLE
+                AS 'SELECT * FROM public.proofs WHERE forecast_record_id=$1';
+        """)
+        writer.commit()
+        reader = psycopg.connect(isolated_url)
+        yield reader, writer
+    finally:
+        if reader is not None:
+            reader.close()
+        if writer is not None:
+            writer.close()
+        if database_created:
+            admin.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)))
+        admin.close()
+
+
+@pytest.mark.parametrize("page_size", (2, 4_096))
+def test_postgres_v4_history_exact_state_parity_and_snapshot(
+        monkeypatch, v4_history_postgres, page_size):
+    import quant.evidence_outbox as module
+    from psycopg.types.json import Jsonb
+
+    reader, writer = v4_history_postgres
+    v1, v2 = _inputs()
+    calculated = V4DCoordinator(
+        capture_v1=lambda: v1, capture_v2=lambda _captured: v2,
+        forecast_writer=None,
+        compact_state_lookup=lambda **_kwargs: (None, "UNAVAILABLE"),
+        state_cohort_id=lambda *_args: "unused",
+        cutoff_midpoint=lambda _value: 100.0).run_cycle()
+    cohorts = {item.forecast.horizon:
+               (item.forecast.cohort_id, item.forecast.cohort_hash)
+               for item in calculated.persistence}
+    as_of = NOW + timedelta(days=1)
+
+    def insert_outcome(forecast, actual, *, created_at=None, proof=True):
+        outcome = build_outcome(
+            forecast=forecast, target_identity=canonical_target_identity(forecast),
+            previous_observation_at=forecast.target_endpoint - timedelta(seconds=1),
+            endpoint_observation_at=forecast.target_endpoint,
+            target_resolved_at=forecast.target_endpoint, actual_return_bps=actual)
+        payload = _canonical(asdict(outcome))
+        if not proof:
+            payload["proof_eligible"] = False
+        writer.execute(
+            "INSERT INTO public.atom_v9_v4_outcomes VALUES (%s,%s,%s,%s,%s)",
+            (outcome.outcome_record_id, forecast.forecast_record_id,
+             outcome.outcome_record_hash, created_at or forecast.target_endpoint,
+             Jsonb(payload)))
+
+    forecasts = []
+    for index, offset in enumerate((0, 0, 0, 30, 60, 3_600, 7_200)):
+        v1.cutoff_at = NOW + timedelta(seconds=offset)
+        v1.cycle_id = f"page-cycle-{index}"
+        for result in calculated.v3.horizon_results:
+            forecast = build_forecast(
+                v1=v1, v2=v2, result=replace(result, predictive_variance_bps2=4.0),
+                evidence_origin="PRODUCTION", cutoff_midpoint=100.0)
+            forecast = replace(
+                forecast, persisted_at=forecast.cutoff_at,
+                persistence_proof_eligible=True)
+            forecasts.append(forecast)
+            writer.execute(
+                "INSERT INTO public.atom_v9_v4_forecasts VALUES (%s,%s,%s,%s,%s,%s)",
+                (forecast.forecast_record_id, forecast.forecast_record_hash,
+                 forecast.symbol, forecast.horizon, forecast.cutoff_at,
+                 Jsonb(_canonical(asdict(forecast)))))
+            writer.execute(
+                "INSERT INTO public.proofs VALUES (%s,%s,%s,%s,%s,%s)",
+                (forecast.forecast_record_id, forecast.forecast_record_hash,
+                 forecast.cutoff_at, forecast.target_endpoint, index != 5,
+                 "POST_COMMIT_DB_OBSERVATION_V1"))
+            if index == 6:
+                continue  # Outcome arrives during the reader's snapshot below.
+            insert_outcome(forecast, 1.0 + index)
+            if index == 3:
+                insert_outcome(forecast, -3.0)  # Conflicting outcomes stay visible.
+                insert_outcome(forecast, 17.0, created_at=as_of + timedelta(seconds=1))
+                insert_outcome(forecast, 19.0, proof=False)
+
+    # An entire first page is ineligible; pagination must still reach later rows.
+    writer.execute(
+        """INSERT INTO public.atom_v9_v4_forecasts
+           SELECT 'ineligible-' || n, 'unused', 'COIN', '15M',
+                  %s::timestamptz - interval '1 hour', '{}'::jsonb
+           FROM generate_series(1, %s) AS n""", (NOW, page_size + 1))
+    # One forecast has more outcomes than a fetch or metadata page, without a cap.
+    crowded = next(f for f in forecasts if f.horizon == "30S" and
+                   f.cutoff_at == NOW + timedelta(seconds=60))
+    for index in range(page_size + 1):
+        insert_outcome(crowded, 100.0 + index)
+    writer.commit()
+
+    # Independent old full-history query: deliberately no pagination or ID filter.
+    scope = " OR ".join(
+        "(f.horizon=%s AND f.record_json->>'cohort_id'=%s "
+        "AND f.record_json->>'cohort_hash'=%s)" for _ in HORIZONS)
+    params = tuple(value for h in HORIZONS for value in (h, *cohorts[h]))
+    original_rows = reader.execute(
+        f"""SELECT f.horizon, f.cutoff_at, f.forecast_record_hash, f.record_json,
+                   o.outcome_record_hash, o.record_json,
+                   p.forecast_record_id, p.forecast_record_hash,
+                   p.commit_observed_at, p.target_endpoint,
+                   p.proof_eligible, p.proof_method
+            FROM public.atom_v9_v4_forecasts AS f
+            JOIN public.atom_v9_v4_outcomes AS o USING (forecast_record_id)
+            JOIN LATERAL atom_v9_internal.read_forecast_commit_proof(
+                f.forecast_record_id) AS p ON p.proof_eligible
+            WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
+              AND o.record_json->>'proof_eligible'='true' AND ({scope})
+            ORDER BY f.horizon, f.cutoff_at, f.forecast_record_id,
+                     o.created_at, o.outcome_record_id""",
+        ("COIN", as_of, as_of, *params)).fetchall()
+    reader.rollback()
+    original_pairs = tuple(map(_decode_v4_state_row, original_rows))
+    original_batches = module._iter_v4_state_row_batches
+    observed_rows = []
+
+    def batches_with_concurrent_insert(*args, **kwargs):
+        inserted = False
+        batches = original_batches(*args, **kwargs)
+        try:
+            for batch in batches:
+                if not inserted:
+                    insert_outcome(forecasts[-1], 23.0)
+                    writer.commit()
+                    inserted = True
+                observed_rows.extend(batch)
+                yield batch
+        finally:
+            batches.close()
+        assert inserted
+
+    monkeypatch.setattr(module, "V4_STATE_BUILD_QUERY_CHUNK", page_size)
+    monkeypatch.setattr(module, "_iter_v4_state_row_batches", batches_with_concurrent_insert)
+    prepared = _prepare_v4_state_evidence_sets(
+        reader, symbol="COIN", state_as_of=as_of, cohorts=cohorts,
+        governed_sets={"accuracy": module._governed_v4b_evidence,
+                       "compact": module._governed_v4c_evidence})
+    assert observed_rows == original_rows  # Every SQL row, in the original order.
+    for name, governed in (("accuracy", module._governed_v4b_evidence),
+                           ("compact", module._governed_v4c_evidence)):
+        for horizon in HORIZONS:
+            expected = select_non_overlapping(governed(
+                horizon=horizon, cohort_id=cohorts[horizon][0],
+                cohort_hash=cohorts[horizon][1], symbol="COIN", state_as_of=as_of,
+                pairs=original_pairs))
+            assert prepared[name].selection_map()[horizon] == expected
+    expected_accuracy = module.build_accuracy_state(
+        symbol="COIN", state_as_of=as_of, cohorts=cohorts, evidence=original_pairs)
+    actual_accuracy = module.build_accuracy_state(
+        symbol="COIN", state_as_of=as_of, cohorts=cohorts,
+        evidence=prepared["accuracy"].evidence,
+        overlap_selections=prepared["accuracy"].selection_map())
+    expected_compact = PostgresV4CStateBuilder._build_state(
+        "COIN", as_of, cohorts, original_pairs)
+    actual_compact = PostgresV4CStateBuilder._build_state(
+        "COIN", as_of, cohorts, prepared["compact"].evidence)
+    for expected, actual in ((expected_accuracy, actual_accuracy),
+                             (expected_compact, actual_compact)):
+        assert json.dumps(_canonical(asdict(actual)), sort_keys=True,
+                          separators=(",", ":")) == json.dumps(
+                              _canonical(asdict(expected)), sort_keys=True,
+                              separators=(",", ":"))
