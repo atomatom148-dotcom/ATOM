@@ -278,6 +278,64 @@ class SimulationResolutionDeadlineTests(unittest.TestCase):
         self.assertEqual(records[0].exit_quote.provider_event_ns,
                          endpoint.provider_event_ns)
 
+    def test_late_registration_preserves_retained_first_exit(self):
+        for coverage in (True, False):
+            with self.subTest(continuous_coverage=coverage):
+                worker, entry, target, deadline, samples, records = self.worker(
+                    coverage=coverage,
+                )
+                worker._pending_resolutions.clear()
+                accepted = target + timedelta(seconds=1)
+                samples["now"] = (
+                    datetime_to_epoch_nanoseconds(accepted)
+                    - datetime_to_epoch_nanoseconds(T0)
+                )
+                first = build_quote(
+                    provider_event_ns=datetime_to_epoch_nanoseconds(accepted) - 2,
+                    accepted_at=accepted, bid=100.5, ask=100.75,
+                )
+                later = build_quote(
+                    provider_event_ns=datetime_to_epoch_nanoseconds(accepted) - 1,
+                    accepted_at=accepted, bid=101.0, ask=101.25,
+                )
+                # Reconciliation has not yet registered this durable entry.
+                # Both accepted exits are consumed first, in reverse tuple order.
+                for quote in (later, first):
+                    self.enqueue(worker, quote)
+                    self.assertTrue(worker._drain_one_quote_event())
+                worker._register_pending_resolution(entry)
+                samples["now"] = (
+                    datetime_to_epoch_nanoseconds(deadline)
+                    - datetime_to_epoch_nanoseconds(T0) + 1
+                )
+                worker._ready_loop(None, 0)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0].resolution_status, "RESOLVED")
+                self.assertEqual(records[0].exit_quote, first)
+
+    def test_late_registration_rejects_retained_quote_before_target(self):
+        worker, entry, target, deadline, samples, records = self.worker()
+        worker._pending_resolutions.clear()
+        accepted = target + timedelta(seconds=1)
+        samples["now"] = (
+            datetime_to_epoch_nanoseconds(accepted)
+            - datetime_to_epoch_nanoseconds(T0)
+        )
+        self.enqueue(worker, build_quote(
+            provider_event_ns=datetime_to_epoch_nanoseconds(target) - 1,
+            accepted_at=accepted,
+        ))
+        self.assertTrue(worker._drain_one_quote_event())
+        worker._register_pending_resolution(entry)
+        samples["now"] = (
+            datetime_to_epoch_nanoseconds(deadline)
+            - datetime_to_epoch_nanoseconds(T0) + 1
+        )
+        worker._ready_loop(None, 0)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].resolution_status, "UNRESOLVED_WINDOW_EXPIRED")
+        self.assertIsNone(records[0].exit_quote)
+
     def test_fixed_watermark_does_not_chase_later_admissions(self):
         worker, _entry, target, deadline, _samples, records = self.worker()
         accepted = target + timedelta(seconds=1)
