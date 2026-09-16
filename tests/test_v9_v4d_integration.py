@@ -2785,11 +2785,13 @@ def test_postgres_v4_history_exact_state_parity_and_snapshot(
     forecasts = []
     for index, offset in enumerate((0, 0, 0, 30, 60, 3_600, 7_200)):
         v1.cutoff_at = NOW + timedelta(seconds=offset)
-        v1.cycle_id = f"page-cycle-{index}"
+        # Three distinct hashes of one logical forecast straddle size-two
+        # metadata pages; all must be excluded together as a conflict.
+        v1.cycle_id = "conflicting-cycle" if index < 3 else f"page-cycle-{index}"
         for result in calculated.v3.horizon_results:
             forecast = build_forecast(
                 v1=v1, v2=v2, result=replace(result, predictive_variance_bps2=4.0),
-                evidence_origin="PRODUCTION", cutoff_midpoint=100.0)
+                evidence_origin="PRODUCTION", cutoff_midpoint=100.0 + index)
             forecast = replace(
                 forecast, persisted_at=forecast.cutoff_at,
                 persistence_proof_eligible=True)
