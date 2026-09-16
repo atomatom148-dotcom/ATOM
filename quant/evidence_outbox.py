@@ -122,21 +122,90 @@ def _decode_v4_state_row(row):
     )
 
 
-def _iter_v4_state_pages(cursor):
-    """Fetch bounded batches without splitting one horizon/cutoff identity."""
+def _iter_v4_state_row_batches(
+        connection, *, symbol, state_as_of, cohort_scope, cohort_params):
+    """Page narrow forecast keys before joining their complete evidence rows."""
 
-    fetchmany = getattr(cursor, "fetchmany", None)
+    if bool(getattr(connection, "autocommit", False)):
+        raise RuntimeError("V4 state history requires one transaction")
+    cursor = connection.cursor()
+    try:
+        # Standalone builders need the same stable snapshot as the combined
+        # builder: separate key and evidence statements must not see new rows.
+        cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        cursor.execute(
+            "SELECT unnest(%s::text[]) AS horizon ORDER BY horizon",
+            (list(HORIZONS),),
+        )
+        horizons = tuple(row[0] for row in cursor.fetchall())
+        for horizon in horizons:
+            after = None
+            while True:
+                continuation = (
+                    " AND f.cutoff_at>=%s"
+                    " AND (f.cutoff_at, f.forecast_record_id)>(%s, %s)"
+                    if after is not None else "")
+                cursor.execute(
+                    "SELECT f.cutoff_at, f.forecast_record_id "
+                    "FROM public.atom_v9_v4_forecasts AS f "
+                    "WHERE f.symbol=%s AND f.horizon=%s AND f.cutoff_at<=%s"
+                    + continuation +
+                    " ORDER BY f.cutoff_at, f.forecast_record_id LIMIT %s",
+                    (symbol, horizon, state_as_of,
+                     *((after[0], *after) if after is not None else ()),
+                     V4_STATE_BUILD_QUERY_CHUNK),
+                )
+                keys = tuple(cursor.fetchall())
+                if not keys:
+                    break
+                # Progress comes from the unfiltered keys, including pages
+                # whose cohort, outcome, or commit proof is not eligible.
+                after = keys[-1]
+                evidence_cursor = _open_v4_state_cursor(connection)
+                try:
+                    evidence_cursor.execute(
+                        f"""SELECT f.horizon, f.cutoff_at,
+                                  f.forecast_record_hash, f.record_json,
+                                  o.outcome_record_hash, o.record_json,
+                                  p.forecast_record_id, p.forecast_record_hash,
+                                  p.commit_observed_at, p.target_endpoint,
+                                  p.proof_eligible, p.proof_method
+                           FROM public.atom_v9_v4_forecasts AS f
+                           JOIN public.atom_v9_v4_outcomes AS o
+                             USING (forecast_record_id)
+                           JOIN LATERAL atom_v9_internal.read_forecast_commit_proof(
+                               f.forecast_record_id
+                           ) AS p ON p.proof_eligible
+                           WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
+                             AND o.record_json->>'proof_eligible'='true'
+                             AND ({cohort_scope})
+                             AND f.forecast_record_id = ANY(%s)
+                           ORDER BY f.horizon, f.cutoff_at, f.forecast_record_id,
+                                    o.created_at, o.outcome_record_id""",
+                        (symbol, state_as_of, state_as_of, *cohort_params,
+                         [key[1] for key in keys]),
+                    )
+                    fetchmany = getattr(evidence_cursor, "fetchmany", None)
+                    if callable(fetchmany):
+                        while rows := tuple(fetchmany(V4_STATE_BUILD_QUERY_CHUNK)):
+                            yield rows
+                    else:
+                        rows = tuple(evidence_cursor.fetchall())
+                        if rows:
+                            yield rows
+                finally:
+                    evidence_cursor.close()
+    finally:
+        cursor.close()
+
+
+def _iter_v4_state_pages(row_batches):
+    """Keep a horizon/cutoff identity together across every physical page."""
+
     carry = []
-    while True:
-        if callable(fetchmany):
-            rows = tuple(fetchmany(V4_STATE_BUILD_QUERY_CHUNK))
-        else:
-            rows = tuple(cursor.fetchall())
-            fetchmany = None
+    for rows in row_batches:
         if not rows:
-            if carry:
-                yield tuple(carry)
-            return
+            continue
 
         pairs = carry + [_decode_v4_state_row(row) for row in rows]
         tail_key = (pairs[-1][0].horizon, pairs[-1][0].cutoff_at)
@@ -148,10 +217,8 @@ def _iter_v4_state_pages(cursor):
         if split:
             yield tuple(pairs[:split])
         carry = pairs[split:]
-        if fetchmany is None:
-            if carry:
-                yield tuple(carry)
-            return
+    if carry:
+        yield tuple(carry)
 
 
 def _prepare_v4_state_evidence_sets(
@@ -177,30 +244,12 @@ def _prepare_v4_state_evidence_sets(
         for name in governed_sets
     }
 
-    cursor = _open_v4_state_cursor(connection)
-    cursor_closed = False
+    row_batches = _iter_v4_state_row_batches(
+        connection, symbol=symbol, state_as_of=state_as_of,
+        cohort_scope=cohort_scope, cohort_params=cohort_params,
+    )
     try:
-        cursor.execute(
-            f"""SELECT f.horizon, f.cutoff_at,
-                      f.forecast_record_hash, f.record_json,
-                      o.outcome_record_hash, o.record_json,
-                      p.forecast_record_id, p.forecast_record_hash,
-                      p.commit_observed_at, p.target_endpoint,
-                      p.proof_eligible, p.proof_method
-               FROM public.atom_v9_v4_forecasts AS f
-               JOIN public.atom_v9_v4_outcomes AS o
-                 USING (forecast_record_id)
-               JOIN LATERAL atom_v9_internal.read_forecast_commit_proof(
-                   f.forecast_record_id
-               ) AS p ON p.proof_eligible
-               WHERE f.symbol=%s AND f.cutoff_at<=%s AND o.created_at<=%s
-                 AND o.record_json->>'proof_eligible'='true'
-                 AND ({cohort_scope})
-               ORDER BY f.horizon, f.cutoff_at, f.forecast_record_id,
-                        o.created_at, o.outcome_record_id""",
-            (symbol, state_as_of, state_as_of, *cohort_params),
-        )
-        for page in _iter_v4_state_pages(cursor):
+        for page in _iter_v4_state_pages(row_batches):
             for horizon, horizon_page_iter in groupby(
                     page, key=lambda pair: pair[0].horizon):
                 if horizon not in cohorts:
@@ -252,10 +301,6 @@ def _prepare_v4_state_evidence_sets(
                         last_selected.cutoff_at +
                         timedelta(seconds=last_selected.horizon_seconds))
 
-        close = getattr(cursor, "close", None)
-        if callable(close):
-            close()
-            cursor_closed = True
         commit = getattr(connection, "commit", None)
         if callable(commit):
             commit()
@@ -265,9 +310,7 @@ def _prepare_v4_state_evidence_sets(
             rollback()
         raise
     finally:
-        close = getattr(cursor, "close", None)
-        if not cursor_closed and callable(close):
-            close()
+        row_batches.close()
 
     return {
         name: _PreparedV4StateEvidence(
