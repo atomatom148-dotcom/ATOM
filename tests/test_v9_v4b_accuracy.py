@@ -196,6 +196,63 @@ def test_effective_n_ips_and_metric_specific_sequences():
     assert effective_n([0,1,0,1,0,1])[0] <= 6
 
 
+def _eager_effective_n_reference(values):
+    # Frozen pre-optimization arithmetic at b89dde8d41015cb7f77d73da97fe44f33aec0d33.
+    n = len(values)
+    if n < 3: return float(n), ()
+    mean = math.fsum(values) / n
+    centered = [value-mean for value in values]
+    denominator = math.fsum(value*value for value in centered)
+    if denominator <= math.ulp(max(1.0, max(map(abs, values), default=1.0))) ** 2:
+        return float(n), ("SERIAL_DEPENDENCE_UNIDENTIFIABLE",)
+    rho = [math.fsum(centered[k]*centered[k+lag] for k in range(n-lag))/denominator
+           for lag in range(1, n)]
+    included = []
+    for first in range(1, n-1, 2):
+        if rho[first-1] + rho[first] <= 0: break
+        included.extend((first, first+1))
+    tau = max(1.0, 1.0 + 2.0*math.fsum((1-lag/n)*rho[lag-1] for lag in included))
+    result = n/tau
+    if result > n and result-n <= 16*math.ulp(float(n)): result = float(n)
+    return min(float(n), max(1.0, result)), ()
+
+
+@pytest.mark.parametrize("n", [0, 1, 2, 3, 4, 5, 6, 31, 32, 127, 128, 257])
+def test_effective_n_preserves_frozen_arithmetic_exactly(n):
+    rng = random.Random(n)
+    series = [
+        [1.0] * n,
+        [float(i % 2) for i in range(n)],
+        [float(i) for i in range(n)],
+        [float(i // 8) for i in range(n)],
+        [1.0 + (i % 2) * math.ulp(1.0) for i in range(n)],
+        [rng.uniform(-100.0, 100.0) for _ in range(n)],
+        [rng.choice((-1.0, 0.0, 1.0)) for _ in range(n)],
+    ]
+    for values in series:
+        assert effective_n(values) == _eager_effective_n_reference(values)
+
+
+def test_effective_n_early_stop_avoids_unused_lag_work(monkeypatch):
+    original_fsum = math.fsum
+    summed_terms = 0
+
+    def counted_fsum(values):
+        def counted_values():
+            nonlocal summed_terms
+            for value in values:
+                summed_terms += 1
+                yield value
+        return original_fsum(counted_values())
+
+    monkeypatch.setattr(math, "fsum", counted_fsum)
+    values = [float(i % 2) for i in range(256)]
+    assert effective_n(values) == (float(len(values)), ())
+    # Mean, variance, and the first lag pair suffice for this negative pair.
+    # Count real arithmetic input terms instead of relying on wall-clock speed.
+    assert summed_terms <= 4 * len(values)
+
+
 def test_maturity_requires_both_effective_n_and_interval_width():
     evidence=[]
     for i in range(385):
