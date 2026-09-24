@@ -94,10 +94,11 @@ def effective_n(values: Sequence[float]) -> tuple[float, tuple[str, ...]]:
     denominator = math.fsum(value*value for value in centered)
     if denominator <= math.ulp(max(1.0, max(map(abs, values), default=1.0))) ** 2:
         return float(n), ("SERIAL_DEPENDENCE_UNIDENTIFIABLE",)
-    rho = [math.fsum(centered[k]*centered[k+lag] for k in range(n-lag))/denominator
-           for lag in range(1, n)]
+    rho: list[float] = []
     included: list[int] = []
     for first in range(1, n-1, 2):
+        rho.extend(math.fsum(centered[k]*centered[k+lag] for k in range(n-lag))/denominator
+                   for lag in (first, first+1))
         if rho[first-1] + rho[first] <= 0: break
         included.extend((first, first+1))
     tau = max(1.0, 1.0 + 2.0*math.fsum((1-lag/n)*rho[lag-1] for lag in included))
