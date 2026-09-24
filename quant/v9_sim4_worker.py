@@ -1873,6 +1873,15 @@ class SimulationEntryWorker:
                 target_epoch_ns=_datetime_to_epoch_nanoseconds(target_at),
                 deadline_at=deadline_at,
                 deadline_epoch_ns=_datetime_to_epoch_nanoseconds(deadline_at),
+                # Reconciliation may consume an exit before registering its
+                # entry. Preserve the first valid quote already retained here.
+                selected_quote=select_exit_quote(
+                    decision=entry.decision,
+                    resolution_target_at=target_at,
+                    resolution_deadline_at=deadline_at,
+                    entry_quote=entry.quote,
+                    quotes=(envelope.quote for envelope in self._quotes),
+                ),
             )
 
     def _register_recovered_resolutions(
