@@ -541,17 +541,26 @@ def dashboard_page(data: dict[str, object]) -> bytes:
 <html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>ATOM QUANT</title><style>
 :root{{color-scheme:dark}}body{{margin:0;background:#090c0a;color:#c8facc;font:14px ui-monospace,SFMono-Regular,Consolas,monospace}}main{{max-width:1100px;margin:auto;padding:24px}}h1{{font-size:22px}}h2{{font-size:15px;margin-top:30px;border-bottom:1px solid #315636;padding-bottom:7px}}.market{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}}.label{{color:#7bad80;font-size:11px}}.value{{min-height:1.2em;margin-top:4px}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}th,td{{padding:7px 10px;border-bottom:1px solid #203a24;text-align:right}}th:first-child{{text-align:left}}thead th{{color:#7bad80}}.scroll{{overflow-x:auto}}@media(max-width:600px){{main{{padding:14px}}.market{{grid-template-columns:repeat(2,minmax(0,1fr))}}th,td{{padding:6px 8px}}}}
+.focus-intro{{margin:24px 0;padding:20px;border:1px solid #315636;border-radius:12px;background:#101c14}}.focus-intro h2{{font-size:26px;margin:4px 0 12px;border:0}}.focus-intro p{{line-height:1.6;margin:6px 0}}.focus-note{{color:#9db9a1}}.horizon-control{{display:inline-block;padding:12px 8px;cursor:pointer}}#show-all-horizons:focus-visible{{outline:2px solid #c8facc;outline-offset:4px}}
+#show-all-horizons:not(:checked) ~ .horizon-tables tr > :is(:nth-child(2),:nth-child(3),:nth-child(4),:nth-child(6)){{display:none}}
+.horizon-tables tr > :nth-child(5){{background:#142a1b;color:#e0ffe5;font-weight:600}}.horizon-tables thead tr > :nth-child(5){{border-top:2px solid #97efa6}}.horizon-tables table{{table-layout:fixed}}.horizon-tables th,.horizon-tables td{{white-space:normal;overflow-wrap:anywhere}}details{{margin-top:24px;border:1px solid #315636;border-radius:8px;padding:14px}}summary{{cursor:pointer;font-weight:600;padding:4px}}details h2:first-of-type{{margin-top:18px}}
 </style></head><body><main><h1>ATOM QUANT</h1>
+<section class=focus-intro aria-labelledby=focus-title><div class=label>RESEARCH FOCUS</div><h2 id=focus-title>15m primary · 1H secondary</h2><p>Track the 15-minute forecast, directional accuracy and family inputs. Keep the one-hour horizon alongside it for comparison.</p><p class=focus-note>Focus is a research choice, not proof of a trading edge. All six horizons continue collecting evidence.</p></section>
 <h2>MARKET</h2><div class=market>
 <div><div class=label>COIN</div><div class=value data-dashboard-field="market.symbol">{_decimal_cell(market['symbol'])}</div></div>
 <div><div class=label>BTC</div><div class=value data-dashboard-field="market.btc"></div></div><div><div class=label>QQQ</div><div class=value data-dashboard-field="market.qqq">{_decimal_cell(market['qqq'])}</div></div><div><div class=label>NDX</div><div class=value data-dashboard-field="market.ndx">{_decimal_cell(market['ndx'])}</div></div>
 <div><div class=label>DATA AGE</div><div class=value data-dashboard-field="market.data_age">{_decimal_cell(market['data_age'], 's')}</div></div><div><div class=label>LAST CYCLE</div><div class=value data-dashboard-field="market.last_cycle">{_cycle_cell(market['last_cycle'])}</div></div></div>
-<h2>FINAL NUMBERS</h2>{_table(horizons, final_numbers.items(), section='final_numbers', decimal=True)}
+<section aria-label="Forecast horizons"><input type=checkbox id=show-all-horizons aria-controls=horizon-tables><label class=horizon-control for=show-all-horizons>Show all horizons</label>
+<div class=horizon-tables id=horizon-tables><h2>FINAL NUMBERS</h2>{_table(horizons, final_numbers.items(), section='final_numbers', decimal=True)}
 <h2>V9 DIRECTIONAL ACCURACY</h2>{_table(PHASE_E_HORIZONS, accuracy_rows, section='v9_accuracy')}
 <h2>12 QUANT FAMILIES</h2>{_table(horizons, ((item['name'], item['values']) for item in families), section='quant_families', decimal=True)}
+</div></section>
+<details><summary>Options data</summary>
 <h2>OPTIONS DATA</h2><div>STATUS: <span data-dashboard-field="options_data.status">{_cell(options['status'])}</span></div><div>AS OF: <span data-dashboard-field="options_data.as_of_epoch">{_cycle_cell(options['as_of_epoch'])}</span></div><div>EXPIRATION: <span data-dashboard-field="options_data.expiration">{_cell(options['expiration'])}</span></div>{option_table('calls')}{option_table('puts')}
+</details><details><summary>All evidence and historical replay</summary>
 <h2>EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in evidence.items()), section='evidence')}{phase_e_table}
 <h2>HISTORICAL REPLAY EVIDENCE</h2>{_table((), ((key, (value,)) for key, value in historical_replay.items()), section='historical_replay')}
+</details>
 </main><script>
 (() => {{
   const cells = new Map(
