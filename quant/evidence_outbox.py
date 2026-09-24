@@ -745,7 +745,8 @@ class V4StateBuildWorker:
                  scheduler: OfflineStateBuildScheduler, *, connection=None,
                  connect: Callable | None = None, database_url: str | None = None,
                  metrics: OperationalMetrics | None = None,
-                 shutdown_timeout_seconds: float = STATE_BUILD_SHUTDOWN_TIMEOUT_SECONDS):
+                 shutdown_timeout_seconds: float = STATE_BUILD_SHUTDOWN_TIMEOUT_SECONDS,
+                 on_stopped: Callable[[], None] | None = None):
         self._builder = state_builder
         self._scheduler = scheduler
         self._metrics = metrics or OperationalMetrics()
@@ -764,6 +765,7 @@ class V4StateBuildWorker:
         self._shutdown_deadline: float | None = None
         self._shutdown_abandonment_recorded = threading.Event()
         self._shutdown_abandonment_lock = threading.Lock()
+        self._on_stopped = on_stopped
 
     def _reconnect(self) -> None:
         if self._connect is None or not self._database_url:
@@ -859,10 +861,17 @@ class V4StateBuildWorker:
                 self._metrics.increment("v4_state_build_worker.shutdown_abandoned")
 
     def _close_connection(self) -> None:
+        # Called only after the worker exits or when no worker is running.
+        # A reconnect closes its old connection without releasing this owner.
         connection, self._connection = self._connection, None
-        close = getattr(connection, "close", None)
-        if callable(close):
-            close()
+        try:
+            close = getattr(connection, "close", None)
+            if callable(close):
+                close()
+        finally:
+            on_stopped, self._on_stopped = self._on_stopped, None
+            if on_stopped is not None:
+                on_stopped()
 
     def run(self) -> None:
         active: V4StateBuildCandidate | None = None
@@ -974,7 +983,7 @@ class V4StateBuildWorker:
                 time.monotonic() + self._shutdown_timeout_seconds)
         self._stop.set()
         self._wake.set()
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             # Never close a recovered connection underneath an active build.
             # Its own deadline ends retries.  A small, still-bounded scheduling
             # grace lets the worker execute ``finally`` and close its connection.
